@@ -26,7 +26,8 @@ use super::tools::{
 };
 use crate::bridge::resources::{make_uri, parse_uri};
 use crate::bridge::{
-    NotificationCache, ResourceSubscriptions, Translator, validate_path_against_roots,
+    DiagnosticInfo, NotificationCache, ResourceSubscriptions, Translator,
+    validate_path_against_roots,
 };
 
 /// MCP server that exposes LSP capabilities as tools.
@@ -44,6 +45,111 @@ fn to_tool_result<T: serde::Serialize>(
             .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
         Err(e) => Err(McpError::internal_error(e.to_string(), None)),
     }
+}
+
+/// Fixed page size for `list_resources` pagination.
+///
+/// `DocumentTracker`'s configured `max_documents` (0 = unlimited) isn't
+/// reachable from here -- it's private to the tracker, and `0` means the
+/// document count itself is unbounded anyway -- so this is an independent
+/// page-size ceiling, large enough to rarely trigger for typical workspaces
+/// but small enough to stay well under stdio transport buffer limits.
+const RESOURCE_PAGE_SIZE: usize = 100;
+
+/// Slice `paths` into the page starting at the position `cursor` resumes
+/// from, returning the page and the cursor for the next page (`None` once
+/// the last page is reached).
+///
+/// `paths` must already be sorted: the caller's source
+/// (`open_document_paths()`) is backed by a `HashMap` with no ordering
+/// guarantee, and a stable order is required for a cursor to resume at a
+/// reproducible position across calls. The cursor is an index into that
+/// order, not a document identity: if a document closes at an index below
+/// the cursor between two calls, every later entry shifts down one and the
+/// next page silently skips the entry that moved into the cursor's old
+/// slot. Low-impact for this use case (a stdio single-session server), but
+/// callers pairing pagination with concurrent document open/close should be
+/// aware a page can miss an entry rather than duplicate one.
+///
+/// # Errors
+///
+/// Returns an error only if `cursor` fails to parse as a `usize`. Any
+/// parseable value is accepted as a page-start index, including one that
+/// isn't page-aligned (not a value this function itself ever returns via
+/// `next_cursor`) or is out of range (e.g. documents were closed between
+/// calls) -- an out-of-range cursor is not an error, it yields an empty
+/// final page.
+fn paginate_resource_paths<'a>(
+    paths: &'a [PathBuf],
+    cursor: Option<&str>,
+    page_size: usize,
+) -> Result<(&'a [PathBuf], Option<String>), McpError> {
+    debug_assert!(
+        page_size > 0,
+        "page_size must be non-zero, or next_cursor never advances"
+    );
+
+    let start = match cursor {
+        Some(c) => c.parse::<usize>().map_err(|_| {
+            McpError::invalid_params(format!("invalid pagination cursor: {c}"), None)
+        })?,
+        None => 0,
+    };
+
+    let rest = paths.get(start..).unwrap_or_default();
+    let page = &rest[..rest.len().min(page_size)];
+    // `start` is client-controlled (parsed straight from the cursor), so the
+    // addition must not panic (debug) or silently wrap (release) for a
+    // cursor near `usize::MAX`.
+    let next_start = start.saturating_add(page_size);
+    let next_cursor = (next_start < paths.len()).then(|| next_start.to_string());
+
+    Ok((page, next_cursor))
+}
+
+/// `read_resource`'s diagnostics payload, distinguishing a file mcpls has no
+/// information about (`tracked: false`, always paired with empty
+/// `diagnostics`) from one it does -- whether because the file is currently
+/// open via `DocumentTracker`, or an LSP server has published diagnostics
+/// for it regardless of open state (`tracked: true`; `diagnostics: []` if
+/// clean or not yet analyzed).
+///
+/// `version` is the document version the diagnostics were computed against
+/// (the client's staleness signal, mirroring `DiagnosticInfo::version`) --
+/// `None` both when untracked and when tracked but nothing has been
+/// published yet. `uri` is deliberately omitted: the caller already knows it
+/// (it's the resource they requested).
+#[derive(serde::Serialize)]
+struct ResourceDiagnosticsResponse {
+    tracked: bool,
+    version: Option<i32>,
+    diagnostics: Vec<lsp_types::Diagnostic>,
+}
+
+impl ResourceDiagnosticsResponse {
+    fn new(tracked: bool, entry: Option<&DiagnosticInfo>) -> Self {
+        Self {
+            tracked,
+            version: entry.and_then(|e| e.version),
+            diagnostics: entry.map(|e| e.diagnostics.clone()).unwrap_or_default(),
+        }
+    }
+}
+
+/// Build `read_resource`'s response for a file. `tracked` is true when the
+/// file is currently open via `DocumentTracker` (`document_open`) *or* the
+/// diagnostics cache already holds an entry for it (`entry.is_some()`) --
+/// not `document_open` alone: an LSP server publishes
+/// `textDocument/publishDiagnostics` for whatever it analyzes, including
+/// files mcpls never explicitly opened (e.g. one rust-analyzer pulls in
+/// transitively), so `document_open` alone could report `tracked: false`
+/// while `diagnostics` is still non-empty, contradicting the documented
+/// "untracked implies empty diagnostics" contract.
+fn build_resource_diagnostics_response(
+    document_open: bool,
+    entry: Option<&DiagnosticInfo>,
+) -> ResourceDiagnosticsResponse {
+    ResourceDiagnosticsResponse::new(document_open || entry.is_some(), entry)
 }
 
 #[tool_router]
@@ -686,13 +792,19 @@ impl McplsServer {
 impl ServerHandler for McplsServer {
     async fn list_resources(
         &self,
-        _request: Option<rmcp::model::PaginatedRequestParams>,
+        request: Option<rmcp::model::PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
-        // TODO(critic-S5): paginate when max_documents == 0 (unlimited mode can produce
-        // very large single-page responses that may exceed transport buffers).
-        let open_paths = self.context.translator.open_document_paths();
-        let resources: Vec<_> = open_paths
+        let mut open_paths = self.context.translator.open_document_paths();
+        // `open_document_paths()` is backed by a `HashMap`; sort so pagination
+        // cursors resume at a stable, deterministic position across calls.
+        open_paths.sort();
+
+        let cursor = request.and_then(|r| r.cursor);
+        let (page, next_cursor) =
+            paginate_resource_paths(&open_paths, cursor.as_deref(), RESOURCE_PAGE_SIZE)?;
+
+        let resources: Vec<_> = page
             .iter()
             .filter_map(|path| {
                 let uri = make_uri(path)
@@ -716,7 +828,10 @@ impl ServerHandler for McplsServer {
             })
             .collect();
 
-        Ok(ListResourcesResult::with_all_items(resources))
+        Ok(ListResourcesResult {
+            next_cursor,
+            ..ListResourcesResult::with_all_items(resources)
+        })
     }
 
     async fn read_resource(
@@ -739,15 +854,19 @@ impl ServerHandler for McplsServer {
         let lsp_uri = crate::bridge::path_to_uri(&validated_path)
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
-        // TODO(critic-S2): distinguish "file not tracked" from "file tracked but clean"
-        // in the response shape. Currently both return `{"diagnostics":null}` which is
-        // ambiguous for clients that need to know whether analysis has run yet.
-        let diagnostics = {
+        // Built from a borrow of the cache entry rather than `.cloned()`-ing the
+        // whole `DiagnosticInfo` first: `build_resource_diagnostics_response`
+        // only ever needs `version` (Copy) and its own clone of `diagnostics`,
+        // so cloning the entry up front would clone `diagnostics` twice.
+        let response = {
             let cache = self.context.notification_cache.lock().await;
-            cache.get_diagnostics(lsp_uri.as_str()).cloned()
+            build_resource_diagnostics_response(
+                self.context.translator.is_document_open(&validated_path),
+                cache.get_diagnostics(lsp_uri.as_str()),
+            )
         };
 
-        let json = serde_json::to_string(&diagnostics)
+        let json = serde_json::to_string(&response)
             .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None))?;
 
         Ok(ReadResourceResult::new(vec![ResourceContents::text(json, request.uri)]).into())
@@ -1563,6 +1682,231 @@ mod tests {
         let server = create_test_server();
         let empty = server.context.translator.open_document_paths().is_empty();
         assert!(empty);
+    }
+
+    // ------------------------------------------------------------------
+    // `paginate_resource_paths` (pagination logic behind `list_resources`)
+    // ------------------------------------------------------------------
+
+    fn paths(n: usize) -> Vec<PathBuf> {
+        (0..n)
+            .map(|i| PathBuf::from(format!("/f{i:04}.rs")))
+            .collect()
+    }
+
+    #[test]
+    fn test_paginate_first_page_under_page_size_has_no_next_cursor() {
+        let p = paths(5);
+        let (page, next_cursor) = paginate_resource_paths(&p, None, 100).unwrap();
+        assert_eq!(page.len(), 5);
+        assert!(next_cursor.is_none());
+    }
+
+    #[test]
+    fn test_paginate_splits_across_pages_when_over_page_size() {
+        let p = paths(250);
+
+        let (page1, cursor1) = paginate_resource_paths(&p, None, 100).unwrap();
+        assert_eq!(page1.len(), 100);
+        assert_eq!(page1.first(), p.first());
+        assert_eq!(cursor1.as_deref(), Some("100"));
+
+        let (page2, cursor2) = paginate_resource_paths(&p, cursor1.as_deref(), 100).unwrap();
+        assert_eq!(page2.len(), 100);
+        assert_eq!(page2.first(), Some(&p[100]));
+        assert_eq!(cursor2.as_deref(), Some("200"));
+
+        let (page3, cursor3) = paginate_resource_paths(&p, cursor2.as_deref(), 100).unwrap();
+        assert_eq!(page3.len(), 50);
+        assert_eq!(page3.first(), Some(&p[200]));
+        assert!(cursor3.is_none());
+    }
+
+    #[test]
+    fn test_paginate_rejects_malformed_cursor() {
+        let p = paths(5);
+        let result = paginate_resource_paths(&p, Some("not-a-number"), 100);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_paginate_out_of_range_cursor_yields_empty_page_not_error() {
+        let p = paths(5);
+        let (page, next_cursor) = paginate_resource_paths(&p, Some("9999"), 100).unwrap();
+        assert!(page.is_empty());
+        assert!(next_cursor.is_none());
+    }
+
+    /// Regression for a client-controlled cursor near `usize::MAX`: `start + page_size`
+    /// must not panic (debug) or silently wrap to a bogus cursor (release).
+    #[test]
+    fn test_paginate_cursor_near_usize_max_does_not_overflow() {
+        let p = paths(5);
+        let cursor = usize::MAX.to_string();
+        let (page, next_cursor) = paginate_resource_paths(&p, Some(&cursor), 100).unwrap();
+        assert!(page.is_empty());
+        assert!(next_cursor.is_none());
+    }
+
+    /// `list_resources` overrides `next_cursor` via struct-update syntax on top of
+    /// `ListResourcesResult::with_all_items` (which always sets it to `None`) --
+    /// confirm the explicit field wins and survives serialization under its
+    /// wire name (`nextCursor`, camelCase per `rmcp`'s `paginated_result!`).
+    #[test]
+    fn test_list_resources_result_next_cursor_survives_struct_update_override() {
+        let result = ListResourcesResult {
+            next_cursor: Some("100".to_string()),
+            ..ListResourcesResult::with_all_items(Vec::new())
+        };
+        assert_eq!(result.next_cursor.as_deref(), Some("100"));
+
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json.get("nextCursor").unwrap(), "100");
+    }
+
+    // ------------------------------------------------------------------
+    // `ResourceDiagnosticsResponse` (tracked-vs-untracked shape behind
+    // `read_resource`)
+    // ------------------------------------------------------------------
+
+    fn sample_diagnostic_info(diagnostics: Vec<lsp_types::Diagnostic>) -> DiagnosticInfo {
+        use url::Url;
+
+        let uri: lsp_types::Uri = Url::parse("file:///sample.rs")
+            .unwrap()
+            .as_str()
+            .parse()
+            .unwrap();
+        DiagnosticInfo {
+            uri,
+            version: Some(1),
+            diagnostics,
+        }
+    }
+
+    #[test]
+    fn test_resource_diagnostics_response_untracked_is_not_tracked_and_empty() {
+        let response = ResourceDiagnosticsResponse::new(false, None);
+        assert!(!response.tracked);
+        assert!(response.version.is_none());
+        assert!(response.diagnostics.is_empty());
+
+        // #132's contract is the wire shape, not the Rust struct -- assert the JSON directly.
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["tracked"], false);
+        assert!(json["version"].is_null());
+        assert_eq!(json["diagnostics"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn test_resource_diagnostics_response_tracked_but_no_cache_entry_is_clean() {
+        let response = ResourceDiagnosticsResponse::new(true, None);
+        assert!(response.tracked);
+        assert!(response.version.is_none());
+        assert!(response.diagnostics.is_empty());
+
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["tracked"], true);
+        assert!(json["version"].is_null());
+        assert_eq!(json["diagnostics"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn test_resource_diagnostics_response_tracked_with_diagnostics() {
+        let entry = sample_diagnostic_info(vec![lsp_types::Diagnostic {
+            range: lsp_types::Range {
+                start: lsp_types::Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: lsp_types::Position {
+                    line: 0,
+                    character: 1,
+                },
+            },
+            severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+            code: None,
+            code_description: None,
+            source: None,
+            message: "boom".to_string(),
+            related_information: None,
+            tags: None,
+            data: None,
+        }]);
+        let response = ResourceDiagnosticsResponse::new(true, Some(&entry));
+        assert!(response.tracked);
+        assert_eq!(response.version, Some(1));
+        assert_eq!(response.diagnostics.len(), 1);
+        assert_eq!(response.diagnostics[0].message, "boom");
+
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["tracked"], true);
+        assert_eq!(json["version"], 1);
+        assert_eq!(json["diagnostics"][0]["message"], "boom");
+    }
+
+    /// A path `read_resource` never opened reports `is_document_open() == false`
+    /// -- one of the two inputs `build_resource_diagnostics_response` ORs together.
+    #[tokio::test]
+    async fn test_read_resource_untracked_path_is_not_open() {
+        let server = create_test_server();
+        let tracked = server
+            .context
+            .translator
+            .is_document_open(std::path::Path::new("/never/opened.rs"));
+        assert!(!tracked);
+    }
+
+    #[test]
+    fn test_build_resource_diagnostics_response_neither_open_nor_cached_is_untracked() {
+        let response = build_resource_diagnostics_response(false, None);
+        assert!(!response.tracked);
+        assert!(response.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_build_resource_diagnostics_response_open_but_uncached_is_tracked() {
+        let response = build_resource_diagnostics_response(true, None);
+        assert!(response.tracked);
+        assert!(response.diagnostics.is_empty());
+    }
+
+    /// Regression: an LSP server can publish diagnostics for a file mcpls never
+    /// explicitly opened via `DocumentTracker` (e.g. one rust-analyzer analyzes
+    /// transitively). `tracked` must still be `true` here -- deriving it from
+    /// `document_open` alone would report `tracked: false` while `diagnostics`
+    /// is non-empty, contradicting the documented "untracked implies empty
+    /// diagnostics" contract.
+    #[test]
+    fn test_build_resource_diagnostics_response_cached_but_unopened_is_tracked() {
+        let entry = sample_diagnostic_info(vec![lsp_types::Diagnostic {
+            range: lsp_types::Range {
+                start: lsp_types::Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: lsp_types::Position {
+                    line: 0,
+                    character: 1,
+                },
+            },
+            severity: Some(lsp_types::DiagnosticSeverity::WARNING),
+            code: None,
+            code_description: None,
+            source: None,
+            message: "transitively analyzed".to_string(),
+            related_information: None,
+            tags: None,
+            data: None,
+        }]);
+
+        let response = build_resource_diagnostics_response(false, Some(&entry));
+        assert!(
+            response.tracked,
+            "a cached diagnostics entry must make the response tracked, \
+             even for a file that was never explicitly opened"
+        );
+        assert_eq!(response.diagnostics.len(), 1);
     }
 
     /// `parse_uri` rejects `file://` scheme — ensures `read_resource` would return an error.
