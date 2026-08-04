@@ -40,6 +40,18 @@ pub struct ServerConfig {
     /// LSP server configurations.
     #[serde(default)]
     pub lsp_servers: Vec<LspServerConfig>,
+
+    /// Whether a CWD-discovered `./mcpls.toml` was ignored as untrusted
+    /// during this load (see [`ProjectConfigTrust`]).
+    ///
+    /// Load-time metadata, not user-configurable: never read from or written
+    /// to a TOML file. Consumed by `McplsServer::get_info` (the
+    /// `ServerHandler` implementation in `crate::mcp::server`) to surface
+    /// the ignore decision in-band to MCP clients, supplementing the
+    /// `tracing::warn!` emitted at load time (which is stderr-only and
+    /// typically invisible to an MCP client).
+    #[serde(skip)]
+    pub project_config_ignored: bool,
 }
 
 /// Workspace-level configuration.
@@ -373,6 +385,10 @@ impl ServerConfig {
     /// logged naming the ignored path; discovery falls through to the
     /// global config tier or built-in defaults, so project-marker
     /// heuristics (e.g. `Cargo.toml` → rust-analyzer) still apply normally.
+    /// The returned config's [`project_config_ignored`](Self::project_config_ignored)
+    /// is set to `true` in that case, so callers with access to the loaded
+    /// config (e.g. `McplsServer::get_info`) can surface the ignore decision
+    /// in-band, not just via the stderr-only warning.
     ///
     /// `$MCPLS_CONFIG` and an explicit path are unaffected by `trust` and
     /// are always loaded: naming a path is itself the user's consent.
@@ -393,11 +409,14 @@ impl ServerConfig {
             return Self::load_from(Path::new(&path));
         }
 
+        let mut project_config_ignored = false;
+
         let local_config = PathBuf::from("mcpls.toml");
         if local_config.exists() {
             match trust {
                 ProjectConfigTrust::Trusted => return Self::load_from(&local_config),
                 ProjectConfigTrust::Untrusted => {
+                    project_config_ignored = true;
                     let display_path = local_config.canonicalize().unwrap_or_else(|_| {
                         std::env::current_dir()
                             .map_or_else(|_| local_config.clone(), |cwd| cwd.join(&local_config))
@@ -415,7 +434,9 @@ impl ServerConfig {
         if let Some(config_dir) = dirs::config_dir() {
             let user_config = config_dir.join("mcpls").join("mcpls.toml");
             if user_config.exists() {
-                return Self::load_from(&user_config);
+                let mut config = Self::load_from(&user_config)?;
+                config.project_config_ignored = project_config_ignored;
+                return Ok(config);
             }
 
             // No config found - create default config file
@@ -431,7 +452,10 @@ impl ServerConfig {
         }
 
         // Return default configuration
-        Ok(Self::default())
+        Ok(Self {
+            project_config_ignored,
+            ..Self::default()
+        })
     }
 
     /// Load configuration from a specific path.
@@ -553,6 +577,7 @@ impl Default for ServerConfig {
                 LspServerConfig::clangd(),
                 LspServerConfig::zls(),
             ],
+            project_config_ignored: false,
         }
     }
 }
@@ -974,6 +999,7 @@ mod tests {
                 name: None,
                 handles: None,
             }],
+            project_config_ignored: false,
         };
 
         let map = config.build_effective_extension_map();
@@ -997,6 +1023,7 @@ mod tests {
                 name: None,
                 handles: None,
             }],
+            project_config_ignored: false,
         };
 
         let map = config.build_effective_extension_map();
@@ -1020,6 +1047,7 @@ mod tests {
                 name: None,
                 handles: None,
             }],
+            project_config_ignored: false,
         };
 
         let map = config.build_effective_extension_map();
@@ -1043,6 +1071,7 @@ mod tests {
                 name: None,
                 handles: None,
             }],
+            project_config_ignored: false,
         };
 
         let map = config.build_effective_extension_map();
@@ -1130,8 +1159,84 @@ mod tests {
     // must not run concurrently with each other or with any other test that
     // relies on CWD (e.g. via a bare `load()`/`load_with_trust()` call).
     // Nextest runs each test in its own process, but `cargo test` in-process
-    // would race; guard with a mutex.
+    // would race; guard with a mutex. `CwdGuard` below additionally restores
+    // the original directory on drop, so a panic mid-test (e.g. a failed
+    // `assert_eq!` between the temp-dir switch and the manual restore) can
+    // never leave the process cwd changed for the rest of the run.
     static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard that serializes CWD-mutating tests behind [`CWD_LOCK`] and
+    /// switches into `dir` for the guard's lifetime, restoring the original
+    /// working directory on drop — including on an early return or panic.
+    struct CwdGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        original_dir: PathBuf,
+    }
+
+    impl CwdGuard {
+        fn enter(dir: &Path) -> Self {
+            let lock = CWD_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let original_dir = std::env::current_dir().unwrap();
+            std::env::set_current_dir(dir).unwrap();
+            Self {
+                _lock: lock,
+                original_dir,
+            }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let restored = std::env::set_current_dir(&self.original_dir);
+            // A failure here during an already-unwinding panic must not
+            // panic again (double panic aborts the process, losing the
+            // original failure's message). On the normal path, though,
+            // silently swallowing this would leave the process cwd wrong
+            // for every subsequent test with no diagnostic — panic loudly
+            // instead, since that's exactly the failure mode this guard
+            // exists to prevent.
+            if !std::thread::panicking() {
+                #[allow(clippy::expect_used)]
+                restored.expect("CwdGuard failed to restore original working directory");
+            }
+        }
+    }
+
+    #[test]
+    fn test_cwd_guard_restores_cwd_on_panic() {
+        let original_dir = std::env::current_dir().unwrap();
+        let tmp_dir = TempDir::new().unwrap();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = CwdGuard::enter(tmp_dir.path());
+            panic!("boom");
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(std::env::current_dir().unwrap(), original_dir);
+    }
+
+    /// Precondition for tests that assert on `ServerConfig::load_with_trust`'s
+    /// CWD-local-file branch: a `$MCPLS_CONFIG` set in the ambient
+    /// environment makes `load_with_trust` return before ever looking at
+    /// CWD (see its `MCPLS_CONFIG` branch above), which would otherwise fail
+    /// the test for a reason unrelated to the code under test.
+    ///
+    /// Scrubbing the variable for the test's duration would be the more
+    /// thorough fix, but `std::env::remove_var`/`set_var` are `unsafe`
+    /// (mutate process-wide state) and this crate denies `unsafe_code`
+    /// workspace-wide with no existing exception — so this asserts the
+    /// precondition instead of silently working around it, turning an
+    /// environment-dependent false failure into an explicit, legible one.
+    fn assert_mcpls_config_env_unset() {
+        assert!(
+            std::env::var_os("MCPLS_CONFIG").is_none(),
+            "this test requires MCPLS_CONFIG to be unset in the test environment, since \
+             load_with_trust returns before consulting CWD when it's set"
+        );
+    }
 
     #[test]
     fn test_load_ignores_untrusted_project_local_config() {
@@ -1142,9 +1247,6 @@ mod tests {
         // covers this without any filesystem interaction. This test only
         // needs to prove the planted attacker file's content never leaks
         // through `load()`.
-        let _guard = CWD_LOCK.lock().unwrap();
-        let original_dir = std::env::current_dir().unwrap();
-
         let tmp_dir = TempDir::new().unwrap();
         let config_path = tmp_dir.path().join("mcpls.toml");
 
@@ -1165,9 +1267,10 @@ mod tests {
 
         fs::write(&config_path, custom_toml).unwrap();
 
-        std::env::set_current_dir(tmp_dir.path()).unwrap();
-        let config = ServerConfig::load().unwrap();
-        std::env::set_current_dir(&original_dir).unwrap();
+        let config = {
+            let _guard = CwdGuard::enter(tmp_dir.path());
+            ServerConfig::load().unwrap()
+        };
 
         assert!(
             !config
@@ -1185,9 +1288,6 @@ mod tests {
 
     #[test]
     fn test_load_with_trust_loads_trusted_project_local_config() {
-        let _guard = CWD_LOCK.lock().unwrap();
-        let original_dir = std::env::current_dir().unwrap();
-
         let tmp_dir = TempDir::new().unwrap();
         let config_path = tmp_dir.path().join("mcpls.toml");
 
@@ -1202,9 +1302,10 @@ mod tests {
 
         fs::write(&config_path, custom_toml).unwrap();
 
-        std::env::set_current_dir(tmp_dir.path()).unwrap();
-        let config = ServerConfig::load_with_trust(ProjectConfigTrust::Trusted).unwrap();
-        std::env::set_current_dir(&original_dir).unwrap();
+        let config = {
+            let _guard = CwdGuard::enter(tmp_dir.path());
+            ServerConfig::load_with_trust(ProjectConfigTrust::Trusted).unwrap()
+        };
 
         assert_eq!(config.workspace.roots, vec![PathBuf::from("/custom/path")]);
         assert_eq!(config.lsp_servers.len(), 1);
@@ -1213,9 +1314,6 @@ mod tests {
 
     #[test]
     fn test_load_with_trust_untrusted_ignores_workspace_and_servers() {
-        let _guard = CWD_LOCK.lock().unwrap();
-        let original_dir = std::env::current_dir().unwrap();
-
         let tmp_dir = TempDir::new().unwrap();
         let config_path = tmp_dir.path().join("mcpls.toml");
 
@@ -1232,9 +1330,10 @@ mod tests {
 
         fs::write(&config_path, custom_toml).unwrap();
 
-        std::env::set_current_dir(tmp_dir.path()).unwrap();
-        let config = ServerConfig::load_with_trust(ProjectConfigTrust::Untrusted).unwrap();
-        std::env::set_current_dir(&original_dir).unwrap();
+        let config = {
+            let _guard = CwdGuard::enter(tmp_dir.path());
+            ServerConfig::load_with_trust(ProjectConfigTrust::Untrusted).unwrap()
+        };
 
         assert!(
             !config
@@ -1244,6 +1343,44 @@ mod tests {
         );
         assert_ne!(config.workspace.heuristics_max_depth, 999_999);
         assert!(!config.lsp_servers.iter().any(|s| s.language_id == "evil"));
+    }
+
+    #[test]
+    fn test_load_with_trust_sets_project_config_ignored_flag() {
+        assert_mcpls_config_env_unset();
+
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("mcpls.toml");
+        fs::write(&config_path, "[workspace]\nroots = []\n").unwrap();
+
+        let config = {
+            let _guard = CwdGuard::enter(tmp_dir.path());
+            ServerConfig::load_with_trust(ProjectConfigTrust::Untrusted).unwrap()
+        };
+        assert!(config.project_config_ignored);
+
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("mcpls.toml");
+        fs::write(&config_path, "[workspace]\nroots = []\n").unwrap();
+
+        let config = {
+            let _guard = CwdGuard::enter(tmp_dir.path());
+            ServerConfig::load_with_trust(ProjectConfigTrust::Trusted).unwrap()
+        };
+        assert!(!config.project_config_ignored);
+    }
+
+    #[test]
+    fn test_load_no_local_config_leaves_flag_unset() {
+        assert_mcpls_config_env_unset();
+
+        let tmp_dir = TempDir::new().unwrap();
+
+        let config = {
+            let _guard = CwdGuard::enter(tmp_dir.path());
+            ServerConfig::load_with_trust(ProjectConfigTrust::Untrusted).unwrap()
+        };
+        assert!(!config.project_config_ignored);
     }
 
     #[test]
