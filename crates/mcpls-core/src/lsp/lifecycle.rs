@@ -632,6 +632,41 @@ fn workspace_folder(root: &Path) -> Result<WorkspaceFolder> {
 }
 
 #[cfg(test)]
+impl LspServer {
+    /// Construct an `LspServer` fixture carrying the given capabilities, for
+    /// tests elsewhere in the crate that need to drive capability-gated
+    /// dispatch paths in `Translator` without spawning a real language server.
+    ///
+    /// The underlying client and child process are inert placeholders — only
+    /// `capabilities()` is meaningful on the returned value.
+    ///
+    /// Uses `LspClient::new` (uninitialized, no background task) rather than
+    /// `LspClient::from_transport`, so this does not depend on the Tokio
+    /// message loop — only `_child`'s spawn needs a Tokio runtime, i.e. an
+    /// async test context (`#[tokio::test]`).
+    #[allow(clippy::unwrap_used)]
+    pub(crate) fn new_for_test(capabilities: ServerCapabilities) -> Self {
+        let child = Command::new("echo")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+
+        let client = LspClient::new(LspServerConfig::rust_analyzer());
+        let (_, notification_rx) = mpsc::channel(1);
+
+        Self {
+            client,
+            capabilities,
+            position_encoding: PositionEncodingKind::UTF16,
+            notification_rx,
+            _child: child,
+        }
+    }
+}
+
+#[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
