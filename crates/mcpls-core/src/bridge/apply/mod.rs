@@ -16,7 +16,7 @@ pub use offsets::LineTable;
 pub use plan::{EditPlan, Operation};
 
 use crate::bridge::encoding::{EncodingConverter, PositionEncoding};
-use crate::bridge::translator::{ResourceOperation, resource_operations_from_plan};
+use crate::bridge::translator::ResourceOperation;
 use crate::bridge::{uri_to_path, validate_path_against_roots};
 use crate::config::ApplyConfig;
 use crate::error::{Error, Result};
@@ -38,7 +38,10 @@ pub struct ApplySummary {
     /// Files whose content was written. Renamed and deleted paths are in
     /// `resource_operations` instead.
     pub files_changed: Vec<FileChange>,
-    /// File-system operations performed.
+    /// File-system operations actually performed. An operation the plan
+    /// asked for but the applier skipped -- a create whose target already
+    /// exists under `ignoreIfExists`, say -- is absent, so this together
+    /// with `files_changed` says whether the tree changed at all.
     pub resource_operations: Vec<ResourceOperation>,
     /// Every absolute path whose on-disk content no longer matches what a
     /// cache of it would hold: written files plus both ends of a rename and
@@ -121,7 +124,7 @@ impl Applier {
             journal::execute(&outcome.steps)?;
             Ok(ApplySummary {
                 files_changed: outcome.files_changed,
-                resource_operations: resource_operations_from_plan(&plan),
+                resource_operations: outcome.resource_operations,
                 paths_invalidated: outcome.paths_invalidated,
             })
         })
@@ -146,6 +149,7 @@ enum Presence {
 struct PlannedEdit {
     steps: Vec<Step>,
     files_changed: Vec<FileChange>,
+    resource_operations: Vec<ResourceOperation>,
     paths_invalidated: Vec<PathBuf>,
 }
 
@@ -158,6 +162,7 @@ struct Planner<'a> {
     overlay: HashMap<PathBuf, Presence>,
     steps: Vec<Step>,
     files_changed: Vec<FileChange>,
+    resource_operations: Vec<ResourceOperation>,
     paths_invalidated: Vec<PathBuf>,
 }
 
@@ -170,6 +175,7 @@ impl<'a> Planner<'a> {
             overlay: HashMap::new(),
             steps: Vec::new(),
             files_changed: Vec::new(),
+            resource_operations: Vec::new(),
             paths_invalidated: Vec::new(),
         }
     }
@@ -199,6 +205,7 @@ impl<'a> Planner<'a> {
         Ok(PlannedEdit {
             steps: self.steps,
             files_changed: self.files_changed,
+            resource_operations: self.resource_operations,
             paths_invalidated: self.paths_invalidated,
         })
     }
@@ -360,6 +367,11 @@ impl<'a> Planner<'a> {
             previous,
         });
         self.record_change(&path, 0);
+        self.resource_operations.push(ResourceOperation {
+            kind: "create".to_string(),
+            uri: uri.to_string(),
+            new_uri: None,
+        });
         Ok(())
     }
 
@@ -406,6 +418,11 @@ impl<'a> Planner<'a> {
         self.invalidate(&from);
         self.invalidate(&to);
         self.steps.push(Step::Move { from, to });
+        self.resource_operations.push(ResourceOperation {
+            kind: "rename".to_string(),
+            uri: old.to_string(),
+            new_uri: Some(new.to_string()),
+        });
         Ok(())
     }
 
@@ -453,6 +470,11 @@ impl<'a> Planner<'a> {
         self.overlay.insert(path.clone(), Presence::Absent);
         self.invalidate(&path);
         self.steps.push(Step::Trash { path, trash });
+        self.resource_operations.push(ResourceOperation {
+            kind: "delete".to_string(),
+            uri: uri.to_string(),
+            new_uri: None,
+        });
         Ok(())
     }
 

@@ -13,12 +13,12 @@ use super::Translator;
 use super::diagnostics::diagnostic_to_mcp;
 use super::dto::{
     ApplyCodeActionResult, CodeAction, CodeActionsResult, CommandDescription, DocumentChanges,
-    FormatDocumentResult, RenameResult, TextEdit, WorkspaceEditDescription,
+    FormatDocumentResult, RenameResult, ResourceOperation, TextEdit, WorkspaceEditDescription,
     resource_operations_from_plan,
 };
 use super::encoding_ctx::EncodingCtx;
 use super::routing::{MAX_POSITION_VALUE, MAX_RANGE_LINES};
-use crate::bridge::apply::{Applier, EditPlan, Operation};
+use crate::bridge::apply::{Applier, ApplySummary, EditPlan, Operation};
 use crate::config::{ServerId, ToolKind};
 use crate::error::{Error, Result};
 use crate::lsp::LspClient;
@@ -199,6 +199,43 @@ enum CodeActionSelector {
     Title(String),
 }
 
+/// Everything one `apply_code_action` call wrote, across its own edit and
+/// however many `workspace/applyEdit` requests the action's command sent
+/// back.
+#[derive(Debug, Default)]
+struct InboundEdits {
+    /// Whether any of those applies changed the tree.
+    changed_the_tree: bool,
+    /// Absolute paths whose content was rewritten.
+    files_written: Vec<String>,
+    /// File-system operations performed.
+    resource_operations: Vec<ResourceOperation>,
+}
+
+impl InboundEdits {
+    /// Fold one apply's outcome in.
+    fn absorb(&mut self, summary: &ApplySummary) {
+        self.changed_the_tree |= changed_the_tree(summary);
+        self.files_written.extend(
+            summary
+                .files_changed
+                .iter()
+                .map(|change| change.path.display().to_string()),
+        );
+        self.resource_operations
+            .extend(summary.resource_operations.iter().cloned());
+    }
+}
+
+/// Whether an apply changed the working tree.
+///
+/// The one definition every write path reports as `applied`: an edit that
+/// only moves or deletes a file changed the tree as surely as one that
+/// rewrote bytes, and an edit the applier skipped entirely changed nothing.
+const fn changed_the_tree(summary: &ApplySummary) -> bool {
+    !summary.files_changed.is_empty() || !summary.resource_operations.is_empty()
+}
+
 /// Narrow the tool's two optional selector fields to exactly one selector.
 ///
 /// # Errors
@@ -330,7 +367,7 @@ impl Translator {
             let (applied, files_written) = if let Some(applier) = write_permit {
                 let summary = self.apply_locked(&applier, plan, &server_id).await?;
                 (
-                    true,
+                    changed_the_tree(&summary),
                     summary
                         .files_changed
                         .iter()
@@ -423,9 +460,8 @@ impl Translator {
             });
         }
 
-        // `applied` means bytes were written, not that the pipeline ran: an
-        // already-well-formatted file yields no edits, and running the write
-        // path over nothing would still report a write that never happened.
+        // An already-well-formatted file yields no edits, so there is
+        // nothing to plan and nothing to write.
         let applied = if let (Some(applier), false) = (write_permit, edits.is_empty()) {
             // A `Uri`-keyed `changes` map would trip `clippy::mutable_key_type`
             // (`Uri` wraps a `Cell`), so the single document is wrapped as
@@ -441,8 +477,8 @@ impl Translator {
                 }])),
                 ..WorkspaceEdit::default()
             })?;
-            self.apply_locked(&applier, plan, &server_id).await?;
-            true
+            let summary = self.apply_locked(&applier, plan, &server_id).await?;
+            changed_the_tree(&summary)
         } else {
             false
         };
@@ -689,21 +725,11 @@ impl Translator {
             }
         };
 
-        let mut files_written = Vec::new();
-        let mut applied = false;
+        let mut written = InboundEdits::default();
         if let Some(edit) = edit {
             let plan = EditPlan::from_workspace_edit(edit)?;
             let summary = self.apply_locked(&write_permit, plan, &server_id).await?;
-            // `applied` means bytes were written, not that the pipeline
-            // ran: an edit with no changes plans zero operations and
-            // writes nothing.
-            applied = !summary.files_changed.is_empty();
-            files_written.extend(
-                summary
-                    .files_changed
-                    .iter()
-                    .map(|change| change.path.display().to_string()),
-            );
+            written.absorb(&summary);
         }
 
         // A command-only action still reaches `workspace/executeCommand`
@@ -711,17 +737,20 @@ impl Translator {
         // legitimately carry a command and nothing else.
         let executed_command = if let Some(command) = command {
             let name = command.command.clone();
-            let pumped = self
-                .execute_command_applying_inbound_edits(&client, &write_permit, &server_id, command)
-                .await?;
-            applied = applied || !pumped.is_empty();
-            files_written.extend(pumped);
+            self.execute_command_applying_inbound_edits(
+                &client,
+                &write_permit,
+                &server_id,
+                command,
+                &mut written,
+            )
+            .await?;
             Some(name)
         } else {
             None
         };
 
-        if !applied && executed_command.is_none() {
+        if !written.changed_the_tree && executed_command.is_none() {
             return Err(Error::ApplyRefused(format!(
                 "code action {title:?} resolved to neither an edit nor a command"
             )));
@@ -729,8 +758,9 @@ impl Translator {
 
         Ok(ApplyCodeActionResult {
             title,
-            applied,
-            files_written,
+            applied: written.changed_the_tree,
+            files_written: written.files_written,
+            resource_operations: written.resource_operations,
             executed_command,
         })
     }
@@ -768,7 +798,8 @@ impl Translator {
         applier: &Applier,
         server_id: &ServerId,
         command: lsp_types::Command,
-    ) -> Result<Vec<String>> {
+        written: &mut InboundEdits,
+    ) -> Result<()> {
         let _guard = self.apply_sink_lock.lock().await;
 
         let (sink_tx, mut sink_rx) = mpsc::channel(INBOUND_EDIT_QUEUE_DEPTH);
@@ -785,7 +816,6 @@ impl Translator {
         );
         tokio::pin!(request);
 
-        let mut written = Vec::new();
         let outcome = loop {
             tokio::select! {
                 // Biased, edits first: a server may send its edit and its
@@ -797,7 +827,7 @@ impl Translator {
                 inbound = sink_rx.recv() => match inbound {
                     Some((edit, reply)) => {
                         let answer = self
-                            .apply_inbound_edit(applier, server_id, edit, &mut written)
+                            .apply_inbound_edit(applier, server_id, edit, written)
                             .await;
                         let _ = reply.send(answer);
                     }
@@ -823,7 +853,7 @@ impl Translator {
         // this window.
         while let Ok((edit, reply)) = sink_rx.try_recv() {
             let answer = self
-                .apply_inbound_edit(applier, server_id, edit, &mut written)
+                .apply_inbound_edit(applier, server_id, edit, written)
                 .await;
             let _ = reply.send(answer);
         }
@@ -832,12 +862,13 @@ impl Translator {
         client.set_apply_sink(None).await;
 
         match outcome {
-            Ok(_) => Ok(written),
+            Ok(_) => Ok(()),
             Err(error) => {
-                if !written.is_empty() {
+                if !written.files_written.is_empty() {
                     warn!(
                         "workspace/executeCommand failed after inbound edits had already \
-                         written {written:?}: {error}"
+                         written {:?}: {error}",
+                        written.files_written
                     );
                 }
                 Err(error)
@@ -845,7 +876,7 @@ impl Translator {
         }
     }
 
-    /// Apply one inbound `workspace/applyEdit`, appending what it wrote to
+    /// Apply one inbound `workspace/applyEdit`, folding what it wrote into
     /// `written`, and report whether the server's edit was applied.
     ///
     /// The answer is whether the apply succeeded, which is the yes-or-no
@@ -862,7 +893,7 @@ impl Translator {
         applier: &Applier,
         server_id: &ServerId,
         edit: WorkspaceEdit,
-        written: &mut Vec<String>,
+        written: &mut InboundEdits,
     ) -> bool {
         let outcome = match EditPlan::from_workspace_edit(edit) {
             Ok(plan) => self.apply_locked(applier, plan, server_id).await,
@@ -870,12 +901,7 @@ impl Translator {
         };
         match outcome {
             Ok(summary) => {
-                written.extend(
-                    summary
-                        .files_changed
-                        .iter()
-                        .map(|change| change.path.display().to_string()),
-                );
+                written.absorb(&summary);
                 true
             }
             Err(error) => {
@@ -1801,6 +1827,88 @@ mod tests {
                 "fn new() {}\n"
             );
         }
+    }
+
+    /// A `WorkspaceEdit` that only moves a file writes no bytes, but the
+    /// tree changed: the file is somewhere else now, and a caller told
+    /// `applied: false` would believe nothing happened.
+    #[tokio::test]
+    async fn test_a_rename_only_edit_reports_applied() {
+        use std::sync::Arc;
+
+        use tokio::io::BufReader;
+        use tokio::time::{Duration, timeout};
+
+        use crate::bridge::apply::Applier;
+        use crate::config::{ApplyConfig, ServerId};
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let caps = lsp_types::ServerCapabilities {
+            rename_provider: Some(lsp_types::OneOf::Left(true)),
+            ..Default::default()
+        };
+        let (translator, mut server) =
+            translator_with_capabilities(&dir, &ServerId::from("rust"), caps);
+        let translator = Arc::new(translator.with_applier(Arc::new(Applier::new(
+            vec![dir.path().to_path_buf()],
+            ApplyConfig {
+                rename: true,
+                ..ApplyConfig::default()
+            },
+        ))));
+
+        let anchor = dir.path().join("anchor.rs");
+        let old = dir.path().join("moved.rs");
+        let new = dir.path().join("moved_again.rs");
+        fs::write(&anchor, "fn caller() {}\n").expect("write the anchor fixture");
+        fs::write(&old, "fn moved() {}\n").expect("write the moved fixture");
+        let old_uri = crate::bridge::path_to_uri(&old.canonicalize().expect("moved.rs exists"))
+            .expect("uri for moved.rs");
+        let new_uri = crate::bridge::path_to_uri(&new).expect("uri for the destination");
+
+        let handle = {
+            let translator = Arc::clone(&translator);
+            let path = anchor.to_string_lossy().to_string();
+            tokio::spawn(async move {
+                translator
+                    .handle_rename(path, 1, 4, "renamed".to_string(), true)
+                    .await
+            })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let rename = read_framed_reply(&mut wire).await;
+        write_response(
+            &mut server.read_half_stdin,
+            &rename["id"],
+            serde_json::json!({
+                "documentChanges": [{
+                    "kind": "rename",
+                    "oldUri": old_uri.as_str(),
+                    "newUri": new_uri.as_str(),
+                }],
+            }),
+        )
+        .await;
+
+        let result = timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("the handler must not hang")
+            .expect("the handler task must not panic")
+            .expect("a rename-only edit applies");
+
+        assert!(
+            result.applied,
+            "a file moved, so the edit reached the working tree"
+        );
+        assert!(result.files_written.is_empty(), "no bytes were rewritten");
+        assert!(!old.exists());
+        assert_eq!(
+            fs::read_to_string(&new).expect("read the moved file"),
+            "fn moved() {}\n"
+        );
     }
 
     /// An apply writes files the call never queried -- a rename anchored in

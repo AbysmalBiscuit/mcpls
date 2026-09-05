@@ -231,6 +231,11 @@ pub struct ApplyCodeActionResult {
     /// Files written, when `applied`.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub files_written: Vec<String>,
+    /// File-system operations the action performed alongside its text
+    /// changes. An action that moves or deletes a file reports it here and
+    /// nowhere else.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub resource_operations: Vec<ResourceOperation>,
     /// Command dispatched to the server, when the action carried one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub executed_command: Option<String>,
