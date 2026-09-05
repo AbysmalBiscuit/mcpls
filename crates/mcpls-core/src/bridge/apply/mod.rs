@@ -133,6 +133,20 @@ impl Applier {
     }
 }
 
+/// `path` with its longest existing prefix canonicalized, which is how
+/// [`Planner::resolve`] shapes every overlay key: an existing path becomes
+/// its canonical self, and one that does not exist yet becomes its canonical
+/// parent plus the names below it.
+fn normalize(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => normalize(parent).join(name),
+        _ => path.to_path_buf(),
+    }
+}
+
 /// What a path holds at some point during planning.
 #[derive(Clone)]
 enum Presence {
@@ -219,6 +233,23 @@ impl<'a> Planner<'a> {
     /// same overlay key.
     fn resolve(&self, uri: &lsp_types::Uri) -> Result<PathBuf> {
         let path = uri_to_path(uri).ok_or_else(|| Error::InvalidUri(uri.as_str().to_string()))?;
+
+        // The overlay is keyed on each path an operation names, never on
+        // that path's children, so a file under a directory the same edit
+        // creates or moves resolves against the tree as it stands before
+        // the move. gopls emits exactly this for a package move. Nothing is
+        // lost by refusing -- the journal would fail mid-run and roll back
+        // -- but the caller gets a message that says what is unsupported
+        // instead of one naming a directory it never mentioned.
+        if let Some(ancestor) = self.planned_ancestor(&path) {
+            return Err(Error::ApplyRefused(format!(
+                "{} sits under {}, which this edit also creates or moves; mcpls cannot apply \
+                 an edit to a file under a directory the same edit relocates",
+                path.display(),
+                ancestor.display()
+            )));
+        }
+
         if path.exists() {
             return validate_path_against_roots(&path, self.roots);
         }
@@ -228,8 +259,28 @@ impl<'a> Planner<'a> {
         let file_name = path
             .file_name()
             .ok_or_else(|| Error::ApplyRefused(format!("{} has no file name", path.display())))?;
+        // Checked before confinement, which canonicalizes and would
+        // otherwise report a missing directory as a file-I/O failure.
+        // rust-analyzer's "create module" quick fix lands here.
+        if !parent.exists() {
+            return Err(Error::ApplyRefused(format!(
+                "{} would be created in {}, which does not exist; mcpls does not create \
+                 directories",
+                path.display(),
+                parent.display()
+            )));
+        }
         let canonical_parent = validate_path_against_roots(parent, self.roots)?;
         Ok(canonical_parent.join(file_name))
+    }
+
+    /// The directory an earlier operation in this plan creates or moves that
+    /// `path` sits under, if any.
+    fn planned_ancestor(&self, path: &Path) -> Option<PathBuf> {
+        path.ancestors()
+            .skip(1)
+            .map(normalize)
+            .find(|ancestor| self.overlay.contains_key(ancestor))
     }
 
     /// What `path` holds at this point in the plan, reading disk on the
@@ -795,6 +846,88 @@ mod tests {
             "the error names the key that would permit it: {error}"
         );
         assert!(path.exists(), "the file survives a refused deletion");
+    }
+
+    /// rust-analyzer's "create module" quick fix asks for a file in a
+    /// directory that does not exist yet. mcpls does not create directories,
+    /// and the refusal must say so rather than surface as a file-I/O failure
+    /// naming a directory the caller never asked about.
+    #[tokio::test]
+    async fn test_refuses_a_create_into_a_directory_that_does_not_exist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("submodule");
+        let path = missing.join("mod.rs");
+
+        let applier = Applier::new(vec![dir.path().to_path_buf()], permissive());
+        let plan = EditPlan::from_workspace_edit(WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Operations(vec![
+                DocumentChangeOperation::Op(ResourceOp::Create(CreateFile {
+                    uri: uri_for(&path),
+                    options: None,
+                    annotation_id: None,
+                })),
+            ])),
+            ..WorkspaceEdit::default()
+        })
+        .expect("plan builds");
+
+        let error = applier
+            .apply(plan, PositionEncoding::Utf16)
+            .await
+            .expect_err("mcpls does not create directories");
+        assert!(
+            error.to_string().contains("does not create directories"),
+            "the error says what is unsupported: {error}"
+        );
+        assert!(!missing.exists());
+    }
+
+    /// gopls emits a package move as a directory rename followed by edits to
+    /// files under the new directory. The overlay is keyed on the directory,
+    /// not its children, so this shape cannot be planned; refusing it names
+    /// the shape rather than failing later on a path the caller never saw.
+    #[tokio::test]
+    async fn test_refuses_an_edit_under_a_directory_the_same_edit_moves() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let package = dir.path().join("pkg");
+        fs::create_dir(&package).expect("create the package directory");
+        fs::write(package.join("thing.go"), "package pkg\n").expect("seed");
+        let moved = dir.path().join("renamed");
+
+        let applier = Applier::new(vec![dir.path().to_path_buf()], permissive());
+        let plan = EditPlan::from_workspace_edit(WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Operations(vec![
+                DocumentChangeOperation::Op(ResourceOp::Rename(RenameFile {
+                    old_uri: uri_for(&package),
+                    new_uri: uri_for(&moved),
+                    options: None,
+                    annotation_id: None,
+                })),
+                DocumentChangeOperation::Edit(TextDocumentEdit {
+                    text_document: OptionalVersionedTextDocumentIdentifier {
+                        uri: uri_for(&moved.join("thing.go")),
+                        version: None,
+                    },
+                    edits: vec![OneOf::Left(TextEdit {
+                        range: Range::new(Position::new(0, 8), Position::new(0, 11)),
+                        new_text: "renamed".to_string(),
+                    })],
+                }),
+            ])),
+            ..WorkspaceEdit::default()
+        })
+        .expect("plan builds");
+
+        let error = applier
+            .apply(plan, PositionEncoding::Utf16)
+            .await
+            .expect_err("an edit under a moved directory is unsupported");
+        assert!(
+            error.to_string().contains("the same edit relocates"),
+            "the error names the unsupported shape: {error}"
+        );
+        assert!(package.is_dir(), "nothing was moved");
+        assert!(!moved.exists());
     }
 
     /// A create with `overwrite` truncates an existing file to empty, which
