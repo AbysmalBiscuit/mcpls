@@ -68,12 +68,24 @@ impl Applier {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::ApplyRefused`] when an operation targets a path
-    /// outside the workspace, deletes a file without
-    /// `apply.allow_file_deletion`, or resolves to an invalid range, and
-    /// [`Error::ApplyPartiallyFailed`] when a step fails after another has
-    /// already landed.
+    /// Returns [`Error::ApplyRefused`] when the applier has no workspace
+    /// roots configured, when an operation targets a path outside the
+    /// workspace, deletes a file without `apply.allow_file_deletion`, or
+    /// resolves to an invalid range, and [`Error::ApplyPartiallyFailed`]
+    /// when a step fails after another has already landed.
     pub async fn apply(&self, plan: EditPlan, encoding: PositionEncoding) -> Result<ApplySummary> {
+        // `validate_path_against_roots` treats an empty root list as "any
+        // path is in bounds", which is fine for the read-only queries it
+        // was written for but would let a misconfigured applier write
+        // anywhere the server names a URI. Refuse before any path is
+        // resolved rather than relying on that fallback here.
+        if self.roots.is_empty() {
+            return Err(Error::ApplyRefused(
+                "no workspace roots are configured, so the applier refuses to write anywhere"
+                    .to_string(),
+            ));
+        }
+
         let roots = self.roots.clone();
         let config = self.config.clone();
         // Planning reads files and execution writes them, and the caller
@@ -634,6 +646,31 @@ mod tests {
             fs::read_to_string(&path).expect("read"),
             "x\n",
             "the file outside the workspace is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refuses_to_write_with_no_workspace_roots_configured() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("a.rs");
+        fs::write(&path, "fn old() {}\n").expect("seed");
+
+        let config = ApplyConfig {
+            rename: true,
+            ..ApplyConfig::default()
+        };
+        let applier = Applier::new(vec![], config);
+        let plan = plan_replacing(
+            uri_for(&path),
+            Range::new(Position::new(0, 3), Position::new(0, 6)),
+            "new",
+        );
+
+        assert!(applier.apply(plan, PositionEncoding::Utf16).await.is_err());
+        assert_eq!(
+            fs::read_to_string(&path).expect("read"),
+            "fn old() {}\n",
+            "no workspace roots means nothing is written, not just an error returned"
         );
     }
 
