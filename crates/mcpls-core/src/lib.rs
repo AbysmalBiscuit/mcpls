@@ -48,6 +48,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use bridge::apply::Applier;
 use bridge::resources::make_uri;
 use bridge::{NotificationCache, ResourceSubscriptions, Translator};
 pub use config::{ProjectConfigTrust, ServerConfig};
@@ -617,12 +618,13 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     // in-flight LSP round-trip.
     let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
 
-    let mut translator = Translator::new()
-        .with_resource_limits(config.workspace.resource_limits())
-        .with_extensions(extension_map)
-        .with_router(router)
-        .with_notification_cache(Arc::clone(&notification_cache));
-    translator.set_workspace_roots(workspace_roots.clone());
+    let translator = build_translator(
+        &config,
+        workspace_roots.clone(),
+        extension_map,
+        router,
+        Arc::clone(&notification_cache),
+    );
 
     // Mark applicable servers as "expected" so a tool call that arrives while
     // its server is still initializing gets a clear "still initializing" error
@@ -699,6 +701,29 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
 
     info!("MCPLS server shutting down");
     result
+}
+
+/// Build the translator `serve_with` runs on.
+///
+/// A named function rather than an inline chain so a test can construct
+/// the same translator the server does, and so a new `with_*` call cannot
+/// be added to one and forgotten in the other.
+fn build_translator(
+    config: &ServerConfig,
+    workspace_roots: Vec<PathBuf>,
+    extension_map: HashMap<String, String>,
+    router: ToolRouter,
+    notification_cache: Arc<Mutex<NotificationCache>>,
+) -> Translator {
+    let applier = Arc::new(Applier::new(workspace_roots.clone(), config.apply.clone()));
+    let mut translator = Translator::new()
+        .with_resource_limits(config.workspace.resource_limits())
+        .with_extensions(extension_map)
+        .with_router(router)
+        .with_notification_cache(notification_cache)
+        .with_applier(applier);
+    translator.set_workspace_roots(workspace_roots);
+    translator
 }
 
 /// Bounds how long [`shutdown`] waits for the background LSP init task
@@ -1588,6 +1613,31 @@ mod tests {
         assert_eq!(roots.len(), 2);
         assert_eq!(roots[0], base.join("workspace/path with spaces"));
         assert_eq!(roots[1], base.join("another path/workspace"));
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_serve_translator_carries_the_configured_apply_permissions() {
+        let config: ServerConfig =
+            toml::from_str("[apply]\nrename = true\n").expect("config parses");
+        let translator = build_translator(
+            &config,
+            Vec::new(),
+            HashMap::new(),
+            ToolRouter::default(),
+            Arc::new(Mutex::new(NotificationCache::new())),
+        );
+
+        assert!(
+            translator
+                .applier_for(
+                    crate::config::ToolKind::Rename,
+                    "rename_symbol",
+                    "apply.rename"
+                )
+                .is_ok(),
+            "`[apply] rename = true` must reach the translator serve_with runs on"
+        );
     }
 
     // Tests for graceful degradation behavior

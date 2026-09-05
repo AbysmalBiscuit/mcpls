@@ -15,10 +15,12 @@ use tokio::sync::Mutex;
 use self::clock::{Clock, SystemClock};
 use self::encoding_ctx::EncodingCtx;
 use self::respawn::RespawnBackoff;
+use crate::bridge::apply::Applier;
 use crate::bridge::encoding::PositionEncoding;
 use crate::bridge::state::ResourceLimits;
 use crate::bridge::{DocumentTracker, NotificationCache, lock_std};
-use crate::config::{ServerId, ToolKind, ToolRouter};
+use crate::config::{ApplyConfig, ServerId, ToolKind, ToolRouter};
+use crate::error::{Error, Result};
 use crate::lsp::{LspClient, LspServer, ServerInitConfig};
 
 mod assist;
@@ -107,6 +109,15 @@ pub struct Translator {
     /// it to invalidate a respawned server's stale cached diagnostics --
     /// see that method's docs for why that matters.
     notification_cache: Option<Arc<Mutex<NotificationCache>>>,
+    /// Serializes every apply-enabled tool call. Two concurrent applies to
+    /// one file would otherwise both plan against the same pre-edit
+    /// content and the second would overwrite the first.
+    #[allow(dead_code)]
+    apply_lock: Arc<Mutex<()>>,
+    /// Writes a permitted `WorkspaceEdit` to the working tree. Always
+    /// present; a translator that may not write carries one whose
+    /// `ApplyConfig` permits nothing.
+    applier: Arc<Applier>,
     /// Time source for respawn-backoff bookkeeping ([`respawn`](self::respawn)).
     /// Always [`SystemClock`] in production; overridden via
     /// [`Self::with_clock`] in tests so backoff-window tests can advance
@@ -142,6 +153,8 @@ impl Translator {
             respawn_locks: Arc::new(StdMutex::new(HashMap::new())),
             respawn_backoffs: Arc::new(StdMutex::new(HashMap::new())),
             notification_cache: None,
+            apply_lock: Arc::new(Mutex::new(())),
+            applier: Arc::new(Applier::new(Vec::new(), ApplyConfig::default())),
             clock: Arc::new(SystemClock),
         }
     }
@@ -176,6 +189,43 @@ impl Translator {
     pub fn with_notification_cache(mut self, cache: Arc<Mutex<NotificationCache>>) -> Self {
         self.notification_cache = Some(cache);
         self
+    }
+
+    /// Install the applier that permitted tools write through.
+    ///
+    /// Only called during single-owner setup (mirrors
+    /// [`Self::with_router`]), before the translator is shared.
+    #[must_use]
+    pub fn with_applier(mut self, applier: Arc<Applier>) -> Self {
+        self.applier = applier;
+        self
+    }
+
+    /// The applier, if `tool` is permitted to write.
+    ///
+    /// Called before any LSP request, so a refused call costs nothing and
+    /// reports the config key that would allow it rather than a generic
+    /// permission error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ApplyDisabled`] naming `config_key` when the tool's
+    /// key is `false`.
+    #[allow(dead_code)]
+    pub(crate) fn applier_for(
+        &self,
+        tool: ToolKind,
+        tool_name: &'static str,
+        config_key: &'static str,
+    ) -> Result<Arc<Applier>> {
+        if self.applier.config().permits(tool) {
+            Ok(Arc::clone(&self.applier))
+        } else {
+            Err(Error::ApplyDisabled {
+                tool: tool_name,
+                config_key,
+            })
+        }
     }
 
     /// Mark the set of servers that are expected (configured + applicable)
@@ -436,6 +486,60 @@ mod tests {
         let roots = vec![PathBuf::from("/test/root1"), PathBuf::from("/test/root2")];
         translator.set_workspace_roots(roots.clone());
         assert_eq!(*translator.workspace_roots, roots);
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_applier_for_refuses_a_tool_its_config_forbids() {
+        let applier = std::sync::Arc::new(crate::bridge::apply::Applier::new(
+            Vec::new(),
+            crate::config::ApplyConfig {
+                rename: true,
+                ..crate::config::ApplyConfig::default()
+            },
+        ));
+        let translator = Translator::new().with_applier(applier);
+
+        assert!(
+            translator
+                .applier_for(ToolKind::Rename, "rename_symbol", "apply.rename")
+                .is_ok()
+        );
+
+        let error = translator
+            .applier_for(
+                ToolKind::FormatDocument,
+                "format_document",
+                "apply.format_document",
+            )
+            .expect_err("format_document is not permitted");
+        assert!(
+            error.to_string().contains("apply.format_document"),
+            "the error names the key that would permit it: {error}"
+        );
+    }
+
+    #[test]
+    fn test_a_default_translator_permits_no_writes() {
+        let translator = Translator::new();
+        for (tool, name, key) in [
+            (ToolKind::Rename, "rename_symbol", "apply.rename"),
+            (
+                ToolKind::FormatDocument,
+                "format_document",
+                "apply.format_document",
+            ),
+            (
+                ToolKind::CodeActions,
+                "apply_code_action",
+                "apply.code_actions",
+            ),
+        ] {
+            assert!(
+                translator.applier_for(tool, name, key).is_err(),
+                "{name} must be refused with no [apply] table"
+            );
+        }
     }
 
     #[test]
