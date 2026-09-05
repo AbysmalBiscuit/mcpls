@@ -147,6 +147,23 @@ fn normalize(path: &Path) -> PathBuf {
     }
 }
 
+/// Refuse to rewrite a file the filesystem marks read-only.
+///
+/// Renaming onto a read-only destination succeeds on Unix and fails with
+/// access-denied on Windows, so taking the platform's answer would mean the
+/// same edit silently rewrites a protected file on one machine and errors
+/// on another. mcpls refuses on both: a file is marked read-only
+/// deliberately, and an edit is not the place to override that.
+fn refuse_if_read_only(path: &Path) -> Result<()> {
+    if fs::metadata(path).is_ok_and(|meta| meta.permissions().readonly()) {
+        return Err(Error::ApplyRefused(format!(
+            "{} is read-only, so mcpls will not rewrite it",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 /// What a path holds at some point during planning.
 #[derive(Clone)]
 enum Presence {
@@ -340,6 +357,7 @@ impl<'a> Planner<'a> {
 
     fn plan_edit(&mut self, uri: &lsp_types::Uri, edits: &[lsp_types::TextEdit]) -> Result<()> {
         let path = self.resolve(uri)?;
+        refuse_if_read_only(&path)?;
         let previous = match self.presence(&path) {
             Presence::Text(text) => text,
             Presence::Absent => {
@@ -398,6 +416,7 @@ impl<'a> Planner<'a> {
                     )));
                 }
                 self.require_destruction_allowed(&path, "truncated to empty")?;
+                refuse_if_read_only(&path)?;
                 match existing {
                     Presence::Text(text) => Some(text),
                     _ => {
@@ -846,6 +865,37 @@ mod tests {
             "the error names the key that would permit it: {error}"
         );
         assert!(path.exists(), "the file survives a refused deletion");
+    }
+
+    /// A rename onto a read-only destination succeeds on Unix and fails
+    /// with access-denied on Windows. mcpls refuses on both rather than
+    /// letting the platform decide whether a protected file is rewritten.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_refuses_to_rewrite_a_read_only_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("protected.rs");
+        fs::write(&path, "fn old() {}\n").expect("seed");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).expect("chmod");
+
+        let applier = Applier::new(vec![dir.path().to_path_buf()], permissive());
+        let plan = plan_replacing(
+            uri_for(&path),
+            Range::new(Position::new(0, 3), Position::new(0, 6)),
+            "new",
+        );
+
+        let error = applier
+            .apply(plan, PositionEncoding::Utf16)
+            .await
+            .expect_err("a read-only file is not rewritten");
+        assert!(
+            error.to_string().contains("read-only"),
+            "the error says why: {error}"
+        );
+        assert_eq!(fs::read_to_string(&path).expect("read"), "fn old() {}\n");
     }
 
     /// rust-analyzer's "create module" quick fix asks for a file in a

@@ -2,10 +2,40 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use tracing::warn;
 
 use crate::error::{Error, Result};
+
+/// How many times a rename is attempted before the step is called failed.
+///
+/// On Windows a rename involving a path another process holds open fails
+/// with a transient sharing violation or access-denied, and Defender's
+/// real-time scanner, the Search Indexer and an open editor all take such a
+/// handle for a moment after a file is written. One of those would
+/// otherwise lose an otherwise-good multi-file apply to a rollback. Every
+/// attempt after the first waits [`RENAME_RETRY_DELAY`].
+const RENAME_ATTEMPTS: u32 = 3;
+
+/// Pause between rename attempts. Long enough to outlast a scanner's handle,
+/// short enough that three of them are imperceptible.
+const RENAME_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+/// `fs::rename` with a short bounded retry, for the transient failures
+/// described on [`RENAME_ATTEMPTS`].
+///
+/// Sleeps the calling thread, which is always the blocking thread
+/// `Applier::apply` puts the whole journal on.
+fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    for _ in 1..RENAME_ATTEMPTS {
+        match fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(_) => std::thread::sleep(RENAME_RETRY_DELAY),
+        }
+    }
+    fs::rename(from, to)
+}
 
 /// One reversible file-system change, in the order it must be performed.
 #[derive(Debug)]
@@ -70,10 +100,10 @@ fn perform(step: &Step) -> std::result::Result<(), String> {
                     from.display()
                 ));
             }
-            fs::rename(from, to)
+            rename_with_retry(from, to)
                 .map_err(|e| format!("moving {} to {}: {e}", from.display(), to.display()))
         }
-        Step::Trash { path, trash } => fs::rename(path, trash).map_err(|e| {
+        Step::Trash { path, trash } => rename_with_retry(path, trash).map_err(|e| {
             format!(
                 "moving {} aside to {}: {e}",
                 path.display(),
@@ -104,7 +134,7 @@ fn write_atomically(path: &Path, content: &str) -> std::result::Result<(), Strin
         let _ = fs::set_permissions(&temp, meta.permissions());
     }
 
-    fs::rename(&temp, path).map_err(|e| {
+    rename_with_retry(&temp, path).map_err(|e| {
         let _ = fs::remove_file(&temp);
         format!("renaming onto {}: {e}", path.display())
     })
@@ -137,13 +167,13 @@ fn roll_back(completed: &[Step], reason: String) -> Error {
                     Err(_) => written.push(path.clone()),
                 }
             }
-            Step::Move { from, to } => match fs::rename(to, from) {
+            Step::Move { from, to } => match rename_with_retry(to, from) {
                 Ok(()) => restored.push(from.clone()),
                 Err(e) => {
                     unrecovered.push(format!("{} is at {} ({e})", from.display(), to.display()));
                 }
             },
-            Step::Trash { path, trash } => match fs::rename(trash, path) {
+            Step::Trash { path, trash } => match rename_with_retry(trash, path) {
                 Ok(()) => restored.push(path.clone()),
                 Err(e) => unrecovered.push(format!(
                     "{} is at {} ({e})",
