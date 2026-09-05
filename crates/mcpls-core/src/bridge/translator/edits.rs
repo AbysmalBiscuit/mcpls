@@ -2131,6 +2131,101 @@ mod tests {
             .expect("the second call succeeds");
     }
 
+    /// The drain runs inside the request future, so it is dropped by the
+    /// same Esc that cancels anything else. A drain that emptied the queue
+    /// up front would lose every path it had not reached, leaving those
+    /// documents tracked at pre-apply content with nothing left to notice.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn test_a_cancelled_drain_leaves_the_paths_it_did_not_reach_queued() {
+        use std::sync::Arc;
+
+        use tokio::io::BufReader;
+        use tokio::time::{Duration, timeout};
+
+        use crate::config::ServerId;
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let caps = lsp_types::ServerCapabilities {
+            rename_provider: Some(lsp_types::OneOf::Left(true)),
+            ..Default::default()
+        };
+        let (translator, mut server) =
+            translator_with_capabilities(&dir, &ServerId::from("rust"), caps);
+        let translator = Arc::new(translator);
+
+        let first = dir.path().join("first.rs");
+        let second = dir.path().join("second.rs");
+        let mut wire = BufReader::new(&mut server.write_stdout);
+
+        // Both are open in the server, which is what makes closing them
+        // observable on the wire.
+        let mut canonical = Vec::new();
+        for path in [&first, &second] {
+            fs::write(path, "fn old() {}\n").expect("write the fixture");
+            canonical.push(path.canonicalize().expect("the fixture exists"));
+
+            let opening = {
+                let translator = Arc::clone(&translator);
+                let path = path.to_string_lossy().to_string();
+                tokio::spawn(async move {
+                    translator
+                        .handle_rename(path, 1, 1, "x".to_string(), false)
+                        .await
+                })
+            };
+            assert_eq!(
+                read_framed_message(&mut wire).await["method"],
+                "textDocument/didOpen"
+            );
+            let request = read_framed_reply(&mut wire).await;
+            write_response(
+                &mut server.read_half_stdin,
+                &request["id"],
+                serde_json::Value::Null,
+            )
+            .await;
+            timeout(Duration::from_secs(5), opening)
+                .await
+                .expect("the opening call must not hang")
+                .expect("the opening task must not panic")
+                .expect("a rename with no edits still succeeds");
+        }
+
+        // Holding the second path's lock stops the drain there, exactly
+        // where an interrupt would otherwise land between two paths.
+        let held = translator.document_tracker().lock_path(&canonical[1]).await;
+
+        translator.pending_invalidations.extend(&canonical);
+        let drain = {
+            let translator = Arc::clone(&translator);
+            tokio::spawn(async move { translator.forget_changed_documents().await })
+        };
+
+        // The first path is dealt with; the drain is now parked on the
+        // second path's lock.
+        let closed = read_framed_message(&mut wire).await;
+        assert_eq!(closed["method"], "textDocument/didClose");
+        assert!(!translator.is_document_open(&canonical[0]));
+
+        drain.abort();
+        assert!(
+            drain.await.is_err(),
+            "the drain's future is dropped, as a cancelled request drops it"
+        );
+        drop(held);
+
+        assert!(
+            translator.is_document_open(&canonical[1]),
+            "the cancelled drain never got to the second path"
+        );
+        assert_eq!(
+            translator.pending_invalidations.take(),
+            vec![canonical[1].clone()],
+            "so it must still be queued for the next drain to deal with"
+        );
+    }
+
     /// An apply writes files the call never queried -- a rename anchored in
     /// one file rewrites every file referencing the symbol. Those files stay
     /// open in the routed server at their pre-apply content unless mcpls

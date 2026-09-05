@@ -143,6 +143,26 @@ pub struct Translator {
     clock: Arc<dyn Clock>,
 }
 
+/// The paths a drain of [`Translator::pending_invalidations`] has taken off
+/// the queue and not yet dealt with.
+///
+/// Returns them if the drain does not finish. The drain runs inside the
+/// request future, which is dropped whenever the caller cancels, and a path
+/// forgotten here is forgotten for good: nothing else knows the file on disk
+/// no longer matches the document still tracked for it.
+struct PendingDrain<'a> {
+    queue: &'a InvalidationQueue,
+    remaining: Vec<PathBuf>,
+}
+
+impl Drop for PendingDrain<'_> {
+    fn drop(&mut self) {
+        if !self.remaining.is_empty() {
+            self.queue.extend(&std::mem::take(&mut self.remaining));
+        }
+    }
+}
+
 /// Upper bound on how long [`Translator::shutdown_servers`] waits for a
 /// single LSP server's graceful `shutdown`/`exit` handshake before giving up
 /// and letting `kill_on_drop` terminate it instead.
@@ -306,31 +326,53 @@ impl Translator {
     /// window between the close and the notify and have this `didClose`
     /// arrive after its `didOpen`.
     ///
+    /// This loop runs inside the request future, which is dropped whenever
+    /// the caller cancels, so it must not empty the queue up front: a drop
+    /// between two paths would lose the rest permanently, leaving them
+    /// tracked at pre-apply content with nothing left to notice. The paths
+    /// it has not finished with go back on the queue, and a path is dropped
+    /// from it only once that path's `didClose` has been sent.
+    ///
     /// A failed notify is logged rather than returned: the bytes are already
     /// on disk, and the tracker entry is gone either way, so the next call
-    /// still re-opens the document from its current content.
+    /// still re-opens the document from its current content. A drop between
+    /// the close and the notify is the same case, and leaves the path
+    /// queued, so the next drain finds the document already closed and moves
+    /// on.
     async fn forget_changed_documents(&self) {
-        for path in self.pending_invalidations.take() {
-            let _path_guard = self.document_tracker.lock_path(&path).await;
-            let Some(state) = self.document_tracker.close(&path) else {
-                continue;
+        let mut drain = PendingDrain {
+            queue: &self.pending_invalidations,
+            remaining: self.pending_invalidations.take(),
+        };
+        // Read without removing: the path leaves `remaining` only after its
+        // notify has gone out, so a drop mid-path re-queues that path too.
+        while let Some(path) = drain.remaining.first().cloned() {
+            self.close_one_document(&path).await;
+            drain.remaining.remove(0);
+        }
+    }
+
+    /// Forget one path and tell every server holding it open.
+    async fn close_one_document(&self, path: &Path) {
+        let _path_guard = self.document_tracker.lock_path(path).await;
+        let Some(state) = self.document_tracker.close(path) else {
+            return;
+        };
+        for server in state.synced_servers() {
+            let client = lock_std(&self.lsp_clients).get(&server).cloned();
+            let Some(client) = client else { continue };
+            let params = lsp_types::DidCloseTextDocumentParams {
+                text_document: lsp_types::TextDocumentIdentifier {
+                    uri: state.uri().clone(),
+                },
             };
-            for server in state.synced_servers() {
-                let client = lock_std(&self.lsp_clients).get(&server).cloned();
-                let Some(client) = client else { continue };
-                let params = lsp_types::DidCloseTextDocumentParams {
-                    text_document: lsp_types::TextDocumentIdentifier {
-                        uri: state.uri().clone(),
-                    },
-                };
-                if let Err(error) = client.notify("textDocument/didClose", params).await {
-                    tracing::warn!(
-                        %server,
-                        path = %path.display(),
-                        %error,
-                        "could not tell the server that an applied file is closed"
-                    );
-                }
+            if let Err(error) = client.notify("textDocument/didClose", params).await {
+                tracing::warn!(
+                    %server,
+                    path = %path.display(),
+                    %error,
+                    "could not tell the server that an applied file is closed"
+                );
             }
         }
     }
