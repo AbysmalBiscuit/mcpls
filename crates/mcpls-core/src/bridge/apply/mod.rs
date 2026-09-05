@@ -809,6 +809,70 @@ mod tests {
         );
     }
 
+    /// A symlink inside a root pointing outside it is the interesting
+    /// escape: the path the server names is in bounds, and only
+    /// canonicalizing it shows where the write would land.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_refuses_a_symlink_that_leaves_the_workspace() {
+        let inside = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("tempdir");
+        let target = outside.path().join("secret.rs");
+        fs::write(&target, "x\n").expect("seed");
+        let link = inside.path().join("innocent.rs");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        let applier = Applier::new(vec![inside.path().to_path_buf()], permissive());
+        let plan = plan_replacing(
+            uri_for(&link),
+            Range::new(Position::new(0, 0), Position::new(0, 1)),
+            "y",
+        );
+
+        assert!(applier.apply(plan, PositionEncoding::Utf16).await.is_err());
+        assert_eq!(
+            fs::read_to_string(&target).expect("read"),
+            "x\n",
+            "a path inside a root that resolves outside one is still outside"
+        );
+    }
+
+    /// The whole delete path through the applier: planned, journalled, and
+    /// the trash entry purged, leaving neither the file nor a stray sibling.
+    #[tokio::test]
+    async fn test_deletes_a_file_when_the_config_permits_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("doomed.rs");
+        fs::write(&path, "bye\n").expect("seed");
+
+        let applier = Applier::new(vec![dir.path().to_path_buf()], permissive());
+        let plan = EditPlan::from_workspace_edit(WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Operations(vec![
+                DocumentChangeOperation::Op(ResourceOp::Delete(DeleteFile {
+                    uri: uri_for(&path),
+                    options: None,
+                })),
+            ])),
+            ..WorkspaceEdit::default()
+        })
+        .expect("plan builds");
+
+        let summary = applier
+            .apply(plan, PositionEncoding::Utf16)
+            .await
+            .expect("the delete applies");
+
+        assert!(!path.exists(), "the file is gone");
+        assert_eq!(summary.resource_operations.len(), 1);
+        assert_eq!(summary.resource_operations[0].kind, "delete");
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains("mcpls-trash"))
+            .collect();
+        assert!(leftovers.is_empty(), "the trash entry is purged");
+    }
+
     #[tokio::test]
     async fn test_refuses_to_write_with_no_workspace_roots_configured() {
         let dir = tempfile::tempdir().expect("tempdir");

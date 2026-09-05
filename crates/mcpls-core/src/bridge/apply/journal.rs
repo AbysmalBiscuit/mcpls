@@ -93,7 +93,11 @@ fn perform(step: &Step) -> std::result::Result<(), String> {
             previous: _,
         } => write_atomically(path, content),
         Step::Move { from, to } => {
-            if to.exists() {
+            // `symlink_metadata`, not `exists`: a dangling symlink at the
+            // destination reports as absent to `exists`, and `fs::rename`
+            // would then replace it with no way for rollback to put it
+            // back.
+            if to.symlink_metadata().is_ok() {
                 return Err(format!(
                     "{} already exists, so {} cannot be moved onto it",
                     to.display(),
@@ -198,7 +202,12 @@ fn roll_back(completed: &[Step], reason: String) -> Error {
 fn purge_trash(steps: &[Step]) {
     for step in steps {
         if let Step::Trash { path, trash } = step {
-            let outcome = if trash.is_dir() {
+            // `symlink_metadata`, not `is_dir`: a symlink pointing at a
+            // directory is a file to remove, not a tree to walk.
+            let is_dir = trash
+                .symlink_metadata()
+                .is_ok_and(|meta| meta.file_type().is_dir());
+            let outcome = if is_dir {
                 fs::remove_dir_all(trash)
             } else {
                 fs::remove_file(trash)

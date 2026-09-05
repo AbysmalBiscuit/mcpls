@@ -1,10 +1,15 @@
 //! Turning a `WorkspaceEdit` into an ordered, validated operation list.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 
-use lsp_types::{TextEdit, Uri, WorkspaceEdit};
+use lsp_types::{ChangeAnnotation, ChangeAnnotationIdentifier, TextEdit, Uri, WorkspaceEdit};
+use tracing::warn;
 
 use crate::error::{Error, Result};
+
+/// The `changeAnnotations` map of the `WorkspaceEdit` being normalized.
+type Annotations = HashMap<ChangeAnnotationIdentifier, ChangeAnnotation>;
 
 /// One step of an edit, in the order it must be performed.
 #[derive(Debug)]
@@ -70,23 +75,35 @@ impl EditPlan {
     /// # Errors
     ///
     /// Returns [`Error::ApplyRefused`] when two edits to the same document
-    /// have overlapping ranges.
+    /// have overlapping ranges, or when one document is addressed by two
+    /// entries with no resource operation between them.
     pub fn from_workspace_edit(edit: WorkspaceEdit) -> Result<Self> {
+        let annotations = edit.change_annotations.unwrap_or_default();
         let mut operations = Vec::new();
+        // Each entry's ranges are computed against the document as it was
+        // before the whole edit, so a second entry for a document already
+        // edited would splice its ranges into text the first entry already
+        // changed. The LSP specification says entries address distinct
+        // documents; a resource operation in between resets that, since
+        // the document at that path is a different one afterwards.
+        let mut already_edited: Vec<String> = Vec::new();
 
         match edit.document_changes {
             Some(lsp_types::DocumentChanges::Edits(edits)) => {
                 for tde in edits {
-                    operations.push(Self::text_document_edit(tde)?);
+                    Self::claim_document(&mut already_edited, &tde.text_document.uri)?;
+                    operations.push(Self::text_document_edit(tde, &annotations)?);
                 }
             }
             Some(lsp_types::DocumentChanges::Operations(ops)) => {
                 for op in ops {
                     operations.push(match op {
                         lsp_types::DocumentChangeOperation::Edit(tde) => {
-                            Self::text_document_edit(tde)?
+                            Self::claim_document(&mut already_edited, &tde.text_document.uri)?;
+                            Self::text_document_edit(tde, &annotations)?
                         }
                         lsp_types::DocumentChangeOperation::Op(resource) => {
+                            already_edited.clear();
                             Self::resource_operation(resource)
                         }
                     });
@@ -104,22 +121,57 @@ impl EditPlan {
         Ok(Self { operations })
     }
 
+    /// Record that `uri` is being edited, refusing a second entry for a
+    /// document already edited since the last resource operation.
+    fn claim_document(already_edited: &mut Vec<String>, uri: &Uri) -> Result<()> {
+        let uri = uri.as_str().to_string();
+        if already_edited.contains(&uri) {
+            return Err(Error::ApplyRefused(format!(
+                "{uri} is addressed by two entries of one workspace edit: the second's ranges \
+                 were computed against the text before the first, so applying both would \
+                 corrupt it"
+            )));
+        }
+        already_edited.push(uri);
+        Ok(())
+    }
+
     /// The normalized operations, in execution order.
     #[must_use]
     pub fn operations(&self) -> &[Operation] {
         &self.operations
     }
 
-    fn text_document_edit(tde: lsp_types::TextDocumentEdit) -> Result<Operation> {
+    fn text_document_edit(
+        tde: lsp_types::TextDocumentEdit,
+        annotations: &Annotations,
+    ) -> Result<Operation> {
+        let uri = tde.text_document.uri;
         let edits = tde
             .edits
             .into_iter()
             .map(|one_of| match one_of {
                 lsp_types::OneOf::Left(te) => te,
-                lsp_types::OneOf::Right(ate) => ate.text_edit,
+                lsp_types::OneOf::Right(ate) => {
+                    // The annotation asks the client to put this edit to the
+                    // user before applying it. mcpls has no user to ask, so
+                    // it applies it anyway; saying so is the most it can do.
+                    if annotations
+                        .get(&ate.annotation_id)
+                        .is_some_and(|annotation| annotation.needs_confirmation == Some(true))
+                    {
+                        warn!(
+                            "applying an edit to {} without confirming it: the server marked \
+                             it with the annotation {:?}, which asks for confirmation",
+                            uri.as_str(),
+                            ate.annotation_id
+                        );
+                    }
+                    ate.text_edit
+                }
             })
             .collect();
-        Self::edit_operation(tde.text_document.uri, tde.text_document.version, edits)
+        Self::edit_operation(uri, tde.text_document.version, edits)
     }
 
     fn edit_operation(uri: Uri, version: Option<i32>, edits: Vec<TextEdit>) -> Result<Operation> {
@@ -385,6 +437,61 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Each `TextDocumentEdit`'s ranges are computed against the document
+    /// as it was before the whole edit, so two entries for one document
+    /// would splice the second's ranges into text the first already
+    /// changed. A server sending this is out of spec, but the failure mode
+    /// is silent corruption.
+    #[test]
+    fn test_two_entries_for_one_document_are_refused() {
+        let entry = |text: &str| TextDocumentEdit {
+            text_document: OptionalVersionedTextDocumentIdentifier {
+                uri: uri("/w/a.rs"),
+                version: None,
+            },
+            edits: vec![OneOf::Left(edit(0, 0, text))],
+        };
+
+        let result = EditPlan::from_workspace_edit(WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Edits(vec![
+                entry("first"),
+                entry("second"),
+            ])),
+            ..WorkspaceEdit::default()
+        });
+        assert!(result.is_err(), "the second entry would corrupt the file");
+    }
+
+    /// A resource operation between two entries makes the second address a
+    /// different document at that path, so it is legitimate.
+    #[test]
+    fn test_a_resource_operation_between_two_entries_is_allowed() {
+        let entry = |path: &str| {
+            DocumentChangeOperation::Edit(TextDocumentEdit {
+                text_document: OptionalVersionedTextDocumentIdentifier {
+                    uri: uri(path),
+                    version: None,
+                },
+                edits: vec![OneOf::Left(edit(0, 0, "x"))],
+            })
+        };
+
+        let plan = EditPlan::from_workspace_edit(WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Operations(vec![
+                entry("/w/a.rs"),
+                DocumentChangeOperation::Op(ResourceOp::Create(CreateFile {
+                    uri: uri("/w/a.rs"),
+                    options: None,
+                    annotation_id: None,
+                })),
+                entry("/w/a.rs"),
+            ])),
+            ..WorkspaceEdit::default()
+        })
+        .expect("plan builds");
+        assert_eq!(plan.operations().len(), 3);
     }
 
     #[test]
