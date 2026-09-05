@@ -238,6 +238,23 @@ impl InboundEdits {
         self.resource_operations
             .extend(summary.resource_operations.iter().cloned());
     }
+
+    /// Every path these applies changed, for an error that has to tell the
+    /// caller which of its cached contents went stale.
+    fn changed_paths(&self) -> Vec<String> {
+        let mut paths = self.files_written.clone();
+        for operation in &self.resource_operations {
+            for path in [Some(&operation.uri), operation.new_uri.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                if !paths.contains(path) {
+                    paths.push(path.clone());
+                }
+            }
+        }
+        paths
+    }
 }
 
 /// Whether an apply changed the working tree.
@@ -893,14 +910,22 @@ impl Translator {
         match outcome {
             Ok(_) => Ok(()),
             Err(error) => {
-                if !written.files_written.is_empty() {
-                    warn!(
-                        "workspace/executeCommand failed after inbound edits had already \
-                         written {:?}: {error}",
-                        written.files_written
-                    );
+                let changed = written.changed_paths();
+                if changed.is_empty() {
+                    return Err(error);
                 }
-                Err(error)
+                // The tree changed and the caller is about to be told the
+                // call failed. Carry the paths in the error rather than
+                // only in a log line, or its natural retry recomputes an
+                // edit against content it still believes is unchanged.
+                warn!(
+                    "workspace/executeCommand failed after its inbound edits had already \
+                     changed {changed:?}: {error}"
+                );
+                Err(Error::CommandFailedAfterWrites {
+                    changed,
+                    reason: error.to_string(),
+                })
             }
         }
     }
@@ -2101,6 +2126,79 @@ mod tests {
         assert!(
             !translator.is_document_open(&other_canonical),
             "a written document must not stay tracked at its pre-apply content"
+        );
+    }
+
+    /// A command can fail after the edits it sent back have already landed.
+    /// The caller gets `Err`, and its natural response is to retry, so the
+    /// error itself has to name what changed -- a log line does not reach
+    /// it.
+    #[tokio::test]
+    async fn test_a_command_failing_after_its_edits_landed_names_them() {
+        use std::sync::Arc;
+
+        use tokio::io::BufReader;
+        use tokio::time::{Duration, timeout};
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (translator, mut server, path) = code_action_fixture(&dir);
+        let uri = crate::bridge::path_to_uri(&path).expect("uri for the fixture file");
+        let path_str = path.to_string_lossy().to_string();
+
+        let handle = {
+            let translator = Arc::clone(&translator);
+            tokio::spawn(async move {
+                translator
+                    .handle_apply_code_action(path_str, 1, 1, 1, 5, None, Some(0), None)
+                    .await
+            })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+
+        let listing = read_framed_message(&mut wire).await;
+        write_response(
+            &mut server.read_half_stdin,
+            &listing["id"],
+            command_only_listing(),
+        )
+        .await;
+
+        let command = read_framed_reply(&mut wire).await;
+        write_request(
+            &mut server.read_half_stdin,
+            &serde_json::json!(4246),
+            "workspace/applyEdit",
+            rename_old_to_new(&uri),
+        )
+        .await;
+        let answer = read_framed_reply(&mut wire).await;
+        assert_eq!(answer["id"], 4246);
+
+        write_error_response(
+            &mut server.read_half_stdin,
+            &command["id"],
+            -32603,
+            "the assist could not be completed",
+        )
+        .await;
+
+        let error = timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("the handler must not hang")
+            .expect("the handler task must not panic")
+            .expect_err("the command failed");
+        let written = path.canonicalize().expect("the fixture file exists");
+        assert!(
+            error.to_string().contains(&written.display().to_string()),
+            "the error must name the file the failed command already wrote: {error}"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).expect("read the fixture back"),
+            "fn new() {}\n",
+            "the edit did land, which is why the caller has to be told"
         );
     }
 

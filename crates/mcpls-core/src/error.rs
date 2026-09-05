@@ -300,6 +300,24 @@ pub enum Error {
         /// Why the original step failed.
         reason: String,
     },
+
+    /// `workspace/executeCommand` failed after edits it had already sent
+    /// back landed in the working tree.
+    ///
+    /// The command's own failure alone would tell the caller nothing about
+    /// those files, and the natural response to a bare failure is to retry,
+    /// which would compute the next edit against content the caller still
+    /// believes is unchanged.
+    #[error(
+        "the command failed after its edits had already changed {changed:?}: {reason}. \
+         Re-read those paths before retrying"
+    )]
+    CommandFailedAfterWrites {
+        /// Paths the command's edits wrote, moved, or removed.
+        changed: Vec<String>,
+        /// Why the command itself failed.
+        reason: String,
+    },
 }
 
 /// A specialized Result type for mcpls-core operations.
