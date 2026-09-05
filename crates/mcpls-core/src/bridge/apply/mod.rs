@@ -197,21 +197,13 @@ fn normalize(path: &Path) -> PathBuf {
     }
 }
 
-/// Refuse to rewrite a file the filesystem marks read-only.
+/// Whether the filesystem marks `path` read-only.
 ///
-/// Renaming onto a read-only destination succeeds on Unix and fails with
-/// access-denied on Windows, so taking the platform's answer would mean the
-/// same edit silently rewrites a protected file on one machine and errors
-/// on another. mcpls refuses on both: a file is marked read-only
-/// deliberately, and an edit is not the place to override that.
-fn refuse_if_read_only(path: &Path) -> Result<()> {
-    if fs::metadata(path).is_ok_and(|meta| meta.permissions().readonly()) {
-        return Err(Error::ApplyRefused(format!(
-            "{} is read-only, so mcpls will not rewrite it",
-            path.display()
-        )));
-    }
-    Ok(())
+/// A path that cannot be stat'd is not read-only for this purpose: it is
+/// either absent, which is fine, or unreadable, which the operation itself
+/// will report.
+fn is_read_only(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|meta| meta.permissions().readonly())
 }
 
 /// What a path holds at some point during planning.
@@ -245,6 +237,7 @@ struct Planner<'a> {
     files_changed: Vec<FileChange>,
     resource_operations: Vec<ResourceOperation>,
     paths_invalidated: Vec<PathBuf>,
+    read_only: Vec<PathBuf>,
 }
 
 impl<'a> Planner<'a> {
@@ -258,6 +251,7 @@ impl<'a> Planner<'a> {
             files_changed: Vec::new(),
             resource_operations: Vec::new(),
             paths_invalidated: Vec::new(),
+            read_only: Vec::new(),
         }
     }
 
@@ -283,6 +277,23 @@ impl<'a> Planner<'a> {
                 } => self.plan_delete(uri, *recursive, *ignore_if_not_exists)?,
             }
         }
+        // Collected across the whole plan rather than refused at the first
+        // one: a Perforce or ClearCase-style checkout marks every unopened
+        // file read-only, so a thirty-file rename would otherwise be thirty
+        // rounds of chmod-and-retry with no way to see the whole list.
+        if !self.read_only.is_empty() {
+            let names: Vec<String> = self
+                .read_only
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect();
+            return Err(Error::ApplyRefused(format!(
+                "this edit would change files the filesystem marks read-only, which mcpls \
+                 refuses to do: {}",
+                names.join(", ")
+            )));
+        }
+
         Ok(PlannedEdit {
             steps: self.steps,
             files_changed: self.files_changed,
@@ -381,6 +392,23 @@ impl<'a> Planner<'a> {
         )))
     }
 
+    /// Record that this plan would change `path`, which the filesystem
+    /// marks read-only.
+    ///
+    /// Renaming onto a read-only destination succeeds on Unix and fails
+    /// with access-denied on Windows, and deleting one differs the same
+    /// way, so taking the platform's answer would mean the same edit
+    /// silently destroying a protected file on one machine and erroring on
+    /// another. mcpls refuses on both: a file is marked read-only
+    /// deliberately, and an edit is not the place to override that. Noted
+    /// rather than returned so [`Self::plan`] can name every such file at
+    /// once.
+    fn note_read_only(&mut self, path: &Path) {
+        if is_read_only(path) && !self.read_only.iter().any(|known| known == path) {
+            self.read_only.push(path.to_path_buf());
+        }
+    }
+
     /// Note that `path`'s on-disk content no longer matches anything cached
     /// against it, so a caller tracking open documents must drop its entry.
     fn invalidate(&mut self, path: &Path) {
@@ -407,7 +435,7 @@ impl<'a> Planner<'a> {
 
     fn plan_edit(&mut self, uri: &lsp_types::Uri, edits: &[lsp_types::TextEdit]) -> Result<()> {
         let path = self.resolve(uri)?;
-        refuse_if_read_only(&path)?;
+        self.note_read_only(&path);
         let previous = match self.presence(&path) {
             Presence::Text(text) => text,
             Presence::Absent => {
@@ -466,7 +494,7 @@ impl<'a> Planner<'a> {
                     )));
                 }
                 self.require_destruction_allowed(&path, "truncated to empty")?;
-                refuse_if_read_only(&path)?;
+                self.note_read_only(&path);
                 match existing {
                     Presence::Text(text) => Some(text),
                     _ => {
@@ -526,6 +554,7 @@ impl<'a> Planner<'a> {
                 )));
             }
             self.require_destruction_allowed(&to, "replaced by a rename")?;
+            self.note_read_only(&to);
             let trash = self.trash_path(&to)?;
             self.steps.push(Step::Trash {
                 path: to.clone(),
@@ -586,6 +615,7 @@ impl<'a> Planner<'a> {
             )));
         }
 
+        self.note_read_only(&path);
         let trash = self.trash_path(&path)?;
         self.overlay.insert(path.clone(), Presence::Absent);
         self.invalidate(&path);
@@ -1049,35 +1079,105 @@ mod tests {
         );
     }
 
-    /// A rename onto a read-only destination succeeds on Unix and fails
-    /// with access-denied on Windows. mcpls refuses on both rather than
-    /// letting the platform decide whether a protected file is rewritten.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn test_refuses_to_rewrite_a_read_only_file() {
-        use std::os::unix::fs::PermissionsExt;
+    /// Mark `path` read-only, or writable again.
+    ///
+    /// `set_readonly` is the one spelling that means the same thing on both
+    /// platforms -- it clears the write bits on Unix and sets the read-only
+    /// attribute on Windows -- which is what lets the tests below run on
+    /// Windows, the platform the refusal exists for. They restore write
+    /// access before returning: Windows will not remove a read-only file, so
+    /// the temporary directory could not otherwise clean itself up.
+    fn set_read_only(path: &Path, read_only: bool) {
+        let mut permissions = fs::metadata(path).expect("stat").permissions();
+        permissions.set_readonly(read_only);
+        fs::set_permissions(path, permissions).expect("set permissions");
+    }
 
+    /// Rewriting a read-only file succeeds on Unix and fails with
+    /// access-denied on Windows. mcpls refuses on both rather than letting
+    /// the platform decide whether a protected file is rewritten, and names
+    /// every such file at once so a checkout that marks all of them
+    /// read-only does not become a chmod-and-retry loop.
+    #[tokio::test]
+    async fn test_refuses_to_rewrite_read_only_files_and_names_them_all() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("protected.rs");
-        fs::write(&path, "fn old() {}\n").expect("seed");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).expect("chmod");
+        let first = dir.path().join("first.rs");
+        let second = dir.path().join("second.rs");
+        for path in [&first, &second] {
+            fs::write(path, "fn old() {}\n").expect("seed");
+            set_read_only(path, true);
+        }
+
+        let mut changes = HashMap::new();
+        for path in [&first, &second] {
+            changes.insert(
+                uri_for(path),
+                vec![TextEdit {
+                    range: Range::new(Position::new(0, 3), Position::new(0, 6)),
+                    new_text: "new".to_string(),
+                }],
+            );
+        }
+        let plan = EditPlan::from_workspace_edit(WorkspaceEdit {
+            changes: Some(changes),
+            ..WorkspaceEdit::default()
+        })
+        .expect("plan builds");
 
         let applier = Applier::new(vec![dir.path().to_path_buf()], permissive());
-        let plan = plan_replacing(
-            uri_for(&path),
-            Range::new(Position::new(0, 3), Position::new(0, 6)),
-            "new",
-        );
-
         let error = applier
             .apply(plan, PositionEncoding::Utf16, &InvalidationQueue::default())
             .await
             .expect_err("a read-only file is not rewritten");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("read-only"),
+            "the error says why: {message}"
+        );
+        for path in [&first, &second] {
+            assert!(
+                message.contains(&path.display().to_string()),
+                "every read-only file is named, missing {}: {message}",
+                path.display()
+            );
+            assert_eq!(fs::read_to_string(path).expect("read"), "fn old() {}\n");
+            set_read_only(path, false);
+        }
+    }
+
+    /// Deleting destroys a read-only file as surely as rewriting it does,
+    /// and `allow_file_deletion` is exactly the setting the documentation
+    /// tells a user to turn on for a delete.
+    #[tokio::test]
+    async fn test_refuses_to_delete_a_read_only_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("protected.rs");
+        fs::write(&path, "keep me\n").expect("seed");
+        set_read_only(&path, true);
+
+        let applier = Applier::new(vec![dir.path().to_path_buf()], permissive());
+        let plan = EditPlan::from_workspace_edit(WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Operations(vec![
+                DocumentChangeOperation::Op(ResourceOp::Delete(DeleteFile {
+                    uri: uri_for(&path),
+                    options: None,
+                })),
+            ])),
+            ..WorkspaceEdit::default()
+        })
+        .expect("plan builds");
+
+        let error = applier
+            .apply(plan, PositionEncoding::Utf16, &InvalidationQueue::default())
+            .await
+            .expect_err("a read-only file is not deleted either");
         assert!(
             error.to_string().contains("read-only"),
             "the error says why: {error}"
         );
-        assert_eq!(fs::read_to_string(&path).expect("read"), "fn old() {}\n");
+        assert!(path.exists(), "the file survives");
+        set_read_only(&path, false);
     }
 
     /// rust-analyzer's "create module" quick fix asks for a file in a
