@@ -57,6 +57,16 @@ pub fn caller() -> i32 {
     add(1, 2)
 }
 
+/// Non-ASCII text ahead of an `add` reference on the same line.
+///
+/// An applier that ignores the encoding rust-analyzer negotiated resolves
+/// this line's columns against the wrong offsets and corrupts it, which no
+/// pure-ASCII fixture would catch.
+#[allow(dead_code)]
+pub fn unicode_caller() -> String {
+    format!("ü {}", add(1, 2))
+}
+
 /// A simple point with two coordinates.
 pub struct Point {
     /// X coordinate.

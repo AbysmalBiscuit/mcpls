@@ -138,6 +138,12 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
 struct E2eConfig {
     workspace: WorkspaceConfig,
     lsp_servers: Vec<LspServerConfig>,
+    apply: ApplyTable,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ApplyTable {
+    rename: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -165,6 +171,9 @@ fn write_config(ra_binary: &Path, workspace_root: &Path, config_path: &Path) {
             args: vec![],
             file_patterns: vec!["**/*.rs".to_owned()],
         }],
+        // Only `rename` is on: the earlier read-only sub-cases must keep
+        // proving that a tool called without `apply` writes nothing.
+        apply: ApplyTable { rename: true },
     };
     let content = toml::to_string(&cfg).expect("failed to serialize e2e config");
     fs::write(config_path, content).expect("failed to write e2e config");
@@ -1374,6 +1383,65 @@ fn sc_get_server_messages(client: &mut McpClient, _workspace: &Path) -> Result<(
     Ok(())
 }
 
+/// Tool 25: `rename_symbol` with `apply` — rename `add` → `plus` and check
+/// that the files really changed on disk.
+///
+/// Registered last: it rewrites `pub fn add(`, which earlier sub-cases
+/// anchor on.
+fn sc_rename_symbol_apply(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
+    let lib = workspace.join("src/lib.rs");
+    let add_line = find_line(&lib, "pub fn add(");
+
+    let resp = client
+        .call_tool(
+            "rename_symbol",
+            &json!({
+                "file_path": lib.to_string_lossy(),
+                "line": add_line,
+                "character": 8,
+                "new_name": "plus",
+                "apply": true,
+            }),
+        )
+        .map_err(|e| format!("call failed: {e}"))?;
+
+    let text = assertions::assert_tool_ok(&resp);
+    let inner: Value = serde_json::from_str(&text).map_err(|e| format!("bad JSON: {e}"))?;
+
+    if inner["applied"] != json!(true) {
+        return Err(format!("expected applied=true, got {inner}"));
+    }
+    let written = inner["files_written"]
+        .as_array()
+        .ok_or_else(|| format!("expected files_written array, got {inner}"))?;
+    if written.is_empty() {
+        return Err("rename reported applied with no files written".to_owned());
+    }
+
+    let after = fs::read_to_string(&lib).map_err(|e| format!("read lib.rs: {e}"))?;
+    if !after.contains("pub fn plus(") {
+        return Err("the definition was not rewritten on disk".to_owned());
+    }
+    if after.contains("pub fn add(") {
+        return Err("the old definition is still on disk".to_owned());
+    }
+    if !after.contains("plus(1, 2)") {
+        return Err("a reference in the same file was not rewritten".to_owned());
+    }
+    if !after.contains(r#"format!("ü {}", plus(1, 2))"#) {
+        return Err(format!(
+            "the non-ASCII line was corrupted or missed; \
+             the applier used the wrong position encoding. Line reads: {:?}",
+            after
+                .lines()
+                .find(|l| l.contains("ü"))
+                .unwrap_or("<line gone>")
+        ));
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Suite driver
 // ---------------------------------------------------------------------------
@@ -1449,6 +1517,9 @@ fn ra_e2e_suite() {
         sub_case!(sc_read_resource),
         sub_case!(sc_subscribe_unsubscribe_resource),
         sub_case!(sc_subscribe_no_replay_without_cached_diagnostics),
+        // Last: this one writes to the staged workspace, and every anchor
+        // above it looks for text this rename moves.
+        sub_case!(sc_rename_symbol_apply),
     ];
 
     let filter = std::env::var("MCPLS_RA_FILTER").ok();
