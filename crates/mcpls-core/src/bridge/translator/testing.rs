@@ -129,18 +129,47 @@ pub(super) fn fake_lsp_client() -> (LspClient, FakeServer) {
     )
 }
 
-/// Writes a framed JSON-RPC success response, as a real LSP server would.
-pub(super) async fn write_response(stdin: &mut ChildStdin, id: &JsonValue, result: JsonValue) {
-    let message = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "result": result,
-    });
-    let content = serde_json::to_string(&message).unwrap();
+/// Writes `message` behind its `Content-Length` header, the framing every
+/// LSP message on the wire uses.
+async fn write_frame(stdin: &mut ChildStdin, message: &JsonValue) {
+    let content = serde_json::to_string(message).unwrap();
     let header = format!("Content-Length: {}\r\n\r\n", content.len());
     stdin.write_all(header.as_bytes()).await.unwrap();
     stdin.write_all(content.as_bytes()).await.unwrap();
     stdin.flush().await.unwrap();
+}
+
+/// Writes a framed JSON-RPC success response, as a real LSP server would.
+pub(super) async fn write_response(stdin: &mut ChildStdin, id: &JsonValue, result: JsonValue) {
+    write_frame(
+        stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result,
+        }),
+    )
+    .await;
+}
+
+/// Writes a framed JSON-RPC request from the server to the client, as a
+/// server does when it answers a command with `workspace/applyEdit`.
+pub(super) async fn write_request(
+    stdin: &mut ChildStdin,
+    id: &JsonValue,
+    method: &str,
+    params: JsonValue,
+) {
+    write_frame(
+        stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        }),
+    )
+    .await;
 }
 
 /// Writes a framed JSON-RPC error response, e.g. to simulate a push-only
@@ -151,19 +180,18 @@ pub(super) async fn write_error_response(
     code: i64,
     message: &str,
 ) {
-    let response = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "error": {
-            "code": code,
-            "message": message,
-        },
-    });
-    let content = serde_json::to_string(&response).unwrap();
-    let header = format!("Content-Length: {}\r\n\r\n", content.len());
-    stdin.write_all(header.as_bytes()).await.unwrap();
-    stdin.write_all(content.as_bytes()).await.unwrap();
-    stdin.flush().await.unwrap();
+    write_frame(
+        stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": code,
+                "message": message,
+            },
+        }),
+    )
+    .await;
 }
 
 /// Builds a single-server translator routed to `server_id` for every tool,

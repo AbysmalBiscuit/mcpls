@@ -6,6 +6,8 @@ use lsp_types::{
     TextDocumentEdit, TextDocumentIdentifier, TextDocumentPositionParams, WorkDoneProgressParams,
     WorkspaceEdit,
 };
+use tokio::sync::mpsc;
+use tracing::warn;
 
 use super::Translator;
 use super::diagnostics::diagnostic_to_mcp;
@@ -16,9 +18,15 @@ use super::dto::{
 };
 use super::encoding_ctx::EncodingCtx;
 use super::routing::{MAX_POSITION_VALUE, MAX_RANGE_LINES};
-use crate::bridge::apply::{EditPlan, Operation};
-use crate::config::ToolKind;
+use crate::bridge::apply::{Applier, EditPlan, Operation};
+use crate::config::{ServerId, ToolKind};
 use crate::error::{Error, Result};
+use crate::lsp::LspClient;
+
+/// How many inbound `workspace/applyEdit` requests may queue while a
+/// command's edits are applied one at a time. Deeper than any server is
+/// known to need, and a server that overruns it simply waits.
+const INBOUND_EDIT_QUEUE_DEPTH: usize = 4;
 
 /// Convert LSP range to MCP range (0-based to 1-based).
 /// Validate parameters for `handle_code_actions`.
@@ -702,18 +710,13 @@ impl Translator {
         // even with no edit to write: an organize-imports-style action can
         // legitimately carry a command and nothing else.
         let executed_command = if let Some(command) = command {
-            client
-                .request::<_, serde_json::Value>(
-                    "workspace/executeCommand",
-                    lsp_types::ExecuteCommandParams {
-                        command: command.command.clone(),
-                        arguments: command.arguments.unwrap_or_default(),
-                        work_done_progress_params: WorkDoneProgressParams::default(),
-                    },
-                    client.request_timeout(),
-                )
+            let name = command.command.clone();
+            let pumped = self
+                .execute_command_applying_inbound_edits(&client, &write_permit, &server_id, command)
                 .await?;
-            Some(command.command)
+            applied = applied || !pumped.is_empty();
+            files_written.extend(pumped);
+            Some(name)
         } else {
             None
         };
@@ -730,6 +733,156 @@ impl Translator {
             files_written,
             executed_command,
         })
+    }
+
+    /// Run `command` on `client` while applying any `workspace/applyEdit`
+    /// the server sends back, and report the files those edits wrote.
+    ///
+    /// A server that delivers an assist as a command asks the client to
+    /// apply the edit and waits for that answer before replying to the
+    /// command itself, so the command and the inbound edits are driven
+    /// together rather than one after the other.
+    ///
+    /// The sink is installed for this call and no longer. Clearing it is
+    /// not enough on its own to close that window: the message loop clones
+    /// the sink when an inbound request arrives and hands the clone to a
+    /// responder it spawns, so a responder already in flight outlives the
+    /// clearing. Closing and then dropping the receiver is what closes the
+    /// window -- the receiver is a local, so it goes on every path out of
+    /// this call, including when the caller's own future is dropped
+    /// mid-command -- and a late send then fails and is answered `applied:
+    /// false`. That is what keeps a server from writing to the tree at a
+    /// moment of its own choosing.
+    ///
+    /// Only one window is open at a time, per `Translator::apply_sink_lock`:
+    /// a client's sink is a single slot shared by every clone of it, so
+    /// overlapping windows would clobber each other's sender.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever `workspace/executeCommand` returns. An inbound edit
+    /// that is refused does not fail the call: see [`Self::apply_inbound_edit`].
+    async fn execute_command_applying_inbound_edits(
+        &self,
+        client: &LspClient,
+        applier: &Applier,
+        server_id: &ServerId,
+        command: lsp_types::Command,
+    ) -> Result<Vec<String>> {
+        let _guard = self.apply_sink_lock.lock().await;
+
+        let (sink_tx, mut sink_rx) = mpsc::channel(INBOUND_EDIT_QUEUE_DEPTH);
+        client.set_apply_sink(Some(sink_tx)).await;
+
+        let request = client.request::<_, serde_json::Value>(
+            "workspace/executeCommand",
+            lsp_types::ExecuteCommandParams {
+                command: command.command,
+                arguments: command.arguments.unwrap_or_default(),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            },
+            client.request_timeout(),
+        );
+        tokio::pin!(request);
+
+        let mut written = Vec::new();
+        let outcome = loop {
+            tokio::select! {
+                // Biased, edits first: a server may send its edit and its
+                // command response without waiting in between, leaving both
+                // arms ready at once. Random order would then break the loop
+                // on the response half the time and refuse an edit that had
+                // already arrived.
+                biased;
+                inbound = sink_rx.recv() => match inbound {
+                    Some((edit, reply)) => {
+                        let answer = self
+                            .apply_inbound_edit(applier, server_id, edit, &mut written)
+                            .await;
+                        let _ = reply.send(answer);
+                    }
+                    // Reached only if something else replaces or clears this
+                    // client's sink slot mid-command. The window lock rules
+                    // that out for this translator's own code actions, and a
+                    // client shared with another translator could still do
+                    // it. Wait the command out rather than selecting on a
+                    // closed channel that is ready forever.
+                    None => break (&mut request).await,
+                },
+                result = &mut request => break result,
+            }
+        };
+
+        // Refuse anything sent from here on, before draining: the drain
+        // awaits an apply per message, and a still-open channel would take
+        // in edits the server sent after the command answered.
+        sink_rx.close();
+
+        // The command's response can overtake an edit that was queued
+        // before it, so what is already in the channel still belongs to
+        // this window.
+        while let Ok((edit, reply)) = sink_rx.try_recv() {
+            let answer = self
+                .apply_inbound_edit(applier, server_id, edit, &mut written)
+                .await;
+            let _ = reply.send(answer);
+        }
+
+        drop(sink_rx);
+        client.set_apply_sink(None).await;
+
+        match outcome {
+            Ok(_) => Ok(written),
+            Err(error) => {
+                if !written.is_empty() {
+                    warn!(
+                        "workspace/executeCommand failed after inbound edits had already \
+                         written {written:?}: {error}"
+                    );
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Apply one inbound `workspace/applyEdit`, appending what it wrote to
+    /// `written`, and report whether the server's edit was applied.
+    ///
+    /// The answer is whether the apply succeeded, which is the yes-or-no
+    /// the server asked. That is not the same question the tool's own
+    /// `applied` field answers: an edit planning no operations succeeds
+    /// without writing, so it answers `true` here while adding nothing to
+    /// `written`.
+    ///
+    /// A refused or unplannable edit is answered `false` instead of failing
+    /// the tool call: the command around it may still succeed, and the
+    /// caller reports only what actually landed.
+    async fn apply_inbound_edit(
+        &self,
+        applier: &Applier,
+        server_id: &ServerId,
+        edit: WorkspaceEdit,
+        written: &mut Vec<String>,
+    ) -> bool {
+        let outcome = match EditPlan::from_workspace_edit(edit) {
+            Ok(plan) => self.apply_locked(applier, plan, server_id).await,
+            Err(error) => Err(error),
+        };
+        match outcome {
+            Ok(summary) => {
+                written.extend(
+                    summary
+                        .files_changed
+                        .iter()
+                        .map(|change| change.path.display().to_string()),
+                );
+                true
+            }
+            Err(error) => {
+                warn!("Refused an inbound workspace/applyEdit from {server_id}: {error}");
+                false
+            }
+        }
     }
 }
 
@@ -1410,5 +1563,321 @@ mod tests {
         )
         .expect_err("no action has this title");
         assert!(error.to_string().contains("Not present"));
+    }
+
+    /// A translator permitted to apply code actions, routed to a fake
+    /// server advertising `codeActionProvider`, over a file holding
+    /// `fn old() {}`.
+    fn code_action_fixture(
+        dir: &tempfile::TempDir,
+    ) -> (std::sync::Arc<Translator>, FakeServer, std::path::PathBuf) {
+        use crate::bridge::apply::Applier;
+        use crate::config::{ApplyConfig, ServerId};
+
+        let caps = lsp_types::ServerCapabilities {
+            code_action_provider: Some(lsp_types::CodeActionProviderCapability::Simple(true)),
+            ..Default::default()
+        };
+        let (translator, server) = translator_with_capabilities(dir, &ServerId::from("rust"), caps);
+        let translator = translator.with_applier(std::sync::Arc::new(Applier::new(
+            vec![dir.path().to_path_buf()],
+            ApplyConfig {
+                code_actions: true,
+                ..ApplyConfig::default()
+            },
+        )));
+
+        let path = dir.path().join("target.rs");
+        fs::write(&path, "fn old() {}\n").expect("write fixture");
+
+        (std::sync::Arc::new(translator), server, path)
+    }
+
+    /// A JSON `textDocument/codeAction` listing holding one command-only
+    /// action, the shape a server uses for an assist it runs itself.
+    fn command_only_listing() -> serde_json::Value {
+        serde_json::json!([{
+            "title": "Extract into function",
+            "command": {
+                "title": "Extract into function",
+                "command": "test.extract",
+                "arguments": [],
+            },
+        }])
+    }
+
+    /// `params` for a `workspace/applyEdit` rewriting `old` to `new` in
+    /// `uri`'s first line.
+    fn rename_old_to_new(uri: &lsp_types::Uri) -> serde_json::Value {
+        serde_json::json!({
+            "edit": {
+                "changes": {
+                    uri.as_str(): [{
+                        "range": {
+                            "start": { "line": 0, "character": 3 },
+                            "end": { "line": 0, "character": 6 },
+                        },
+                        "newText": "new",
+                    }],
+                },
+            },
+        })
+    }
+
+    /// Several servers deliver an assist as a command whose only effect is
+    /// an inbound `workspace/applyEdit`. That edit must reach the applier
+    /// the direct path writes through, and must be answered while the
+    /// command is still in flight: a server that waits for the answer
+    /// before replying to the command would otherwise never reply.
+    #[tokio::test]
+    async fn test_command_driven_action_applies_the_edit_the_server_sends_back() {
+        use std::sync::Arc;
+
+        use tokio::io::BufReader;
+        use tokio::time::{Duration, timeout};
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (translator, mut server, path) = code_action_fixture(&dir);
+        let uri = crate::bridge::path_to_uri(&path).expect("uri for the fixture file");
+        let path_str = path.to_string_lossy().to_string();
+
+        let handle = {
+            let translator = Arc::clone(&translator);
+            tokio::spawn(async move {
+                translator
+                    .handle_apply_code_action(path_str, 1, 1, 1, 5, None, Some(0), None)
+                    .await
+            })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+
+        let listing = read_framed_message(&mut wire).await;
+        assert_eq!(listing["method"], "textDocument/codeAction");
+        write_response(
+            &mut server.read_half_stdin,
+            &listing["id"],
+            command_only_listing(),
+        )
+        .await;
+
+        let command = read_framed_message(&mut wire).await;
+        assert_eq!(command["method"], "workspace/executeCommand");
+        assert_eq!(command["params"]["command"], "test.extract");
+
+        write_request(
+            &mut server.read_half_stdin,
+            &serde_json::json!(4242),
+            "workspace/applyEdit",
+            rename_old_to_new(&uri),
+        )
+        .await;
+
+        let answer = read_framed_message(&mut wire).await;
+        assert_eq!(answer["id"], 4242);
+        assert_eq!(
+            answer["result"]["applied"], true,
+            "the edit must be applied while the command is still in flight"
+        );
+
+        write_response(
+            &mut server.read_half_stdin,
+            &command["id"],
+            serde_json::Value::Null,
+        )
+        .await;
+
+        let result = timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("the handler must not hang")
+            .expect("the handler task must not panic")
+            .expect("a command-driven action succeeds");
+
+        assert!(
+            result.applied,
+            "the inbound edit wrote bytes, so the action applied"
+        );
+        let written = path.canonicalize().expect("the fixture file exists");
+        assert_eq!(result.files_written, vec![written.display().to_string()]);
+        assert_eq!(result.executed_command.as_deref(), Some("test.extract"));
+        assert_eq!(
+            fs::read_to_string(&path).expect("read the fixture back"),
+            "fn new() {}\n"
+        );
+    }
+
+    /// One command can answer with several edits, over several files. Every
+    /// one of them must land and be reported, which is what the pump loops
+    /// for.
+    #[tokio::test]
+    async fn test_command_driven_action_applies_every_edit_the_server_sends() {
+        use std::sync::Arc;
+
+        use tokio::io::BufReader;
+        use tokio::time::{Duration, timeout};
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (translator, mut server, first) = code_action_fixture(&dir);
+        let second = dir.path().join("other.rs");
+        fs::write(&second, "fn old() {}\n").expect("write the second fixture");
+        let uris = [
+            crate::bridge::path_to_uri(&first).expect("uri for the first file"),
+            crate::bridge::path_to_uri(&second).expect("uri for the second file"),
+        ];
+        let path_str = first.to_string_lossy().to_string();
+
+        let handle = {
+            let translator = Arc::clone(&translator);
+            tokio::spawn(async move {
+                translator
+                    .handle_apply_code_action(path_str, 1, 1, 1, 5, None, Some(0), None)
+                    .await
+            })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+
+        let listing = read_framed_message(&mut wire).await;
+        write_response(
+            &mut server.read_half_stdin,
+            &listing["id"],
+            command_only_listing(),
+        )
+        .await;
+
+        let command = read_framed_message(&mut wire).await;
+        assert_eq!(command["method"], "workspace/executeCommand");
+
+        for (id, uri) in [(4244, &uris[0]), (4245, &uris[1])] {
+            write_request(
+                &mut server.read_half_stdin,
+                &serde_json::json!(id),
+                "workspace/applyEdit",
+                rename_old_to_new(uri),
+            )
+            .await;
+            let answer = read_framed_message(&mut wire).await;
+            assert_eq!(answer["id"], id);
+            assert_eq!(
+                answer["result"]["applied"], true,
+                "every edit of the command must be applied, not just the first"
+            );
+        }
+
+        write_response(
+            &mut server.read_half_stdin,
+            &command["id"],
+            serde_json::Value::Null,
+        )
+        .await;
+
+        let result = timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("the handler must not hang")
+            .expect("the handler task must not panic")
+            .expect("a command-driven action succeeds");
+
+        assert!(result.applied);
+        let written: Vec<String> = [&first, &second]
+            .iter()
+            .map(|path| {
+                path.canonicalize()
+                    .expect("the fixture file exists")
+                    .display()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            result.files_written, written,
+            "both files the command wrote must be reported"
+        );
+        for path in [&first, &second] {
+            assert_eq!(
+                fs::read_to_string(path).expect("read the fixture back"),
+                "fn new() {}\n"
+            );
+        }
+    }
+
+    /// The sink lives for the `executeCommand` call and no longer: an edit
+    /// the server sends once the command has answered is refused, so it
+    /// cannot write to the tree at a moment of its own choosing.
+    ///
+    /// This covers the window closing, not the mechanism that closes it.
+    /// With the sink cleared, `forward_apply_edit` refuses before it ever
+    /// reaches the send, so this passes whether or not the receiver was
+    /// also dropped. `lsp::client`'s
+    /// `test_apply_edit_is_refused_when_the_sink_is_gone` covers the drop.
+    #[tokio::test]
+    async fn test_inbound_apply_edit_after_the_command_is_refused() {
+        use std::sync::Arc;
+
+        use tokio::io::BufReader;
+        use tokio::time::{Duration, timeout};
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (translator, mut server, path) = code_action_fixture(&dir);
+        let uri = crate::bridge::path_to_uri(&path).expect("uri for the fixture file");
+        let path_str = path.to_string_lossy().to_string();
+
+        let handle = {
+            let translator = Arc::clone(&translator);
+            tokio::spawn(async move {
+                translator
+                    .handle_apply_code_action(path_str, 1, 1, 1, 5, None, Some(0), None)
+                    .await
+            })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+
+        let listing = read_framed_message(&mut wire).await;
+        write_response(
+            &mut server.read_half_stdin,
+            &listing["id"],
+            command_only_listing(),
+        )
+        .await;
+
+        let command = read_framed_message(&mut wire).await;
+        write_response(
+            &mut server.read_half_stdin,
+            &command["id"],
+            serde_json::Value::Null,
+        )
+        .await;
+
+        let result = timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("the handler must not hang")
+            .expect("the handler task must not panic")
+            .expect("a command that writes nothing still succeeds");
+        assert!(!result.applied, "the command sent no edit back");
+
+        write_request(
+            &mut server.read_half_stdin,
+            &serde_json::json!(4243),
+            "workspace/applyEdit",
+            rename_old_to_new(&uri),
+        )
+        .await;
+
+        let answer = read_framed_message(&mut wire).await;
+        assert_eq!(answer["id"], 4243);
+        assert_eq!(
+            answer["result"]["applied"], false,
+            "the apply window closed with the command"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).expect("read the fixture back"),
+            "fn old() {}\n",
+            "a refused edit writes nothing"
+        );
     }
 }

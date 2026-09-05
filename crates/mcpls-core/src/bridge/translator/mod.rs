@@ -113,6 +113,19 @@ pub struct Translator {
     /// one file would otherwise both plan against the same pre-edit
     /// content and the second would overwrite the first.
     apply_lock: Arc<Mutex<()>>,
+    /// Serializes the windows during which an inbound `workspace/applyEdit`
+    /// is honored, so only one is open at a time. A client's apply sink is
+    /// a single slot shared by every clone of that client, so two
+    /// overlapping windows would clobber each other: the second's install
+    /// drops the first's sender, and the first's teardown clears the
+    /// second's sink mid-command. Both would silently degrade to no window
+    /// at all.
+    ///
+    /// Deliberately not [`Self::apply_lock`]: that one is taken per apply
+    /// *inside* the window, so holding it across a command whose inbound
+    /// edit needs it would deadlock. A window always takes this lock first
+    /// and the apply lock second, never the other way round.
+    apply_sink_lock: Arc<Mutex<()>>,
     /// Writes a permitted `WorkspaceEdit` to the working tree. Always
     /// present; a translator that may not write carries one whose
     /// `ApplyConfig` permits nothing.
@@ -153,6 +166,7 @@ impl Translator {
             respawn_backoffs: Arc::new(StdMutex::new(HashMap::new())),
             notification_cache: None,
             apply_lock: Arc::new(Mutex::new(())),
+            apply_sink_lock: Arc::new(Mutex::new(())),
             applier: Arc::new(Applier::new(Vec::new(), ApplyConfig::default())),
             clock: Arc::new(SystemClock),
         }
