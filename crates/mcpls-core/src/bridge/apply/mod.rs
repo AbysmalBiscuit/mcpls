@@ -406,8 +406,7 @@ mod tests {
     };
 
     use super::{Applier, EditPlan};
-    use crate::bridge::PositionEncoding;
-    use crate::bridge::path_to_uri;
+    use crate::bridge::{PositionEncoding, path_to_uri};
     use crate::config::ApplyConfig;
 
     fn uri_for(path: &Path) -> Uri {
@@ -519,10 +518,7 @@ mod tests {
                     annotation_id: None,
                 })),
                 DocumentChangeOperation::Edit(TextDocumentEdit {
-                    text_document: OptionalVersionedTextDocumentIdentifier {
-                        uri,
-                        version: None,
-                    },
+                    text_document: OptionalVersionedTextDocumentIdentifier { uri, version: None },
                     edits: vec![OneOf::Left(TextEdit {
                         range: Range::new(Position::new(0, 0), Position::new(0, 0)),
                         new_text: "pub fn generated() {}\n".to_string(),
@@ -583,7 +579,10 @@ mod tests {
             .expect("rename-then-edit succeeds");
 
         assert!(!old.exists());
-        assert_eq!(fs::read_to_string(&new).expect("read"), "fn new_name() {}\n");
+        assert_eq!(
+            fs::read_to_string(&new).expect("read"),
+            "fn new_name() {}\n"
+        );
     }
 
     #[tokio::test]
