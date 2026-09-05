@@ -110,6 +110,11 @@ go install golang.org/x/tools/gopls@latest
 
 </details>
 
+**Shell completions:** `mcpls completions <bash|elvish|fish|nushell|powershell|zsh>`
+prints a completion script to stdout. See the
+[installation guide](docs/user-guide/installation.md#shell-completions) for where
+each shell expects it.
+
 ## Quick Start
 
 **1. Configure Claude Code** (`~/.claude/claude_desktop_config.json`):

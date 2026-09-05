@@ -2,7 +2,9 @@
 
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
+
+use crate::completions::Shell;
 
 /// Parses a boolean flag/env value, accepting common truthy and falsy
 /// spellings beyond the strict `"true"`/`"false"` that `str::parse::<bool>`
@@ -36,6 +38,10 @@ pub fn parse_bool_flag(s: &str) -> Result<bool, String> {
 #[command(version, about, long_about = None)]
 #[command(propagate_version = true)]
 pub struct Args {
+    /// Subcommand to run instead of the MCP server
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
     /// Path to configuration file
     ///
     /// If not specified, searches for mcpls.toml in:
@@ -94,6 +100,30 @@ pub struct Args {
     pub http_path: String,
 }
 
+/// Subcommands that replace the default action.
+///
+/// `mcpls` with no subcommand runs the MCP server, which is what an MCP host
+/// launches; everything here is a one-shot utility that prints and exits.
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Print a shell completion script to stdout
+    ///
+    /// Redirect it to wherever the shell reads completions from, for example:
+    ///
+    ///   mcpls completions bash > ~/.local/share/bash-completion/completions/mcpls
+    ///
+    ///   mcpls completions fish > ~/.config/fish/completions/mcpls.fish
+    ///
+    /// A nushell script defines a module, so save it to a file and source that
+    /// file from config.nu rather than piping it in. The installation guide
+    /// lists the path each shell expects.
+    Completions {
+        /// Shell dialect to emit
+        #[arg(value_enum)]
+        shell: Shell,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,9 +163,28 @@ mod tests {
     #[test]
     fn test_default_args() {
         let args = Args::parse_from(["mcpls"]);
+        assert!(args.command.is_none(), "no subcommand runs the MCP server");
         assert!(args.config.is_none());
         assert_eq!(args.log_level, "info");
         assert!(!args.log_json);
+    }
+
+    #[test]
+    fn test_completions_subcommand_parses_shell() {
+        let args = Args::parse_from(["mcpls", "completions", "nushell"]);
+        assert!(matches!(
+            args.command,
+            Some(Command::Completions {
+                shell: Shell::Nushell
+            })
+        ));
+    }
+
+    /// A shell mcpls cannot generate for has to be a parse error, not an
+    /// empty script the user sources without noticing.
+    #[test]
+    fn test_completions_rejects_unknown_shell() {
+        assert!(Args::try_parse_from(["mcpls", "completions", "tcsh"]).is_err());
     }
 
     #[test]

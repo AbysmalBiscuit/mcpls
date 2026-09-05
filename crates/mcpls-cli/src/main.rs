@@ -8,13 +8,25 @@ use clap::Parser;
 use mcpls_core::ProjectConfigTrust;
 
 mod args;
+mod completions;
 mod logging;
 
-use args::Args;
+use args::{Args, Command};
 
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+
+    // Completions need neither a loaded config nor a log subscriber, and
+    // printing the script is the whole command, so this runs before both.
+    if let Some(Command::Completions { shell }) = &args.command {
+        let mut out = std::io::stdout().lock();
+        if let Err(err) = completions::emit(*shell, &mut out) {
+            eprintln!("failed to write completion script: {err}");
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
 
     // Initialize logging. No subscriber is installed yet, so failures here
     // must go straight to stderr.

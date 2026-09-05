@@ -17,6 +17,8 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
+clap_complete = { workspace = true }
+clap_complete_nushell = { workspace = true }
 mcpls-core = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true }

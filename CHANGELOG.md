@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`mcpls completions <shell>` subcommand** — prints a shell completion script to stdout for bash, elvish, fish, nushell, powershell, and zsh. The script is generated from the live `Args` definition, so it covers whatever flags the build accepts: a build without the `transport-http` feature emits completions without `--listen`/`--http-path`. The shell argument is a first-party `completions::Shell` rather than `clap_complete::Shell`, which is closed and has no nushell variant; each variant forwards to the crate owning that generator (`clap_complete` for five, `clap_complete_nushell` for nushell), and the value strings match `clap_complete::Shell`'s so they stay stable. Generation goes through `Generator::try_generate` instead of `clap_complete::generate`, which panics when the write fails and would turn `mcpls completions bash | head` into a crash; a broken pipe is treated as the reader being done. This is the binary's first subcommand: `mcpls` with no subcommand still runs the MCP server exactly as before, and the completions path short-circuits before config loading and logging initialization. Documented under "Shell Completions" in `docs/user-guide/installation.md`.
+
 ### Removed
 
 - **`async-trait` direct dependency** — dropped from the workspace and `mcpls-core`; unused now that no trait in the crate needs it, remains available transitively through `rmcp`'s own optional dependency when its `--all-features` build enables it.

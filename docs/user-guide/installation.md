@@ -378,6 +378,46 @@ source ~/.bashrc  # or ~/.zshrc
 3. Add the directory containing `mcpls.exe` (e.g., `C:\Users\YourName\.cargo\bin`)
 4. Click OK and restart your terminal
 
+## Shell Completions
+
+`mcpls completions <shell>` prints a completion script to stdout for bash,
+elvish, fish, nushell, powershell, or zsh. The script is generated from the
+binary's own argument definitions, so it always matches the flags the
+installed build accepts.
+
+```bash
+# Bash
+mcpls completions bash > ~/.local/share/bash-completion/completions/mcpls
+
+# Zsh (any directory on $fpath)
+mcpls completions zsh > ~/.zfunc/_mcpls
+
+# Fish
+mcpls completions fish > ~/.config/fish/completions/mcpls.fish
+
+# Elvish
+mcpls completions elvish >> ~/.config/elvish/rc.elv
+```
+
+A nushell script defines a module and re-exports it, so save it to a file and
+source that file from `config.nu` rather than piping it in:
+
+```nu
+mcpls completions nushell | save -f ($nu.default-config-dir | path join completions mcpls.nu)
+# then in config.nu:
+source ($nu.default-config-dir | path join completions mcpls.nu)
+```
+
+PowerShell reads its completions from the profile:
+
+```powershell
+mcpls completions powershell | Out-String | Invoke-Expression
+```
+
+Start a new shell (or re-source the profile) for the completions to take
+effect. Regenerate the script after upgrading mcpls, since a release can add
+or rename flags.
+
 ## Upgrading
 
 ### Cargo Install

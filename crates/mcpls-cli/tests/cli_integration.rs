@@ -438,3 +438,95 @@ fn test_default_logging_is_not_json() {
         .stderr(predicate::str::contains("starting mcpls"))
         .stderr(predicate::str::contains("\"message\":\"starting mcpls\"").not());
 }
+
+/// Every shell `clap_complete` supports must produce a non-empty script and
+/// exit 0. The subcommand short-circuits before config loading and before
+/// the MCP server starts, so it works with no `mcpls.toml` present and
+/// terminates on its own rather than blocking on stdio like a bare `mcpls`.
+#[test]
+fn test_completions_subcommand_emits_script_for_every_shell() {
+    for shell in ["bash", "elvish", "fish", "nushell", "powershell", "zsh"] {
+        let mut cmd = Command::cargo_bin("mcpls").unwrap();
+
+        let output = clear_ambient_env(&mut cmd)
+            .arg("completions")
+            .arg(shell)
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "completions {shell} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !output.stdout.is_empty(),
+            "completions {shell} wrote an empty script"
+        );
+    }
+}
+
+/// The script is generated from the live `Args` definition rather than
+/// checked in, so a flag added to `Args` shows up in completions without a
+/// second edit. `--trust-project-config` stands in for that: it is the
+/// longest-lived flag with no short form, so its presence means the real
+/// argument definitions were walked.
+#[test]
+fn test_completions_script_covers_current_flags() {
+    let mut cmd = Command::cargo_bin("mcpls").unwrap();
+
+    clear_ambient_env(&mut cmd)
+        .arg("completions")
+        .arg("bash")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--trust-project-config"))
+        .stdout(predicate::str::contains("--log-json"));
+}
+
+/// An unsupported shell name is a parse error, not an empty script written
+/// to stdout that a user would source without noticing.
+#[test]
+fn test_completions_rejects_unknown_shell() {
+    let mut cmd = Command::cargo_bin("mcpls").unwrap();
+
+    clear_ambient_env(&mut cmd)
+        .arg("completions")
+        .arg("tcsh")
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty());
+}
+
+/// A reader that closes the pipe early (`mcpls completions bash | head`) must
+/// not crash the writer. `clap_complete::generate` panics on the failed write,
+/// so `completions::emit` uses the fallible generator and treats a broken pipe
+/// as a clean exit.
+#[cfg(unix)]
+#[test]
+fn test_completions_survives_a_closed_pipe() {
+    use std::process::Stdio;
+
+    let mut cmd = Command::cargo_bin("mcpls").unwrap();
+    let mut child = clear_ambient_env(&mut cmd)
+        .arg("completions")
+        .arg("zsh")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take().unwrap());
+
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !stderr.contains("panicked"),
+        "a closed pipe must not panic: {stderr}"
+    );
+    assert!(
+        output.status.success(),
+        "a closed pipe is a clean exit, got {:?}: {stderr}",
+        output.status
+    );
+}

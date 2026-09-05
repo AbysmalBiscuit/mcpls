@@ -23,6 +23,7 @@ mcpls                                      # stdio transport (default)
 mcpls --log-level debug                    # verbose output
 mcpls --config ./mcpls.toml               # custom config
 mcpls --listen 127.0.0.1:3000             # HTTP transport (transport-http feature)
+mcpls completions fish                     # print a shell completion script
 ```
 
 ## Configuration
@@ -57,6 +58,16 @@ See the main [README](../../README.md) for configuration examples and custom ext
 
 > [!NOTE]
 > `MCPLS_TRUST_PROJECT_CONFIG` and `MCPLS_LOG_JSON` accept `1`/`0`, `true`/`false`, `yes`/`no`, `y`/`n`, and `on`/`off` (case-insensitive).
+
+## Shell Completions
+
+```bash
+mcpls completions <bash|elvish|fish|nushell|powershell|zsh>
+```
+
+Prints a completion script to stdout, generated from the binary's own argument
+definitions. See the [installation guide](../../docs/user-guide/installation.md#shell-completions)
+for where each shell expects the file.
 
 ## Claude Code Integration
 
