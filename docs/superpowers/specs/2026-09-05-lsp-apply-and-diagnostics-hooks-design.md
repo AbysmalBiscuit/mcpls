@@ -101,7 +101,9 @@ requires, which it currently drops.
 
 Some servers deliver an assist as a command rather than an edit, requiring
 `workspace/executeCommand` and answering through an inbound `workspace/applyEdit`. That
-path is specified below and is not optional: the configured server set is not Rust-only.
+path is specified below and is not optional: gopls, vtsls, typescript-language-server, and
+lua-language-server all send it, so four of the configured servers reach code actions this
+way.
 
 ### The applier
 
@@ -189,33 +191,60 @@ response is sent after the write and the tracker update, before the resync.
 
 ### Why mcpls needs it
 
-The servers in use do not agree on who watches the filesystem, and two of them expect the
-client to do it.
+Every configured language server was checked against its own source. Only one of them
+watches the filesystem for itself.
 
-- **rust-analyzer** runs its own watcher and sees disk changes without help.
-- **tsgo** chooses at init (`internal/lsp/server.go:1694-1713`): client-side watching if
-  the client advertises `didChangeWatchedFiles.dynamicRegistration`; otherwise an
-  in-process watcher if the backend supports fast recursive watching, which its own
-  comment limits to Windows and FSEvents; otherwise `"file watching: disabled"`. On Linux
-  and WSL2 with mcpls as it stands, that is the third branch.
-- **pyrefly** registers `FileSystemWatcher` patterns with the client
-  (`pyrefly/lib/lsp/non_wasm/server.rs:5811-5861`). The `notify`-based watcher in that
-  codebase belongs to the CLI `check` command, not the LSP server.
+| Server | Watches for itself | Needs the client to watch | Sends `workspace/applyEdit` |
+|---|---|---|---|
+| rust-analyzer | yes | no | not observed |
+| gopls | no | yes | yes |
+| tsgo | Windows and macOS only | yes on Linux | protocol types only |
+| vtsls | no | yes | yes |
+| typescript-language-server | no | yes | yes |
+| pyrefly | no | yes | no |
+| ty | no | yes | no |
+| lua-language-server | no | yes | yes |
+| taplo | no | ignores the notification | no |
+| marksman | no | ignores the notification | no |
+
+The two that decide it at runtime deserve their reasoning spelled out, because both land
+badly under mcpls as it stands:
+
+- **gopls** builds its watcher registrations in `registerWatchedDirectoriesLocked`
+  (`gopls/internal/server/general.go:596`), whose first statement returns `nil` when
+  `DynamicWatchedFilesSupported` is false. There is no in-process fallback. A client that
+  does not watch leaves gopls seeing only the documents it is told about.
+- **tsgo** chooses among three branches at init (`internal/lsp/server.go:1694-1713`):
+  client-side watching when the client advertises
+  `didChangeWatchedFiles.dynamicRegistration`; otherwise an in-process watcher when the
+  backend supports fast recursive watching, which its own comment limits to Windows and
+  FSEvents; otherwise `"file watching: disabled"`. On Linux and WSL2 that is the third
+  branch.
+
+ty and typescript-language-server both gate registration on the same client capability
+(`crates/ty_server/src/session.rs:958`, `src/lsp-server.ts:187`). pyrefly registers
+`FileSystemWatcher` patterns with the client (`pyrefly/lib/lsp/non_wasm/server.rs:5811`);
+the `notify`-based watcher elsewhere in that codebase belongs to the CLI `check` command.
+
+taplo and marksman handle no watched-files notification at all, so they see only what
+document synchronization tells them. Nothing in this design changes that, and nothing can.
 
 So mcpls implements the client half of `workspace/didChangeWatchedFiles`:
 
 1. `client/registerCapability` for `workspace/didChangeWatchedFiles` stops being answered
-   with a bare `null`. The registration's `watchers` array (glob pattern plus a change
-   kind bitmask) is stored per server, keyed by registration id.
-   `client/unregisterCapability` drops it.
+   with a bare `null` (`lsp/client.rs:663`). The registration's `watchers` array (glob
+   pattern plus a change kind bitmask) is stored per server, keyed by registration id.
+   `client/unregisterCapability` drops it. gopls re-registers as its watched directory set
+   grows, incrementing its own registration id, so registrations accumulate per server
+   rather than replacing one another.
 2. `workspace.did_change_watched_files.dynamic_registration = true` is advertised, which
-   also moves tsgo out of its disabled branch.
+   also moves gopls and tsgo out of their do-nothing branches.
 3. When mcpls learns a path changed, it sends `workspace/didChangeWatchedFiles` to every
    server whose registered globs match that path and whose bitmask includes the event
    kind.
 
 Advertising the capability without implementing the notification would be worse than
-today: tsgo would take the client-side branch and then hear nothing.
+today: gopls and tsgo would both abandon what they do now and hear nothing in return.
 
 ### Where change events come from
 
@@ -449,10 +478,14 @@ assert the on-disk files changed; a module rename producing a file rename operat
 confirm the capability change works and that preview and apply agree; break a caller and
 assert the fanout file appears in a later flush.
 
-Two behaviors need probing against live servers rather than assuming: whether
+One behavior still needs probing against a live server rather than assuming: whether
 rust-analyzer runs flycheck on a change it learned about from its own watcher rather than
-from `didSave`, and whether any configured server actually sends `workspace/applyEdit`
-rather than resolving assists into edits.
+from `didSave`. If it does not, an external write to a Rust file produces no compiler
+diagnostics until a tool call opens it.
+
+The `workspace/applyEdit` path is exercised end to end against gopls rather than
+rust-analyzer, since rust-analyzer resolves its assists into edits and never takes that
+path.
 
 Windows named pipes have no CI coverage, but Windows is a supported target, so the listener
 sits behind a small trait with the logic tested once and the transport verified by hand.
@@ -462,9 +495,11 @@ sits behind a small trait with the logic tested once and the transport verified 
 - Position encoding conversion is the highest-consequence code in the applier. A wrong
   offset silently corrupts a file rather than failing loudly. It reuses the existing
   tested converter for exactly this reason.
-- Advertising `didChangeWatchedFiles.dynamic_registration` changes tsgo's behavior at
-  init. If the notification side is incomplete, tsgo ends up worse off than before, since
-  it will have abandoned its in-process fallback. Land both halves together.
+- Advertising `didChangeWatchedFiles.dynamic_registration` changes what gopls and tsgo do
+  at init. Both stop doing what they do today on the strength of that advertisement:
+  gopls starts registering watchers it currently skips, tsgo abandons the in-process
+  fallback it uses on Windows and macOS. An incomplete notification side leaves both
+  worse off than before. Land the advertisement and the notification together.
 - Claude Code's `FileChanged` watcher spawns a hook process per event and passes no ignore
   list. The `SessionStart` `watchPaths` computation is the only thing bounding it, so it
   needs measuring on a repository mid-build rather than at rest.
@@ -508,11 +543,13 @@ Verified against 2.1.261:
 - `additionalContext` is accepted from `PostToolBatch`, `UserPromptSubmit`, `Stop`,
   `SessionStart`, and others, but not from `FileChanged`, whose only output is
   `watchPaths`. On `Stop` it continues the conversation.
-- `CLAUDE_PROJECT_DIR` is exported into plugin and regular hook environments.
-- The default hook timeout is 600 s.
-
-Language server behavior was read from source checkouts, not documentation:
-typescript-go at `internal/lsp/server.go:1694-1713`, pyrefly 1.2.0 at
-`pyrefly/lib/lsp/non_wasm/server.rs:5811-5861`. gopls, vtsls,
-typescript-language-server, ty, taplo, marksman, and lua-language-server were not checked
-and their watching and command behavior is unverified.
+Language server behavior was read from source checkouts, not documentation. gopls at
+`gopls/internal/server/general.go:596` and `gopls/internal/server/command.go:991`;
+typescript-go at `internal/lsp/server.go:1694-1713`; typescript-language-server at
+`src/lsp-server.ts:187` and `src/lsp-server.ts:1065`; vtsls at
+`packages/service/src/service/delegate.ts:49`; pyrefly 1.2.0 at
+`pyrefly/lib/lsp/non_wasm/server.rs:5811`; ty at `crates/ty_server/src/session.rs:901-962`
+and `crates/ty_server/src/server/api/requests/execute_command.rs`, whose only supported
+command returns debug text; lua-language-server at `script/client.lua:595`; taplo and
+marksman by the absence of any match for the watched-files notification in
+`crates/taplo-lsp/src` and `Marksman/`.
