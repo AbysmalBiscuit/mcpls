@@ -122,11 +122,7 @@ impl EditPlan {
         Self::edit_operation(tde.text_document.uri, tde.text_document.version, edits)
     }
 
-    fn edit_operation(
-        uri: Uri,
-        version: Option<i32>,
-        edits: Vec<TextEdit>,
-    ) -> Result<Operation> {
+    fn edit_operation(uri: Uri, version: Option<i32>, edits: Vec<TextEdit>) -> Result<Operation> {
         // Descending by start, and among equal starts descending by the
         // server's own array index. Splicing front to back then reproduces
         // array order in the text for consecutive inserts at one point,
@@ -165,13 +161,12 @@ impl EditPlan {
     fn resource_operation(resource: lsp_types::ResourceOp) -> Operation {
         match resource {
             lsp_types::ResourceOp::Create(create) => {
-                let (overwrite, ignore_if_exists) =
-                    create.options.map_or((false, false), |o| {
-                        (
-                            o.overwrite.unwrap_or(false),
-                            o.ignore_if_exists.unwrap_or(false),
-                        )
-                    });
+                let (overwrite, ignore_if_exists) = create.options.map_or((false, false), |o| {
+                    (
+                        o.overwrite.unwrap_or(false),
+                        o.ignore_if_exists.unwrap_or(false),
+                    )
+                });
                 Operation::Create {
                     uri: create.uri,
                     overwrite,
@@ -179,13 +174,12 @@ impl EditPlan {
                 }
             }
             lsp_types::ResourceOp::Rename(rename) => {
-                let (overwrite, ignore_if_exists) =
-                    rename.options.map_or((false, false), |o| {
-                        (
-                            o.overwrite.unwrap_or(false),
-                            o.ignore_if_exists.unwrap_or(false),
-                        )
-                    });
+                let (overwrite, ignore_if_exists) = rename.options.map_or((false, false), |o| {
+                    (
+                        o.overwrite.unwrap_or(false),
+                        o.ignore_if_exists.unwrap_or(false),
+                    )
+                });
                 Operation::Rename {
                     old: rename.old_uri,
                     new: rename.new_uri,
@@ -360,7 +354,10 @@ mod tests {
         assert!(matches!(plan.operations()[0], Operation::Create { .. }));
         assert!(matches!(
             plan.operations()[1],
-            Operation::Edit { version: Some(3), .. }
+            Operation::Edit {
+                version: Some(3),
+                ..
+            }
         ));
     }
 
@@ -392,8 +389,7 @@ mod tests {
 
     #[test]
     fn test_empty_edit_produces_no_operations() {
-        let plan =
-            EditPlan::from_workspace_edit(WorkspaceEdit::default()).expect("plan builds");
+        let plan = EditPlan::from_workspace_edit(WorkspaceEdit::default()).expect("plan builds");
         assert!(plan.operations().is_empty());
     }
 }

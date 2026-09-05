@@ -10,12 +10,11 @@ use super::Translator;
 use super::diagnostics::diagnostic_to_mcp;
 use super::dto::{
     CodeAction, CodeActionsResult, CommandDescription, DocumentChanges, FormatDocumentResult,
-    RenameResult, TextEdit, WorkspaceEditDescription,
-    resource_operations_from_plan,
+    RenameResult, TextEdit, WorkspaceEditDescription, resource_operations_from_plan,
 };
-use crate::bridge::apply::{EditPlan, Operation};
 use super::encoding_ctx::EncodingCtx;
 use super::routing::{MAX_POSITION_VALUE, MAX_RANGE_LINES};
+use crate::bridge::apply::{EditPlan, Operation};
 use crate::config::ToolKind;
 use crate::error::{Error, Result};
 

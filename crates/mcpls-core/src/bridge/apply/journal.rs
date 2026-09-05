@@ -70,12 +70,15 @@ fn perform(step: &Step) -> std::result::Result<(), String> {
                     from.display()
                 ));
             }
-            fs::rename(from, to).map_err(|e| {
-                format!("moving {} to {}: {e}", from.display(), to.display())
-            })
+            fs::rename(from, to)
+                .map_err(|e| format!("moving {} to {}: {e}", from.display(), to.display()))
         }
         Step::Trash { path, trash } => fs::rename(path, trash).map_err(|e| {
-            format!("moving {} aside to {}: {e}", path.display(), trash.display())
+            format!(
+                "moving {} aside to {}: {e}",
+                path.display(),
+                trash.display()
+            )
         }),
     }
 }
@@ -136,11 +139,9 @@ fn roll_back(completed: &[Step], reason: String) -> Error {
             }
             Step::Move { from, to } => match fs::rename(to, from) {
                 Ok(()) => restored.push(from.clone()),
-                Err(e) => unrecovered.push(format!(
-                    "{} is at {} ({e})",
-                    from.display(),
-                    to.display()
-                )),
+                Err(e) => {
+                    unrecovered.push(format!("{} is at {} ({e})", from.display(), to.display()))
+                }
             },
             Step::Trash { path, trash } => match fs::rename(trash, path) {
                 Ok(()) => restored.push(path.clone()),

@@ -589,7 +589,10 @@ mod tests {
             config_key: "apply.rename",
         };
         let message = err.to_string();
-        assert!(message.contains("rename_symbol"), "names the tool: {message}");
+        assert!(
+            message.contains("rename_symbol"),
+            "names the tool: {message}"
+        );
         assert!(message.contains("apply.rename"), "names the key: {message}");
     }
 
@@ -603,7 +606,10 @@ mod tests {
         };
         let message = err.to_string();
         for expected in ["/w/a.rs", "/w/b.rs", "mcpls-trash0", "permission denied"] {
-            assert!(message.contains(expected), "missing {expected} in: {message}");
+            assert!(
+                message.contains(expected),
+                "missing {expected} in: {message}"
+            );
         }
     }
 }

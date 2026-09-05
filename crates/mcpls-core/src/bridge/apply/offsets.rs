@@ -57,17 +57,11 @@ impl<'a> LineTable<'a> {
     ///
     /// Returns [`Error::ApplyRefused`] when the line is beyond the document
     /// or the column does not land on a character boundary.
-    pub fn byte_offset(
-        &self,
-        position: Position,
-        converter: &EncodingConverter,
-    ) -> Result<usize> {
+    pub fn byte_offset(&self, position: Position, converter: &EncodingConverter) -> Result<usize> {
         let line_text = self.line(position.line)?;
         let line_length = converter
             .byte_offset_to_character(line_text, line_text.len())
-            .map_err(|e| {
-                Error::ApplyRefused(format!("measuring line {}: {e}", position.line))
-            })?;
+            .map_err(|e| Error::ApplyRefused(format!("measuring line {}: {e}", position.line)))?;
         let character = position.character.min(line_length);
         let within_line = converter
             .character_to_byte_offset(line_text, character)

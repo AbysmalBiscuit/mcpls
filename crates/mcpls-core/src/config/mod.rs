@@ -2280,8 +2280,8 @@ mod tests {
     #[test]
     #[allow(clippy::expect_used)]
     fn test_apply_permits_only_enabled_tools() {
-        let config: ServerConfig = toml::from_str("[apply]\nrename = true\n")
-            .expect("config parses");
+        let config: ServerConfig =
+            toml::from_str("[apply]\nrename = true\n").expect("config parses");
         assert!(config.apply.permits(ToolKind::Rename));
         assert!(!config.apply.permits(ToolKind::FormatDocument));
         assert!(!config.apply.permits(ToolKind::CodeActions));
