@@ -33,6 +33,48 @@ pub struct LanguageExtensionMapping {
     pub language_id: String,
 }
 
+/// Which tools may write their edits to the working tree.
+///
+/// Every field defaults to `false`, so a configuration without an
+/// `[apply]` table leaves mcpls entirely read-only.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct ApplyConfig {
+    /// `rename_symbol` may apply its `WorkspaceEdit`.
+    #[serde(default)]
+    pub rename: bool,
+
+    /// `format_document` may apply its edits.
+    #[serde(default)]
+    pub format_document: bool,
+
+    /// `apply_code_action` may apply a resolved action.
+    #[serde(default)]
+    pub code_actions: bool,
+
+    /// Delete operations inside an otherwise permitted `WorkspaceEdit` are
+    /// honored. Gates deletion for every tool above rather than any one of
+    /// them, because a delete destroys content no other operation does.
+    #[serde(default)]
+    pub allow_file_deletion: bool,
+}
+
+impl ApplyConfig {
+    /// Whether `tool` may write. Tools with nothing to write are always
+    /// `false`, so a caller need not know which of the fifteen `ToolKind`
+    /// variants can mutate anything.
+    #[must_use]
+    pub const fn permits(&self, tool: ToolKind) -> bool {
+        match tool {
+            ToolKind::Rename => self.rename,
+            ToolKind::FormatDocument => self.format_document,
+            ToolKind::CodeActions => self.code_actions,
+            _ => false,
+        }
+    }
+}
+
 /// Main configuration for the MCPLS server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -44,6 +86,10 @@ pub struct ServerConfig {
     /// LSP server configurations.
     #[serde(default)]
     pub lsp_servers: Vec<LspServerConfig>,
+
+    /// Which tools may write their edits to the working tree.
+    #[serde(default)]
+    pub apply: ApplyConfig,
 
     /// Whether a CWD-discovered `./mcpls.toml` was ignored as untrusted
     /// during this load (see [`ProjectConfigTrust`]).
@@ -874,6 +920,7 @@ impl Default for ServerConfig {
                 LspServerConfig::clangd(),
                 LspServerConfig::zls(),
             ],
+            apply: ApplyConfig::default(),
             project_config_ignored: false,
         }
     }
@@ -1680,6 +1727,7 @@ mod tests {
                 name: None,
                 handles: None,
             }],
+            apply: ApplyConfig::default(),
             project_config_ignored: false,
         };
 
@@ -1705,6 +1753,7 @@ mod tests {
                 name: None,
                 handles: None,
             }],
+            apply: ApplyConfig::default(),
             project_config_ignored: false,
         };
 
@@ -1730,6 +1779,7 @@ mod tests {
                 name: None,
                 handles: None,
             }],
+            apply: ApplyConfig::default(),
             project_config_ignored: false,
         };
 
@@ -1755,6 +1805,7 @@ mod tests {
                 name: None,
                 handles: None,
             }],
+            apply: ApplyConfig::default(),
             project_config_ignored: false,
         };
 
@@ -2214,5 +2265,33 @@ mod tests {
         );
         assert_eq!(round_tripped.max_documents, original.max_documents);
         assert_eq!(round_tripped.max_file_size, original.max_file_size);
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_apply_defaults_to_read_only() {
+        let config: ServerConfig = toml::from_str("").expect("empty config parses");
+        assert!(!config.apply.rename);
+        assert!(!config.apply.format_document);
+        assert!(!config.apply.code_actions);
+        assert!(!config.apply.allow_file_deletion);
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_apply_permits_only_enabled_tools() {
+        let config: ServerConfig = toml::from_str("[apply]\nrename = true\n")
+            .expect("config parses");
+        assert!(config.apply.permits(ToolKind::Rename));
+        assert!(!config.apply.permits(ToolKind::FormatDocument));
+        assert!(!config.apply.permits(ToolKind::CodeActions));
+        assert!(!config.apply.permits(ToolKind::Hover));
+    }
+
+    #[test]
+    fn test_apply_rejects_unknown_key() {
+        let result: std::result::Result<ServerConfig, _> =
+            toml::from_str("[apply]\nrenmae = true\n");
+        assert!(result.is_err(), "typo in an apply key must fail to parse");
     }
 }

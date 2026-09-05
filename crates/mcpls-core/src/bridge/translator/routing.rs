@@ -612,6 +612,7 @@ mod tests {
                 max_file_size: DEFAULT_MAX_FILE_SIZE,
             },
             lsp_servers: vec![],
+            apply: crate::config::ApplyConfig::default(),
             project_config_ignored: false,
         };
 
