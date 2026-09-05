@@ -22,6 +22,7 @@ use crate::bridge::apply::{Applier, ApplySummary, EditPlan, Operation};
 use crate::config::{ServerId, ToolKind};
 use crate::error::{Error, Result};
 use crate::lsp::LspClient;
+use crate::util::display_path;
 
 /// How many inbound `workspace/applyEdit` requests may queue while a
 /// command's edits are applied one at a time. Deeper than any server is
@@ -233,7 +234,7 @@ impl InboundEdits {
             summary
                 .files_changed
                 .iter()
-                .map(|change| change.path.display().to_string()),
+                .map(|change| display_path(&change.path)),
         );
         self.resource_operations
             .extend(summary.resource_operations.iter().cloned());
@@ -416,7 +417,7 @@ impl Translator {
                     summary
                         .files_changed
                         .iter()
-                        .map(|change| change.path.display().to_string())
+                        .map(|change| display_path(&change.path))
                         .collect(),
                 )
             } else {

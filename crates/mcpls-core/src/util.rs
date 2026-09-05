@@ -1,5 +1,27 @@
 //! Small helpers shared across `mcpls-core` modules.
 
+use std::path::Path;
+
+/// `path` rendered as a string a caller can hand straight back to a file
+/// API.
+///
+/// `Path::canonicalize` returns a verbatim path on Windows
+/// (`\\?\C:\src\a.rs`, or `\\?\UNC\server\share` for a network path), and
+/// plenty of tools and shells reject that form. Every path mcpls reports
+/// having written has been through canonicalization, so the prefix is
+/// stripped here rather than left for the caller to recognize. A Unix path
+/// can never carry it, so this is the identity there.
+pub fn display_path(path: &Path) -> String {
+    let text = path.display().to_string();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    if let Some(rest) = text.strip_prefix(r"\\?\") {
+        return rest.to_string();
+    }
+    text
+}
+
 /// Marker appended to a truncated string; the returned string can be up to
 /// `max_bytes + TRUNCATION_MARKER.len()` bytes, not exactly `max_bytes`.
 const TRUNCATION_MARKER: &str = "... (truncated)";
@@ -59,6 +81,16 @@ pub fn truncate_string(mut s: String, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_path_strips_windows_verbatim_prefixes() {
+        assert_eq!(display_path(Path::new(r"\\?\C:\src\a.rs")), r"C:\src\a.rs");
+        assert_eq!(
+            display_path(Path::new(r"\\?\UNC\server\share\a.rs")),
+            r"\\server\share\a.rs"
+        );
+        assert_eq!(display_path(Path::new("/home/lev/a.rs")), "/home/lev/a.rs");
+    }
 
     #[test]
     fn no_truncation_at_or_below_limit() {
