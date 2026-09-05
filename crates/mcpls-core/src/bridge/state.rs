@@ -489,7 +489,7 @@ impl DocumentTracker {
     /// [`PathLockGuard`]'s `Drop` impl) — otherwise the map would grow by
     /// one entry per distinct path ever opened, for the lifetime of the
     /// process.
-    async fn lock_path(&self, path: &Path) -> PathLockGuard<'_> {
+    pub(crate) async fn lock_path(&self, path: &Path) -> PathLockGuard<'_> {
         let arc = {
             let mut locks = lock_std(&self.path_locks);
             locks
@@ -854,7 +854,7 @@ impl DocumentTracker {
 /// path. On drop, evicts the `path_locks` map entry if (and only if) no
 /// other caller holds a clone of the same `Arc` -- see the `Drop` impl for
 /// why that check is race-free.
-struct PathLockGuard<'a> {
+pub struct PathLockGuard<'a> {
     path_locks: &'a StdMutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>>,
     path: PathBuf,
     arc: Arc<AsyncMutex<()>>,

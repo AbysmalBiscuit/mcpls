@@ -282,11 +282,20 @@ impl Translator {
     /// ranges that no longer mean what the server meant. Forgetting the
     /// document makes the next call on it re-read disk and re-open it.
     ///
+    /// Each path is closed under the same per-path lock `ensure_open` holds
+    /// for its whole duration, and the `didClose` goes out while that lock
+    /// is still held. Without it, a concurrent call for the same path could
+    /// find the entry gone between its disk phase and its commit and fail
+    /// with [`Error::DocumentNotFound`], or open the document again in the
+    /// window between the close and the notify and have this `didClose`
+    /// arrive after its `didOpen`.
+    ///
     /// A failed notify is logged rather than returned: the bytes are already
     /// on disk, and the tracker entry is gone either way, so the next call
     /// still re-opens the document from its current content.
     async fn close_stale_documents(&self, paths: &[PathBuf]) {
         for path in paths {
+            let _path_guard = self.document_tracker.lock_path(path).await;
             let Some(state) = self.document_tracker.close(path) else {
                 continue;
             };
