@@ -267,6 +267,39 @@ pub enum Error {
         /// Name of the missing LSP capability field (e.g. `"renameProvider"`).
         capability: &'static str,
     },
+
+    /// A tool was called with `apply: true` while its config key is `false`.
+    #[error("{tool} cannot write: set `{config_key} = true` in mcpls.toml to allow it")]
+    ApplyDisabled {
+        /// MCP tool name the caller used.
+        tool: &'static str,
+        /// Dotted config key that would permit the write.
+        config_key: &'static str,
+    },
+
+    /// The edit was rejected before anything was written.
+    #[error("edit refused: {0}")]
+    ApplyRefused(String),
+
+    /// A step failed partway through and rollback did not fully restore the
+    /// tree. Names every file in each state so the caller can recover.
+    #[error(
+        "apply failed partway: {reason}. left holding new content: {written:?}; \
+         restored to original: {restored:?}; not recovered: {unrecovered:?}"
+    )]
+    ApplyPartiallyFailed {
+        /// Files whose new content is on disk, including any whose restore
+        /// itself failed: the restore is atomic, so a failed one changed
+        /// nothing.
+        written: Vec<PathBuf>,
+        /// Files rolled back to their original content.
+        restored: Vec<PathBuf>,
+        /// Files that are at neither their original nor their new location,
+        /// each described with where they actually are.
+        unrecovered: Vec<String>,
+        /// Why the original step failed.
+        reason: String,
+    },
 }
 
 /// A specialized Result type for mcpls-core operations.
@@ -547,5 +580,30 @@ mod tests {
             err.to_string(),
             "server 'rust' does not support capability 'renameProvider'"
         );
+    }
+
+    #[test]
+    fn test_apply_disabled_names_the_config_key() {
+        let err = Error::ApplyDisabled {
+            tool: "rename_symbol",
+            config_key: "apply.rename",
+        };
+        let message = err.to_string();
+        assert!(message.contains("rename_symbol"), "names the tool: {message}");
+        assert!(message.contains("apply.rename"), "names the key: {message}");
+    }
+
+    #[test]
+    fn test_apply_partially_failed_lists_each_file_group() {
+        let err = Error::ApplyPartiallyFailed {
+            written: vec![PathBuf::from("/w/a.rs")],
+            restored: vec![PathBuf::from("/w/b.rs")],
+            unrecovered: vec!["/w/c.rs is at /w/.c.rs.mcpls-trash0".to_string()],
+            reason: "permission denied".to_string(),
+        };
+        let message = err.to_string();
+        for expected in ["/w/a.rs", "/w/b.rs", "mcpls-trash0", "permission denied"] {
+            assert!(message.contains(expected), "missing {expected} in: {message}");
+        }
     }
 }
