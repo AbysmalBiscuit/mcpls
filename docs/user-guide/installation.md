@@ -396,7 +396,9 @@ mcpls completions zsh > ~/.zfunc/_mcpls
 mcpls completions fish > ~/.config/fish/completions/mcpls.fish
 
 # Elvish
-mcpls completions elvish >> ~/.config/elvish/rc.elv
+mcpls completions elvish > ~/.config/elvish/lib/mcpls.elv
+# then in rc.elv:
+use mcpls
 ```
 
 A nushell script defines a module and re-exports it, so save it to a file and
