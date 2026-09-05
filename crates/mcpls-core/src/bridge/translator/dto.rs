@@ -170,6 +170,9 @@ pub struct DocumentSymbolsResult {
 pub struct FormatDocumentResult {
     /// List of edits to format the document.
     pub edits: Vec<TextEdit>,
+    /// Whether the edits were written to disk.
+    #[serde(default)]
+    pub applied: bool,
 }
 
 /// A workspace symbol.

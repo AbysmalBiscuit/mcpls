@@ -1,9 +1,10 @@
 //! Rename, format-document, and code-actions handlers.
 
 use lsp_types::{
-    DocumentFormattingParams, FormattingOptions, PartialResultParams,
-    RenameParams as LspRenameParams, TextDocumentIdentifier, TextDocumentPositionParams,
-    WorkDoneProgressParams, WorkspaceEdit,
+    DocumentChanges as LspDocumentChanges, DocumentFormattingParams, FormattingOptions, OneOf,
+    OptionalVersionedTextDocumentIdentifier, PartialResultParams, RenameParams as LspRenameParams,
+    TextDocumentEdit, TextDocumentIdentifier, TextDocumentPositionParams, WorkDoneProgressParams,
+    WorkspaceEdit,
 };
 
 use super::Translator;
@@ -282,18 +283,35 @@ impl Translator {
         })
     }
 
-    /// Handle format document request.
+    /// Handle format document request. With `apply` true, writes the
+    /// resulting edits to disk instead of only describing them.
     ///
     /// # Errors
     ///
     /// Returns an error if the LSP request fails, the file cannot be opened,
-    /// or the routed server does not advertise `documentFormattingProvider` support.
+    /// or the routed server does not advertise `documentFormattingProvider`
+    /// support. When `apply` is true, also returns [`Error::ApplyDisabled`]
+    /// if config forbids `format_document` from writing,
+    /// [`Error::ApplyRefused`] if the edit is rejected before anything is
+    /// written, or [`Error::ApplyPartiallyFailed`] if a write step fails
+    /// partway through.
     pub async fn handle_format_document(
         &self,
         file_path: String,
         tab_size: u32,
         insert_spaces: bool,
+        apply: bool,
     ) -> Result<FormatDocumentResult> {
+        let write_permit = if apply {
+            Some(self.applier_for(
+                ToolKind::FormatDocument,
+                "format_document",
+                "apply.format_document",
+            )?)
+        } else {
+            None
+        };
+
         let (server_id, client, uri) = self
             .prepare_gated_document(
                 &file_path,
@@ -327,17 +345,46 @@ impl Translator {
         let edits = response.unwrap_or_default();
 
         let mut result_edits = Vec::with_capacity(edits.len());
-        for edit in edits {
+        for edit in &edits {
             result_edits.push(TextEdit {
                 range: ctx.normalize_range(&response_uri, edit.range).await,
-                new_text: edit.new_text,
+                new_text: edit.new_text.clone(),
             });
         }
-        let result = FormatDocumentResult {
-            edits: result_edits,
+
+        // `applied` means bytes were written, not that the pipeline ran: an
+        // already-well-formatted file yields no edits, and running the write
+        // path over nothing would still report a write that never happened.
+        let applied = if let (Some(applier), false) = (write_permit, edits.is_empty()) {
+            // A `Uri`-keyed `changes` map would trip `clippy::mutable_key_type`
+            // (`Uri` wraps a `Cell`), so the single document is wrapped as
+            // `document_changes` instead; the LSP spec gives it precedence
+            // over `changes` anyway.
+            let plan = EditPlan::from_workspace_edit(WorkspaceEdit {
+                document_changes: Some(LspDocumentChanges::Edits(vec![TextDocumentEdit {
+                    text_document: OptionalVersionedTextDocumentIdentifier {
+                        uri: response_uri,
+                        version: None,
+                    },
+                    edits: edits.into_iter().map(OneOf::Left).collect(),
+                }])),
+                ..WorkspaceEdit::default()
+            })?;
+            // Held for the whole apply, so a second apply-enabled call
+            // cannot plan against content this one is about to replace.
+            let _guard = self.apply_lock.lock().await;
+            applier
+                .apply(plan, self.position_encoding_for(&server_id))
+                .await?;
+            true
+        } else {
+            false
         };
 
-        Ok(result)
+        Ok(FormatDocumentResult {
+            edits: result_edits,
+            applied,
+        })
     }
 
     /// Handle code actions request.
@@ -853,6 +900,92 @@ mod tests {
             message.contains("apply.rename"),
             "the error names the config key that would permit it: {message}"
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::expect_used)]
+    async fn test_format_with_apply_is_refused_when_config_forbids_it() {
+        let translator = Translator::new();
+        let error = translator
+            .handle_format_document("/w/a.rs".to_string(), 4, true, true)
+            .await
+            .expect_err("apply must be refused by a read-only translator");
+        assert!(
+            error.to_string().contains("apply.format_document"),
+            "the error names the config key"
+        );
+    }
+
+    /// A server that returns no edits (an already-well-formatted file)
+    /// must not report `applied: true` even when config permits the write:
+    /// `applied` means bytes were written, not that the pipeline ran.
+    #[tokio::test]
+    #[allow(clippy::expect_used)]
+    async fn test_format_with_apply_and_no_edits_reports_not_applied() {
+        use std::sync::Arc;
+
+        use tempfile::TempDir;
+        use tokio::io::BufReader;
+        use tokio::time::{Duration, timeout};
+
+        use crate::bridge::apply::Applier;
+        use crate::config::{ApplyConfig, ServerId};
+
+        type JsonValue = serde_json::Value;
+
+        let dir = TempDir::new().expect("temp dir");
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            document_formatting_provider: Some(lsp_types::OneOf::Left(true)),
+            ..Default::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
+        let applier = Arc::new(Applier::new(
+            vec![dir.path().to_path_buf()],
+            ApplyConfig {
+                format_document: true,
+                ..ApplyConfig::default()
+            },
+        ));
+        let translator = translator.with_applier(applier);
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").expect("write fixture");
+        let path_str = path.to_string_lossy().to_string();
+
+        let translator = Arc::new(translator);
+        let handle = {
+            let translator = Arc::clone(&translator);
+            tokio::spawn(async move {
+                translator
+                    .handle_format_document(path_str, 4, true, true)
+                    .await
+            })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let format_request = read_framed_message(&mut wire).await;
+        assert_eq!(format_request["method"], "textDocument/formatting");
+        write_response(
+            &mut server.read_half_stdin,
+            &format_request["id"],
+            JsonValue::Array(vec![]),
+        )
+        .await;
+
+        let result = timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handler call should not hang")
+            .expect("task should not panic");
+
+        let format_result = result.expect("apply is permitted, no edits should not error");
+        assert!(
+            !format_result.applied,
+            "no edits were returned, nothing was written, applied must be false"
+        );
+        assert!(format_result.edits.is_empty());
     }
 
     #[test]

@@ -363,12 +363,19 @@ impl McplsServer {
         )
     }
 
-    /// Format a document according to language server rules.
-    // read-only: returns proposed text edits, does not apply them -- mcpls
-    // has no write-back path today; revisit if that changes.
+    /// Format a document according to language server rules, optionally
+    /// writing the edits.
     #[tool(
-        description = "Format document with language-specific rules. Returns text edits for indentation, spacing, and style.",
-        title = "Format Document"
+        description = "Format document with language-specific rules. Returns text edits for \
+                       indentation, spacing, and style. With apply=true, and \
+                       apply.format_document enabled in config, writes those edits to disk.",
+        title = "Format Document",
+        annotations(
+            title = "Format Document",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true
+        )
     )]
     async fn format_document(
         &self,
@@ -376,12 +383,13 @@ impl McplsServer {
             file_path,
             tab_size,
             insert_spaces,
+            apply,
         }): Parameters<FormatDocumentParams>,
     ) -> Result<String, McpError> {
         to_tool_result(
             self.context
                 .translator
-                .handle_format_document(file_path, tab_size, insert_spaces)
+                .handle_format_document(file_path, tab_size, insert_spaces, apply)
                 .await,
         )
     }
@@ -1013,6 +1021,7 @@ mod tests {
             file_path: "/test/file.rs".to_string(),
             tab_size: 4,
             insert_spaces: true,
+            apply: false,
         });
 
         let result = server.format_document(params).await;
@@ -1637,7 +1646,7 @@ mod tests {
             ("rename_symbol", false, true, false),
             ("get_completions", true, false, true),
             ("get_document_symbols", true, false, true),
-            ("format_document", true, false, true),
+            ("format_document", false, true, true),
             ("workspace_symbol_search", true, false, true),
             ("get_code_actions", true, false, true),
             ("prepare_call_hierarchy", true, false, true),

@@ -1138,7 +1138,7 @@ mod tests {
         fs::write(&path, "fn main() {}").unwrap();
 
         let result = translator
-            .handle_format_document(path.to_string_lossy().to_string(), 4, true)
+            .handle_format_document(path.to_string_lossy().to_string(), 4, true, false)
             .await;
 
         assert!(matches!(

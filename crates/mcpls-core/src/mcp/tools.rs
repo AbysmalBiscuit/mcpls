@@ -113,6 +113,13 @@ pub struct FormatDocumentParams {
     #[schemars(description = "Whether to use spaces instead of tabs (default: true).")]
     #[serde(default = "default_insert_spaces")]
     pub insert_spaces: bool,
+    /// Write the edits to disk instead of only describing them.
+    #[schemars(
+        description = "Write the edits to disk instead of only describing them. \
+                       Requires apply.format_document = true in mcpls.toml."
+    )]
+    #[serde(default)]
+    pub apply: bool,
 }
 
 const fn default_tab_size() -> u32 {

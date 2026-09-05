@@ -2,10 +2,15 @@
   {
     "name": "format_document",
     "title": "Format Document",
-    "description": "Format document with language-specific rules. Returns text edits for indentation, spacing, and style.",
+    "description": "Format document with language-specific rules. Returns text edits for indentation, spacing, and style. With apply=true, and apply.format_document enabled in config, writes those edits to disk.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
+        "apply": {
+          "default": false,
+          "description": "Write the edits to disk instead of only describing them. Requires apply.format_document = true in mcpls.toml.",
+          "type": "boolean"
+        },
         "file_path": {
           "description": "Absolute path to the file.",
           "type": "string"
@@ -30,8 +35,8 @@
     },
     "annotations": {
       "title": "Format Document",
-      "readOnlyHint": true,
-      "destructiveHint": false,
+      "readOnlyHint": false,
+      "destructiveHint": true,
       "idempotentHint": true
     }
   },
