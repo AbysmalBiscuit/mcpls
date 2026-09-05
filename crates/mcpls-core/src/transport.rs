@@ -386,14 +386,14 @@ pub(crate) async fn run_stdio(
 /// predates this function's own `TcpListener::bind` call — a signal between
 /// bind and the graceful-shutdown future's first poll is still caught.
 /// `shutdown_signal` is moved into (and dropped by) the
-/// `with_graceful_shutdown` closure below once it resolves — i.e. as soon as
-/// the *first* signal is received, well before this function returns — so
-/// there is no listener at all for a repeat signal arriving during the
-/// connection-drain wait that follows (bounded by
+/// `with_graceful_shutdown` closure in [`serve_http_on`] once it resolves —
+/// i.e. as soon as the *first* signal is received, well before this function
+/// returns — so there is no listener at all for a repeat signal arriving
+/// during the connection-drain wait that follows (bounded by
 /// [`HTTP_GRACEFUL_SHUTDOWN_TIMEOUT`]). [`crate::shutdown`]'s own
 /// registration only takes effect once *this* function returns, so it
 /// covers the post-transport cleanup window, not the drain wait inside this
-/// one; see #329 and the TODO on the closure below for that gap.
+/// one; see #329 and the TODO on that closure for the gap.
 #[cfg(feature = "transport-http")]
 pub(crate) async fn run_http(
     mcp_server: crate::mcp::McplsServer,
@@ -955,7 +955,7 @@ mod tests {
         /// is cancelled, so this advance must have no effect and the task
         /// must still be running.
         #[tokio::test(start_paused = true)]
-        async fn test_run_http_does_not_self_terminate_without_signal() {
+        async fn test_serve_http_on_does_not_self_terminate_without_signal() {
             let (_addr, server_task) =
                 serve_http_for_test(|addr| HttpConfig::new(addr, "/mcp")).await;
 
@@ -977,7 +977,7 @@ mod tests {
 
             assert!(
                 !server_task.is_finished(),
-                "run_http must still be serving after HTTP_GRACEFUL_SHUTDOWN_TIMEOUT of uptime \
+                "the server must still be serving after HTTP_GRACEFUL_SHUTDOWN_TIMEOUT of uptime \
                  with no shutdown signal sent"
             );
 
@@ -1019,7 +1019,7 @@ mod tests {
         }
 
         /// Builds a `McplsServer` with empty/default collaborators, matching the
-        /// setup shared by every `run_http`-driving test in this module.
+        /// setup shared by every HTTP-serving test in this module.
         fn test_server() -> crate::mcp::McplsServer {
             use std::path::PathBuf;
             use std::sync::Arc;
@@ -1099,7 +1099,7 @@ mod tests {
         /// with `413 Payload Too Large`, proving the config value reaches
         /// `StreamableHttpServerConfig::max_request_body_bytes`.
         #[tokio::test]
-        async fn test_run_http_rejects_oversized_body_with_413() {
+        async fn test_serve_http_on_rejects_oversized_body_with_413() {
             let (addr, server_task) = serve_http_for_test(|addr| {
                 HttpConfig::new(addr, "/mcp").with_max_request_body_bytes(64)
             })
@@ -1127,7 +1127,7 @@ mod tests {
         /// intentionally not valid JSON-RPC, so a non-413 error distinguishes
         /// "passed the size check" from "was a valid request").
         #[tokio::test]
-        async fn test_run_http_accepts_body_within_limit() {
+        async fn test_serve_http_on_accepts_body_within_limit() {
             let (addr, server_task) = serve_http_for_test(|addr| {
                 HttpConfig::new(addr, "/mcp").with_max_request_body_bytes(64)
             })
@@ -1303,7 +1303,7 @@ mod tests {
         /// `initialize` handshake over `run_http` must be rejected with `429`
         /// once the first session is established.
         #[tokio::test]
-        async fn test_run_http_rejects_new_session_at_capacity_with_429() {
+        async fn test_serve_http_on_rejects_new_session_at_capacity_with_429() {
             let (addr, server_task) = serve_http_for_test(|addr| {
                 HttpConfig::new(addr, "/mcp").with_max_concurrent_sessions(1)
             })
@@ -1338,7 +1338,7 @@ mod tests {
         /// guards against a future refactor reintroducing request-header
         /// sniffing for the cap decision (the bug this design replaced).
         #[tokio::test]
-        async fn test_run_http_stateless_request_bypasses_session_cap() {
+        async fn test_serve_http_on_stateless_request_bypasses_session_cap() {
             let (addr, server_task) = serve_http_for_test(|addr| {
                 HttpConfig::new(addr, "/mcp").with_max_concurrent_sessions(1)
             })
