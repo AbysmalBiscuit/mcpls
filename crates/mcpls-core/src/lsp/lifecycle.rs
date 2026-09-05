@@ -744,6 +744,13 @@ fn workspace_folder(root: &Path) -> Result<WorkspaceFolder> {
 /// Builds an `LspServer` backed by mock `echo`/`cat` child processes, so it
 /// can be registered without a real language server.
 ///
+/// `child` is an already-exited `echo`, unlike
+/// [`LspServer::new_for_test_with_encoding`]'s live `cat`: the shutdown-path
+/// tests this feeds drive `shutdown_servers`, which waits `CHILD_EXIT_GRACE`
+/// on a child that is still running. They do not route calls through
+/// `respawn_if_dead`, so the dead-server reading that breaks a routed call
+/// costs them nothing.
+///
 /// `pub` rather than private to this module's own `tests` (`lifecycle` is a
 /// private module, so this stays crate-scoped in practice, per the
 /// `redundant_pub_crate` clippy lint): it constructs `LspServer` via a
@@ -808,12 +815,17 @@ impl LspServer {
     /// encoding -- for tests exercising a non-UTF-16 conversion path (e.g.
     /// `EncodingCtx`-driven range conversion) without spawning a real
     /// process.
+    ///
+    /// `child` is a `cat` blocked on a piped stdin rather than anything that
+    /// returns on its own: `has_exited` reads it, and a server that looks
+    /// dead sends every routed call through `respawn_if_dead`, which fails
+    /// with `ServerUnavailable` since a fixture registers no respawn config.
     #[allow(clippy::unwrap_used)]
     pub(crate) fn new_for_test_with_encoding(
         capabilities: ServerCapabilities,
         position_encoding: PositionEncodingKind,
     ) -> Self {
-        let child = Command::new("echo")
+        let child = Command::new("cat")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .kill_on_drop(true)
