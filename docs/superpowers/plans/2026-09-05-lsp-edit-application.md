@@ -4,9 +4,9 @@
 
 **Goal:** Let `rename_symbol`, `format_document`, and code actions write their edits to the working tree when config permits, defaulting to read-only.
 
-**Architecture:** A new `bridge/apply/` module turns an `lsp_types::WorkspaceEdit` into an ordered operation list, resolves LSP positions to byte offsets with the existing encoding converter, and writes each file through a temp-file rename under a process-wide mutex. Tools gain an `apply` parameter gated by a new `[apply]` config table. Servers that deliver assists as commands answer through an inbound `workspace/applyEdit`, handled by a spawned task so the client message loop never parks against its own command channel.
+**Architecture:** A new `bridge/apply/` module turns an `lsp_types::WorkspaceEdit` into an ordered operation list, plans that list into a journal of reversible file-system steps, and executes the journal under a process-wide mutex. Tools gain an `apply` parameter gated by a new `[apply]` config table. Servers that deliver assists as commands answer through an inbound `workspace/applyEdit`, handled by a spawned task so the client message loop never parks against its own command channel.
 
-**Tech Stack:** Rust 2024, tokio, `lsp_types` 0.97, rmcp 3.1, serde/toml, rstest, tempfile.
+**Tech Stack:** Rust 2024, tokio, `lsp_types` 0.97, rmcp 3.1, serde/toml, tempfile.
 
 **Spec:** `docs/superpowers/specs/2026-09-05-lsp-apply-and-diagnostics-hooks-design.md` (Part 1, plus the "Multiple agents" section)
 
@@ -17,11 +17,27 @@
 - Rust edition 2024, MSRV 1.88. Do not raise either.
 - `unsafe_code = "deny"` at the workspace level. No `unsafe` blocks.
 - `missing_docs = "warn"`: every public item gets a doc comment.
-- clippy `pedantic` and `nursery` at warn, `unwrap_used` and `expect_used` at warn. Production code returns `Result`. Test code that needs `expect` carries `#[allow(clippy::expect_used)]` on the test function, matching `crates/mcpls-core/tests/integration/basic_tests.rs`.
+- clippy `pedantic` and `nursery` at warn, `unwrap_used` and `expect_used` at warn. Production code returns `Result`. Test code that needs `expect` carries `#[allow(clippy::expect_used)]` on the test function or the test module.
+- `clippy::unused_async` is in `pedantic`. An `async fn` with no `.await` in its body blocks the commit.
 - `ServerConfig` carries `#[serde(deny_unknown_fields)]`. Every new config struct does too.
 - Default behavior is unchanged: with no `[apply]` table present, every tool stays read-only.
 - Run `cargo clippy --workspace --all-targets` before each commit. Warnings introduced by your change block the commit.
 - Commit messages follow Conventional Commits, imperative mood, subject at most 50 characters.
+
+### Two guard tests fire whenever the tool surface moves
+
+`crates/mcpls-core/src/mcp/server.rs` holds two regression guards that a task touching any `#[tool]` attribute, parameter struct, or annotation will trip:
+
+- `test_tool_surface_matches_golden_snapshot` (line 2039) compares `tool_router().list_all()` against `crates/mcpls-core/src/mcp/tool_surface.json`, which pins each tool's name, description, title, annotations, and input schema.
+- `test_tool_annotation_classifications_match_intent` (line 1609) holds a `(name, read_only, destructive, idempotent)` table and asserts its length equals the registered tool count.
+
+Regenerating the golden file is one command, and every task below that changes the surface names it explicitly:
+
+```bash
+cargo test -p mcpls-core --lib dump_tool_surface -- --ignored --nocapture > /tmp/tool_surface.txt
+```
+
+The command prints a leading `running 1 test` banner and a trailing summary; copy only the JSON array into `crates/mcpls-core/src/mcp/tool_surface.json`.
 
 ---
 
@@ -29,9 +45,10 @@
 
 **Files:**
 - Modify: `crates/mcpls-core/src/config/mod.rs`
-- Test: `crates/mcpls-core/src/config/mod.rs` (the existing `#[cfg(test)] mod tests` at line 882)
+- Test: `crates/mcpls-core/src/config/mod.rs` (the existing `#[cfg(test)] mod tests` at line 884)
 
 **Interfaces:**
+- Consumes: nothing.
 - Produces: `ApplyConfig { rename: bool, format_document: bool, code_actions: bool, allow_file_deletion: bool }`, `ServerConfig::apply: ApplyConfig`, and `ApplyConfig::permits(ToolKind) -> bool`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -52,10 +69,8 @@ fn test_apply_defaults_to_read_only() {
 #[test]
 #[allow(clippy::expect_used)]
 fn test_apply_permits_only_enabled_tools() {
-    let config: ServerConfig = toml::from_str(
-        "[apply]\nrename = true\n",
-    )
-    .expect("config parses");
+    let config: ServerConfig = toml::from_str("[apply]\nrename = true\n")
+        .expect("config parses");
     assert!(config.apply.permits(ToolKind::Rename));
     assert!(!config.apply.permits(ToolKind::FormatDocument));
     assert!(!config.apply.permits(ToolKind::CodeActions));
@@ -148,42 +163,41 @@ git commit -m "feat(config): add apply permission table"
 
 **Files:**
 - Modify: `crates/mcpls-core/src/error.rs`
-- Test: `crates/mcpls-core/src/error.rs` (add a `#[cfg(test)] mod tests` if none exists, otherwise extend it)
+- Test: `crates/mcpls-core/src/error.rs` (the existing `#[cfg(test)] mod tests` at line 275)
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `Error::ApplyDisabled { tool: &'static str, config_key: &'static str }`, `Error::ApplyRefused(String)`, `Error::ApplyPartiallyFailed { written: Vec<PathBuf>, restored: Vec<PathBuf>, failed: Vec<PathBuf>, reason: String }`.
+- Produces: `Error::ApplyDisabled { tool: &'static str, config_key: &'static str }`, `Error::ApplyRefused(String)`, `Error::ApplyPartiallyFailed { written: Vec<PathBuf>, restored: Vec<PathBuf>, unrecovered: Vec<String>, reason: String }`.
+
+The three groups in `ApplyPartiallyFailed` are exhaustive and each says exactly where the bytes are. Task 7's executor writes through a temp file and renames, so a file whose restore failed still holds its *new* content: it belongs in `written`, never in a vaguer "unknown" bucket. `unrecovered` carries free text rather than paths because the only way to land there is a file sitting at a path the caller did not name, such as the trash sibling a failed delete-rollback left behind, and the message has to say where.
 
 - [ ] **Step 1: Write the failing test**
 
+Add to the `tests` module in `crates/mcpls-core/src/error.rs`:
+
 ```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
+#[test]
+fn test_apply_disabled_names_the_config_key() {
+    let err = Error::ApplyDisabled {
+        tool: "rename_symbol",
+        config_key: "apply.rename",
+    };
+    let message = err.to_string();
+    assert!(message.contains("rename_symbol"), "names the tool: {message}");
+    assert!(message.contains("apply.rename"), "names the key: {message}");
+}
 
-    #[test]
-    fn test_apply_disabled_names_the_config_key() {
-        let err = Error::ApplyDisabled {
-            tool: "rename_symbol",
-            config_key: "apply.rename",
-        };
-        let message = err.to_string();
-        assert!(message.contains("rename_symbol"), "names the tool: {message}");
-        assert!(message.contains("apply.rename"), "names the key: {message}");
-    }
-
-    #[test]
-    fn test_apply_partially_failed_lists_each_file_group() {
-        let err = Error::ApplyPartiallyFailed {
-            written: vec![PathBuf::from("/w/a.rs")],
-            restored: vec![PathBuf::from("/w/b.rs")],
-            failed: vec![PathBuf::from("/w/c.rs")],
-            reason: "permission denied".to_string(),
-        };
-        let message = err.to_string();
-        for expected in ["/w/a.rs", "/w/b.rs", "/w/c.rs", "permission denied"] {
-            assert!(message.contains(expected), "missing {expected} in: {message}");
-        }
+#[test]
+fn test_apply_partially_failed_lists_each_file_group() {
+    let err = Error::ApplyPartiallyFailed {
+        written: vec![PathBuf::from("/w/a.rs")],
+        restored: vec![PathBuf::from("/w/b.rs")],
+        unrecovered: vec!["/w/c.rs is at /w/.c.rs.mcpls-trash0".to_string()],
+        reason: "permission denied".to_string(),
+    };
+    let message = err.to_string();
+    for expected in ["/w/a.rs", "/w/b.rs", "mcpls-trash0", "permission denied"] {
+        assert!(message.contains(expected), "missing {expected} in: {message}");
     }
 }
 ```
@@ -199,9 +213,7 @@ Add to the `Error` enum in `crates/mcpls-core/src/error.rs`:
 
 ```rust
     /// A tool was called with `apply: true` while its config key is `false`.
-    #[error(
-        "{tool} cannot write: set `{config_key} = true` in mcpls.toml to allow it"
-    )]
+    #[error("{tool} cannot write: set `{config_key} = true` in mcpls.toml to allow it")]
     ApplyDisabled {
         /// MCP tool name the caller used.
         tool: &'static str,
@@ -213,28 +225,33 @@ Add to the `Error` enum in `crates/mcpls-core/src/error.rs`:
     #[error("edit refused: {0}")]
     ApplyRefused(String),
 
-    /// A write failed partway through and rollback did not fully restore
-    /// the tree. Names every file in each state so the caller can recover.
+    /// A step failed partway through and rollback did not fully restore the
+    /// tree. Names every file in each state so the caller can recover.
     #[error(
-        "apply failed partway: {reason}. written and kept: {written:?}; \
-         restored to original: {restored:?}; left in an unknown state: {failed:?}"
+        "apply failed partway: {reason}. left holding new content: {written:?}; \
+         restored to original: {restored:?}; not recovered: {unrecovered:?}"
     )]
     ApplyPartiallyFailed {
-        /// Files whose new content is on disk.
+        /// Files whose new content is on disk, including any whose restore
+        /// itself failed: the restore is atomic, so a failed one changed
+        /// nothing.
         written: Vec<PathBuf>,
         /// Files rolled back to their original content.
         restored: Vec<PathBuf>,
-        /// Files whose rollback itself failed.
-        failed: Vec<PathBuf>,
-        /// Why the original write failed.
+        /// Files that are at neither their original nor their new location,
+        /// each described with where they actually are.
+        unrecovered: Vec<String>,
+        /// Why the original step failed.
         reason: String,
     },
 ```
 
+`error.rs` already imports `PathBuf`, so no import change is needed.
+
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p mcpls-core --lib error::tests`
-Expected: PASS, 2 tests.
+Expected: PASS, 2 new tests plus the module's existing ones.
 
 - [ ] **Step 5: Commit**
 
@@ -254,10 +271,12 @@ git commit -m "feat(error): add apply failure variants"
 - Test: `crates/mcpls-core/src/bridge/apply/offsets.rs` (inline `#[cfg(test)] mod tests`)
 
 **Interfaces:**
-- Consumes: `crate::bridge::encoding::{EncodingConverter, PositionEncoding}`, whose `character_to_byte_offset(&self, text: &str, character_offset: u32) -> Result<usize, String>` resolves a column within one line.
+- Consumes: `crate::bridge::encoding::{EncodingConverter, PositionEncoding}`. `character_to_byte_offset(&self, text: &str, character_offset: u32) -> Result<usize, String>` resolves a column within one line and accepts `character == len`; `byte_offset_to_character(&self, text: &str, byte_offset: usize) -> Result<u32, String>` is the inverse, used here to compute a line's own length in the server's encoding.
 - Produces: `LineTable::new(text: &str) -> Self`, `LineTable::byte_offset(&self, position: lsp_types::Position, converter: &EncodingConverter) -> Result<usize>`, `LineTable::byte_range(&self, range: lsp_types::Range, converter: &EncodingConverter) -> Result<std::ops::Range<usize>>`.
 
 Build the table by scanning for `\n` rather than using `str::lines()`, which drops a trailing empty line and strips `\r`. Both matter: LSP position `(1, 0)` is valid in `"a\n"`, and a CRLF file's column offsets count the `\r`.
+
+A column past the end of its line is clamped to the line's length, which is what the LSP specification requires ("if the character value is greater than the line length it defaults back to the line length"). A line past the end of the document stays an error: there is no defensible offset to clamp it to, and a server asking for one is confused about which document it is editing.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -265,6 +284,7 @@ Create `crates/mcpls-core/src/bridge/apply/offsets.rs` containing only the test 
 
 ```rust
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use lsp_types::{Position, Range};
 
@@ -276,7 +296,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn test_resolves_ascii_position() {
         let table = LineTable::new("fn main() {}\nlet x = 1;\n");
         let offset = table
@@ -286,7 +305,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn test_counts_utf16_units_not_bytes() {
         // "héllo" is 6 bytes and 5 UTF-16 units; column 3 sits after "hél".
         let table = LineTable::new("héllo\n");
@@ -297,7 +315,16 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
+    fn test_counts_utf8_bytes_when_the_server_negotiated_utf8() {
+        let table = LineTable::new("héllo\n");
+        let converter = EncodingConverter::new(PositionEncoding::Utf8);
+        let offset = table
+            .byte_offset(Position::new(0, 4), &converter)
+            .expect("position resolves");
+        assert_eq!(offset, 4, "in UTF-8 the column is already a byte offset");
+    }
+
+    #[test]
     fn test_crlf_line_keeps_carriage_return() {
         let table = LineTable::new("ab\r\ncd\r\n");
         let offset = table
@@ -307,7 +334,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn test_position_on_line_after_final_terminator() {
         let table = LineTable::new("a\n");
         let offset = table
@@ -317,13 +343,21 @@ mod tests {
     }
 
     #[test]
+    fn test_column_past_end_of_line_clamps_to_the_line_end() {
+        let table = LineTable::new("abc\ndef\n");
+        let offset = table
+            .byte_offset(Position::new(0, 99), &utf16())
+            .expect("the spec says clamp, not refuse");
+        assert_eq!(offset, 3, "end of line 0, before its newline");
+    }
+
+    #[test]
     fn test_line_beyond_document_is_an_error() {
         let table = LineTable::new("a\n");
         assert!(table.byte_offset(Position::new(9, 0), &utf16()).is_err());
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn test_byte_range_spans_lines() {
         let table = LineTable::new("abc\ndef\n");
         let range = table
@@ -405,18 +439,28 @@ impl<'a> LineTable<'a> {
     /// Byte offset of `position`, with columns counted in `converter`'s
     /// encoding.
     ///
+    /// A column past the end of its line resolves to the line's end, which
+    /// the LSP specification requires. A line past the end of the document
+    /// is an error.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::ApplyRefused`] when the line is beyond the document
-    /// or the column is beyond the line.
+    /// or the column does not land on a character boundary.
     pub fn byte_offset(
         &self,
         position: Position,
         converter: &EncodingConverter,
     ) -> Result<usize> {
         let line_text = self.line(position.line)?;
+        let line_length = converter
+            .byte_offset_to_character(line_text, line_text.len())
+            .map_err(|e| {
+                Error::ApplyRefused(format!("measuring line {}: {e}", position.line))
+            })?;
+        let character = position.character.min(line_length);
         let within_line = converter
-            .character_to_byte_offset(line_text, position.character)
+            .character_to_byte_offset(line_text, character)
             .map_err(|e| {
                 Error::ApplyRefused(format!(
                     "column {} on line {}: {e}",
@@ -459,18 +503,18 @@ pub mod offsets;
 pub use offsets::LineTable;
 ```
 
-Add to `crates/mcpls-core/src/bridge/mod.rs`, beside the other module declarations:
+Add to `crates/mcpls-core/src/bridge/mod.rs`, beside the other module declarations at lines 8 to 12:
 
 ```rust
 pub mod apply;
 ```
 
-If `encoding` is private in `bridge/mod.rs`, make it `pub(crate)` so `apply` can reach `EncodingConverter`.
+`encoding` is already declared `mod encoding;` at line 8 with `pub use encoding::{PositionEncoding, ...}` at line 14. `apply` is a sibling module inside `bridge`, so `crate::bridge::encoding::EncodingConverter` resolves without widening anything.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p mcpls-core --lib bridge::apply::offsets`
-Expected: PASS, 7 tests.
+Expected: PASS, 9 tests.
 
 - [ ] **Step 5: Check lints and commit**
 
@@ -491,18 +535,26 @@ git commit -m "feat(apply): add line table for position resolution"
 
 **Interfaces:**
 - Consumes: nothing from earlier tasks.
-- Produces: `EditPlan::from_workspace_edit(edit: lsp_types::WorkspaceEdit) -> Result<EditPlan>`, `EditPlan::operations(&self) -> &[Operation]`, and the enums:
+- Produces: `EditPlan::from_workspace_edit(edit: lsp_types::WorkspaceEdit) -> Result<EditPlan>`, `EditPlan::operations(&self) -> &[Operation]`, and:
 
 ```rust
 pub enum Operation {
     Edit { uri: lsp_types::Uri, version: Option<i32>, edits: Vec<lsp_types::TextEdit> },
-    Create { uri: lsp_types::Uri, overwrite: bool },
-    Rename { old: lsp_types::Uri, new: lsp_types::Uri, overwrite: bool },
-    Delete { uri: lsp_types::Uri, recursive: bool },
+    Create { uri: lsp_types::Uri, overwrite: bool, ignore_if_exists: bool },
+    Rename { old: lsp_types::Uri, new: lsp_types::Uri, overwrite: bool, ignore_if_exists: bool },
+    Delete { uri: lsp_types::Uri, recursive: bool, ignore_if_not_exists: bool },
 }
 ```
 
-Three rules the tests pin down. Resource operations keep their array order, because a rename followed by an edit to the new path means something different from the reverse. Text edits within one file sort descending by start position, so applying them in order never invalidates a later range. Two edits whose ranges overlap in one file are an error rather than a merge.
+Five rules the tests pin down.
+
+1. `documentChanges` wins when both shapes are present. The specification says a client that advertises `documentChanges`, which Task 6 makes mcpls do, must prefer it. Concatenating both would apply every edit twice.
+2. Operations keep their array order. A rename followed by an edit to the new path means something different from the reverse.
+3. Text edits within one file sort descending by start position, so applying them front to back never invalidates a later range.
+4. Among edits that start at the same position, later array entries sort first. Applying them front to back then reproduces array order in the resulting text, which is what the specification requires for consecutive inserts at one point. A stable sort alone gets this backwards and silently emits `"ba"` for an edit that says `"ab"`.
+5. Two edits whose ranges genuinely overlap in one file are an error rather than a merge.
+
+`ignore_if_exists` and `ignore_if_not_exists` are carried through rather than dropped. Both mean "skip this operation", and turning either into a refusal breaks a plan the server considers valid.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -510,6 +562,7 @@ Create `crates/mcpls-core/src/bridge/apply/plan.rs` with the test module:
 
 ```rust
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use std::collections::HashMap;
     use std::str::FromStr;
@@ -522,7 +575,6 @@ mod tests {
 
     use super::{EditPlan, Operation};
 
-    #[allow(clippy::expect_used)]
     fn uri(path: &str) -> Uri {
         Uri::from_str(&format!("file://{path}")).expect("valid uri")
     }
@@ -534,8 +586,15 @@ mod tests {
         }
     }
 
+    fn insert_at(line: u32, character: u32, text: &str) -> TextEdit {
+        let point = Position::new(line, character);
+        TextEdit {
+            range: Range::new(point, point),
+            new_text: text.to_string(),
+        }
+    }
+
     #[test]
-    #[allow(clippy::expect_used)]
     fn test_changes_map_becomes_one_edit_operation_per_file() {
         let mut changes = HashMap::new();
         changes.insert(uri("/w/a.rs"), vec![edit(0, 0, "x")]);
@@ -549,10 +608,40 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
+    fn test_document_changes_wins_when_both_shapes_are_present() {
+        let mut changes = HashMap::new();
+        changes.insert(uri("/w/legacy.rs"), vec![edit(0, 0, "legacy")]);
+        let plan = EditPlan::from_workspace_edit(WorkspaceEdit {
+            changes: Some(changes),
+            document_changes: Some(DocumentChanges::Edits(vec![TextDocumentEdit {
+                text_document: OptionalVersionedTextDocumentIdentifier {
+                    uri: uri("/w/modern.rs"),
+                    version: None,
+                },
+                edits: vec![OneOf::Left(edit(0, 0, "modern"))],
+            }])),
+            ..WorkspaceEdit::default()
+        })
+        .expect("plan builds");
+
+        assert_eq!(
+            plan.operations().len(),
+            1,
+            "applying both shapes would edit the same change twice"
+        );
+        let Operation::Edit { uri: target, .. } = &plan.operations()[0] else {
+            panic!("expected an edit operation");
+        };
+        assert_eq!(target.as_str(), "file:///w/modern.rs");
+    }
+
+    #[test]
     fn test_edits_within_a_file_sort_bottom_up() {
         let mut changes = HashMap::new();
-        changes.insert(uri("/w/a.rs"), vec![edit(1, 1, "first"), edit(5, 5, "second")]);
+        changes.insert(
+            uri("/w/a.rs"),
+            vec![edit(1, 1, "first"), edit(5, 5, "second")],
+        );
         let plan = EditPlan::from_workspace_edit(WorkspaceEdit {
             changes: Some(changes),
             ..WorkspaceEdit::default()
@@ -563,6 +652,28 @@ mod tests {
         };
         assert_eq!(edits[0].new_text, "second", "highest line applies first");
         assert_eq!(edits[1].new_text, "first");
+    }
+
+    #[test]
+    fn test_inserts_at_one_position_apply_in_array_order() {
+        let mut changes = HashMap::new();
+        changes.insert(
+            uri("/w/a.rs"),
+            vec![insert_at(0, 0, "a"), insert_at(0, 0, "b")],
+        );
+        let plan = EditPlan::from_workspace_edit(WorkspaceEdit {
+            changes: Some(changes),
+            ..WorkspaceEdit::default()
+        })
+        .expect("plan builds");
+        let Operation::Edit { edits, .. } = &plan.operations()[0] else {
+            panic!("expected an edit operation");
+        };
+        // Applied front to back into the same offset, the last one spliced
+        // ends up first in the text, so "b" must be spliced before "a" for
+        // the document to read "ab".
+        assert_eq!(edits[0].new_text, "b");
+        assert_eq!(edits[1].new_text, "a");
     }
 
     #[test]
@@ -577,7 +688,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn test_operations_keep_their_array_order() {
         let plan = EditPlan::from_workspace_edit(WorkspaceEdit {
             document_changes: Some(DocumentChanges::Operations(vec![
@@ -605,7 +715,32 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
+    fn test_create_carries_its_ignore_if_exists_flag() {
+        let plan = EditPlan::from_workspace_edit(WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Operations(vec![
+                DocumentChangeOperation::Op(ResourceOp::Create(CreateFile {
+                    uri: uri("/w/new.rs"),
+                    options: Some(lsp_types::CreateFileOptions {
+                        overwrite: None,
+                        ignore_if_exists: Some(true),
+                    }),
+                    annotation_id: None,
+                })),
+            ])),
+            ..WorkspaceEdit::default()
+        })
+        .expect("plan builds");
+        assert!(matches!(
+            plan.operations()[0],
+            Operation::Create {
+                overwrite: false,
+                ignore_if_exists: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn test_empty_edit_produces_no_operations() {
         let plan =
             EditPlan::from_workspace_edit(WorkspaceEdit::default()).expect("plan builds");
@@ -626,6 +761,8 @@ Prepend to `crates/mcpls-core/src/bridge/apply/plan.rs`:
 ```rust
 //! Turning a `WorkspaceEdit` into an ordered, validated operation list.
 
+use std::cmp::Ordering;
+
 use lsp_types::{TextEdit, Uri, WorkspaceEdit};
 
 use crate::error::{Error, Result};
@@ -633,8 +770,8 @@ use crate::error::{Error, Result};
 /// One step of an edit, in the order it must be performed.
 #[derive(Debug)]
 pub enum Operation {
-    /// Replace ranges within one document. `edits` is sorted so the
-    /// highest position applies first.
+    /// Replace ranges within one document. `edits` is ordered so that
+    /// splicing them front to back leaves every later range valid.
     Edit {
         /// Document to edit.
         uri: Uri,
@@ -647,8 +784,11 @@ pub enum Operation {
     Create {
         /// Path to create.
         uri: Uri,
-        /// Replace the file if it already exists.
+        /// Replace the file if it already exists. Wins over
+        /// `ignore_if_exists`.
         overwrite: bool,
+        /// Do nothing if the file already exists.
+        ignore_if_exists: bool,
     },
     /// Move a file.
     Rename {
@@ -656,8 +796,11 @@ pub enum Operation {
         old: Uri,
         /// Path to move it to.
         new: Uri,
-        /// Replace the destination if it already exists.
+        /// Replace the destination if it already exists. Wins over
+        /// `ignore_if_exists`.
         overwrite: bool,
+        /// Do nothing if the destination already exists.
+        ignore_if_exists: bool,
     },
     /// Remove a file or directory.
     Delete {
@@ -665,6 +808,8 @@ pub enum Operation {
         uri: Uri,
         /// Remove directory contents as well.
         recursive: bool,
+        /// Do nothing if the path is already gone.
+        ignore_if_not_exists: bool,
     },
 }
 
@@ -679,8 +824,9 @@ impl EditPlan {
     ///
     /// Accepts all three shapes a server may send: the legacy `changes`
     /// map, `documentChanges` as plain edits, and `documentChanges` with
-    /// resource operations interleaved. Resource operations keep their
-    /// array order; text edits within a file are sorted bottom-up.
+    /// resource operations interleaved. `documentChanges` wins when both
+    /// are present, since mcpls advertises support for it. Operations keep
+    /// their array order; text edits within a file are ordered bottom-up.
     ///
     /// # Errors
     ///
@@ -688,12 +834,6 @@ impl EditPlan {
     /// have overlapping ranges.
     pub fn from_workspace_edit(edit: WorkspaceEdit) -> Result<Self> {
         let mut operations = Vec::new();
-
-        if let Some(changes) = edit.changes {
-            for (uri, edits) in changes {
-                operations.push(Self::edit_operation(uri, None, edits)?);
-            }
-        }
 
         match edit.document_changes {
             Some(lsp_types::DocumentChanges::Edits(edits)) => {
@@ -713,7 +853,13 @@ impl EditPlan {
                     });
                 }
             }
-            None => {}
+            None => {
+                if let Some(changes) = edit.changes {
+                    for (uri, edits) in changes {
+                        operations.push(Self::edit_operation(uri, None, edits)?);
+                    }
+                }
+            }
         }
 
         Ok(Self { operations })
@@ -740,9 +886,21 @@ impl EditPlan {
     fn edit_operation(
         uri: Uri,
         version: Option<i32>,
-        mut edits: Vec<TextEdit>,
+        edits: Vec<TextEdit>,
     ) -> Result<Operation> {
-        edits.sort_by(|a, b| b.range.start.cmp(&a.range.start));
+        // Descending by start, and among equal starts descending by the
+        // server's own array index. Splicing front to back then reproduces
+        // array order in the text for consecutive inserts at one point,
+        // which the LSP specification requires.
+        let mut indexed: Vec<(usize, TextEdit)> = edits.into_iter().enumerate().collect();
+        indexed.sort_by(|(left_index, left), (right_index, right)| {
+            match right.range.start.cmp(&left.range.start) {
+                Ordering::Equal => right_index.cmp(left_index),
+                other => other,
+            }
+        });
+        let edits: Vec<TextEdit> = indexed.into_iter().map(|(_, edit)| edit).collect();
+
         for pair in edits.windows(2) {
             // Sorted descending, so pair[1] starts no later than pair[0].
             if pair[1].range.end > pair[0].range.start {
@@ -754,6 +912,7 @@ impl EditPlan {
                 )));
             }
         }
+
         Ok(Operation::Edit {
             uri,
             version,
@@ -761,30 +920,54 @@ impl EditPlan {
         })
     }
 
+    /// `lsp-types` 0.97 does not derive `Default` on the three file-option
+    /// structs, so each absent-options case is spelled out here rather than
+    /// at the call sites.
     fn resource_operation(resource: lsp_types::ResourceOp) -> Operation {
         match resource {
-            lsp_types::ResourceOp::Create(create) => Operation::Create {
-                uri: create.uri,
-                overwrite: create
-                    .options
-                    .and_then(|o| o.overwrite)
-                    .unwrap_or(false),
-            },
-            lsp_types::ResourceOp::Rename(rename) => Operation::Rename {
-                old: rename.old_uri,
-                new: rename.new_uri,
-                overwrite: rename
-                    .options
-                    .and_then(|o| o.overwrite)
-                    .unwrap_or(false),
-            },
-            lsp_types::ResourceOp::Delete(delete) => Operation::Delete {
-                uri: delete.uri,
-                recursive: delete
-                    .options
-                    .and_then(|o| o.recursive)
-                    .unwrap_or(false),
-            },
+            lsp_types::ResourceOp::Create(create) => {
+                let (overwrite, ignore_if_exists) =
+                    create.options.map_or((false, false), |o| {
+                        (
+                            o.overwrite.unwrap_or(false),
+                            o.ignore_if_exists.unwrap_or(false),
+                        )
+                    });
+                Operation::Create {
+                    uri: create.uri,
+                    overwrite,
+                    ignore_if_exists,
+                }
+            }
+            lsp_types::ResourceOp::Rename(rename) => {
+                let (overwrite, ignore_if_exists) =
+                    rename.options.map_or((false, false), |o| {
+                        (
+                            o.overwrite.unwrap_or(false),
+                            o.ignore_if_exists.unwrap_or(false),
+                        )
+                    });
+                Operation::Rename {
+                    old: rename.old_uri,
+                    new: rename.new_uri,
+                    overwrite,
+                    ignore_if_exists,
+                }
+            }
+            lsp_types::ResourceOp::Delete(delete) => {
+                let (recursive, ignore_if_not_exists) =
+                    delete.options.map_or((false, false), |o| {
+                        (
+                            o.recursive.unwrap_or(false),
+                            o.ignore_if_not_exists.unwrap_or(false),
+                        )
+                    });
+                Operation::Delete {
+                    uri: delete.uri,
+                    recursive,
+                    ignore_if_not_exists,
+                }
+            }
         }
     }
 }
@@ -801,7 +984,7 @@ pub use plan::{EditPlan, Operation};
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p mcpls-core --lib bridge::apply::plan`
-Expected: PASS, 5 tests.
+Expected: PASS, 8 tests.
 
 - [ ] **Step 5: Check lints and commit**
 
@@ -813,20 +996,25 @@ git commit -m "feat(apply): normalize workspace edits into a plan"
 
 ---
 
-### Task 5: Show resource operations in the preview
+### Task 5: Show resource operations and documentChanges in the preview
 
 **Files:**
-- Modify: `crates/mcpls-core/src/bridge/translator/dto.rs:99-113` and `:210-213`
-- Modify: `crates/mcpls-core/src/bridge/translator/edits.rs:225-231`
-- Test: `crates/mcpls-core/src/bridge/translator/edits.rs` (the existing `#[cfg(test)] mod tests` at line 429)
+- Modify: `crates/mcpls-core/src/bridge/translator/dto.rs` (`RenameResult` at line 110, `WorkspaceEditDescription` at line 210)
+- Modify: `crates/mcpls-core/src/bridge/translator/edits.rs` (`convert_code_action` at line 103, `handle_rename` at line 173)
+- Test: `crates/mcpls-core/src/bridge/translator/edits.rs` (the existing `#[cfg(test)] mod tests`)
 
 **Interfaces:**
 - Consumes: `EditPlan` and `Operation` from Task 4.
 - Produces: `ResourceOperation { kind: String, uri: String, new_uri: Option<String> }`, a `resource_operations: Vec<ResourceOperation>` field on both `RenameResult` and `WorkspaceEditDescription`, and `resource_operations_from_plan(&EditPlan) -> Vec<ResourceOperation>`.
 
-Once Task 6 advertises `resource_operations`, rust-analyzer starts returning file renames for a module rename. `handle_rename` currently drops them (`edits.rs:226`, the `DocumentChangeOperation::Op(_) => None` arm), which would show a preview missing the rename that apply then performs. Preview and apply must describe the same thing.
+Two preview paths currently describe less than an apply would perform, and the gap widens the moment Task 6 lands:
 
-- [ ] **Step 1: Write the failing test**
+- `handle_rename` (`edits.rs:226`) drops `DocumentChangeOperation::Op(_)` on the floor. Once Task 6 advertises `resourceOperations`, rust-analyzer starts returning file renames for a module rename, and the preview would show text edits with no mention of the file moving.
+- `convert_code_action` (`edits.rs:115-141`) reads `edit.changes` only and ignores `document_changes` entirely, so a rust-analyzer assist previews as an empty edit while Task 12 applies a full `documentChanges` set.
+
+Routing both through `EditPlan` gives preview and apply one normalization to disagree about. The visible consequence is that previewed edits now arrive bottom-up rather than in the server's array order, which is the order they are applied in.
+
+- [ ] **Step 1: Write the failing tests**
 
 Add to the `tests` module in `crates/mcpls-core/src/bridge/translator/edits.rs`:
 
@@ -862,12 +1050,49 @@ fn test_preview_reports_file_rename_operations() {
     assert_eq!(ops[0].uri, "file:///w/foo.rs");
     assert_eq!(ops[0].new_uri.as_deref(), Some("file:///w/bar.rs"));
 }
+
+#[test]
+#[allow(clippy::expect_used)]
+fn test_workspace_edit_description_reads_document_changes() {
+    use std::str::FromStr;
+
+    use lsp_types::{
+        DocumentChanges, OneOf, OptionalVersionedTextDocumentIdentifier, Position, Range,
+        TextDocumentEdit, TextEdit as LspTextEdit, Uri, WorkspaceEdit,
+    };
+
+    use crate::bridge::apply::EditPlan;
+    use crate::bridge::translator::dto::workspace_edit_description_from_plan;
+
+    let edit = WorkspaceEdit {
+        document_changes: Some(DocumentChanges::Edits(vec![TextDocumentEdit {
+            text_document: OptionalVersionedTextDocumentIdentifier {
+                uri: Uri::from_str("file:///w/a.rs").expect("valid uri"),
+                version: None,
+            },
+            edits: vec![OneOf::Left(LspTextEdit {
+                range: Range::new(Position::new(0, 0), Position::new(0, 3)),
+                new_text: "new".to_string(),
+            })],
+        }])),
+        ..WorkspaceEdit::default()
+    };
+    let plan = EditPlan::from_workspace_edit(edit).expect("plan builds");
+    let description = workspace_edit_description_from_plan(&plan);
+
+    assert_eq!(
+        description.changes.len(),
+        1,
+        "a documentChanges-only action must not preview as empty"
+    );
+    assert_eq!(description.changes[0].uri, "file:///w/a.rs");
+}
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p mcpls-core --lib test_preview_reports_file_rename_operations`
-Expected: FAIL to compile, `unresolved import 'resource_operations_from_plan'`.
+Run: `cargo test -p mcpls-core --lib bridge::translator::edits`
+Expected: FAIL to compile, `unresolved imports 'resource_operations_from_plan', 'workspace_edit_description_from_plan'`.
 
 - [ ] **Step 3: Write the implementation**
 
@@ -916,9 +1141,52 @@ pub fn resource_operations_from_plan(
         })
         .collect()
 }
+
+/// Describe `plan` as a preview, with LSP ranges left as the server sent
+/// them.
+///
+/// Callers holding an encoding context convert the ranges afterwards; this
+/// function exists so a caller that has none, and no need to convert, still
+/// sees `documentChanges`.
+#[must_use]
+pub fn workspace_edit_description_from_plan(
+    plan: &crate::bridge::apply::EditPlan,
+) -> WorkspaceEditDescription {
+    use crate::bridge::apply::Operation;
+
+    let changes = plan
+        .operations()
+        .iter()
+        .filter_map(|op| match op {
+            Operation::Edit { uri, edits, .. } => Some(DocumentChanges {
+                uri: uri.to_string(),
+                edits: edits
+                    .iter()
+                    .map(|edit| TextEdit {
+                        range: Range {
+                            start_line: edit.range.start.line,
+                            start_character: edit.range.start.character,
+                            end_line: edit.range.end.line,
+                            end_character: edit.range.end.character,
+                        },
+                        new_text: edit.new_text.clone(),
+                    })
+                    .collect(),
+            }),
+            _ => None,
+        })
+        .collect();
+
+    WorkspaceEditDescription {
+        changes,
+        resource_operations: resource_operations_from_plan(plan),
+    }
+}
 ```
 
-Add the field to `RenameResult` and to `WorkspaceEditDescription`, in both cases after their existing `changes` field:
+Check the `Range` DTO's field names against `dto.rs` before writing that literal; if they differ, use the module's own constructor rather than inventing one.
+
+Add the new field to `RenameResult` and to `WorkspaceEditDescription`, in both cases after their existing `changes` field:
 
 ```rust
     /// File-system operations the edit performs alongside its text changes.
@@ -926,7 +1194,7 @@ Add the field to `RenameResult` and to `WorkspaceEditDescription`, in both cases
     pub resource_operations: Vec<ResourceOperation>,
 ```
 
-In `handle_rename` (`edits.rs`), stop discarding resource operations. Replace the body that builds `changes` with a pass through `EditPlan`, so preview and apply read the same normalization:
+In `handle_rename` (`edits.rs:207-244`), replace the whole `let changes = if let Some(edit) = response { ... }` block, both the legacy-map branch and the `documentChanges` fallback, with one pass through `EditPlan`:
 
 ```rust
         let (changes, resource_operations) = if let Some(edit) = response {
@@ -959,25 +1227,75 @@ In `handle_rename` (`edits.rs`), stop discarding resource operations. Replace th
         })
 ```
 
-Add the imports `use crate::bridge::apply::{EditPlan, Operation};` and extend the `dto` import with `resource_operations_from_plan, ResourceOperation`.
+In `convert_code_action` (`edits.rs:115-141`), replace the `edit.changes`-only block with the same normalization, keeping the range conversion the DTO expects:
+
+```rust
+    let edit = match action.edit {
+        Some(workspace_edit) => {
+            let plan = EditPlan::from_workspace_edit(workspace_edit).ok();
+            match plan {
+                Some(plan) => {
+                    let mut changes = Vec::new();
+                    for operation in plan.operations() {
+                        if let Operation::Edit {
+                            uri: edit_uri,
+                            edits,
+                            ..
+                        } = operation
+                        {
+                            let mut text_edits = Vec::with_capacity(edits.len());
+                            for e in edits {
+                                text_edits.push(TextEdit {
+                                    range: ctx.normalize_range(edit_uri, e.range).await,
+                                    new_text: e.new_text.clone(),
+                                });
+                            }
+                            changes.push(DocumentChanges {
+                                uri: edit_uri.to_string(),
+                                edits: text_edits,
+                            });
+                        }
+                    }
+                    Some(WorkspaceEditDescription {
+                        resource_operations: resource_operations_from_plan(&plan),
+                        changes,
+                    })
+                }
+                // An edit this malformed cannot be applied either, so the
+                // preview says the action carries no usable edit rather
+                // than failing the whole listing.
+                None => None,
+            }
+        }
+        None => None,
+    };
+```
+
+Add to the imports at the top of `edits.rs`:
+
+```rust
+use crate::bridge::apply::{EditPlan, Operation};
+```
+
+and extend the `super::dto` import list with `ResourceOperation` and `resource_operations_from_plan`.
 
 Every other construction site of `RenameResult` and `WorkspaceEditDescription` needs the new field. Find them with:
 
 ```bash
-rg -n "RenameResult \{|WorkspaceEditDescription \{" crates/mcpls-core
+rg -n "RenameResult \{|WorkspaceEditDescription \{" /home/lev/Git/lev/mcpls/crates/mcpls-core
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p mcpls-core --lib bridge::translator::edits`
-Expected: PASS, including the existing tests in that module.
+Expected: PASS, including the module's existing tests.
 
 - [ ] **Step 5: Check lints and commit**
 
 ```bash
 cargo clippy -p mcpls-core --all-targets
 git add crates/mcpls-core/src/bridge/translator/
-git commit -m "feat(preview): report file operations in rename preview"
+git commit -m "feat(preview): show file operations in edit previews"
 ```
 
 ---
@@ -985,23 +1303,26 @@ git commit -m "feat(preview): report file operations in rename preview"
 ### Task 6: Advertise the client capabilities apply needs
 
 **Files:**
-- Modify: `crates/mcpls-core/src/lsp/lifecycle.rs:460-464`
-- Test: `crates/mcpls-core/src/lsp/lifecycle.rs` (inline `#[cfg(test)] mod tests`, extend if present)
+- Modify: `crates/mcpls-core/src/lsp/lifecycle.rs:410-465` (the `ClientCapabilities` literal inside `InitializeParams`)
+- Test: `crates/mcpls-core/src/lsp/lifecycle.rs` (the existing `#[cfg(test)] mod tests`)
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: no new API. The `initialize` handshake now declares `workspace.applyEdit`, `workspace.workspaceEdit.documentChanges`, `workspace.workspaceEdit.resourceOperations`, and `textDocument.synchronization.didSave`.
+- Produces: `build_client_capabilities(position_encodings: Vec<lsp_types::PositionEncodingKind>) -> ClientCapabilities`, a private free function in `lifecycle.rs`. The `initialize` handshake now declares `workspace.applyEdit`, `workspace.workspaceEdit.documentChanges`, `workspace.workspaceEdit.resourceOperations`, and `textDocument.synchronization.didSave`.
 
-A server gates behavior on these. rust-analyzer will not emit file renames without `resourceOperations`, and nothing currently tells a server that mcpls sends `didSave`, which the applier's resync does.
+A server gates behavior on these. rust-analyzer will not emit file renames without `resourceOperations`, and nothing currently tells a server that mcpls sends `didSave`.
 
-Do not add `workspace.didChangeWatchedFiles.dynamicRegistration` here. That belongs to the file-watching plan and, advertised without its notification half, makes gopls and tsgo strictly worse.
+Do not add `workspace.didChangeWatchedFiles.dynamicRegistration` here. That belongs to the file-watching plan and, advertised without its notification half, makes gopls and tsgo strictly worse: gopls's `registerWatchedDirectoriesLocked` returns immediately when the client does not support dynamic registration, with no fallback.
 
-- [ ] **Step 1: Write the failing test**
+The `tests` module in `lifecycle.rs` carries `#[allow(clippy::unwrap_used)]` but not `expect_used`. Add `#[allow(clippy::expect_used)]` beside it, or these tests fail the lint gate.
+
+- [ ] **Step 1: Write the failing tests**
 
 ```rust
 #[test]
+#[allow(clippy::expect_used)]
 fn test_client_capabilities_declare_edit_application() {
-    let caps = build_client_capabilities();
+    let caps = build_client_capabilities(vec![]);
     let workspace = caps.workspace.expect("workspace capabilities are declared");
 
     assert_eq!(workspace.apply_edit, Some(true));
@@ -1027,7 +1348,7 @@ fn test_client_capabilities_declare_edit_application() {
 
 #[test]
 fn test_client_capabilities_do_not_claim_dynamic_file_watching() {
-    let caps = build_client_capabilities();
+    let caps = build_client_capabilities(vec![]);
     let declared = caps
         .workspace
         .and_then(|w| w.did_change_watched_files)
@@ -1038,19 +1359,27 @@ fn test_client_capabilities_do_not_claim_dynamic_file_watching() {
         "advertising this without sending the notification blinds gopls and tsgo"
     );
 }
+
+#[test]
+#[allow(clippy::expect_used)]
+fn test_client_capabilities_pass_through_position_encodings() {
+    let caps = build_client_capabilities(vec![lsp_types::PositionEncodingKind::UTF8]);
+    let general = caps.general.expect("general capabilities are declared");
+    let encodings = general
+        .position_encodings
+        .expect("position encodings are declared");
+    assert_eq!(encodings, vec![lsp_types::PositionEncodingKind::UTF8]);
+}
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p mcpls-core --lib lsp::lifecycle`
-Expected: FAIL, either `build_client_capabilities` is not a function or `apply_edit` is `None`.
+Expected: FAIL to compile, `cannot find function 'build_client_capabilities'`.
 
 - [ ] **Step 3: Write the implementation**
 
-The capabilities are currently built inline inside the `InitializeParams` literal in
-`lsp/lifecycle.rs`, which is why nothing can assert them. Move the whole
-`ClientCapabilities` value into a free function in the same module, adding the four new
-declarations. `position_encodings` stays a parameter because it comes from config:
+The capabilities are built inline inside the `InitializeParams` literal, which is why nothing can assert them. Move the whole `ClientCapabilities` value into a free function in the same module, copying the existing `text_document` block verbatim and adding the four new declarations. `position_encodings` stays a parameter because it comes from config.
 
 ```rust
 /// Client capabilities mcpls declares during `initialize`.
@@ -1074,47 +1403,10 @@ fn build_client_capabilities(
                 will_save: Some(false),
                 will_save_wait_until: Some(false),
             }),
-            hover: Some(lsp_types::HoverClientCapabilities {
-                dynamic_registration: Some(false),
-                content_format: Some(vec![
-                    lsp_types::MarkupKind::Markdown,
-                    lsp_types::MarkupKind::PlainText,
-                ]),
-            }),
-            definition: Some(lsp_types::GotoCapability {
-                dynamic_registration: Some(false),
-                link_support: Some(true),
-            }),
-            references: Some(lsp_types::ReferenceClientCapabilities {
-                dynamic_registration: Some(false),
-            }),
-            code_action: Some(lsp_types::CodeActionClientCapabilities {
-                dynamic_registration: Some(false),
-                data_support: Some(true),
-                resolve_support: Some(lsp_types::CodeActionCapabilityResolveSupport {
-                    properties: vec!["edit".to_string()],
-                }),
-                // Declare supported action kinds so the server returns
-                // CodeAction objects (not just legacy Command objects).
-                code_action_literal_support: Some(lsp_types::CodeActionLiteralSupport {
-                    code_action_kind: lsp_types::CodeActionKindLiteralSupport {
-                        value_set: [
-                            lsp_types::CodeActionKind::EMPTY,
-                            lsp_types::CodeActionKind::QUICKFIX,
-                            lsp_types::CodeActionKind::REFACTOR,
-                            lsp_types::CodeActionKind::REFACTOR_EXTRACT,
-                            lsp_types::CodeActionKind::REFACTOR_INLINE,
-                            lsp_types::CodeActionKind::REFACTOR_REWRITE,
-                            lsp_types::CodeActionKind::SOURCE,
-                            lsp_types::CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
-                        ]
-                        .iter()
-                        .map(|k| k.as_str().to_string())
-                        .collect(),
-                    },
-                }),
-                ..Default::default()
-            }),
+            // Everything below is the existing literal from
+            // `InitializeParams`, moved unchanged. Copy it across rather
+            // than retyping it: a dropped field silently narrows what a
+            // server returns.
             ..Default::default()
         }),
         workspace: Some(lsp_types::WorkspaceClientCapabilities {
@@ -1137,11 +1429,11 @@ fn build_client_capabilities(
 }
 ```
 
-`failure_handling: Abort` matches what the applier actually does: it validates the whole
-plan before writing anything, so a refused edit leaves the tree untouched.
+Take the `text_document` block from `lifecycle.rs:410-450` as it stands, including its `hover`, `definition`, `references`, and `code_action` entries (the `code_action` entry already carries `data_support: Some(true)` and `resolve_support.properties = vec!["edit"]`, which Task 12 depends on). The only edit to that block is inserting the `synchronization` field shown above.
 
-In `InitializeParams`, replace the whole `capabilities: ClientCapabilities { ... }` literal
-with:
+`failure_handling: Abort` matches what the applier actually does: Task 8 plans and validates every operation before Task 7's executor writes anything, so a refused edit leaves the tree untouched.
+
+In `InitializeParams`, replace the whole `capabilities: ClientCapabilities { ... }` literal with:
 
 ```rust
             capabilities: build_client_capabilities(resolve_position_encodings(
@@ -1149,13 +1441,12 @@ with:
             )),
 ```
 
-The two tests call `build_client_capabilities(vec![])`, since the encodings are irrelevant
-to what they assert.
+`resolve_position_encodings` already exists at `lifecycle.rs:702`.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p mcpls-core --lib lsp::lifecycle`
-Expected: PASS.
+Expected: PASS, 3 new tests plus the module's existing ones.
 
 - [ ] **Step 5: Check lints and commit**
 
@@ -1167,33 +1458,52 @@ git commit -m "feat(lsp): declare edit application capabilities"
 
 ---
 
-### Task 7: The writer
+### Task 7: The journal executor
 
 **Files:**
-- Create: `crates/mcpls-core/src/bridge/apply/writer.rs`
+- Create: `crates/mcpls-core/src/bridge/apply/journal.rs`
 - Modify: `crates/mcpls-core/src/bridge/apply/mod.rs`
-- Test: `crates/mcpls-core/src/bridge/apply/writer.rs` (inline `#[cfg(test)] mod tests`)
+- Test: `crates/mcpls-core/src/bridge/apply/journal.rs` (inline `#[cfg(test)] mod tests`)
 
 **Interfaces:**
 - Consumes: `Error::ApplyPartiallyFailed` (Task 2).
-- Produces: `StagedWrite { path: PathBuf, original: Option<String>, new_content: String }` and `commit_writes(writes: Vec<StagedWrite>) -> Result<Vec<PathBuf>>`.
+- Produces:
 
-Phase two of the applier, kept separate from planning so it can be tested without an LSP server. Each file is written to a temp file in the same directory and renamed over the target, which makes a single file's replacement atomic. The temp file copies the target's permissions, because a rename replaces the inode and an executable script would otherwise lose its mode bit. The temp name is dot-prefixed with a `.mcpls-tmp` suffix so it matches no source-file glob and no language server picks it up as a new source file.
+```rust
+pub enum Step {
+    Write { path: PathBuf, content: String, previous: Option<String> },
+    Move { from: PathBuf, to: PathBuf },
+    Trash { path: PathBuf, trash: PathBuf },
+}
+pub fn execute(steps: &[Step]) -> Result<()>;
+```
 
-Rollback restores originals in reverse order. If a restore itself fails, the error names which files are in which state rather than claiming a clean failure.
+Phase two of the applier, kept separate from planning so it can be tested by handing it steps directly, with no LSP server and no `WorkspaceEdit` in sight.
+
+Every step is reversible and the steps run in the order the plan produced them, which is the only way to honor a `WorkspaceEdit` that creates a file and then edits it. A two-list design that writes every file and then performs resource operations cannot express that ordering, and gets it wrong for the exact shape rust-analyzer's "create module" assist emits.
+
+Three step kinds cover every operation:
+
+- `Write` replaces a file's whole content through a temp file in the same directory, renamed over the target, so a single file never observes a partial write. The temp file copies the target's permissions, because the rename replaces the inode and an executable script would otherwise lose its mode bit. Its name is dot-prefixed with a `.mcpls-tmp` suffix so it matches no source-file glob and no language server picks it up as a new source file. `previous` holds what to put back, or `None` when the file is being created, in which case rollback removes it.
+- `Move` renames a path. The destination must not exist: `std::fs::rename` replaces it silently on Unix and fails on Windows, and neither is a behavior to build on. A plan that needs to replace an existing destination emits a `Trash` for it first.
+- `Trash` renames a path to a sibling instead of deleting it. Rollback renames it back, which is the only way to undo a delete without holding the file, or a whole directory tree, in memory. Once every step succeeds, the executor removes the trash entries.
+
+Rollback walks the completed steps in reverse. A failed `Write` rollback leaves that file holding its new content, since the restore is itself a temp-and-rename and either lands whole or does nothing at all: it is reported in `written`, not in a vaguer bucket. A failed `Move` or `Trash` rollback leaves a file at a path the caller never named, so it is reported in `unrecovered` with that path spelled out.
 
 - [ ] **Step 1: Write the failing tests**
 
+Create `crates/mcpls-core/src/bridge/apply/journal.rs` with the test module:
+
 ```rust
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    use super::{commit_writes, StagedWrite};
+    use super::{Step, execute};
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn test_writes_new_content_to_each_path() {
         let dir = tempfile::tempdir().expect("tempdir");
         let a = dir.path().join("a.txt");
@@ -1201,44 +1511,48 @@ mod tests {
         fs::write(&a, "old a").expect("seed a");
         fs::write(&b, "old b").expect("seed b");
 
-        let written = commit_writes(vec![
-            StagedWrite {
+        execute(&[
+            Step::Write {
                 path: a.clone(),
-                original: Some("old a".to_string()),
-                new_content: "new a".to_string(),
+                content: "new a".to_string(),
+                previous: Some("old a".to_string()),
             },
-            StagedWrite {
+            Step::Write {
                 path: b.clone(),
-                original: Some("old b".to_string()),
-                new_content: "new b".to_string(),
+                content: "new b".to_string(),
+                previous: Some("old b".to_string()),
             },
         ])
-        .expect("writes commit");
+        .expect("steps execute");
 
-        assert_eq!(written.len(), 2);
         assert_eq!(fs::read_to_string(&a).expect("read a"), "new a");
         assert_eq!(fs::read_to_string(&b).expect("read b"), "new b");
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
-    fn test_creates_a_file_that_did_not_exist() {
+    fn test_creates_then_edits_the_same_path_in_order() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("fresh.txt");
+        let path = dir.path().join("fresh.rs");
 
-        commit_writes(vec![StagedWrite {
-            path: path.clone(),
-            original: None,
-            new_content: "hello".to_string(),
-        }])
-        .expect("writes commit");
+        execute(&[
+            Step::Write {
+                path: path.clone(),
+                content: String::new(),
+                previous: None,
+            },
+            Step::Write {
+                path: path.clone(),
+                content: "mod inner;\n".to_string(),
+                previous: Some(String::new()),
+            },
+        ])
+        .expect("steps execute");
 
-        assert_eq!(fs::read_to_string(&path).expect("read"), "hello");
+        assert_eq!(fs::read_to_string(&path).expect("read"), "mod inner;\n");
     }
 
     #[cfg(unix)]
     #[test]
-    #[allow(clippy::expect_used)]
     fn test_preserves_mode_bits() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -1247,60 +1561,149 @@ mod tests {
         fs::write(&path, "#!/bin/sh\n").expect("seed");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
 
-        commit_writes(vec![StagedWrite {
+        execute(&[Step::Write {
             path: path.clone(),
-            original: Some("#!/bin/sh\n".to_string()),
-            new_content: "#!/bin/sh\necho hi\n".to_string(),
+            content: "#!/bin/sh\necho hi\n".to_string(),
+            previous: Some("#!/bin/sh\n".to_string()),
         }])
-        .expect("writes commit");
+        .expect("steps execute");
 
         let mode = fs::metadata(&path).expect("stat").permissions().mode();
         assert_eq!(mode & 0o777, 0o755, "executable bit survives the rename");
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
-    fn test_rolls_back_earlier_writes_when_a_later_one_fails() {
+    fn test_moves_a_file_to_a_new_path() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let good = dir.path().join("good.txt");
-        fs::write(&good, "original").expect("seed");
-        // A path whose parent does not exist cannot be written.
-        let bad: PathBuf = dir.path().join("missing-dir").join("bad.txt");
+        let from = dir.path().join("old.rs");
+        let to = dir.path().join("new.rs");
+        fs::write(&from, "content").expect("seed");
 
-        let result = commit_writes(vec![
-            StagedWrite {
-                path: good.clone(),
-                original: Some("original".to_string()),
-                new_content: "changed".to_string(),
-            },
-            StagedWrite {
-                path: bad,
-                original: None,
-                new_content: "never lands".to_string(),
-            },
-        ]);
+        execute(&[Step::Move {
+            from: from.clone(),
+            to: to.clone(),
+        }])
+        .expect("steps execute");
 
-        assert!(result.is_err(), "the batch fails");
+        assert!(!from.exists());
+        assert_eq!(fs::read_to_string(&to).expect("read"), "content");
+    }
+
+    #[test]
+    fn test_move_onto_an_existing_path_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let from = dir.path().join("old.rs");
+        let to = dir.path().join("occupied.rs");
+        fs::write(&from, "source").expect("seed from");
+        fs::write(&to, "victim").expect("seed to");
+
+        assert!(
+            execute(&[Step::Move {
+                from: from.clone(),
+                to: to.clone(),
+            }])
+            .is_err()
+        );
         assert_eq!(
-            fs::read_to_string(&good).expect("read"),
-            "original",
-            "the earlier write is rolled back"
+            fs::read_to_string(&to).expect("read"),
+            "victim",
+            "the destination is never clobbered by a bare move"
         );
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
+    fn test_trashed_file_is_gone_after_a_successful_run() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let doomed = dir.path().join("doomed.rs");
+        fs::write(&doomed, "bye").expect("seed");
+        let trash = dir.path().join(".doomed.rs.mcpls-trash0");
+
+        execute(&[Step::Trash {
+            path: doomed.clone(),
+            trash: trash.clone(),
+        }])
+        .expect("steps execute");
+
+        assert!(!doomed.exists(), "the file is deleted");
+        assert!(!trash.exists(), "the trash entry is purged");
+    }
+
+    #[test]
+    fn test_rolls_back_every_earlier_step_when_a_later_one_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let edited = dir.path().join("edited.rs");
+        let doomed = dir.path().join("doomed.rs");
+        fs::write(&edited, "original").expect("seed edited");
+        fs::write(&doomed, "still here").expect("seed doomed");
+        let trash = dir.path().join(".doomed.rs.mcpls-trash1");
+        // A path whose parent does not exist cannot be written.
+        let unwritable: PathBuf = dir.path().join("missing-dir").join("bad.rs");
+
+        let result = execute(&[
+            Step::Write {
+                path: edited.clone(),
+                content: "changed".to_string(),
+                previous: Some("original".to_string()),
+            },
+            Step::Trash {
+                path: doomed.clone(),
+                trash,
+            },
+            Step::Write {
+                path: unwritable,
+                content: "never lands".to_string(),
+                previous: None,
+            },
+        ]);
+
+        assert!(result.is_err(), "the run fails");
+        assert_eq!(
+            fs::read_to_string(&edited).expect("read"),
+            "original",
+            "the earlier write is rolled back"
+        );
+        assert_eq!(
+            fs::read_to_string(&doomed).expect("read"),
+            "still here",
+            "the trashed file comes back"
+        );
+    }
+
+    #[test]
+    fn test_rollback_removes_a_file_the_run_created() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let created = dir.path().join("created.rs");
+        let unwritable: PathBuf = dir.path().join("missing-dir").join("bad.rs");
+
+        let result = execute(&[
+            Step::Write {
+                path: created.clone(),
+                content: "new file".to_string(),
+                previous: None,
+            },
+            Step::Write {
+                path: unwritable,
+                content: "never lands".to_string(),
+                previous: None,
+            },
+        ]);
+
+        assert!(result.is_err());
+        assert!(!created.exists(), "a created file is removed on rollback");
+    }
+
+    #[test]
     fn test_leaves_no_temp_files_behind() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("a.txt");
         fs::write(&path, "old").expect("seed");
 
-        commit_writes(vec![StagedWrite {
+        execute(&[Step::Write {
             path,
-            original: Some("old".to_string()),
-            new_content: "new".to_string(),
+            content: "new".to_string(),
+            previous: Some("old".to_string()),
         }])
-        .expect("writes commit");
+        .expect("steps execute");
 
         let leftovers: Vec<_> = fs::read_dir(dir.path())
             .expect("read dir")
@@ -1314,58 +1717,102 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p mcpls-core --lib bridge::apply::writer`
-Expected: FAIL to compile, `unresolved import 'super::commit_writes'`.
+Run: `cargo test -p mcpls-core --lib bridge::apply::journal`
+Expected: FAIL to compile, `unresolved imports 'super::Step', 'super::execute'`.
 
 - [ ] **Step 3: Write the implementation**
 
-Prepend to `crates/mcpls-core/src/bridge/apply/writer.rs`:
+Prepend to `crates/mcpls-core/src/bridge/apply/journal.rs`:
 
 ```rust
-//! Committing computed file contents to disk.
+//! Executing an ordered, reversible list of file-system steps.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use tracing::warn;
+
 use crate::error::{Error, Result};
 
-/// One file's content, computed and validated, waiting to be written.
+/// One reversible file-system change, in the order it must be performed.
 #[derive(Debug)]
-pub struct StagedWrite {
-    /// Absolute path to write.
-    pub path: PathBuf,
-    /// Content before the edit, or `None` when the file is being created.
-    /// Held so a later failure can restore it.
-    pub original: Option<String>,
-    /// Content to write.
-    pub new_content: String,
+pub enum Step {
+    /// Replace a file's whole content.
+    Write {
+        /// Absolute path to write.
+        path: PathBuf,
+        /// Content to write.
+        content: String,
+        /// Content before this step, or `None` when the file does not exist
+        /// yet, in which case rollback removes it.
+        previous: Option<String>,
+    },
+    /// Move a file or directory. The destination must not exist.
+    Move {
+        /// Current path.
+        from: PathBuf,
+        /// Path to move it to.
+        to: PathBuf,
+    },
+    /// Move a path aside so a later failure can put it back, and so a
+    /// successful run can remove it without ever having held its contents.
+    Trash {
+        /// Path being removed.
+        path: PathBuf,
+        /// Sibling path it is parked at until the run finishes.
+        trash: PathBuf,
+    },
 }
 
-/// Write every staged file, rolling back on the first failure.
-///
-/// Each file is written to a temp file beside it and renamed over the
-/// target, so a single file never observes a partial write. The temp file
-/// carries the target's permissions, because the rename replaces the inode.
+/// Perform every step in order, rolling back on the first failure.
 ///
 /// # Errors
 ///
-/// Returns [`Error::ApplyPartiallyFailed`] when a write fails. Files
-/// written before the failure are restored; the error names any whose
-/// restore also failed.
-pub fn commit_writes(writes: Vec<StagedWrite>) -> Result<Vec<PathBuf>> {
-    let mut committed: Vec<&StagedWrite> = Vec::with_capacity(writes.len());
+/// Returns [`Error::ApplyPartiallyFailed`] when a step fails. Completed
+/// steps are reversed in order; the error names any file the reversal could
+/// not return to its original state and says where it actually is.
+pub fn execute(steps: &[Step]) -> Result<()> {
+    let mut completed = 0usize;
 
-    for write in &writes {
-        match write_one(&write.path, &write.new_content) {
-            Ok(()) => committed.push(write),
-            Err(reason) => return Err(roll_back(&committed, reason)),
+    for step in steps {
+        if let Err(reason) = perform(step) {
+            return Err(roll_back(&steps[..completed], reason));
         }
+        completed += 1;
     }
 
-    Ok(writes.iter().map(|w| w.path.clone()).collect())
+    purge_trash(steps);
+    Ok(())
 }
 
-fn write_one(path: &Path, content: &str) -> std::result::Result<(), String> {
+fn perform(step: &Step) -> std::result::Result<(), String> {
+    match step {
+        Step::Write {
+            path,
+            content,
+            previous: _,
+        } => write_atomically(path, content),
+        Step::Move { from, to } => {
+            if to.exists() {
+                return Err(format!(
+                    "{} already exists, so {} cannot be moved onto it",
+                    to.display(),
+                    from.display()
+                ));
+            }
+            fs::rename(from, to).map_err(|e| {
+                format!("moving {} to {}: {e}", from.display(), to.display())
+            })
+        }
+        Step::Trash { path, trash } => fs::rename(path, trash).map_err(|e| {
+            format!("moving {} aside to {}: {e}", path.display(), trash.display())
+        }),
+    }
+}
+
+/// Write `content` to `path` through a temp file in the same directory,
+/// renamed over the target, so the file never holds a partial write.
+fn write_atomically(path: &Path, content: &str) -> std::result::Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
@@ -1390,27 +1837,77 @@ fn write_one(path: &Path, content: &str) -> std::result::Result<(), String> {
     })
 }
 
-fn roll_back(committed: &[&StagedWrite], reason: String) -> Error {
+fn roll_back(completed: &[Step], reason: String) -> Error {
+    let mut written = Vec::new();
     let mut restored = Vec::new();
-    let mut failed = Vec::new();
+    let mut unrecovered = Vec::new();
 
-    for write in committed.iter().rev() {
-        let outcome = match &write.original {
-            Some(original) => write_one(&write.path, original),
-            None => fs::remove_file(&write.path)
-                .map_err(|e| format!("removing {}: {e}", write.path.display())),
-        };
-        match outcome {
-            Ok(()) => restored.push(write.path.clone()),
-            Err(_) => failed.push(write.path.clone()),
+    for step in completed.iter().rev() {
+        match step {
+            Step::Write {
+                path,
+                content: _,
+                previous,
+            } => {
+                let outcome = match previous {
+                    Some(original) => write_atomically(path, original),
+                    None => fs::remove_file(path)
+                        .map_err(|e| format!("removing {}: {e}", path.display())),
+                };
+                match outcome {
+                    Ok(()) => restored.push(path.clone()),
+                    // The restore is itself a temp-and-rename, so a failed
+                    // one changed nothing: the file still holds the content
+                    // this run put there.
+                    Err(_) => written.push(path.clone()),
+                }
+            }
+            Step::Move { from, to } => match fs::rename(to, from) {
+                Ok(()) => restored.push(from.clone()),
+                Err(e) => unrecovered.push(format!(
+                    "{} is at {} ({e})",
+                    from.display(),
+                    to.display()
+                )),
+            },
+            Step::Trash { path, trash } => match fs::rename(trash, path) {
+                Ok(()) => restored.push(path.clone()),
+                Err(e) => unrecovered.push(format!(
+                    "{} is at {} ({e})",
+                    path.display(),
+                    trash.display()
+                )),
+            },
         }
     }
 
     Error::ApplyPartiallyFailed {
-        written: Vec::new(),
+        written,
         restored,
-        failed,
+        unrecovered,
         reason,
+    }
+}
+
+/// Remove every trash entry once the whole run has succeeded. A failure
+/// here leaves a stray file but does not make the apply wrong, so it is
+/// logged rather than returned.
+fn purge_trash(steps: &[Step]) {
+    for step in steps {
+        if let Step::Trash { path, trash } = step {
+            let outcome = if trash.is_dir() {
+                fs::remove_dir_all(trash)
+            } else {
+                fs::remove_file(trash)
+            };
+            if let Err(e) = outcome {
+                warn!(
+                    "could not remove {} after deleting {}: {e}",
+                    trash.display(),
+                    path.display()
+                );
+            }
+        }
     }
 }
 ```
@@ -1418,72 +1915,97 @@ fn roll_back(committed: &[&StagedWrite], reason: String) -> Error {
 Add to `crates/mcpls-core/src/bridge/apply/mod.rs`:
 
 ```rust
-pub mod writer;
+pub mod journal;
 
-pub use writer::{commit_writes, StagedWrite};
+pub use journal::{Step, execute};
 ```
 
-Add `tempfile` to `[dev-dependencies]` in `crates/mcpls-core/Cargo.toml` if it is not already there. It is, so no change should be needed; confirm with `rg -n tempfile crates/mcpls-core/Cargo.toml`.
+`tempfile` is already a dev-dependency of `mcpls-core` (`Cargo.toml:35`), so no manifest change is needed.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p mcpls-core --lib bridge::apply::writer`
-Expected: PASS, 5 tests on Unix and 4 on Windows.
+Run: `cargo test -p mcpls-core --lib bridge::apply::journal`
+Expected: PASS, 9 tests on Unix and 8 on Windows.
 
 - [ ] **Step 5: Check lints and commit**
 
 ```bash
 cargo clippy -p mcpls-core --all-targets
 git add crates/mcpls-core/src/bridge/apply/
-git commit -m "feat(apply): commit staged writes atomically"
+git commit -m "feat(apply): add reversible file-system journal"
 ```
 
 ---
 
-### Task 8: The applier entry point
+### Task 8: The applier
 
 **Files:**
 - Modify: `crates/mcpls-core/src/bridge/apply/mod.rs`
-- Modify: `crates/mcpls-core/src/bridge/translator/mod.rs`
 - Test: `crates/mcpls-core/src/bridge/apply/mod.rs` (inline `#[cfg(test)] mod tests`)
 
 **Interfaces:**
-- Consumes: `LineTable` (Task 3), `EditPlan` and `Operation` (Task 4), `commit_writes` and `StagedWrite` (Task 7), `ApplyConfig` (Task 1), `validate_path_against_roots` from `crate::bridge::translator::routing`.
+- Consumes: `LineTable` (Task 3), `EditPlan` and `Operation` (Task 4), `Step` and `execute` (Task 7), `ApplyConfig` (Task 1), `crate::bridge::validate_path_against_roots` and `crate::bridge::uri_to_path` (both already re-exported from `bridge/mod.rs` at lines 20 to 24).
 - Produces:
 
 ```rust
+pub struct FileChange { pub path: PathBuf, pub edits: usize }
 pub struct ApplySummary {
     pub files_changed: Vec<FileChange>,
-    pub resource_operations: Vec<crate::bridge::translator::dto::ResourceOperation>,
+    pub resource_operations: Vec<crate::bridge::translator::ResourceOperation>,
 }
-pub struct FileChange { pub path: PathBuf, pub edits: usize }
-pub struct Applier { /* roots, config, encoding */ }
+#[derive(Debug)]
+pub struct Applier { /* roots, config */ }
 impl Applier {
-    pub fn new(roots: Vec<PathBuf>, config: ApplyConfig, encoding: PositionEncoding) -> Self;
-    pub async fn apply(&self, plan: EditPlan) -> Result<ApplySummary>;
+    pub fn new(roots: Vec<PathBuf>, config: ApplyConfig) -> Self;
+    pub const fn config(&self) -> &ApplyConfig;
+    pub async fn apply(&self, plan: EditPlan, encoding: PositionEncoding) -> Result<ApplySummary>;
 }
 ```
 
-`Translator` gains `apply_lock: Arc<tokio::sync::Mutex<()>>` and `applier: Option<Arc<Applier>>`. Every apply-enabled call holds that lock for its whole duration, which serializes two concurrent applies to the same file and, in Task 12, defines the window when an inbound `workspace/applyEdit` is honored.
+The encoding is a per-call parameter, not a field. `Translator::position_encoding_for(&ServerId)` exists because the negotiated encoding differs per server, and the default configuration (`position_encodings = ["utf-8", "utf-16"]`) gets UTF-8 from rust-analyzer and UTF-16 from taplo, marksman, and the TypeScript servers. One encoding baked into the applier misplaces every edit after a non-ASCII character for whichever group it guessed wrong about, which is the highest-consequence bug this module can have.
 
-Phase one resolves each `Operation::Edit` against current disk content and produces `StagedWrite`s. Phase two calls `commit_writes`. Nothing is written until every operation validates.
+`Applier` derives `Debug` because `Translator` does and Task 9 gives it an `Applier` field.
+
+Planning walks the operations in array order against an **overlay**: a map from resolved path to what that path holds *at this point in the plan*, seeded from disk on first touch. An `Edit` of a file an earlier `Create` in the same plan produced reads the overlay, not the disk, which is what makes create-then-edit work. Every operation appends its journal steps as it goes, so execution order is array order.
+
+`apply` runs planning and execution inside `spawn_blocking`. Both do file I/O, and the translator holds its apply mutex across the call, so doing this work on a runtime thread would stall every other task behind it. It also gives the `async fn` a real `.await`, which `clippy::unused_async` requires.
 
 - [ ] **Step 1: Write the failing tests**
 
+Add to `crates/mcpls-core/src/bridge/apply/mod.rs`:
+
 ```rust
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use std::collections::HashMap;
     use std::fs;
-    use std::str::FromStr;
+    use std::path::Path;
 
-    use lsp_types::{Position, Range, TextEdit, Uri, WorkspaceEdit};
+    use lsp_types::{
+        CreateFile, DeleteFile, DocumentChangeOperation, DocumentChanges, OneOf,
+        OptionalVersionedTextDocumentIdentifier, Position, Range, RenameFile, ResourceOp,
+        TextDocumentEdit, TextEdit, Uri, WorkspaceEdit,
+    };
 
     use super::{Applier, EditPlan};
-    use crate::bridge::encoding::PositionEncoding;
+    use crate::bridge::PositionEncoding;
+    use crate::bridge::path_to_uri;
     use crate::config::ApplyConfig;
 
-    #[allow(clippy::expect_used)]
+    fn uri_for(path: &Path) -> Uri {
+        path_to_uri(path).expect("path converts to a uri")
+    }
+
+    fn permissive() -> ApplyConfig {
+        ApplyConfig {
+            rename: true,
+            format_document: true,
+            code_actions: true,
+            allow_file_deletion: true,
+        }
+    }
+
     fn plan_replacing(uri: Uri, range: Range, text: &str) -> EditPlan {
         let mut changes = HashMap::new();
         changes.insert(
@@ -1500,35 +2022,23 @@ mod tests {
         .expect("plan builds")
     }
 
-    fn permissive() -> ApplyConfig {
-        ApplyConfig {
-            rename: true,
-            format_document: true,
-            code_actions: true,
-            allow_file_deletion: true,
-        }
-    }
-
     #[tokio::test]
-    #[allow(clippy::expect_used)]
     async fn test_applies_a_text_edit_to_disk() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("a.rs");
         fs::write(&path, "fn old() {}\n").expect("seed");
 
-        let applier = Applier::new(
-            vec![dir.path().to_path_buf()],
-            permissive(),
-            PositionEncoding::Utf16,
-        );
-        let uri = Uri::from_str(&format!("file://{}", path.display())).expect("uri");
+        let applier = Applier::new(vec![dir.path().to_path_buf()], permissive());
         let plan = plan_replacing(
-            uri,
+            uri_for(&path),
             Range::new(Position::new(0, 3), Position::new(0, 6)),
             "new",
         );
 
-        let summary = applier.apply(plan).await.expect("apply succeeds");
+        let summary = applier
+            .apply(plan, PositionEncoding::Utf16)
+            .await
+            .expect("apply succeeds");
 
         assert_eq!(summary.files_changed.len(), 1);
         assert_eq!(summary.files_changed[0].edits, 1);
@@ -1536,26 +2046,174 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::expect_used)]
+    async fn test_utf8_and_utf16_columns_land_in_different_places() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wide.rs");
+        // "é" is one UTF-16 unit and two UTF-8 bytes, so the same column
+        // means a different byte offset in each encoding:
+        //   bytes    a=0  é=1..2  ' '=3  '='=4  ' '=5  x=6 ...
+        //   utf-16   a=0  é=1     ' '=2  '='=3  ' '=4  x=5 ...
+        // Column 3 to 4 is therefore "=" in UTF-16 and " " in UTF-8, and
+        // both land on character boundaries, so neither apply errors out.
+        let seed = "aé = xyz;\n";
+        let columns = Range::new(Position::new(0, 3), Position::new(0, 4));
+
+        let applier = Applier::new(vec![dir.path().to_path_buf()], permissive());
+
+        fs::write(&path, seed).expect("seed");
+        applier
+            .apply(
+                plan_replacing(uri_for(&path), columns, "Z"),
+                PositionEncoding::Utf16,
+            )
+            .await
+            .expect("apply succeeds");
+        let utf16_result = fs::read_to_string(&path).expect("read");
+
+        fs::write(&path, seed).expect("reseed");
+        applier
+            .apply(
+                plan_replacing(uri_for(&path), columns, "Z"),
+                PositionEncoding::Utf8,
+            )
+            .await
+            .expect("apply succeeds");
+        let utf8_result = fs::read_to_string(&path).expect("read");
+
+        assert_eq!(utf16_result, "aé Z xyz;\n", "UTF-16 column 3 is the '='");
+        assert_eq!(utf8_result, "aéZ= xyz;\n", "UTF-8 byte 3 is the space");
+        assert_ne!(
+            utf16_result, utf8_result,
+            "an applier that ignores the negotiated encoding corrupts one of these"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_creates_a_file_and_then_edits_it_in_one_plan() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("new.rs");
+        let uri = uri_for(&dir.path().join("new.rs"));
+
+        let plan = EditPlan::from_workspace_edit(WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Operations(vec![
+                DocumentChangeOperation::Op(ResourceOp::Create(CreateFile {
+                    uri: uri.clone(),
+                    options: None,
+                    annotation_id: None,
+                })),
+                DocumentChangeOperation::Edit(TextDocumentEdit {
+                    text_document: OptionalVersionedTextDocumentIdentifier {
+                        uri,
+                        version: None,
+                    },
+                    edits: vec![OneOf::Left(TextEdit {
+                        range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+                        new_text: "pub fn generated() {}\n".to_string(),
+                    })],
+                }),
+            ])),
+            ..WorkspaceEdit::default()
+        })
+        .expect("plan builds");
+
+        let applier = Applier::new(vec![dir.path().to_path_buf()], permissive());
+        applier
+            .apply(plan, PositionEncoding::Utf16)
+            .await
+            .expect("create-then-edit succeeds");
+
+        assert_eq!(
+            fs::read_to_string(&path).expect("read"),
+            "pub fn generated() {}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_renames_a_file_and_then_edits_its_new_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let old = dir.path().join("old.rs");
+        let new = dir.path().join("new.rs");
+        fs::write(&old, "fn old_name() {}\n").expect("seed");
+        let new_uri = uri_for(&dir.path().join("new.rs"));
+
+        let plan = EditPlan::from_workspace_edit(WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Operations(vec![
+                DocumentChangeOperation::Op(ResourceOp::Rename(RenameFile {
+                    old_uri: uri_for(&old),
+                    new_uri: new_uri.clone(),
+                    options: None,
+                    annotation_id: None,
+                })),
+                DocumentChangeOperation::Edit(TextDocumentEdit {
+                    text_document: OptionalVersionedTextDocumentIdentifier {
+                        uri: new_uri,
+                        version: None,
+                    },
+                    edits: vec![OneOf::Left(TextEdit {
+                        range: Range::new(Position::new(0, 3), Position::new(0, 11)),
+                        new_text: "new_name".to_string(),
+                    })],
+                }),
+            ])),
+            ..WorkspaceEdit::default()
+        })
+        .expect("plan builds");
+
+        let applier = Applier::new(vec![dir.path().to_path_buf()], permissive());
+        applier
+            .apply(plan, PositionEncoding::Utf16)
+            .await
+            .expect("rename-then-edit succeeds");
+
+        assert!(!old.exists());
+        assert_eq!(fs::read_to_string(&new).expect("read"), "fn new_name() {}\n");
+    }
+
+    #[tokio::test]
+    async fn test_create_with_ignore_if_exists_leaves_the_file_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("existing.rs");
+        fs::write(&path, "keep me\n").expect("seed");
+
+        let plan = EditPlan::from_workspace_edit(WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Operations(vec![
+                DocumentChangeOperation::Op(ResourceOp::Create(CreateFile {
+                    uri: uri_for(&path),
+                    options: Some(lsp_types::CreateFileOptions {
+                        overwrite: None,
+                        ignore_if_exists: Some(true),
+                    }),
+                    annotation_id: None,
+                })),
+            ])),
+            ..WorkspaceEdit::default()
+        })
+        .expect("plan builds");
+
+        let applier = Applier::new(vec![dir.path().to_path_buf()], permissive());
+        applier
+            .apply(plan, PositionEncoding::Utf16)
+            .await
+            .expect("an ignored create is not a failure");
+
+        assert_eq!(fs::read_to_string(&path).expect("read"), "keep me\n");
+    }
+
+    #[tokio::test]
     async fn test_refuses_a_path_outside_every_root() {
         let inside = tempfile::tempdir().expect("tempdir");
         let outside = tempfile::tempdir().expect("tempdir");
         let path = outside.path().join("escape.rs");
         fs::write(&path, "x\n").expect("seed");
 
-        let applier = Applier::new(
-            vec![inside.path().to_path_buf()],
-            permissive(),
-            PositionEncoding::Utf16,
-        );
-        let uri = Uri::from_str(&format!("file://{}", path.display())).expect("uri");
+        let applier = Applier::new(vec![inside.path().to_path_buf()], permissive());
         let plan = plan_replacing(
-            uri,
+            uri_for(&path),
             Range::new(Position::new(0, 0), Position::new(0, 1)),
             "y",
         );
 
-        assert!(applier.apply(plan).await.is_err());
+        assert!(applier.apply(plan, PositionEncoding::Utf16).await.is_err());
         assert_eq!(
             fs::read_to_string(&path).expect("read"),
             "x\n",
@@ -1564,7 +2222,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::expect_used)]
     async fn test_refuses_deletion_when_the_config_forbids_it() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("doomed.rs");
@@ -1574,50 +2231,46 @@ mod tests {
             allow_file_deletion: false,
             ..permissive()
         };
-        let applier =
-            Applier::new(vec![dir.path().to_path_buf()], config, PositionEncoding::Utf16);
-        let uri = Uri::from_str(&format!("file://{}", path.display())).expect("uri");
+        let applier = Applier::new(vec![dir.path().to_path_buf()], config);
         let plan = EditPlan::from_workspace_edit(WorkspaceEdit {
-            document_changes: Some(lsp_types::DocumentChanges::Operations(vec![
-                lsp_types::DocumentChangeOperation::Op(lsp_types::ResourceOp::Delete(
-                    lsp_types::DeleteFile {
-                        uri,
-                        options: None,
-                        annotation_id: None,
-                    },
-                )),
+            document_changes: Some(DocumentChanges::Operations(vec![
+                DocumentChangeOperation::Op(ResourceOp::Delete(DeleteFile {
+                    uri: uri_for(&path),
+                    options: None,
+                })),
             ])),
             ..WorkspaceEdit::default()
         })
         .expect("plan builds");
 
-        assert!(applier.apply(plan).await.is_err());
+        let error = applier
+            .apply(plan, PositionEncoding::Utf16)
+            .await
+            .expect_err("deletion is refused");
+        assert!(
+            error.to_string().contains("apply.allow_file_deletion"),
+            "the error names the key that would permit it: {error}"
+        );
         assert!(path.exists(), "the file survives a refused deletion");
     }
 
     #[tokio::test]
-    #[allow(clippy::expect_used)]
     async fn test_nothing_is_written_when_one_operation_is_invalid() {
         let dir = tempfile::tempdir().expect("tempdir");
         let good = dir.path().join("good.rs");
         let missing = dir.path().join("missing.rs");
         fs::write(&good, "fn a() {}\n").expect("seed");
 
-        let applier = Applier::new(
-            vec![dir.path().to_path_buf()],
-            permissive(),
-            PositionEncoding::Utf16,
-        );
         let mut changes = HashMap::new();
         changes.insert(
-            Uri::from_str(&format!("file://{}", good.display())).expect("uri"),
+            uri_for(&good),
             vec![TextEdit {
                 range: Range::new(Position::new(0, 3), Position::new(0, 4)),
                 new_text: "b".to_string(),
             }],
         );
         changes.insert(
-            Uri::from_str(&format!("file://{}", missing.display())).expect("uri"),
+            uri_for(&dir.path().join("missing.rs")),
             vec![TextEdit {
                 range: Range::new(Position::new(0, 0), Position::new(0, 1)),
                 new_text: "z".to_string(),
@@ -1629,12 +2282,14 @@ mod tests {
         })
         .expect("plan builds");
 
-        assert!(applier.apply(plan).await.is_err());
+        let applier = Applier::new(vec![dir.path().to_path_buf()], permissive());
+        assert!(applier.apply(plan, PositionEncoding::Utf16).await.is_err());
         assert_eq!(
             fs::read_to_string(&good).expect("read"),
             "fn a() {}\n",
-            "validation runs before any write"
+            "planning fails before any step runs"
         );
+        assert!(!missing.exists());
     }
 }
 ```
@@ -1646,34 +2301,36 @@ Expected: FAIL to compile, `unresolved import 'super::Applier'`.
 
 - [ ] **Step 3: Write the implementation**
 
-Add to `crates/mcpls-core/src/bridge/apply/mod.rs`:
+Replace the head of `crates/mcpls-core/src/bridge/apply/mod.rs` with:
 
 ```rust
 //! Writing LSP `WorkspaceEdit`s to the working tree.
 
+use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+pub mod journal;
 pub mod offsets;
 pub mod plan;
-pub mod writer;
 
+pub use journal::{Step, execute};
 pub use offsets::LineTable;
 pub use plan::{EditPlan, Operation};
-pub use writer::{commit_writes, StagedWrite};
 
 use crate::bridge::encoding::{EncodingConverter, PositionEncoding};
-use crate::bridge::translator::dto::{resource_operations_from_plan, ResourceOperation};
-use crate::bridge::translator::routing::validate_path_against_roots;
+use crate::bridge::translator::{ResourceOperation, resource_operations_from_plan};
+use crate::bridge::{uri_to_path, validate_path_against_roots};
 use crate::config::ApplyConfig;
 use crate::error::{Error, Result};
 
-/// One file the applier changed.
+/// One file the applier wrote.
 #[derive(Debug, Clone)]
 pub struct FileChange {
     /// Absolute path.
     pub path: PathBuf,
-    /// Number of text edits applied to it.
+    /// Number of text edits applied to it. Zero for a file the edit only
+    /// created.
     pub edits: usize,
 }
 
@@ -1681,32 +2338,25 @@ pub struct FileChange {
 /// cached file contents are now stale.
 #[derive(Debug, Clone)]
 pub struct ApplySummary {
-    /// Files whose text changed.
+    /// Files whose content was written. Renamed and deleted paths are in
+    /// `resource_operations` instead.
     pub files_changed: Vec<FileChange>,
     /// File-system operations performed.
     pub resource_operations: Vec<ResourceOperation>,
 }
 
 /// Applies validated `WorkspaceEdit`s within a set of workspace roots.
+#[derive(Debug)]
 pub struct Applier {
     roots: Vec<PathBuf>,
     config: ApplyConfig,
-    encoding: PositionEncoding,
 }
 
 impl Applier {
     /// Build an applier confined to `roots`.
     #[must_use]
-    pub const fn new(
-        roots: Vec<PathBuf>,
-        config: ApplyConfig,
-        encoding: PositionEncoding,
-    ) -> Self {
-        Self {
-            roots,
-            config,
-            encoding,
-        }
+    pub const fn new(roots: Vec<PathBuf>, config: ApplyConfig) -> Self {
+        Self { roots, config }
     }
 
     /// Which tools this applier permits to write. Read by
@@ -1716,168 +2366,355 @@ impl Applier {
         &self.config
     }
 
-    /// Validate every operation, then write.
+    /// Plan `plan` into a journal and execute it.
+    ///
+    /// `encoding` is the encoding the server that produced `plan`
+    /// negotiated, from `Translator::position_encoding_for`. Passing the
+    /// wrong one misplaces every edit after a non-ASCII character.
     ///
     /// # Errors
     ///
     /// Returns [`Error::ApplyRefused`] when an operation targets a path
     /// outside the workspace, deletes a file without
     /// `apply.allow_file_deletion`, or resolves to an invalid range, and
-    /// [`Error::ApplyPartiallyFailed`] when a write fails after another
-    /// has already landed.
-    pub async fn apply(&self, plan: EditPlan) -> Result<ApplySummary> {
-        let resource_operations = resource_operations_from_plan(&plan);
-        let converter = EncodingConverter::new(self.encoding);
-        let mut staged: Vec<StagedWrite> = Vec::new();
-        let mut files_changed = Vec::new();
+    /// [`Error::ApplyPartiallyFailed`] when a step fails after another has
+    /// already landed.
+    pub async fn apply(
+        &self,
+        plan: EditPlan,
+        encoding: PositionEncoding,
+    ) -> Result<ApplySummary> {
+        let roots = self.roots.clone();
+        let config = self.config.clone();
+        // Planning reads files and execution writes them, and the caller
+        // holds the translator's apply mutex across this call, so none of
+        // it belongs on a runtime thread.
+        tokio::task::spawn_blocking(move || {
+            let planner = Planner::new(&roots, &config, encoding);
+            let (steps, files_changed) = planner.plan(&plan)?;
+            journal::execute(&steps)?;
+            Ok(ApplySummary {
+                files_changed,
+                resource_operations: resource_operations_from_plan(&plan),
+            })
+        })
+        .await
+        .map_err(|e| Error::ApplyRefused(format!("apply task panicked: {e}")))?
+    }
+}
+```
 
+Then add the planner to the same file:
+
+```rust
+/// What a path holds at some point during planning.
+#[derive(Clone)]
+enum Presence {
+    /// The path does not exist.
+    Absent,
+    /// The path holds this text.
+    Text(String),
+    /// The path exists but is not editable text: a directory, or a file
+    /// that is not valid UTF-8.
+    Opaque,
+}
+
+/// Walks a plan's operations in order, resolving each against an overlay of
+/// what the tree looks like at that point, and emitting journal steps.
+struct Planner<'a> {
+    roots: &'a [PathBuf],
+    config: &'a ApplyConfig,
+    converter: EncodingConverter,
+    overlay: HashMap<PathBuf, Presence>,
+    steps: Vec<Step>,
+    files_changed: Vec<FileChange>,
+}
+
+impl<'a> Planner<'a> {
+    fn new(roots: &'a [PathBuf], config: &'a ApplyConfig, encoding: PositionEncoding) -> Self {
+        Self {
+            roots,
+            config,
+            converter: EncodingConverter::new(encoding),
+            overlay: HashMap::new(),
+            steps: Vec::new(),
+            files_changed: Vec::new(),
+        }
+    }
+
+    fn plan(mut self, plan: &EditPlan) -> Result<(Vec<Step>, Vec<FileChange>)> {
         for operation in plan.operations() {
             match operation {
-                Operation::Edit { uri, edits, .. } => {
-                    let path = self.resolve_existing(uri)?;
-                    let original = fs::read_to_string(&path).map_err(|e| Error::FileIo {
-                        path: path.clone(),
-                        source: e,
-                    })?;
-                    let mut content = original.clone();
-                    // `edits` is sorted bottom-up, so each splice leaves
-                    // every not-yet-applied range valid.
-                    for edit in edits {
-                        let table = LineTable::new(&content);
-                        let range = table.byte_range(edit.range, &converter)?;
-                        content.replace_range(range, &edit.new_text);
-                    }
-                    files_changed.push(FileChange {
-                        path: path.clone(),
-                        edits: edits.len(),
-                    });
-                    staged.push(StagedWrite {
-                        path,
-                        original: Some(original),
-                        new_content: content,
-                    });
-                }
-                Operation::Create { uri, overwrite } => {
-                    let path = self.resolve_new(uri)?;
-                    if path.exists() && !overwrite {
-                        return Err(Error::ApplyRefused(format!(
-                            "{} already exists and the edit did not ask to overwrite it",
-                            path.display()
-                        )));
-                    }
-                    staged.push(StagedWrite {
-                        path,
-                        original: None,
-                        new_content: String::new(),
-                    });
-                }
-                Operation::Rename { .. } | Operation::Delete { .. } => {
-                    self.validate_resource_operation(operation)?;
-                }
+                Operation::Edit { uri, edits, .. } => self.plan_edit(uri, edits)?,
+                Operation::Create {
+                    uri,
+                    overwrite,
+                    ignore_if_exists,
+                } => self.plan_create(uri, *overwrite, *ignore_if_exists)?,
+                Operation::Rename {
+                    old,
+                    new,
+                    overwrite,
+                    ignore_if_exists,
+                } => self.plan_rename(old, new, *overwrite, *ignore_if_exists)?,
+                Operation::Delete {
+                    uri,
+                    recursive,
+                    ignore_if_not_exists,
+                } => self.plan_delete(uri, *recursive, *ignore_if_not_exists)?,
             }
         }
-
-        commit_writes(staged)?;
-        self.perform_resource_operations(plan.operations())?;
-
-        Ok(ApplySummary {
-            files_changed,
-            resource_operations,
-        })
+        Ok((self.steps, self.files_changed))
     }
 
-    /// Path of an existing target, confined to the workspace roots.
-    fn resolve_existing(&self, uri: &lsp_types::Uri) -> Result<PathBuf> {
-        let path = crate::util::uri_to_path(uri)?;
-        validate_path_against_roots(&path, &self.roots)
-    }
-
-    /// Path of a target that does not exist yet. The parent must exist and
-    /// must be inside a root; canonicalizing the path itself would fail.
-    fn resolve_new(&self, uri: &lsp_types::Uri) -> Result<PathBuf> {
-        let path = crate::util::uri_to_path(uri)?;
+    /// Absolute, confined path for `uri`.
+    ///
+    /// An existing path is canonicalized and checked against the roots. A
+    /// path that does not exist yet cannot be canonicalized, so its parent
+    /// is checked instead and the file name joined onto the canonical
+    /// parent, which yields the same shape of path either way and so the
+    /// same overlay key.
+    fn resolve(&self, uri: &lsp_types::Uri) -> Result<PathBuf> {
+        let path = uri_to_path(uri)
+            .ok_or_else(|| Error::InvalidUri(uri.as_str().to_string()))?;
+        if path.exists() {
+            return validate_path_against_roots(&path, self.roots);
+        }
         let parent = path.parent().ok_or_else(|| {
             Error::ApplyRefused(format!("{} has no parent directory", path.display()))
         })?;
         let file_name = path.file_name().ok_or_else(|| {
             Error::ApplyRefused(format!("{} has no file name", path.display()))
         })?;
-        let canonical_parent = validate_path_against_roots(parent, &self.roots)?;
+        let canonical_parent = validate_path_against_roots(parent, self.roots)?;
         Ok(canonical_parent.join(file_name))
     }
 
-    fn validate_resource_operation(&self, operation: &Operation) -> Result<()> {
-        match operation {
-            Operation::Delete { uri, .. } => {
-                if !self.config.allow_file_deletion {
-                    return Err(Error::ApplyRefused(format!(
-                        "{} would be deleted, but `apply.allow_file_deletion` is false",
-                        uri.as_str()
-                    )));
-                }
-                self.resolve_existing(uri)?;
-                Ok(())
-            }
-            Operation::Rename { old, new, .. } => {
-                self.resolve_existing(old)?;
-                self.resolve_new(new)?;
-                Ok(())
-            }
-            Operation::Create { .. } | Operation::Edit { .. } => Ok(()),
+    /// What `path` holds at this point in the plan, reading disk on the
+    /// first touch and the overlay thereafter.
+    fn presence(&self, path: &Path) -> Presence {
+        if let Some(known) = self.overlay.get(path) {
+            return known.clone();
+        }
+        if !path.exists() {
+            return Presence::Absent;
+        }
+        if path.is_dir() {
+            return Presence::Opaque;
+        }
+        fs::read_to_string(path).map_or(Presence::Opaque, Presence::Text)
+    }
+
+    fn record_change(&mut self, path: &Path, edits: usize) {
+        if let Some(existing) = self
+            .files_changed
+            .iter_mut()
+            .find(|change| change.path == path)
+        {
+            existing.edits += edits;
+        } else {
+            self.files_changed.push(FileChange {
+                path: path.to_path_buf(),
+                edits,
+            });
         }
     }
 
-    fn perform_resource_operations(&self, operations: &[Operation]) -> Result<()> {
-        for operation in operations {
-            match operation {
-                Operation::Rename { old, new, .. } => {
-                    let from = self.resolve_existing(old)?;
-                    let to = self.resolve_new(new)?;
-                    fs::rename(&from, &to).map_err(|e| Error::FileIo {
-                        path: to,
-                        source: e,
-                    })?;
-                }
-                Operation::Delete { uri, recursive } => {
-                    let path = self.resolve_existing(uri)?;
-                    let outcome = if *recursive && path.is_dir() {
-                        fs::remove_dir_all(&path)
-                    } else {
-                        fs::remove_file(&path)
-                    };
-                    outcome.map_err(|e| Error::FileIo { path, source: e })?;
-                }
-                Operation::Create { .. } | Operation::Edit { .. } => {}
+    fn plan_edit(&mut self, uri: &lsp_types::Uri, edits: &[lsp_types::TextEdit]) -> Result<()> {
+        let path = self.resolve(uri)?;
+        let previous = match self.presence(&path) {
+            Presence::Text(text) => text,
+            Presence::Absent => {
+                return Err(Error::ApplyRefused(format!(
+                    "{} does not exist, so its edits cannot be applied",
+                    path.display()
+                )));
             }
+            Presence::Opaque => {
+                return Err(Error::ApplyRefused(format!(
+                    "{} is not an editable text file",
+                    path.display()
+                )));
+            }
+        };
+
+        let mut content = previous.clone();
+        // `edits` is ordered so each splice leaves every not-yet-applied
+        // range valid, so the table is rebuilt per edit against the text as
+        // it stands.
+        for edit in edits {
+            let table = LineTable::new(&content);
+            let range = table.byte_range(edit.range, &self.converter)?;
+            content.replace_range(range, &edit.new_text);
         }
+
+        self.overlay
+            .insert(path.clone(), Presence::Text(content.clone()));
+        self.steps.push(Step::Write {
+            path: path.clone(),
+            content,
+            previous: Some(previous),
+        });
+        self.record_change(&path, edits.len());
         Ok(())
+    }
+
+    fn plan_create(
+        &mut self,
+        uri: &lsp_types::Uri,
+        overwrite: bool,
+        ignore_if_exists: bool,
+    ) -> Result<()> {
+        let path = self.resolve(uri)?;
+        let previous = match self.presence(&path) {
+            Presence::Absent => None,
+            existing => {
+                // `overwrite` wins over `ignore_if_exists` per the LSP spec.
+                if !overwrite {
+                    if ignore_if_exists {
+                        return Ok(());
+                    }
+                    return Err(Error::ApplyRefused(format!(
+                        "{} already exists and the edit did not ask to overwrite it",
+                        path.display()
+                    )));
+                }
+                match existing {
+                    Presence::Text(text) => Some(text),
+                    _ => {
+                        return Err(Error::ApplyRefused(format!(
+                            "{} exists and is not a text file, so it cannot be overwritten",
+                            path.display()
+                        )));
+                    }
+                }
+            }
+        };
+
+        self.overlay
+            .insert(path.clone(), Presence::Text(String::new()));
+        self.steps.push(Step::Write {
+            path: path.clone(),
+            content: String::new(),
+            previous,
+        });
+        self.record_change(&path, 0);
+        Ok(())
+    }
+
+    fn plan_rename(
+        &mut self,
+        old: &lsp_types::Uri,
+        new: &lsp_types::Uri,
+        overwrite: bool,
+        ignore_if_exists: bool,
+    ) -> Result<()> {
+        let from = self.resolve(old)?;
+        let to = self.resolve(new)?;
+
+        let moving = match self.presence(&from) {
+            Presence::Absent => {
+                return Err(Error::ApplyRefused(format!(
+                    "{} does not exist, so it cannot be renamed",
+                    from.display()
+                )));
+            }
+            present => present,
+        };
+
+        if !matches!(self.presence(&to), Presence::Absent) {
+            if !overwrite {
+                if ignore_if_exists {
+                    return Ok(());
+                }
+                return Err(Error::ApplyRefused(format!(
+                    "{} already exists and the edit did not ask to overwrite it",
+                    to.display()
+                )));
+            }
+            let trash = self.trash_path(&to)?;
+            self.steps.push(Step::Trash {
+                path: to.clone(),
+                trash,
+            });
+        }
+
+        self.overlay.insert(from.clone(), Presence::Absent);
+        self.overlay.insert(to.clone(), moving);
+        self.steps.push(Step::Move { from, to });
+        Ok(())
+    }
+
+    fn plan_delete(
+        &mut self,
+        uri: &lsp_types::Uri,
+        recursive: bool,
+        ignore_if_not_exists: bool,
+    ) -> Result<()> {
+        if !self.config.allow_file_deletion {
+            return Err(Error::ApplyRefused(format!(
+                "{} would be deleted, but `apply.allow_file_deletion` is false",
+                uri.as_str()
+            )));
+        }
+
+        let path = self.resolve(uri)?;
+        if matches!(self.presence(&path), Presence::Absent) {
+            if ignore_if_not_exists {
+                return Ok(());
+            }
+            return Err(Error::ApplyRefused(format!(
+                "{} does not exist, so it cannot be deleted",
+                path.display()
+            )));
+        }
+
+        if !recursive
+            && path.is_dir()
+            && fs::read_dir(&path)
+                .map_err(|e| Error::FileIo {
+                    path: path.clone(),
+                    source: e,
+                })?
+                .next()
+                .is_some()
+        {
+            return Err(Error::ApplyRefused(format!(
+                "{} is a non-empty directory and the edit did not ask for a recursive delete",
+                path.display()
+            )));
+        }
+
+        let trash = self.trash_path(&path)?;
+        self.overlay.insert(path.clone(), Presence::Absent);
+        self.steps.push(Step::Trash { path, trash });
+        Ok(())
+    }
+
+    /// Sibling path a removed file is parked at until the run finishes.
+    /// The step index keeps two removals in one directory from colliding.
+    fn trash_path(&self, path: &Path) -> Result<PathBuf> {
+        let parent = path.parent().ok_or_else(|| {
+            Error::ApplyRefused(format!("{} has no parent directory", path.display()))
+        })?;
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| {
+                Error::ApplyRefused(format!("{} has no file name", path.display()))
+            })?
+            .to_string_lossy()
+            .into_owned();
+        let index = self.steps.len();
+        Ok(parent.join(format!(".{file_name}.mcpls-trash{index}")))
     }
 }
 ```
 
-`validate_path_against_roots` lives in `bridge/translator/routing.rs`. If either that
-function or the `routing` module is private, widen it to `pub(crate)` so `apply` can reach
-it, rather than writing a second confinement check that could drift from the first.
-
-If `crate::util` has no `uri_to_path`, use whatever the translator already uses to convert a `Uri` into a `PathBuf`. Find it with:
+`crate::bridge::translator` must re-export `ResourceOperation` and `resource_operations_from_plan` for the import above to resolve. `translator/mod.rs` line 39 already carries `pub use dto::*`, so Task 5's additions to `dto.rs` come through it; confirm with:
 
 ```bash
-rg -n "fn .*uri.*path|fn .*path.*uri" crates/mcpls-core/src/util.rs
+rg -n "pub use dto" /home/lev/Git/lev/mcpls/crates/mcpls-core/src/bridge/translator/mod.rs
 ```
-
-Add the two fields to `Translator` in `crates/mcpls-core/src/bridge/translator/mod.rs`, beside `notification_cache`:
-
-```rust
-    /// Serializes every apply-enabled tool call. Two concurrent applies to
-    /// one file would otherwise both pass validation and the second would
-    /// overwrite the first.
-    apply_lock: Arc<tokio::sync::Mutex<()>>,
-
-    /// `None` when no tool is permitted to write, which is the default.
-    applier: Option<Arc<Applier>>,
-```
-
-with a `with_applier(mut self, applier: Arc<Applier>) -> Self` builder matching the existing `with_notification_cache` style, and `apply_lock: Arc::new(tokio::sync::Mutex::new(()))` plus `applier: None` in the constructor.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -1888,27 +2725,270 @@ Expected: PASS, all tests across the four apply modules.
 
 ```bash
 cargo clippy -p mcpls-core --all-targets
-git add crates/mcpls-core/src/bridge/
-git commit -m "feat(apply): add confined workspace edit applier"
+git add crates/mcpls-core/src/bridge/apply/
+git commit -m "feat(apply): plan workspace edits into a journal"
 ```
 
 ---
 
-### Task 9: Apply from `rename_symbol`
+### Task 9: Wire the applier into the translator and into `serve_with`
+
+**Files:**
+- Modify: `crates/mcpls-core/src/bridge/translator/mod.rs` (the `Translator` struct at line 58, `Translator::new` at line 126)
+- Modify: `crates/mcpls-core/src/lib.rs:620-625` (the translator construction inside `serve_with`)
+- Test: `crates/mcpls-core/src/bridge/translator/mod.rs` and `crates/mcpls-core/src/lib.rs` (both have `#[cfg(test)] mod tests`)
+
+**Interfaces:**
+- Consumes: `Applier` and `ApplyConfig` (Tasks 8 and 1), `Error::ApplyDisabled` (Task 2).
+- Produces: `Translator::with_applier(self, Arc<Applier>) -> Self`, `Translator::applier_for(&self, ToolKind, &'static str, &'static str) -> Result<Arc<Applier>>`, the private fields `apply_lock: Arc<Mutex<()>>` and `applier: Arc<Applier>`, and the private free function `build_translator(...)` in `lib.rs`.
+
+Without this task every later one is dead code: `serve_with` builds its translator with four `with_*` calls and no applier, so `apply: true` would return `ApplyDisabled` no matter what `mcpls.toml` said, and nothing in the suite would notice until the end-to-end test in Task 15.
+
+`applier` is not an `Option`. A translator with no writable tools carries an applier whose config permits nothing, which is exactly what a default `ApplyConfig` means, and `permits` is then the single gate rather than one gate plus a `None` branch at every call site.
+
+`apply_lock` serializes every apply-enabled call for its whole duration, so two concurrent applies to one file cannot both plan against the same pre-edit content and have the second overwrite the first. Task 14 also uses that window to decide when an inbound `workspace/applyEdit` is honored.
+
+`serve_with`'s translator construction moves into a named function so a test can build the same translator the server runs on. Asserting on a helper that `serve_with` might not call would prove nothing.
+
+- [ ] **Step 1: Write the failing tests**
+
+Add to the `tests` module in `crates/mcpls-core/src/bridge/translator/mod.rs`:
+
+```rust
+#[test]
+#[allow(clippy::expect_used)]
+fn test_applier_for_refuses_a_tool_its_config_forbids() {
+    let applier = std::sync::Arc::new(crate::bridge::apply::Applier::new(
+        Vec::new(),
+        crate::config::ApplyConfig {
+            rename: true,
+            ..crate::config::ApplyConfig::default()
+        },
+    ));
+    let translator = Translator::new().with_applier(applier);
+
+    assert!(
+        translator
+            .applier_for(ToolKind::Rename, "rename_symbol", "apply.rename")
+            .is_ok()
+    );
+
+    let error = translator
+        .applier_for(
+            ToolKind::FormatDocument,
+            "format_document",
+            "apply.format_document",
+        )
+        .expect_err("format_document is not permitted");
+    assert!(
+        error.to_string().contains("apply.format_document"),
+        "the error names the key that would permit it: {error}"
+    );
+}
+
+#[test]
+fn test_a_default_translator_permits_no_writes() {
+    let translator = Translator::new();
+    for (tool, name, key) in [
+        (ToolKind::Rename, "rename_symbol", "apply.rename"),
+        (
+            ToolKind::FormatDocument,
+            "format_document",
+            "apply.format_document",
+        ),
+        (ToolKind::CodeActions, "apply_code_action", "apply.code_actions"),
+    ] {
+        assert!(
+            translator.applier_for(tool, name, key).is_err(),
+            "{name} must be refused with no [apply] table"
+        );
+    }
+}
+```
+
+Add to the `tests` module in `crates/mcpls-core/src/lib.rs`:
+
+```rust
+#[test]
+#[allow(clippy::expect_used)]
+fn test_serve_translator_carries_the_configured_apply_permissions() {
+    let config: ServerConfig = toml::from_str("[apply]\nrename = true\n")
+        .expect("config parses");
+    let translator = build_translator(
+        &config,
+        Vec::new(),
+        HashMap::new(),
+        ToolRouter::default(),
+        Arc::new(Mutex::new(NotificationCache::new())),
+    );
+
+    assert!(
+        translator
+            .applier_for(
+                crate::config::ToolKind::Rename,
+                "rename_symbol",
+                "apply.rename"
+            )
+            .is_ok(),
+        "`[apply] rename = true` must reach the translator serve_with runs on"
+    );
+}
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `cargo test -p mcpls-core --lib applier_for; cargo test -p mcpls-core --lib serve_translator`
+Expected: FAIL to compile, `no method named 'with_applier'` and `cannot find function 'build_translator'`.
+
+- [ ] **Step 3: Write the implementation**
+
+Add the two fields to `Translator` in `crates/mcpls-core/src/bridge/translator/mod.rs`, beside `notification_cache`:
+
+```rust
+    /// Serializes every apply-enabled tool call. Two concurrent applies to
+    /// one file would otherwise both plan against the same pre-edit
+    /// content and the second would overwrite the first.
+    apply_lock: Arc<Mutex<()>>,
+
+    /// Writes a permitted `WorkspaceEdit` to the working tree. Always
+    /// present; a translator that may not write carries one whose
+    /// `ApplyConfig` permits nothing.
+    applier: Arc<Applier>,
+```
+
+In `Translator::new`, add:
+
+```rust
+            apply_lock: Arc::new(Mutex::new(())),
+            applier: Arc::new(Applier::new(Vec::new(), ApplyConfig::default())),
+```
+
+Add the builder and the gate, beside `with_notification_cache`:
+
+```rust
+    /// Install the applier that permitted tools write through.
+    ///
+    /// Only called during single-owner setup (mirrors
+    /// [`Self::with_router`]), before the translator is shared.
+    #[must_use]
+    pub fn with_applier(mut self, applier: Arc<Applier>) -> Self {
+        self.applier = applier;
+        self
+    }
+
+    /// The applier, if `tool` is permitted to write.
+    ///
+    /// Called before any LSP request, so a refused call costs nothing and
+    /// reports the config key that would allow it rather than a generic
+    /// permission error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ApplyDisabled`] naming `config_key` when the tool's
+    /// key is `false`.
+    pub(crate) fn applier_for(
+        &self,
+        tool: ToolKind,
+        tool_name: &'static str,
+        config_key: &'static str,
+    ) -> Result<Arc<Applier>> {
+        if self.applier.config().permits(tool) {
+            Ok(Arc::clone(&self.applier))
+        } else {
+            Err(Error::ApplyDisabled {
+                tool: tool_name,
+                config_key,
+            })
+        }
+    }
+```
+
+Add to the imports at the top of `translator/mod.rs`:
+
+```rust
+use crate::bridge::apply::Applier;
+use crate::config::ApplyConfig;
+```
+
+`Mutex` in that module already refers to `tokio::sync::Mutex` (see `respawn_locks`), and `Error`, `Result`, `ToolKind`, and `Arc` are already imported.
+
+In `crates/mcpls-core/src/lib.rs`, extract the construction at lines 620 to 625 into a free function beside `serve_with`:
+
+```rust
+/// Build the translator `serve_with` runs on.
+///
+/// A named function rather than an inline chain so a test can construct
+/// the same translator the server does, and so a new `with_*` call cannot
+/// be added to one and forgotten in the other.
+fn build_translator(
+    config: &ServerConfig,
+    workspace_roots: Vec<PathBuf>,
+    extension_map: HashMap<String, String>,
+    router: ToolRouter,
+    notification_cache: Arc<Mutex<NotificationCache>>,
+) -> Translator {
+    let applier = Arc::new(Applier::new(workspace_roots.clone(), config.apply.clone()));
+    let mut translator = Translator::new()
+        .with_resource_limits(config.workspace.resource_limits())
+        .with_extensions(extension_map)
+        .with_router(router)
+        .with_notification_cache(notification_cache)
+        .with_applier(applier);
+    translator.set_workspace_roots(workspace_roots);
+    translator
+}
+```
+
+Replace lines 620 to 625 with the call:
+
+```rust
+    let mut translator = build_translator(
+        &config,
+        workspace_roots.clone(),
+        extension_map,
+        router,
+        Arc::clone(&notification_cache),
+    );
+```
+
+The `translator.set_workspace_roots(workspace_roots.clone());` line that followed is now inside `build_translator`; delete it. `translator` stays `mut` because `set_expected_servers` and the later registration calls still take it that way.
+
+Add `use crate::bridge::apply::Applier;` to `lib.rs`'s imports. The new test also needs `ServerConfig`, `ToolRouter`, `NotificationCache`, `HashMap`, `Arc`, and `Mutex` in scope inside `lib.rs`'s `tests` module; `serve_with` already imports all six at module level, so a `use super::*;` in the test module covers them.
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `cargo test -p mcpls-core --lib`
+Expected: PASS, 3 new tests plus everything already green.
+
+- [ ] **Step 5: Check lints and commit**
+
+```bash
+cargo clippy -p mcpls-core --all-targets
+git add crates/mcpls-core/src/
+git commit -m "feat(apply): wire the applier into serve_with"
+```
+
+---
+
+### Task 10: Apply from `rename_symbol`
 
 **Files:**
 - Modify: `crates/mcpls-core/src/bridge/translator/edits.rs` (`handle_rename`)
+- Modify: `crates/mcpls-core/src/bridge/translator/dto.rs` (`RenameResult`)
 - Modify: `crates/mcpls-core/src/mcp/tools.rs` (`RenameParams`)
-- Modify: `crates/mcpls-core/src/mcp/server.rs:297-315` (the `rename_symbol` tool) and `:182-201` (the annotation default)
+- Modify: `crates/mcpls-core/src/mcp/server.rs:182-201` (the annotation default), `:290-315` (the `rename_symbol` tool), `:1609` (the classification table)
+- Modify: `crates/mcpls-core/src/mcp/tool_surface.json`
 - Test: `crates/mcpls-core/src/bridge/translator/edits.rs`
 
 **Interfaces:**
-- Consumes: `Applier` and `ApplySummary` (Task 8), `ApplyConfig::permits` (Task 1), `Error::ApplyDisabled` (Task 2).
+- Consumes: `Applier::apply` (Task 8), `Translator::applier_for` and `apply_lock` (Task 9).
 - Produces: `handle_rename(&self, file_path: String, line: u32, character: u32, new_name: String, apply: bool) -> Result<RenameResult>`, and `RenameResult` gains `applied: bool` and `files_written: Vec<String>`.
 
-`mcp/server.rs:182-201` currently stamps read-only annotations onto every tool and carries a doc comment asserting that every mcpls tool is a read-only query, backed by `test_tool_annotation_classifications_match_intent`. That guardrail fires now, by design. Give `rename_symbol` an explicit annotation with `read_only_hint: false` and `destructive_hint: true`, and update the doc comment so it describes the new rule: tools are read-only unless they declare otherwise.
+`mcp/server.rs:182-192` stamps read-only annotations onto every tool and carries a doc comment asserting that every mcpls tool is a read-only query, with a comment above `rename_symbol` itself saying "mcpls has no write-back path today; revisit if that changes". This is that change. Give `rename_symbol` explicit annotations and rewrite both comments to state the rule that now holds.
 
 - [ ] **Step 1: Write the failing test**
+
+Add to the `tests` module in `crates/mcpls-core/src/bridge/translator/edits.rs`:
 
 ```rust
 #[tokio::test]
@@ -1918,7 +2998,7 @@ async fn test_rename_with_apply_is_refused_when_config_forbids_it() {
     let error = translator
         .handle_rename("/w/a.rs".to_string(), 1, 1, "new".to_string(), true)
         .await
-        .expect_err("apply must be refused without an applier");
+        .expect_err("apply must be refused by a read-only translator");
     let message = error.to_string();
     assert!(
         message.contains("apply.rename"),
@@ -1927,6 +3007,8 @@ async fn test_rename_with_apply_is_refused_when_config_forbids_it() {
 }
 ```
 
+`Translator::new()` builds an offline translator with no servers registered, and the gate runs before any routing, so this fails on the permission check rather than on "no server configured".
+
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p mcpls-core --lib test_rename_with_apply_is_refused`
@@ -1934,7 +3016,7 @@ Expected: FAIL to compile, `handle_rename` takes 4 arguments.
 
 - [ ] **Step 3: Write the implementation**
 
-Add the parameter to `handle_rename` and, before any LSP work, the gate:
+Add the parameter to `handle_rename` and gate before any LSP work:
 
 ```rust
     pub async fn handle_rename(
@@ -1954,54 +3036,61 @@ Add the parameter to `handle_rename` and, before any LSP work, the gate:
         };
 ```
 
-Add the helper to `Translator` in `bridge/translator/mod.rs`:
+Task 5 left the tail of `handle_rename` building `changes` from `plan.operations()` by reference, so the plan is still alive here. Replace its final `Ok(RenameResult { ... })` with:
 
 ```rust
-    /// The applier, if `tool` is permitted to write.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::ApplyDisabled`] naming `config_key` when no applier
-    /// is configured or the tool's key is `false`.
-    fn applier_for(
-        &self,
-        tool: ToolKind,
-        tool_name: &'static str,
-        config_key: &'static str,
-    ) -> Result<Arc<Applier>> {
-        self.applier
-            .as_ref()
-            .filter(|applier| applier.config().permits(tool))
-            .map(Arc::clone)
-            .ok_or(Error::ApplyDisabled {
-                tool: tool_name,
-                config_key,
-            })
-    }
-```
+        let (changes, resource_operations, applied, files_written) = if let Some(edit) = response
+        {
+            let plan = EditPlan::from_workspace_edit(edit)?;
+            let resource_operations = resource_operations_from_plan(&plan);
+            let mut result_changes = Vec::new();
+            for operation in plan.operations() {
+                if let Operation::Edit { uri, edits, .. } = operation {
+                    let mut text_edits = Vec::with_capacity(edits.len());
+                    for e in edits {
+                        text_edits.push(TextEdit {
+                            range: ctx.normalize_range(uri, e.range).await,
+                            new_text: e.new_text.clone(),
+                        });
+                    }
+                    result_changes.push(DocumentChanges {
+                        uri: uri.to_string(),
+                        edits: text_edits,
+                    });
+                }
+            }
 
-and a `config(&self) -> &ApplyConfig` accessor on `Applier`.
+            let (applied, files_written) = if let Some(applier) = applier {
+                // Held for the whole apply, so a second apply-enabled call
+                // cannot plan against content this one is about to replace.
+                let _guard = self.apply_lock.lock().await;
+                let summary = applier
+                    .apply(plan, self.position_encoding_for(&server_id))
+                    .await?;
+                (
+                    true,
+                    summary
+                        .files_changed
+                        .iter()
+                        .map(|change| change.path.display().to_string())
+                        .collect(),
+                )
+            } else {
+                (false, Vec::new())
+            };
 
-At the end of `handle_rename`, after the plan is built, apply when asked. Hold the lock across the whole apply:
-
-```rust
-        let (applied, files_written) = if let Some(applier) = applier {
-            let _guard = self.apply_lock.lock().await;
-            let summary = applier.apply(plan).await?;
-            (
-                true,
-                summary
-                    .files_changed
-                    .iter()
-                    .map(|c| c.path.display().to_string())
-                    .collect(),
-            )
+            (result_changes, resource_operations, applied, files_written)
         } else {
-            (false, Vec::new())
+            (vec![], vec![], false, vec![])
         };
-```
 
-This requires keeping the `EditPlan` rather than consuming it while building `changes`; build `changes` from `plan.operations()` by reference, as Task 5 already does.
+        Ok(RenameResult {
+            changes,
+            resource_operations,
+            applied,
+            files_written,
+        })
+```
 
 Add to `RenameResult` in `dto.rs`:
 
@@ -2018,8 +3107,7 @@ Add to `RenameResult` in `dto.rs`:
 Add to `RenameParams` in `mcp/tools.rs`:
 
 ```rust
-    /// Write the edits to disk instead of only describing them. Requires
-    /// `apply.rename = true` in mcpls.toml.
+    /// Write the edits to disk instead of only describing them.
     #[schemars(
         description = "Write the edits to disk instead of only describing them. \
                        Requires apply.rename = true in mcpls.toml."
@@ -2028,26 +3116,72 @@ Add to `RenameParams` in `mcp/tools.rs`:
     pub apply: bool,
 ```
 
-Update the `rename_symbol` tool in `mcp/server.rs` to destructure and forward `apply`, and give it an explicit annotation so the read-only default does not apply to it:
+Update the `rename_symbol` tool in `mcp/server.rs`: drop the two-line "read-only" comment above it, destructure `apply`, forward it, and declare annotations so the router's read-only default no longer covers it:
 
 ```rust
+    /// Rename a symbol across the workspace, optionally writing the edits.
     #[tool(
         description = "Rename symbol across workspace. Returns text edits for all files \
-                       where symbol is used. With apply=true and apply.rename enabled in \
+                       where symbol is used. With apply=true, and apply.rename enabled in \
                        config, writes those edits to disk.",
         title = "Rename Symbol",
         annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false)
     )]
+    async fn rename_symbol(
+        &self,
+        Parameters(RenameParams {
+            position:
+                PositionParams {
+                    file_path,
+                    line,
+                    character,
+                },
+            new_name,
+            apply,
+        }): Parameters<RenameParams>,
+    ) -> Result<String, McpError> {
+        to_tool_result(
+            self.context
+                .translator
+                .handle_rename(file_path, line, character, new_name, apply)
+                .await,
+        )
+    }
 ```
 
-Update the `tool_router` doc comment at `mcp/server.rs:182-192` so it states the rule that now holds: every tool inherits read-only annotations unless it declares its own, and `rename_symbol` declares its own because it can write.
+Rewrite the `tool_router` doc comment at `mcp/server.rs:182-192` so it describes the rule that now holds rather than the one that no longer does:
 
-Update `test_tool_annotation_classifications_match_intent` to expect `rename_symbol` in the writing set.
+```rust
+    /// Router for every MCP tool, with the read-only classification applied
+    /// as a default.
+    ///
+    /// Most mcpls tools are read-only LSP queries, so applying that once
+    /// here replaces an identical `annotations(...)` block on each `#[tool]`
+    /// attribute. A tool that can write to disk declares its own
+    /// annotations and keeps them;
+    /// `test_tool_annotation_classifications_match_intent` forces any such
+    /// tool to write down an explicit classification rather than inherit
+    /// this default silently.
+```
+
+Update `test_tool_annotation_classifications_match_intent`'s table row:
+
+```rust
+            ("rename_symbol", false, true, false),
+```
+
+Regenerate the golden tool surface: the description, input schema, and annotations of `rename_symbol` all changed.
+
+```bash
+cargo test -p mcpls-core --lib dump_tool_surface -- --ignored --nocapture > /tmp/tool_surface.txt
+```
+
+Copy the JSON array out of `/tmp/tool_surface.txt` into `crates/mcpls-core/src/mcp/tool_surface.json`, then read the diff before staging it: only `rename_symbol` should have moved.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p mcpls-core`
-Expected: PASS. Fix any call site of `handle_rename` the compiler names by passing `false`.
+Expected: PASS. The compiler will name every other call site of `handle_rename`; pass `false` at each.
 
 - [ ] **Step 5: Check lints and commit**
 
@@ -2059,19 +3193,21 @@ git commit -m "feat(rename): apply rename edits when config allows"
 
 ---
 
-### Task 10: Apply from `format_document`
+### Task 11: Apply from `format_document`
 
 **Files:**
 - Modify: `crates/mcpls-core/src/bridge/translator/edits.rs` (`handle_format_document`)
+- Modify: `crates/mcpls-core/src/bridge/translator/dto.rs` (`FormatDocumentResult`)
 - Modify: `crates/mcpls-core/src/mcp/tools.rs` (`FormatDocumentParams`)
-- Modify: `crates/mcpls-core/src/mcp/server.rs` (the `format_document` tool)
+- Modify: `crates/mcpls-core/src/mcp/server.rs:359-380` (the `format_document` tool) and `:1609` (the classification table)
+- Modify: `crates/mcpls-core/src/mcp/tool_surface.json`
 - Test: `crates/mcpls-core/src/bridge/translator/edits.rs`
 
 **Interfaces:**
-- Consumes: everything Task 9 consumes, plus `Translator::applier_for`.
+- Consumes: everything Task 10 consumes.
 - Produces: `handle_format_document(&self, file_path: String, tab_size: u32, insert_spaces: bool, apply: bool) -> Result<FormatDocumentResult>`, and `FormatDocumentResult` gains `applied: bool`.
 
-A formatting response is a `Vec<TextEdit>` for one document rather than a `WorkspaceEdit`, so it is wrapped into one before reaching the applier. That keeps a single normalization and a single write path.
+A formatting response is a `Vec<TextEdit>` for one document rather than a `WorkspaceEdit`, so it is wrapped into one before reaching the applier. That keeps a single normalization and a single write path, and it is where the same-position insert ordering from Task 4 earns its keep: formatters routinely emit several inserts at one point.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2083,7 +3219,7 @@ async fn test_format_with_apply_is_refused_when_config_forbids_it() {
     let error = translator
         .handle_format_document("/w/a.rs".to_string(), 4, true, true)
         .await
-        .expect_err("apply must be refused without an applier");
+        .expect_err("apply must be refused by a read-only translator");
     assert!(
         error.to_string().contains("apply.format_document"),
         "the error names the config key"
@@ -2098,7 +3234,7 @@ Expected: FAIL to compile, `handle_format_document` takes 3 arguments.
 
 - [ ] **Step 3: Write the implementation**
 
-Gate at the top of `handle_format_document`, exactly as Task 9 does:
+Gate at the top of `handle_format_document`, before `prepare_gated_document`:
 
 ```rust
         let applier = if apply {
@@ -2112,30 +3248,75 @@ Gate at the top of `handle_format_document`, exactly as Task 9 does:
         };
 ```
 
-After the LSP response yields `Vec<lsp_types::TextEdit>`, wrap and apply:
+The handler currently consumes `edits` while building `result_edits`. Keep the LSP edits so they can be applied, and return `applied`:
 
 ```rust
+        let edits = response.unwrap_or_default();
+
+        let mut result_edits = Vec::with_capacity(edits.len());
+        for edit in &edits {
+            result_edits.push(TextEdit {
+                range: ctx.normalize_range(&response_uri, edit.range).await,
+                new_text: edit.new_text.clone(),
+            });
+        }
+
         let applied = if let Some(applier) = applier {
             let mut changes = std::collections::HashMap::new();
-            changes.insert(response_uri.clone(), lsp_edits.clone());
+            changes.insert(response_uri.clone(), edits);
             let plan = EditPlan::from_workspace_edit(lsp_types::WorkspaceEdit {
                 changes: Some(changes),
                 ..lsp_types::WorkspaceEdit::default()
             })?;
             let _guard = self.apply_lock.lock().await;
-            applier.apply(plan).await?;
+            applier
+                .apply(plan, self.position_encoding_for(&server_id))
+                .await?;
             true
         } else {
             false
         };
+
+        Ok(FormatDocumentResult {
+            edits: result_edits,
+            applied,
+        })
 ```
 
-Add `applied: bool` with `#[serde(default)]` to `FormatDocumentResult`, add the same `apply` parameter to `FormatDocumentParams` with a description naming `apply.format_document`, forward it from the tool, and give `format_document` the same explicit annotation Task 9 gave `rename_symbol`.
+Add to `FormatDocumentResult` in `dto.rs`:
+
+```rust
+    /// Whether the edits were written to disk.
+    #[serde(default)]
+    pub applied: bool,
+```
+
+Add to `FormatDocumentParams` in `mcp/tools.rs`:
+
+```rust
+    /// Write the edits to disk instead of only describing them.
+    #[schemars(
+        description = "Write the edits to disk instead of only describing them. \
+                       Requires apply.format_document = true in mcpls.toml."
+    )]
+    #[serde(default)]
+    pub apply: bool,
+```
+
+Update the `format_document` tool the way Task 10 updated `rename_symbol`: drop the "read-only" comment above it, destructure and forward `apply`, extend the description, and add `annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = true)`. Formatting is idempotent in a way renaming is not: running it twice on the same file produces the same file.
+
+Update the classification table row:
+
+```rust
+            ("format_document", false, true, true),
+```
+
+Regenerate `tool_surface.json` with the command from the Global Constraints section and check that only `format_document` moved.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p mcpls-core`
-Expected: PASS.
+Expected: PASS. Pass `false` at every existing `handle_format_document` call site the compiler names.
 
 - [ ] **Step 5: Check lints and commit**
 
@@ -2147,30 +3328,50 @@ git commit -m "feat(format): apply formatting edits when config allows"
 
 ---
 
-### Task 11: The `apply_code_action` tool
+### Task 12: The `apply_code_action` tool
 
 **Files:**
-- Modify: `crates/mcpls-core/src/bridge/translator/edits.rs`
-- Modify: `crates/mcpls-core/src/bridge/translator/dto.rs` (`CodeAction`)
-- Modify: `crates/mcpls-core/src/mcp/tools.rs`
-- Modify: `crates/mcpls-core/src/mcp/server.rs`
-- Modify: `crates/mcpls-core/src/config/routing.rs` if a new `ToolKind` is needed; it is not, `ToolKind::CodeActions` covers this route.
+- Modify: `crates/mcpls-core/src/bridge/translator/dto.rs` (`CodeAction`, plus a new `ApplyCodeActionResult`)
+- Modify: `crates/mcpls-core/src/bridge/translator/edits.rs` (`convert_code_action`, `handle_code_actions`, and a new `handle_apply_code_action`)
+- Modify: `crates/mcpls-core/src/mcp/tools.rs` (a new `ApplyCodeActionParams`)
+- Modify: `crates/mcpls-core/src/mcp/server.rs` (register the tool, extend the classification table)
+- Modify: `crates/mcpls-core/src/mcp/tool_surface.json`
 - Test: `crates/mcpls-core/src/bridge/translator/edits.rs`
 
 **Interfaces:**
-- Consumes: `Applier` (Task 8), `ApplyConfig::permits` (Task 1).
-- Produces: `handle_apply_code_action(&self, file_path: String, start_line: u32, start_character: u32, end_line: u32, end_character: u32, action: CodeActionSelector) -> Result<ApplyCodeActionResult>`, plus `CodeActionSelector { Index(usize), Title(String) }` and `ApplyCodeActionResult { title: String, applied: bool, files_written: Vec<String>, executed_command: Option<String> }`. `CodeAction` gains `data: Option<serde_json::Value>` and `index: usize`.
+- Consumes: `Applier` (Task 8), `applier_for` and `apply_lock` (Task 9).
+- Produces: `handle_apply_code_action(&self, file_path: String, start_line: u32, start_character: u32, end_line: u32, end_character: u32, action_index: Option<usize>, action_title: Option<String>) -> Result<ApplyCodeActionResult>`, the private `CodeActionSelector { Index(usize), Title(String) }` and `select_action`, and `ApplyCodeActionResult { title: String, applied: bool, files_written: Vec<String>, executed_command: Option<String> }`. `CodeAction` gains `data: Option<serde_json::Value>` and `index: usize`.
 
 `get_code_actions` returns a list, so `apply: true` on it has no defined meaning. Selection is a separate call that re-issues `textDocument/codeAction` for the same range, picks by index or exact title, resolves, and applies. Stateless, so there is no pending-edit cache to keep fresh.
 
-`resolve_support.properties = ["edit"]` and `data_support = true` are already advertised (`lsp/lifecycle.rs:431-435`), but the DTO drops `data`, which `codeAction/resolve` requires the client to send back unchanged.
+**The index must count the same entries the listing numbered.** `handle_code_actions` pushes both `CodeActionOrCommand::CodeAction` and `CodeActionOrCommand::Command` entries into the list it returns. Filtering commands out before enumerating here would shift every index after the first command and apply the wrong action with no error at all. So this tool enumerates the unfiltered response, and a `Command` entry is selectable: it goes to `workspace/executeCommand` rather than through the applier.
 
-An action that resolves to a command rather than an edit is dispatched through `workspace/executeCommand`, and the server answers by sending `workspace/applyEdit`. That inbound path is Task 12. Until Task 12 lands, a command-only action returns `executed_command: Some(..)` with `applied: false`.
+`resolve_support.properties = ["edit"]` and `data_support = true` are already advertised (`lsp/lifecycle.rs`), but the DTO drops `data`, which `codeAction/resolve` requires the client to send back unchanged. That is why `data` joins the DTO here.
+
+The selector reaches MCP as two flat optional fields rather than one untagged enum. An untagged `CodeActionSelector` does derive a working schema through rmcp, but it lands as a `$def` with a `$ref` from `properties.action`, the only one in the whole tool surface, and it makes `"3"` a title rather than an index. Two optional fields validated in the handler keep the schema flat and the meaning unambiguous; the enum stays as an internal type so `select_action` and its tests read the way they should.
+
+An action carrying both an edit and a command applies the edit and then runs the command, which is what the LSP specification requires.
 
 - [ ] **Step 1: Write the failing tests**
 
+Add to the `tests` module in `crates/mcpls-core/src/bridge/translator/edits.rs`:
+
 ```rust
+fn stub_action(index: usize, title: &str) -> CodeAction {
+    CodeAction {
+        title: title.to_string(),
+        kind: None,
+        diagnostics: Vec::new(),
+        edit: None,
+        command: None,
+        is_preferred: false,
+        data: None,
+        index,
+    }
+}
+
 #[test]
+#[allow(clippy::expect_used)]
 fn test_code_action_selector_matches_by_index() {
     let actions = vec![
         stub_action(0, "Add missing import"),
@@ -2182,6 +3383,7 @@ fn test_code_action_selector_matches_by_index() {
 }
 
 #[test]
+#[allow(clippy::expect_used)]
 fn test_code_action_selector_matches_by_exact_title() {
     let actions = vec![
         stub_action(0, "Add missing import"),
@@ -2196,8 +3398,12 @@ fn test_code_action_selector_matches_by_exact_title() {
 }
 
 #[test]
+#[allow(clippy::expect_used)]
 fn test_code_action_selector_rejects_an_ambiguous_title() {
-    let actions = vec![stub_action(0, "Fill match arms"), stub_action(1, "Fill match arms")];
+    let actions = vec![
+        stub_action(0, "Fill match arms"),
+        stub_action(1, "Fill match arms"),
+    ];
     let error = select_action(
         &actions,
         &CodeActionSelector::Title("Fill match arms".to_string()),
@@ -2212,28 +3418,44 @@ fn test_code_action_selector_rejects_an_out_of_range_index() {
     assert!(select_action(&actions, &CodeActionSelector::Index(7)).is_err());
 }
 
-fn stub_action(index: usize, title: &str) -> CodeAction {
-    CodeAction {
-        title: title.to_string(),
-        kind: None,
-        diagnostics: Vec::new(),
-        edit: None,
-        command: None,
-        is_preferred: false,
-        data: None,
-        index,
-    }
+#[test]
+#[allow(clippy::expect_used)]
+fn test_selector_from_params_requires_exactly_one_field() {
+    assert!(matches!(
+        selector_from_params(Some(2), None).expect("index alone is valid"),
+        CodeActionSelector::Index(2)
+    ));
+    assert!(matches!(
+        selector_from_params(None, Some("Fill".to_string())).expect("title alone is valid"),
+        CodeActionSelector::Title(_)
+    ));
+    assert!(selector_from_params(Some(0), Some("Fill".to_string())).is_err());
+    assert!(selector_from_params(None, None).is_err());
+}
+
+#[tokio::test]
+#[allow(clippy::expect_used)]
+async fn test_apply_code_action_is_refused_when_config_forbids_it() {
+    let translator = Translator::new();
+    let error = translator
+        .handle_apply_code_action("/w/a.rs".to_string(), 1, 1, 1, 5, Some(0), None)
+        .await
+        .expect_err("apply must be refused by a read-only translator");
+    assert!(
+        error.to_string().contains("apply.code_actions"),
+        "the error names the config key"
+    );
 }
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p mcpls-core --lib test_code_action_selector`
+Run: `cargo test -p mcpls-core --lib test_code_action_selector; cargo test -p mcpls-core --lib test_apply_code_action_is_refused`
 Expected: FAIL to compile, `cannot find function 'select_action'`.
 
 - [ ] **Step 3: Write the implementation**
 
-Add to `dto.rs`, on `CodeAction`:
+Add the two fields to `CodeAction` in `dto.rs`:
 
 ```rust
     /// Opaque payload the server needs back verbatim on
@@ -2247,17 +3469,91 @@ Add to `dto.rs`, on `CodeAction`:
     pub index: usize,
 ```
 
-Add to `edits.rs`:
+Add the result type to `dto.rs`:
+
+```rust
+/// Result of applying one code action.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplyCodeActionResult {
+    /// Title of the action that ran.
+    pub title: String,
+    /// Whether an edit reached the working tree.
+    pub applied: bool,
+    /// Files written, when `applied`.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub files_written: Vec<String>,
+    /// Command dispatched to the server, when the action carried one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub executed_command: Option<String>,
+}
+```
+
+In `convert_code_action`, set `data: action.data.clone()` and `index: 0`; `handle_code_actions` overwrites the index. Give the `Command` branch of `handle_code_actions` the same two fields (`data: None`, `index: 0`), and number the whole list as it is built:
+
+```rust
+        for (index, action_or_command) in response_vec.into_iter().enumerate() {
+            let mut action = match action_or_command {
+                lsp_types::CodeActionOrCommand::CodeAction(action) => {
+                    convert_code_action(action, &ctx, &response_uri).await
+                }
+                lsp_types::CodeActionOrCommand::Command(cmd) => {
+                    let arguments = cmd.arguments.unwrap_or_else(Vec::new);
+                    CodeAction {
+                        title: cmd.title.clone(),
+                        kind: None,
+                        diagnostics: Vec::new(),
+                        edit: None,
+                        command: Some(CommandDescription {
+                            title: cmd.title,
+                            command: cmd.command,
+                            arguments,
+                        }),
+                        is_preferred: false,
+                        data: None,
+                        index: 0,
+                    }
+                }
+            };
+            action.index = index;
+            actions.push(action);
+        }
+```
+
+Add the selector and its parsing to `edits.rs`:
 
 ```rust
 /// How a caller names the code action to apply.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(untagged)]
-pub enum CodeActionSelector {
+///
+/// Internal: the MCP surface takes two flat optional fields, which
+/// [`selector_from_params`] narrows to this.
+#[derive(Debug, Clone)]
+enum CodeActionSelector {
     /// Position in the list `get_code_actions` returned.
     Index(usize),
     /// Exact title, which must match exactly one action.
     Title(String),
+}
+
+/// Narrow the tool's two optional selector fields to exactly one selector.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidToolParams`] when neither or both are given.
+fn selector_from_params(
+    action_index: Option<usize>,
+    action_title: Option<String>,
+) -> Result<CodeActionSelector> {
+    match (action_index, action_title) {
+        (Some(index), None) => Ok(CodeActionSelector::Index(index)),
+        (None, Some(title)) => Ok(CodeActionSelector::Title(title)),
+        (Some(_), Some(_)) => Err(Error::InvalidToolParams(
+            "give either action_index or action_title, not both".to_string(),
+        )),
+        (None, None) => Err(Error::InvalidToolParams(
+            "give one of action_index or action_title to name the action to apply"
+                .to_string(),
+        )),
+    }
 }
 
 /// Pick the action `selector` names.
@@ -2294,100 +3590,251 @@ fn select_action<'a>(
 }
 ```
 
-Add `handle_apply_code_action`. It repeats the `prepare_gated_document` and
-`textDocument/codeAction` request that `handle_code_actions` performs, but keeps the raw
-LSP values rather than converting them to DTOs, because `codeAction/resolve` needs the
-server's own `data` payload back unchanged:
+Add `handle_apply_code_action` to the `impl Translator` block in `edits.rs`. It repeats the request `handle_code_actions` makes but keeps the raw LSP values, because `codeAction/resolve` needs the server's own `data` payload back unchanged:
 
 ```rust
+    /// Apply one of the code actions available for a range.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ApplyDisabled`] when `apply.code_actions` is false,
+    /// [`Error::InvalidToolParams`] when the selector names no action or an
+    /// ambiguous one, and whatever the applier returns when the edit itself
+    /// cannot be written.
+    pub async fn handle_apply_code_action(
+        &self,
+        file_path: String,
+        start_line: u32,
+        start_character: u32,
+        end_line: u32,
+        end_character: u32,
+        action_index: Option<usize>,
+        action_title: Option<String>,
+    ) -> Result<ApplyCodeActionResult> {
+        validate_code_action_params(start_line, start_character, end_line, end_character, None)?;
+        let selector = selector_from_params(action_index, action_title)?;
+        let applier =
+            self.applier_for(ToolKind::CodeActions, "apply_code_action", "apply.code_actions")?;
+
+        let (server_id, client, uri) = self
+            .prepare_gated_document(
+                &file_path,
+                ToolKind::CodeActions,
+                "codeActionProvider",
+                |caps| {
+                    matches!(
+                        caps.code_action_provider,
+                        Some(
+                            lsp_types::CodeActionProviderCapability::Simple(true)
+                                | lsp_types::CodeActionProviderCapability::Options(_)
+                        )
+                    )
+                },
+            )
+            .await?;
+        let ctx = self.encoding_ctx(&server_id);
+
+        let range = lsp_types::Range {
+            start: ctx.to_lsp(&uri, start_line, start_character).await,
+            end: ctx.to_lsp(&uri, end_line, end_character).await,
+        };
+        let params = lsp_types::CodeActionParams {
+            text_document: TextDocumentIdentifier { uri },
+            range,
+            context: lsp_types::CodeActionContext {
+                diagnostics: vec![],
+                only: None,
+                trigger_kind: Some(lsp_types::CodeActionTriggerKind::INVOKED),
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+
         let response: Option<lsp_types::CodeActionResponse> = client
             .request("textDocument/codeAction", params, client.request_timeout())
             .await?;
+        let entries = response.unwrap_or_default();
 
-        // Legacy `Command` entries carry no edit and cannot be resolved, so
-        // only `CodeAction` literals are selectable.
-        let lsp_actions: Vec<lsp_types::CodeAction> = response
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|entry| match entry {
-                lsp_types::CodeActionOrCommand::CodeAction(action) => Some(action),
-                lsp_types::CodeActionOrCommand::Command(_) => None,
-            })
-            .collect();
-
-        let selectable: Vec<CodeAction> = lsp_actions
+        // Numbered exactly as `handle_code_actions` numbers its output, so
+        // an index the caller read from that listing names the same entry
+        // here. Legacy `Command` entries occupy positions in that list, so
+        // they are numbered too rather than filtered out.
+        let selectable: Vec<CodeAction> = entries
             .iter()
             .enumerate()
-            .map(|(index, action)| CodeAction {
-                title: action.title.clone(),
-                kind: action.kind.as_ref().map(|k| k.as_str().to_string()),
-                diagnostics: Vec::new(),
-                edit: None,
-                command: None,
-                is_preferred: action.is_preferred.unwrap_or(false),
-                data: action.data.clone(),
-                index,
+            .map(|(index, entry)| {
+                let title = match entry {
+                    lsp_types::CodeActionOrCommand::CodeAction(action) => action.title.clone(),
+                    lsp_types::CodeActionOrCommand::Command(cmd) => cmd.title.clone(),
+                };
+                CodeAction {
+                    title,
+                    kind: None,
+                    diagnostics: Vec::new(),
+                    edit: None,
+                    command: None,
+                    is_preferred: false,
+                    data: None,
+                    index,
+                }
             })
             .collect();
+        let chosen_index = select_action(&selectable, &selector)?.index;
 
-        let chosen_index = select_action(&selectable, &action)?.index;
-        let lsp_action = lsp_actions[chosen_index].clone();
-
-        let resolved = if lsp_action.edit.is_none() && lsp_action.data.is_some() {
-            client
-                .request::<_, lsp_types::CodeAction>(
-                    "codeAction/resolve",
-                    lsp_action,
-                    client.request_timeout(),
-                )
-                .await?
-        } else {
-            lsp_action
+        let (title, edit, command) = match entries[chosen_index].clone() {
+            lsp_types::CodeActionOrCommand::Command(cmd) => (cmd.title.clone(), None, Some(cmd)),
+            lsp_types::CodeActionOrCommand::CodeAction(action) => {
+                let resolved = if action.edit.is_none() && action.data.is_some() {
+                    client
+                        .request::<_, lsp_types::CodeAction>(
+                            "codeAction/resolve",
+                            action,
+                            client.request_timeout(),
+                        )
+                        .await?
+                } else {
+                    action
+                };
+                (resolved.title, resolved.edit, resolved.command)
+            }
         };
 
+        // Held across both halves: an action can carry an edit and a
+        // command, and the command may itself send `workspace/applyEdit`.
         let _guard = self.apply_lock.lock().await;
 
-        if let Some(edit) = resolved.edit {
+        let mut files_written = Vec::new();
+        let mut applied = false;
+        if let Some(edit) = edit {
             let plan = EditPlan::from_workspace_edit(edit)?;
-            let summary = applier.apply(plan).await?;
-            return Ok(ApplyCodeActionResult {
-                title: resolved.title,
-                applied: true,
-                files_written: summary
+            let summary = applier
+                .apply(plan, self.position_encoding_for(&server_id))
+                .await?;
+            applied = true;
+            files_written.extend(
+                summary
                     .files_changed
                     .iter()
-                    .map(|c| c.path.display().to_string())
-                    .collect(),
-                executed_command: None,
-            });
+                    .map(|change| change.path.display().to_string()),
+            );
         }
 
-        let Some(command) = resolved.command else {
-            return Err(Error::ApplyRefused(format!(
-                "code action {:?} resolved to neither an edit nor a command",
-                resolved.title
-            )));
+        let executed_command = if let Some(command) = command {
+            client
+                .request::<_, serde_json::Value>(
+                    "workspace/executeCommand",
+                    lsp_types::ExecuteCommandParams {
+                        command: command.command.clone(),
+                        arguments: command.arguments.unwrap_or_default(),
+                        work_done_progress_params: WorkDoneProgressParams::default(),
+                    },
+                    client.request_timeout(),
+                )
+                .await?;
+            Some(command.command)
+        } else {
+            None
         };
-        client
-            .request::<_, serde_json::Value>(
-                "workspace/executeCommand",
-                lsp_types::ExecuteCommandParams {
-                    command: command.command.clone(),
-                    arguments: command.arguments.unwrap_or_default(),
-                    work_done_progress_params: WorkDoneProgressParams::default(),
-                },
-                client.request_timeout(),
-            )
-            .await?;
+
+        if !applied && executed_command.is_none() {
+            return Err(Error::ApplyRefused(format!(
+                "code action {title:?} resolved to neither an edit nor a command"
+            )));
+        }
+
         Ok(ApplyCodeActionResult {
-            title: resolved.title,
-            applied: false,
-            files_written: Vec::new(),
-            executed_command: Some(command.command),
+            title,
+            applied,
+            files_written,
+            executed_command,
         })
+    }
 ```
 
-Register the tool in `mcp/server.rs` with an explicit non-read-only annotation and a `ApplyCodeActionParams` in `mcp/tools.rs` carrying the range plus the selector.
+Extend `edits.rs`'s imports for this task: add `ApplyCodeActionResult` to the `super::dto` list, and `use std::sync::Arc;` (Task 14 needs it too).
+
+A command-only action reaches the server but the server's `workspace/applyEdit` is still answered `{"applied": false}` until Task 14, so such an action returns `applied: false` with `executed_command` set. That is honest about what happened and it is what Task 14 changes.
+
+Add `ApplyCodeActionParams` to `mcp/tools.rs`:
+
+```rust
+/// Parameters for the `apply_code_action` tool.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(description = "Parameters for applying one code action from a range.")]
+pub struct ApplyCodeActionParams {
+    /// Absolute path to the file.
+    #[schemars(description = "Absolute path to the file.")]
+    pub file_path: String,
+    /// Range in the file to operate on.
+    #[serde(flatten)]
+    pub range: RangeParams,
+    /// Position of the action in the `get_code_actions` list.
+    #[schemars(
+        description = "Position of the action in the get_code_actions list for this same \
+                       range. Give this or action_title, not both."
+    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_index: Option<usize>,
+    /// Exact title of the action.
+    #[schemars(
+        description = "Exact title of the action, which must match exactly one. Give this \
+                       or action_index, not both."
+    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_title: Option<String>,
+}
+```
+
+Register the tool in `mcp/server.rs`, next to `get_code_actions`:
+
+```rust
+    /// Apply one of the code actions available for a range.
+    #[tool(
+        description = "Apply one code action from get_code_actions for the same range, by \
+                       index or exact title. Requires apply.code_actions = true in config. \
+                       Writes the action's edits to disk.",
+        title = "Apply Code Action",
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false)
+    )]
+    async fn apply_code_action(
+        &self,
+        Parameters(ApplyCodeActionParams {
+            file_path,
+            range:
+                RangeParams {
+                    start_line,
+                    start_character,
+                    end_line,
+                    end_character,
+                },
+            action_index,
+            action_title,
+        }): Parameters<ApplyCodeActionParams>,
+    ) -> Result<String, McpError> {
+        to_tool_result(
+            self.context
+                .translator
+                .handle_apply_code_action(
+                    file_path,
+                    start_line,
+                    start_character,
+                    end_line,
+                    end_character,
+                    action_index,
+                    action_title,
+                )
+                .await,
+        )
+    }
+```
+
+Add the row to `test_tool_annotation_classifications_match_intent`. The table's length assertion checks it against the registered tool count, so the count rises by one:
+
+```rust
+            ("apply_code_action", false, true, false),
+```
+
+Regenerate `tool_surface.json` with the command from the Global Constraints section. This time a whole tool entry is new; confirm the diff adds exactly one.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -2404,33 +3851,38 @@ git commit -m "feat(actions): add apply_code_action tool"
 
 ---
 
-### Task 12: Answer inbound `workspace/applyEdit`
+### Task 13: Let the client route an inbound `workspace/applyEdit`
 
 **Files:**
-- Modify: `crates/mcpls-core/src/lsp/client.rs:119-130` (`ClientCommand`), `:521-639` (`message_loop_inner`), `:641-680` (`server_request_response` and `server_request_result`)
-- Modify: `crates/mcpls-core/src/bridge/translator/edits.rs` (install the sink around a code-action apply)
-- Test: `crates/mcpls-core/src/lsp/client.rs`
+- Modify: `crates/mcpls-core/src/lsp/client.rs`: the `LspClient` struct and its hand-written `Clone` (lines 99 to 113), `ClientCommand` (116 to 130), `new` (137 to 152), `from_transport` (158 to 180), `from_transport_with_notifications` (186 to 203), `message_loop` (488), `message_loop_inner` (521 to 639), `server_request_response` (641), `server_request_result` (657)
+- Test: `crates/mcpls-core/src/lsp/client.rs` (the existing `#[cfg(test)] mod tests` at line 693)
 
 **Interfaces:**
-- Consumes: `Applier` (Task 8), the apply mutex on `Translator`.
-- Produces: `ClientCommand::SendResponse { response: JsonRpcResponse }`, `LspClient::set_apply_sink(&self, sink: Option<ApplySink>)`, and `type ApplySink = mpsc::Sender<(WorkspaceEdit, oneshot::Sender<bool>)>`.
+- Consumes: nothing from earlier tasks.
+- Produces: `pub type ApplySink = mpsc::Sender<(lsp_types::WorkspaceEdit, oneshot::Sender<bool>)>`, `LspClient::set_apply_sink(&self, sink: Option<ApplySink>)`, and `ClientCommand::SendResponse { response: JsonRpcResponse }`.
 
-The message loop must never await the applier inline. It is a single `select!` over the command channel and the transport, and the applier's own resync sends notifications back through that same command channel, which has capacity 100 (`client.rs:163`). A rename touching 51 files sends 102 notifications, fills the channel, and blocks the applier against the loop that would drain it. So the request is handed to a spawned task, which answers later through `ClientCommand::SendResponse`.
+`client.rs:672` currently answers `workspace/applyEdit` with `{"applied": false}` unconditionally. Four of the servers in use send that request: gopls, vtsls, typescript-language-server, and lua-language-server all deliver some assists as `workspace/executeCommand` followed by an inbound edit. Without this path, those assists silently do nothing.
 
-The sink exists only while a code-action apply holds the apply mutex. Outside that window there is no sink and the answer stays `{"applied": false}`, so a server cannot write to the tree at a moment of its own choosing.
+**The message loop must never await the applier inline.** It is a single `select!` over the command channel and the transport, and the applier's own follow-up notifications go back through that same command channel, which has capacity 100. A rename touching 51 files would fill it and block the applier against the very loop that drains it. So the request is handed to a spawned task, which writes its answer later through `ClientCommand::SendResponse`.
+
+The sink is `None` by default and Task 14 installs one only while a code-action apply holds the translator's apply mutex. Outside that window the answer stays `{"applied": false}`, so a server cannot write to the tree at a moment of its own choosing.
 
 - [ ] **Step 1: Write the failing tests**
+
+Add to the `tests` module in `crates/mcpls-core/src/lsp/client.rs`:
 
 ```rust
 #[tokio::test]
 async fn test_apply_edit_is_refused_when_no_sink_is_installed() {
     let request = JsonRpcRequest {
-        jsonrpc: "2.0".to_string(),
-        id: Some(serde_json::json!(1)),
+        jsonrpc: JSONRPC_VERSION.to_string(),
+        id: RequestId::Number(1),
         method: "workspace/applyEdit".to_string(),
         params: Some(serde_json::json!({ "edit": { "changes": {} } })),
     };
+
     let response = LspClient::server_request_response(request, None).await;
+
     assert_eq!(
         response.result,
         Some(serde_json::json!({ "applied": false })),
@@ -2448,41 +3900,158 @@ async fn test_apply_edit_is_forwarded_to_an_installed_sink() {
     });
 
     let request = JsonRpcRequest {
-        jsonrpc: "2.0".to_string(),
-        id: Some(serde_json::json!(1)),
+        jsonrpc: JSONRPC_VERSION.to_string(),
+        id: RequestId::Number(1),
         method: "workspace/applyEdit".to_string(),
         params: Some(serde_json::json!({ "edit": { "changes": {} } })),
     };
+
     let response = LspClient::server_request_response(request, Some(tx)).await;
+
     assert_eq!(response.result, Some(serde_json::json!({ "applied": true })));
 }
+
+#[tokio::test]
+async fn test_apply_edit_is_refused_when_the_sink_is_gone() {
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    drop(rx);
+
+    let request = JsonRpcRequest {
+        jsonrpc: JSONRPC_VERSION.to_string(),
+        id: RequestId::Number(1),
+        method: "workspace/applyEdit".to_string(),
+        params: Some(serde_json::json!({ "edit": { "changes": {} } })),
+    };
+
+    let response = LspClient::server_request_response(request, Some(tx)).await;
+
+    assert_eq!(
+        response.result,
+        Some(serde_json::json!({ "applied": false })),
+        "a dropped receiver answers no rather than hanging"
+    );
+}
 ```
+
+Also change the existing `test_unknown_server_request_returns_method_not_found` (line 819) from `#[test]` to `#[tokio::test]`, make its body `async`, and pass `None` as the second argument. It keeps asserting exactly what it asserted before.
 
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p mcpls-core --lib lsp::client`
-Expected: FAIL to compile, `server_request_response` takes 1 argument and is not async.
+Expected: FAIL to compile, `server_request_response` takes 1 argument and is not `async`.
 
 - [ ] **Step 3: Write the implementation**
 
-Add the sink type and the command variant:
+Add the sink type near `ClientCommand`:
 
 ```rust
 /// Channel a code-action apply installs so an inbound `workspace/applyEdit`
-/// can reach the applier. The `oneshot` carries the LSP `applied` answer.
+/// can reach the applier. The `oneshot` carries the LSP `applied` answer
+/// back to the server.
 pub type ApplySink = mpsc::Sender<(lsp_types::WorkspaceEdit, oneshot::Sender<bool>)>;
 ```
 
+Add the command variant:
+
 ```rust
     /// Write a response the message loop did not produce itself, so a
-    /// request needing async work does not block the loop.
+    /// request that needs async work does not block the loop.
     SendResponse {
         /// Response to write to the transport.
         response: JsonRpcResponse,
     },
 ```
 
-Make `server_request_response` async and sink-aware, and keep every other method routed through the existing sync `server_request_result`:
+Add the field to `LspClient`:
+
+```rust
+    /// Installed only while an apply-enabled code action is in flight. When
+    /// `None`, an inbound `workspace/applyEdit` is answered `applied:
+    /// false`, so a server cannot write to the tree at a moment of its own
+    /// choosing.
+    apply_sink: Arc<Mutex<Option<ApplySink>>>,
+```
+
+Initialize it in `new`, `from_transport`, and `from_transport_with_notifications` with `Arc::new(Mutex::new(None))`, and clone it in the hand-written `Clone` impl alongside `pending_requests`:
+
+```rust
+            apply_sink: Arc::clone(&self.apply_sink),
+```
+
+Every clone must share one `Arc`: Task 14 installs the sink through a clone the translator holds while the message loop reads it through the clone it captured.
+
+Add the setter:
+
+```rust
+    /// Install or remove the sink an inbound `workspace/applyEdit` reaches.
+    pub async fn set_apply_sink(&self, sink: Option<ApplySink>) {
+        *self.apply_sink.lock().await = sink;
+    }
+```
+
+Both spawn sites hand the loop the new arguments. In `from_transport` and `from_transport_with_notifications`, build the sink `Arc` before the spawn and pass a clone of `command_tx` as well:
+
+```rust
+        let (command_tx, command_rx) = mpsc::channel(100);
+        let apply_sink = Arc::new(Mutex::new(None));
+
+        let receiver_task = tokio::spawn(Self::message_loop(
+            transport,
+            command_rx,
+            command_tx.clone(),
+            Arc::clone(&pending_requests),
+            Arc::clone(&apply_sink),
+            None,
+        ));
+```
+
+`message_loop` and `message_loop_inner` take the two new parameters and pass them through:
+
+```rust
+    async fn message_loop(
+        mut transport: LspTransport,
+        mut command_rx: mpsc::Receiver<ClientCommand>,
+        command_tx: mpsc::Sender<ClientCommand>,
+        pending_requests: Arc<Mutex<PendingRequests>>,
+        apply_sink: Arc<Mutex<Option<ApplySink>>>,
+        notification_tx: Option<mpsc::Sender<LspNotification>>,
+    ) -> Result<()> {
+```
+
+Replace the `InboundMessage::Request` arm (line 599) with a spawn:
+
+```rust
+                        InboundMessage::Request(request) => {
+                            debug!(
+                                "Received server request: {} (id={:?})",
+                                request.method, request.id
+                            );
+                            // Answered off the loop: the applier this may
+                            // reach sends its own notifications back
+                            // through `command_tx`, so awaiting it here
+                            // would deadlock against a full channel.
+                            let sink = apply_sink.lock().await.clone();
+                            let responder = command_tx.clone();
+                            tokio::spawn(async move {
+                                let response =
+                                    Self::server_request_response(request, sink).await;
+                                let _ = responder
+                                    .send(ClientCommand::SendResponse { response })
+                                    .await;
+                            });
+                        }
+```
+
+Add the matching command arm beside `SendNotification`. The existing request arm serialized with `serde_json::to_value` before sending, so this does the same:
+
+```rust
+                        ClientCommand::SendResponse { response } => {
+                            let value = serde_json::to_value(&response)?;
+                            transport.send(&value).await?;
+                        }
+```
+
+Make `server_request_response` async and sink-aware, keeping every other method on the existing synchronous path:
 
 ```rust
     async fn server_request_response(
@@ -2492,7 +4061,7 @@ Make `server_request_response` async and sink-aware, and keep every other method
         if request.method == "workspace/applyEdit" {
             let applied = Self::forward_apply_edit(request.params.as_ref(), apply_sink).await;
             return JsonRpcResponse {
-                jsonrpc: "2.0".to_string(),
+                jsonrpc: JSONRPC_VERSION.to_string(),
                 id: request.id,
                 result: Some(serde_json::json!({ "applied": applied })),
                 error: None,
@@ -2500,13 +4069,13 @@ Make `server_request_response` async and sink-aware, and keep every other method
         }
         match Self::server_request_result(&request.method, request.params.as_ref()) {
             Ok(result) => JsonRpcResponse {
-                jsonrpc: "2.0".to_string(),
+                jsonrpc: JSONRPC_VERSION.to_string(),
                 id: request.id,
                 result: Some(result),
                 error: None,
             },
             Err(error) => JsonRpcResponse {
-                jsonrpc: "2.0".to_string(),
+                jsonrpc: JSONRPC_VERSION.to_string(),
                 id: request.id,
                 result: None,
                 error: Some(error),
@@ -2514,6 +4083,11 @@ Make `server_request_response` async and sink-aware, and keep every other method
         }
     }
 
+    /// Hand an inbound edit to whatever apply is in flight, or refuse it.
+    ///
+    /// Every failure answers `false` rather than erroring: the server asked
+    /// a yes-or-no question and an unparseable edit, an absent sink, and a
+    /// dropped receiver are all "no".
     async fn forward_apply_edit(
         params: Option<&Value>,
         apply_sink: Option<ApplySink>,
@@ -2535,243 +4109,360 @@ Make `server_request_response` async and sink-aware, and keep every other method
     }
 ```
 
-Remove the `"workspace/applyEdit"` arm from `server_request_result` (`client.rs:672`), since the new path handles it before that function is reached.
-
-In `message_loop_inner`, replace the inline call with a spawn, and handle the new command:
-
-```rust
-                        InboundMessage::Request(request) => {
-                            let sink = apply_sink.lock().await.clone();
-                            let command_tx = command_tx.clone();
-                            tokio::spawn(async move {
-                                let response =
-                                    Self::server_request_response(request, sink).await;
-                                let _ = command_tx
-                                    .send(ClientCommand::SendResponse { response })
-                                    .await;
-                            });
-                        }
-```
-
-```rust
-                        ClientCommand::SendResponse { response } => {
-                            let value = serde_json::to_value(&response)?;
-                            transport.send(&value).await?;
-                        }
-```
-
-The existing `InboundMessage::Request` arm serializes with `serde_json::to_value` before
-sending, so the new arm does the same rather than handing the transport a typed value it
-cannot write.
-
-`apply_sink` is an `Arc<tokio::sync::Mutex<Option<ApplySink>>>` held by the client and cloned into the loop, set by:
-
-```rust
-    /// Install or remove the sink an inbound `workspace/applyEdit` reaches.
-    ///
-    /// Installed only while an apply-enabled code action holds the
-    /// translator's apply mutex, so a server cannot push edits outside a
-    /// call the agent made.
-    pub async fn set_apply_sink(&self, sink: Option<ApplySink>) {
-        *self.apply_sink.lock().await = sink;
-    }
-```
-
-In `handle_apply_code_action`, wrap the `executeCommand` call:
-
-```rust
-        let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel(4);
-        client.set_apply_sink(Some(sink_tx)).await;
-
-        let applier_for_sink = Arc::clone(&applier);
-        let pump = tokio::spawn(async move {
-            let mut written = Vec::new();
-            while let Some((edit, reply)) = sink_rx.recv().await {
-                let outcome = match EditPlan::from_workspace_edit(edit) {
-                    Ok(plan) => applier_for_sink.apply(plan).await.ok(),
-                    Err(_) => None,
-                };
-                let applied = outcome.is_some();
-                if let Some(summary) = outcome {
-                    written.extend(
-                        summary
-                            .files_changed
-                            .iter()
-                            .map(|c| c.path.display().to_string()),
-                    );
-                }
-                let _ = reply.send(applied);
-            }
-            written
-        });
-
-        let command_result = client
-            .request::<_, serde_json::Value>(
-                "workspace/executeCommand",
-                lsp_types::ExecuteCommandParams {
-                    command: command.command.clone(),
-                    arguments: command.arguments.clone().unwrap_or_default(),
-                    work_done_progress_params: WorkDoneProgressParams::default(),
-                },
-                client.request_timeout(),
-            )
-            .await;
-
-        // Removing the client's clone and dropping the local one closes the
-        // channel, which ends the pump loop and yields what it wrote. Both
-        // must go: either sender alone keeps the receiver alive forever.
-        client.set_apply_sink(None).await;
-        drop(sink_tx);
-        let files_written = pump.await.unwrap_or_default();
-        command_result?;
-```
-
-Report `applied: !files_written.is_empty()` in the result.
+Remove the `"workspace/applyEdit" => Ok(serde_json::json!({ "applied": false }))` arm from `server_request_result` (line 672). The new path handles that method before `server_request_result` is reached, so leaving the arm in would be dead code that also reads as the live answer.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p mcpls-core --lib lsp::client`
-Expected: PASS, including the existing `test_unknown_server_request_returns_method_not_found`.
+Expected: PASS, 3 new tests plus the module's existing ones, including the converted `test_unknown_server_request_returns_method_not_found`.
 
 - [ ] **Step 5: Check lints and commit**
 
 ```bash
 cargo clippy -p mcpls-core --all-targets
-git add crates/mcpls-core/src/
-git commit -m "feat(lsp): honor inbound applyEdit during code actions"
+git add crates/mcpls-core/src/lsp/client.rs
+git commit -m "feat(lsp): route inbound applyEdit to a sink"
 ```
 
 ---
 
-### Task 13: End-to-end rename against rust-analyzer
+### Task 14: Honor an inbound `workspace/applyEdit` during a code action
 
 **Files:**
-- Modify: `crates/mcpls-core/tests/ra_e2e.rs`
-- Modify: `crates/mcpls-core/tests/fixtures/rust_workspace/src/` (add a fixture module the test renames)
+- Modify: `crates/mcpls-core/src/bridge/translator/edits.rs` (`handle_apply_code_action`)
+- Test: `crates/mcpls-core/src/bridge/translator/edits.rs`
 
 **Interfaces:**
-- Consumes: everything above, through the public `Translator` API.
-- Produces: no new API.
+- Consumes: `LspClient::set_apply_sink` and `ApplySink` (Task 13), `Applier` (Task 8).
+- Produces: no new public API. `ApplyCodeActionResult::applied` becomes true for a command-driven action that wrote files.
 
-The unit tests prove each piece. This proves the pieces compose against a real server: that rust-analyzer's actual `WorkspaceEdit` for a cross-file rename normalizes correctly, that the resulting files are valid Rust, and that the capability change in Task 6 makes a module rename return a file rename operation rather than text alone.
-
-The test copies the fixture workspace into a temp directory first. It writes to disk, so it must never touch the checked-in fixture.
+Task 12 dispatches a command-only action and reports `applied: false`, because the server's answering `workspace/applyEdit` had nowhere to go. This closes that loop: for the duration of the `executeCommand` call, and only then, a sink forwards inbound edits to the same applier the direct path uses.
 
 - [ ] **Step 1: Write the failing test**
 
 ```rust
 #[tokio::test]
 #[allow(clippy::expect_used)]
-async fn test_rename_with_apply_rewrites_every_referencing_file() {
-    if !rust_analyzer_available() {
-        eprintln!("skipping: rust-analyzer not on PATH");
-        return;
-    }
+async fn test_inbound_apply_edit_pump_writes_and_reports_files() {
+    use std::collections::HashMap;
+    use std::fs;
 
-    let workspace = copy_fixture_workspace();
-    let translator = translator_with_apply(&workspace).await;
+    use crate::bridge::PositionEncoding;
+    use crate::bridge::apply::Applier;
+    use crate::bridge::path_to_uri;
+    use crate::config::ApplyConfig;
 
-    let lib_path = workspace.path().join("src/lib.rs");
-    let before = std::fs::read_to_string(&lib_path).expect("read lib.rs");
-    assert!(
-        before.contains("add_numbers"),
-        "fixture must reference the symbol being renamed"
-    );
-
-    let functions_path = workspace.path().join("src/functions.rs");
-    let (line, character) = position_of(&functions_path, "pub fn add_numbers");
-
-    let result = translator
-        .handle_rename(
-            functions_path.display().to_string(),
-            line,
-            character,
-            "sum_numbers".to_string(),
-            true,
-        )
-        .await
-        .expect("rename applies");
-
-    assert!(result.applied);
-    assert!(
-        result.files_written.len() >= 2,
-        "the definition and at least one reference are written: {:?}",
-        result.files_written
-    );
-
-    let after_definition =
-        std::fs::read_to_string(&functions_path).expect("read functions.rs");
-    assert!(after_definition.contains("pub fn sum_numbers"));
-    assert!(!after_definition.contains("add_numbers"));
-
-    let after_lib = std::fs::read_to_string(&lib_path).expect("read lib.rs");
-    assert!(
-        after_lib.contains("sum_numbers"),
-        "the reference in another file is rewritten too"
-    );
-}
-```
-
-Add the two helpers beside the existing ones in `ra_e2e.rs`:
-
-```rust
-/// Copy the checked-in fixture workspace into a temp directory, so a test
-/// that writes cannot modify the repository.
-#[allow(clippy::expect_used)]
-fn copy_fixture_workspace() -> tempfile::TempDir {
-    let source = rust_workspace_path();
     let dir = tempfile::tempdir().expect("tempdir");
-    copy_dir_recursive(&source, dir.path()).expect("copy fixture");
-    dir
-}
+    let path = dir.path().join("target.rs");
+    fs::write(&path, "fn old() {}\n").expect("seed");
 
-/// Line and character (both 1-based, as mcpls tools take them) of the first
-/// occurrence of `needle`, pointing at the identifier that follows it.
-#[allow(clippy::expect_used)]
-fn position_of(path: &std::path::Path, needle: &str) -> (u32, u32) {
-    let text = std::fs::read_to_string(path).expect("read file");
-    for (index, line) in text.lines().enumerate() {
-        if let Some(column) = line.find(needle) {
-            let identifier_column = column + needle.len() - "add_numbers".len();
-            return (
-                u32::try_from(index + 1).expect("line fits in u32"),
-                u32::try_from(identifier_column + 1).expect("column fits in u32"),
-            );
-        }
-    }
-    panic!("{needle:?} not found in {}", path.display());
-}
-```
-
-Write `copy_dir_recursive` and `translator_with_apply` alongside them. `translator_with_apply` builds a `Translator` the way the existing e2e tests do, plus:
-
-```rust
-    let applier = std::sync::Arc::new(mcpls_core::bridge::apply::Applier::new(
-        vec![workspace.path().to_path_buf()],
-        mcpls_core::config::ApplyConfig {
-            rename: true,
-            format_document: true,
+    let applier = std::sync::Arc::new(Applier::new(
+        vec![dir.path().to_path_buf()],
+        ApplyConfig {
             code_actions: true,
-            allow_file_deletion: false,
+            ..ApplyConfig::default()
         },
-        mcpls_core::bridge::encoding::PositionEncoding::Utf16,
     ));
-    let translator = translator.with_applier(applier);
+
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let pump = spawn_apply_edit_pump(rx, std::sync::Arc::clone(&applier), PositionEncoding::Utf16);
+
+    let mut changes = HashMap::new();
+    changes.insert(
+        path_to_uri(&path).expect("uri"),
+        vec![lsp_types::TextEdit {
+            range: lsp_types::Range::new(
+                lsp_types::Position::new(0, 3),
+                lsp_types::Position::new(0, 6),
+            ),
+            new_text: "new".to_string(),
+        }],
+    );
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    tx.send((
+        lsp_types::WorkspaceEdit {
+            changes: Some(changes),
+            ..lsp_types::WorkspaceEdit::default()
+        },
+        reply_tx,
+    ))
+    .await
+    .expect("the pump is listening");
+
+    assert!(reply_rx.await.expect("the pump answers"));
+
+    drop(tx);
+    let written = pump.await.expect("the pump finishes");
+
+    assert_eq!(written.len(), 1);
+    assert_eq!(fs::read_to_string(&path).expect("read"), "fn new() {}\n");
+}
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p mcpls-core --test ra_e2e test_rename_with_apply -- --nocapture`
-Expected: FAIL to compile, `cannot find function 'copy_fixture_workspace'`. After the helpers exist, expect a real assertion failure rather than a skip: confirm rust-analyzer is on PATH first with `which rust-analyzer`.
+Run: `cargo test -p mcpls-core --lib test_inbound_apply_edit_pump`
+Expected: FAIL to compile, `cannot find function 'spawn_apply_edit_pump'`.
 
-- [ ] **Step 3: Make it pass**
+- [ ] **Step 3: Write the implementation**
 
-No new production code should be needed. If the test fails, the failure is a genuine integration bug in Tasks 3 through 9. Debug it there rather than weakening the assertions. The two likeliest causes:
+Add the pump to `edits.rs` as a free function, so it can be tested without an LSP server:
 
-- The position encoding rust-analyzer negotiated is not UTF-16, so `Applier::new` is being handed the wrong `PositionEncoding`. Take it from `Translator::position_encoding_for(&server_id)` rather than hardcoding.
-- rust-analyzer returns `documentChanges` with an `AnnotatedTextEdit`, whose `text_edit` field Task 4 unwraps. Confirm the `OneOf::Right` arm is exercised.
+```rust
+/// Drain inbound `workspace/applyEdit` requests until the channel closes,
+/// applying each and answering the server.
+///
+/// Returns every file written across the whole run, so the caller can
+/// report them without tracking the pump's progress.
+fn spawn_apply_edit_pump(
+    mut rx: tokio::sync::mpsc::Receiver<(
+        lsp_types::WorkspaceEdit,
+        tokio::sync::oneshot::Sender<bool>,
+    )>,
+    applier: std::sync::Arc<crate::bridge::apply::Applier>,
+    encoding: crate::bridge::PositionEncoding,
+) -> tokio::task::JoinHandle<Vec<String>> {
+    tokio::spawn(async move {
+        let mut written = Vec::new();
+        while let Some((edit, reply)) = rx.recv().await {
+            let summary = match EditPlan::from_workspace_edit(edit) {
+                Ok(plan) => applier.apply(plan, encoding).await.ok(),
+                Err(_) => None,
+            };
+            let applied = summary.is_some();
+            if let Some(summary) = summary {
+                written.extend(
+                    summary
+                        .files_changed
+                        .iter()
+                        .map(|change| change.path.display().to_string()),
+                );
+            }
+            let _ = reply.send(applied);
+        }
+        written
+    })
+}
+```
 
-- [ ] **Step 4: Run the whole suite**
+In `handle_apply_code_action`, wrap the `executeCommand` call. Replace the `executed_command` block Task 12 wrote with:
+
+```rust
+        let executed_command = if let Some(command) = command {
+            let (sink_tx, sink_rx) = tokio::sync::mpsc::channel(4);
+            let pump = spawn_apply_edit_pump(
+                sink_rx,
+                Arc::clone(&applier),
+                self.position_encoding_for(&server_id),
+            );
+            client.set_apply_sink(Some(sink_tx.clone())).await;
+
+            let command_result = client
+                .request::<_, serde_json::Value>(
+                    "workspace/executeCommand",
+                    lsp_types::ExecuteCommandParams {
+                        command: command.command.clone(),
+                        arguments: command.arguments.unwrap_or_default(),
+                        work_done_progress_params: WorkDoneProgressParams::default(),
+                    },
+                    client.request_timeout(),
+                )
+                .await;
+
+            // Both senders must go before the pump's receiver sees the
+            // channel close: the client holds one and this scope holds the
+            // other, and either alone keeps the pump waiting forever.
+            client.set_apply_sink(None).await;
+            drop(sink_tx);
+            let pumped = pump.await.unwrap_or_default();
+
+            command_result?;
+
+            applied = applied || !pumped.is_empty();
+            files_written.extend(pumped);
+            Some(command.command)
+        } else {
+            None
+        };
+```
+
+`applied` and `files_written` are already `mut` from Task 12's edit half.
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `cargo test -p mcpls-core`
+Expected: PASS.
+
+- [ ] **Step 5: Check lints and commit**
+
+```bash
+cargo clippy -p mcpls-core --all-targets
+git add crates/mcpls-core/src/bridge/translator/edits.rs
+git commit -m "feat(actions): apply edits a command sends back"
+```
+
+---
+
+### Task 15: End-to-end rename against rust-analyzer
+
+**Files:**
+- Modify: `crates/mcpls-core/tests/ra_e2e.rs` (`E2eConfig` at line 138, `write_config` at line 157, the sub-case registry at line 1425)
+- Modify: `crates/mcpls-core/tests/fixtures/rust_workspace/src/lib.rs`
+
+**Interfaces:**
+- Consumes: everything above, through the MCP tool surface.
+- Produces: `sc_rename_symbol_apply`, a new sub-case.
+
+The unit tests prove each piece. This proves the pieces compose against a real server: that rust-analyzer's actual `WorkspaceEdit` normalizes correctly, that the files it names are rewritten, and that the offset conversion uses the encoding rust-analyzer actually negotiated.
+
+`ra_e2e.rs` is one `#[test] fn ra_e2e_suite()` that spawns the mcpls binary, drives it through `McpClient`, and runs a table of `sc_*` sub-cases against one staged workspace shared for the whole process. This is a sub-case in that table, not a standalone test.
+
+**It must be registered last.** Earlier sub-cases anchor on text with `find_line`, including `pub fn add(`, and this one renames `add`. Anything registered after it would look for text that is no longer there.
+
+The fixture gains a line with a non-ASCII character before a reference to `add`. rust-analyzer negotiates UTF-8 under mcpls's default `position_encodings = ["utf-8", "utf-16"]`, so that line is what proves the applier used the negotiated encoding rather than assuming UTF-16. On a pure-ASCII fixture both choices produce the same bytes and the bug hides.
+
+- [ ] **Step 1: Write the failing test**
+
+Add to `crates/mcpls-core/tests/fixtures/rust_workspace/src/lib.rs`, after `caller`:
+
+```rust
+/// Non-ASCII text ahead of an `add` reference on the same line.
+///
+/// An applier that ignores the encoding rust-analyzer negotiated resolves
+/// this line's columns against the wrong offsets and corrupts it, which no
+/// pure-ASCII fixture would catch.
+#[allow(dead_code)]
+pub fn unicode_caller() -> String {
+    format!("ü {}", add(1, 2))
+}
+```
+
+Add the sub-case to `crates/mcpls-core/tests/ra_e2e.rs`:
+
+```rust
+/// Tool 25: `rename_symbol` with `apply` — rename `add` → `plus` and check
+/// that the files really changed on disk.
+///
+/// Registered last: it rewrites `pub fn add(`, which earlier sub-cases
+/// anchor on.
+fn sc_rename_symbol_apply(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
+    let lib = workspace.join("src/lib.rs");
+    let add_line = find_line(&lib, "pub fn add(");
+
+    let resp = client
+        .call_tool(
+            "rename_symbol",
+            &json!({
+                "file_path": lib.to_string_lossy(),
+                "line": add_line,
+                "character": 8,
+                "new_name": "plus",
+                "apply": true,
+            }),
+        )
+        .map_err(|e| format!("call failed: {e}"))?;
+
+    let text = assertions::assert_tool_ok(&resp);
+    let inner: Value = serde_json::from_str(&text).map_err(|e| format!("bad JSON: {e}"))?;
+
+    if inner["applied"] != json!(true) {
+        return Err(format!("expected applied=true, got {inner}"));
+    }
+    let written = inner["files_written"]
+        .as_array()
+        .ok_or_else(|| format!("expected files_written array, got {inner}"))?;
+    if written.is_empty() {
+        return Err("rename reported applied with no files written".to_owned());
+    }
+
+    let after = fs::read_to_string(&lib).map_err(|e| format!("read lib.rs: {e}"))?;
+    if !after.contains("pub fn plus(") {
+        return Err("the definition was not rewritten on disk".to_owned());
+    }
+    if after.contains("pub fn add(") {
+        return Err("the old definition is still on disk".to_owned());
+    }
+    if !after.contains("plus(1, 2)") {
+        return Err("a reference in the same file was not rewritten".to_owned());
+    }
+    if !after.contains(r#"format!("ü {}", plus(1, 2))"#) {
+        return Err(format!(
+            "the non-ASCII line was corrupted or missed; \
+             the applier used the wrong position encoding. Line reads: {:?}",
+            after
+                .lines()
+                .find(|l| l.contains("ü"))
+                .unwrap_or("<line gone>")
+        ));
+    }
+
+    Ok(())
+}
+```
+
+Register it as the last entry in the sub-case table:
+
+```rust
+        sub_case!(sc_subscribe_no_replay_without_cached_diagnostics),
+        // Last: this one writes to the staged workspace, and every anchor
+        // above it looks for text this rename moves.
+        sub_case!(sc_rename_symbol_apply),
+    ];
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `cargo test -p mcpls-core --test ra_e2e -- --ignored --nocapture`
+Expected: the suite runs and `sc_rename_symbol_apply` fails with `expected applied=true`, because the e2e config has no `[apply]` table yet. Every earlier sub-case still passes. If rust-analyzer is not on PATH, install it with `rustup component add rust-analyzer` rather than skipping: this sub-case is the only proof the pieces compose.
+
+- [ ] **Step 3: Turn on apply in the e2e config**
+
+Give `E2eConfig` an apply table and set it in `write_config`:
+
+```rust
+#[derive(Serialize, Deserialize)]
+struct E2eConfig {
+    workspace: WorkspaceConfig,
+    lsp_servers: Vec<LspServerConfig>,
+    apply: ApplyTable,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ApplyTable {
+    rename: bool,
+}
+```
+
+```rust
+    let cfg = E2eConfig {
+        workspace: WorkspaceConfig {
+            roots: vec![workspace_root.to_string_lossy().into_owned()],
+        },
+        lsp_servers: vec![LspServerConfig {
+            language_id: "rust".to_owned(),
+            command: ra_binary.to_string_lossy().into_owned(),
+            args: vec![],
+            file_patterns: vec!["**/*.rs".to_owned()],
+        }],
+        // Only `rename` is on: the earlier read-only sub-cases must keep
+        // proving that a tool called without `apply` writes nothing.
+        apply: ApplyTable { rename: true },
+    };
+```
+
+`toml::to_string` emits tables after scalar keys, so `[apply]` serializes correctly wherever the field sits in the struct.
+
+- [ ] **Step 4: Run the suite**
+
+Run: `cargo test -p mcpls-core --test ra_e2e -- --ignored --nocapture`
+Expected: PASS, every sub-case including the new one.
+
+If `sc_rename_symbol_apply` fails now, the failure is a real integration bug in Tasks 3 through 10, not a reason to weaken an assertion. Two likely causes:
+
+- The non-ASCII assertion fails while the ASCII ones pass. The applier is using the wrong encoding: check that `handle_rename` passes `self.position_encoding_for(&server_id)` rather than a constant, and print what that returns for this server.
+- `files_written` is empty while `applied` is true. `Applier::apply` returned a summary with no `files_changed`, which means the plan produced no `Operation::Edit`. Print the `changes` array the same response carries: if it is populated and `files_written` is not, `Planner::record_change` is not being reached.
+
+Then run the whole suite:
 
 Run: `cargo test -p mcpls-core`
 Expected: PASS.
@@ -2780,21 +4471,29 @@ Expected: PASS.
 
 ```bash
 git add crates/mcpls-core/tests/
-git commit -m "test(e2e): apply a real rename across files"
+git commit -m "test(e2e): apply a real rename across a file"
 ```
 
 ---
 
 ## Self-review notes
 
-Checked against the spec's Part 1 section by section.
+Checked against the spec's Part 1, section by section.
 
-- Configuration: Task 1. Client capabilities: Task 6. Tool surface: Tasks 9, 10, 11. Normalization: Task 4. Encoding: Task 3. Staleness: partially covered, see the gap below. Confinement: Task 8. Atomicity: Task 7. Tracker updates: gap below. Resync: gap below. Return value: Tasks 9 and 10. Inbound applyEdit: Task 12.
+Configuration: Task 1. Client capabilities: Task 6. Tool surface: Tasks 10, 11, 12. Normalization: Task 4. Encoding: Tasks 3 and 8. Confinement: Task 8. Atomicity and ordering: Tasks 7 and 8. Return value: Tasks 10, 11, 12. Inbound applyEdit: Tasks 13 and 14. Production wiring: Task 9. Staleness, tracker updates, and resync: deferred, see below.
 
-Three spec requirements are deliberately deferred, because each needs the document-synchronization work that the file-watching plan builds:
+**Three spec requirements are deliberately deferred**, because each needs the document-synchronization work the file-watching plan builds:
 
-1. **Staleness checks against `DocumentTracker`.** Task 8 reads current disk content and applies against it, which is the spec's rule for untracked targets. The tracked-target rule, requiring disk to equal what the tracker holds, needs `disk_phase` wired into the applier and belongs with the resync work.
+1. **Staleness checks against `DocumentTracker`.** Task 8 plans against current disk content, which is the spec's rule for untracked targets. The tracked-target rule, requiring disk to equal what the tracker holds, needs `disk_phase` wired into the planner.
 2. **Tracker updates after a write.** Closing a renamed document under its old path and dropping its `NotificationCache` entry needs the same wiring.
-3. **`didChange` and `didSave` after a write.** The applier writes but does not yet tell the servers. Until then, diagnostics after an apply come from whatever the server notices itself.
+3. **`didChange` and `didSave` after a write.** The applier writes but does not tell the servers. Until then, diagnostics after an apply come from whatever the server notices itself.
 
-Each is a task in the file-watching plan rather than a hole here: applying edits is useful and correct without them, and doing them now would mean building the resync path twice.
+Deferring these is mostly safe because `DocumentTracker::disk_phase` re-stats and re-reads every tracked file on each `ensure_open`, so a file resyncs on its next tool call. One hole survives that: a file an earlier call opened and a later apply rewrote without querying. For every server except rust-analyzer, which watches the filesystem itself, the server still holds pre-edit text under `didOpen`, and a second apply would compute edits against that stale text and land them on the new disk content.
+
+**Close that hole cheaply in whichever task ships first after this plan**, rather than building the resync path twice: after a successful apply, for each written path where `document_tracker.close(path)` returns `Some`, send `textDocument/didClose`. The server then falls back to disk truth and the next `ensure_open` reopens cleanly. Without the `didClose`, calling `close` alone would produce a second `didOpen` for a document the server still considers open.
+
+## Unresolved questions
+
+1. **Directory renames.** `Planner::plan_rename` moves whatever the source is, directory included, and `Presence::Opaque` covers the case where its content is not readable text. gopls emits directory renames for package moves. Nothing in this plan tests one against a real server.
+2. **`ignore_if_exists` on a rename whose source is also missing.** The specification does not say which check wins. This plan checks the source first and errors, on the grounds that a rename with no source is a plan the server got wrong, not a no-op it asked for.
+3. **Trash entries left behind by a crash.** `purge_trash` runs only on the success path, and a process killed mid-run leaves `.name.mcpls-trash0` siblings. Nothing sweeps them. A later run whose trash path collides fails its `Trash` step and rolls back, which is safe but opaque.
