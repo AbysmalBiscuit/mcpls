@@ -140,7 +140,7 @@ fn roll_back(completed: &[Step], reason: String) -> Error {
             Step::Move { from, to } => match fs::rename(to, from) {
                 Ok(()) => restored.push(from.clone()),
                 Err(e) => {
-                    unrecovered.push(format!("{} is at {} ({e})", from.display(), to.display()))
+                    unrecovered.push(format!("{} is at {} ({e})", from.display(), to.display()));
                 }
             },
             Step::Trash { path, trash } => match fs::rename(trash, path) {
