@@ -3,6 +3,9 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use tokio::sync::Mutex;
 
 pub mod journal;
 pub mod offsets;
@@ -49,13 +52,22 @@ pub struct ApplySummary {
 pub struct Applier {
     roots: Vec<PathBuf>,
     config: ApplyConfig,
+    /// Serializes applies. Held by the blocking task that does the writing
+    /// rather than by [`Self::apply`]'s future, so dropping that future --
+    /// a cancelled request, a disconnected client, shutdown -- cannot
+    /// release the lock while the journal is still rewriting the tree.
+    lock: Arc<Mutex<()>>,
 }
 
 impl Applier {
     /// Build an applier confined to `roots`.
     #[must_use]
-    pub const fn new(roots: Vec<PathBuf>, config: ApplyConfig) -> Self {
-        Self { roots, config }
+    pub fn new(roots: Vec<PathBuf>, config: ApplyConfig) -> Self {
+        Self {
+            roots,
+            config,
+            lock: Arc::new(Mutex::new(())),
+        }
     }
 
     /// Which tools this applier permits to write. Read by
@@ -66,6 +78,10 @@ impl Applier {
     }
 
     /// Plan `plan` into a journal and execute it.
+    ///
+    /// Applies are serialized against each other: two concurrent ones would
+    /// otherwise both plan against the same pre-edit content and the second
+    /// would overwrite the first.
     ///
     /// `encoding` is the encoding the server that produced `plan`
     /// negotiated, from `Translator::position_encoding_for`. Passing the
@@ -93,10 +109,14 @@ impl Applier {
 
         let roots = self.roots.clone();
         let config = self.config.clone();
-        // Planning reads files and execution writes them, and the caller
-        // holds the translator's apply mutex across this call, so none of
-        // it belongs on a runtime thread.
+        // Taken here and moved into the blocking task, so the lock's
+        // lifetime is the write's rather than this future's: a dropped
+        // future cancels the await but not the task already writing.
+        let guard = Arc::clone(&self.lock).lock_owned().await;
+        // Planning reads files and execution writes them, so none of it
+        // belongs on a runtime thread.
         tokio::task::spawn_blocking(move || {
+            let _guard = guard;
             let outcome = Planner::new(&roots, &config, encoding).plan(&plan)?;
             journal::execute(&outcome.steps)?;
             Ok(ApplySummary {

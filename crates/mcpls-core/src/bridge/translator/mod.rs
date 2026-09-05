@@ -109,10 +109,6 @@ pub struct Translator {
     /// it to invalidate a respawned server's stale cached diagnostics --
     /// see that method's docs for why that matters.
     notification_cache: Option<Arc<Mutex<NotificationCache>>>,
-    /// Serializes every apply-enabled tool call. Two concurrent applies to
-    /// one file would otherwise both plan against the same pre-edit
-    /// content and the second would overwrite the first.
-    apply_lock: Arc<Mutex<()>>,
     /// Serializes the windows during which an inbound `workspace/applyEdit`
     /// is honored, so only one is open at a time. A client's apply sink is
     /// a single slot shared by every clone of that client, so two
@@ -121,7 +117,7 @@ pub struct Translator {
     /// second's sink mid-command. Both would silently degrade to no window
     /// at all.
     ///
-    /// Deliberately not [`Self::apply_lock`]: that one is taken per apply
+    /// Deliberately not the applier's own lock: that one is taken per apply
     /// *inside* the window, so holding it across a command whose inbound
     /// edit needs it would deadlock. A window always takes this lock first
     /// and the apply lock second, never the other way round.
@@ -165,7 +161,6 @@ impl Translator {
             respawn_locks: Arc::new(StdMutex::new(HashMap::new())),
             respawn_backoffs: Arc::new(StdMutex::new(HashMap::new())),
             notification_cache: None,
-            apply_lock: Arc::new(Mutex::new(())),
             apply_sink_lock: Arc::new(Mutex::new(())),
             applier: Arc::new(Applier::new(Vec::new(), ApplyConfig::default())),
             clock: Arc::new(SystemClock),
@@ -241,9 +236,9 @@ impl Translator {
     }
 
     /// Write `plan` to disk through `applier`, using the `PositionEncoding`
-    /// negotiated for `server_id`.
+    /// negotiated for `server_id`, and forget every document it rewrote.
     ///
-    /// The apply lock is held for the whole apply, so a second
+    /// [`Applier::apply`] serializes applies against each other, so a second
     /// apply-enabled call cannot plan against content this one is about to
     /// replace.
     ///
@@ -258,7 +253,6 @@ impl Translator {
         plan: EditPlan,
         server_id: &ServerId,
     ) -> Result<ApplySummary> {
-        let _guard = self.apply_lock.lock().await;
         let outcome = applier
             .apply(plan, self.position_encoding_for(server_id))
             .await;
