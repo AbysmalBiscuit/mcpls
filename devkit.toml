@@ -1,0 +1,24 @@
+#:schema https://github.com/AbysmalBiscuit/devkit/releases/latest/download/devkit-config.json
+
+# Uncomment what this project uses and replace the <placeholders>. Until
+# [defaults] is uncommented the config does not resolve, and `devkit brief`
+# reports that rather than staying quiet.
+
+# [defaults]
+worktree_root = "../mcpls_worktrees/"
+# branch_prefix = "<you>/"
+baseline_ref = "origin/main"
+# baseline_dir = "~/git/<project>-worktrees/_baselines"
+
+# An app needs base_port and launch to parse at all, and path to resolve
+# without a doppler.yaml to infer it from.
+# [apps.web]
+# base_port = 9100
+# path = "apps/web"
+# launch = ["pnpm", "dev", "--port", "{{ port }}"]
+
+# Commands run on a lifecycle event, as argv arrays (no shell). Failures warn
+# and are skipped. after_worktree_create runs in a worktree `issue setup` or
+# `issue pr checkout` has just created.
+# [hooks]
+# after_worktree_create = [["zoxide", "add", "{{ worktree }}"]]
