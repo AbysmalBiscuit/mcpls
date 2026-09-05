@@ -1675,7 +1675,7 @@ mod tests {
         )
         .await;
 
-        let answer = read_framed_message(&mut wire).await;
+        let answer = read_framed_reply(&mut wire).await;
         assert_eq!(answer["id"], 4242);
         assert_eq!(
             answer["result"]["applied"], true,
@@ -1760,7 +1760,7 @@ mod tests {
                 rename_old_to_new(uri),
             )
             .await;
-            let answer = read_framed_message(&mut wire).await;
+            let answer = read_framed_reply(&mut wire).await;
             assert_eq!(answer["id"], id);
             assert_eq!(
                 answer["result"]["applied"], true,
@@ -1801,6 +1801,131 @@ mod tests {
                 "fn new() {}\n"
             );
         }
+    }
+
+    /// An apply writes files the call never queried -- a rename anchored in
+    /// one file rewrites every file referencing the symbol. Those files stay
+    /// open in the routed server at their pre-apply content unless mcpls
+    /// closes them, and the next edit against that content corrupts them.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn test_apply_closes_a_written_document_the_call_never_queried() {
+        use std::sync::Arc;
+
+        use tokio::io::BufReader;
+        use tokio::time::{Duration, timeout};
+
+        use crate::bridge::apply::Applier;
+        use crate::config::{ApplyConfig, ServerId};
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let caps = lsp_types::ServerCapabilities {
+            rename_provider: Some(lsp_types::OneOf::Left(true)),
+            ..Default::default()
+        };
+        let (translator, mut server) =
+            translator_with_capabilities(&dir, &ServerId::from("rust"), caps);
+        let translator = Arc::new(translator.with_applier(Arc::new(Applier::new(
+            vec![dir.path().to_path_buf()],
+            ApplyConfig {
+                rename: true,
+                ..ApplyConfig::default()
+            },
+        ))));
+
+        let anchor = dir.path().join("anchor.rs");
+        let other = dir.path().join("other.rs");
+        fs::write(&anchor, "fn caller() {}\n").expect("write the anchor fixture");
+        fs::write(&other, "fn old() {}\n").expect("write the other fixture");
+        let other_canonical = other.canonicalize().expect("the other fixture exists");
+        let other_uri = crate::bridge::path_to_uri(&other_canonical).expect("uri for other.rs");
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+
+        // A read-only call on other.rs, so the server holds it open at its
+        // pre-apply content -- exactly the state an earlier tool call leaves
+        // behind.
+        let opening = {
+            let translator = Arc::clone(&translator);
+            let path = other.to_string_lossy().to_string();
+            tokio::spawn(async move {
+                translator
+                    .handle_rename(path, 1, 1, "x".to_string(), false)
+                    .await
+            })
+        };
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let first_rename = read_framed_message(&mut wire).await;
+        write_response(
+            &mut server.read_half_stdin,
+            &first_rename["id"],
+            serde_json::Value::Null,
+        )
+        .await;
+        timeout(Duration::from_secs(5), opening)
+            .await
+            .expect("the opening call must not hang")
+            .expect("the opening task must not panic")
+            .expect("a rename with no edits still succeeds");
+        assert!(
+            translator.is_document_open(&other_canonical),
+            "the read-only call left other.rs open"
+        );
+
+        // A rename anchored in anchor.rs whose edit lands entirely in
+        // other.rs.
+        let handle = {
+            let translator = Arc::clone(&translator);
+            let path = anchor.to_string_lossy().to_string();
+            tokio::spawn(async move {
+                translator
+                    .handle_rename(path, 1, 4, "renamed".to_string(), true)
+                    .await
+            })
+        };
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let rename = read_framed_message(&mut wire).await;
+        assert_eq!(rename["method"], "textDocument/rename");
+        write_response(
+            &mut server.read_half_stdin,
+            &rename["id"],
+            serde_json::json!({
+                "changes": {
+                    other_uri.as_str(): [{
+                        "range": {
+                            "start": { "line": 0, "character": 3 },
+                            "end": { "line": 0, "character": 6 },
+                        },
+                        "newText": "renamed",
+                    }],
+                },
+            }),
+        )
+        .await;
+
+        let closed = read_framed_message(&mut wire).await;
+        assert_eq!(
+            closed["method"], "textDocument/didClose",
+            "the server must be told the file it still holds open was rewritten"
+        );
+        assert_eq!(closed["params"]["textDocument"]["uri"], other_uri.as_str());
+
+        let result = timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("the handler must not hang")
+            .expect("the handler task must not panic")
+            .expect("the rename applies");
+        assert!(result.applied);
+        assert_eq!(
+            fs::read_to_string(&other).expect("read other.rs back"),
+            "fn renamed() {}\n"
+        );
+        assert!(
+            !translator.is_document_open(&other_canonical),
+            "a written document must not stay tracked at its pre-apply content"
+        );
     }
 
     /// The sink lives for the `executeCommand` call and no longer: an edit

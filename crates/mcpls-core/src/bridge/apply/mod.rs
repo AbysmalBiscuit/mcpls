@@ -37,6 +37,11 @@ pub struct ApplySummary {
     pub files_changed: Vec<FileChange>,
     /// File-system operations performed.
     pub resource_operations: Vec<ResourceOperation>,
+    /// Every absolute path whose on-disk content no longer matches what a
+    /// cache of it would hold: written files plus both ends of a rename and
+    /// the source of a delete. A caller tracking open documents must drop
+    /// its entry for each of these.
+    pub paths_invalidated: Vec<PathBuf>,
 }
 
 /// Applies validated `WorkspaceEdit`s within a set of workspace roots.
@@ -92,12 +97,12 @@ impl Applier {
         // holds the translator's apply mutex across this call, so none of
         // it belongs on a runtime thread.
         tokio::task::spawn_blocking(move || {
-            let planner = Planner::new(&roots, &config, encoding);
-            let (steps, files_changed) = planner.plan(&plan)?;
-            journal::execute(&steps)?;
+            let outcome = Planner::new(&roots, &config, encoding).plan(&plan)?;
+            journal::execute(&outcome.steps)?;
             Ok(ApplySummary {
-                files_changed,
+                files_changed: outcome.files_changed,
                 resource_operations: resource_operations_from_plan(&plan),
+                paths_invalidated: outcome.paths_invalidated,
             })
         })
         .await
@@ -117,6 +122,13 @@ enum Presence {
     Opaque,
 }
 
+/// What planning a whole `EditPlan` produced.
+struct PlannedEdit {
+    steps: Vec<Step>,
+    files_changed: Vec<FileChange>,
+    paths_invalidated: Vec<PathBuf>,
+}
+
 /// Walks a plan's operations in order, resolving each against an overlay of
 /// what the tree looks like at that point, and emitting journal steps.
 struct Planner<'a> {
@@ -126,6 +138,7 @@ struct Planner<'a> {
     overlay: HashMap<PathBuf, Presence>,
     steps: Vec<Step>,
     files_changed: Vec<FileChange>,
+    paths_invalidated: Vec<PathBuf>,
 }
 
 impl<'a> Planner<'a> {
@@ -137,10 +150,11 @@ impl<'a> Planner<'a> {
             overlay: HashMap::new(),
             steps: Vec::new(),
             files_changed: Vec::new(),
+            paths_invalidated: Vec::new(),
         }
     }
 
-    fn plan(mut self, plan: &EditPlan) -> Result<(Vec<Step>, Vec<FileChange>)> {
+    fn plan(mut self, plan: &EditPlan) -> Result<PlannedEdit> {
         for operation in plan.operations() {
             match operation {
                 Operation::Edit { uri, edits, .. } => self.plan_edit(uri, edits)?,
@@ -162,7 +176,11 @@ impl<'a> Planner<'a> {
                 } => self.plan_delete(uri, *recursive, *ignore_if_not_exists)?,
             }
         }
-        Ok((self.steps, self.files_changed))
+        Ok(PlannedEdit {
+            steps: self.steps,
+            files_changed: self.files_changed,
+            paths_invalidated: self.paths_invalidated,
+        })
     }
 
     /// Absolute, confined path for `uri`.
@@ -202,7 +220,16 @@ impl<'a> Planner<'a> {
         fs::read_to_string(path).map_or(Presence::Opaque, Presence::Text)
     }
 
+    /// Note that `path`'s on-disk content no longer matches anything cached
+    /// against it, so a caller tracking open documents must drop its entry.
+    fn invalidate(&mut self, path: &Path) {
+        if !self.paths_invalidated.iter().any(|known| known == path) {
+            self.paths_invalidated.push(path.to_path_buf());
+        }
+    }
+
     fn record_change(&mut self, path: &Path, edits: usize) {
+        self.invalidate(path);
         if let Some(existing) = self
             .files_changed
             .iter_mut()
@@ -338,6 +365,8 @@ impl<'a> Planner<'a> {
 
         self.overlay.insert(from.clone(), Presence::Absent);
         self.overlay.insert(to.clone(), moving);
+        self.invalidate(&from);
+        self.invalidate(&to);
         self.steps.push(Step::Move { from, to });
         Ok(())
     }
@@ -384,6 +413,7 @@ impl<'a> Planner<'a> {
 
         let trash = self.trash_path(&path)?;
         self.overlay.insert(path.clone(), Presence::Absent);
+        self.invalidate(&path);
         self.steps.push(Step::Trash { path, trash });
         Ok(())
     }

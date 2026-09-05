@@ -193,6 +193,15 @@ impl DocumentState {
         self.synced.is_empty()
     }
 
+    /// Every server that has been sent a `didOpen` for this document and so
+    /// still holds it open. Each of them must be sent a `didClose` before
+    /// the tracker forgets the document, or the server keeps serving results
+    /// computed against content nothing will refresh.
+    #[must_use]
+    pub fn synced_servers(&self) -> Vec<ServerId> {
+        self.synced.keys().cloned().collect()
+    }
+
     /// Applies a local (non-disk) edit: bumps `version`, replaces `content`,
     /// and clears `disk` provenance, since the new content did not come from
     /// a verified disk read. Returns the new version.

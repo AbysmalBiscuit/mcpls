@@ -259,9 +259,61 @@ impl Translator {
         server_id: &ServerId,
     ) -> Result<ApplySummary> {
         let _guard = self.apply_lock.lock().await;
-        applier
+        let outcome = applier
             .apply(plan, self.position_encoding_for(server_id))
-            .await
+            .await;
+        match &outcome {
+            Ok(summary) => self.close_stale_documents(&summary.paths_invalidated).await,
+            // A rollback that could not restore a file leaves it holding the
+            // new content, which is exactly as stale as a successful write.
+            Err(Error::ApplyPartiallyFailed { written, .. }) => {
+                self.close_stale_documents(written).await;
+            }
+            Err(_) => {}
+        }
+        outcome
+    }
+
+    /// Drop every tracked document whose file an apply rewrote, moved, or
+    /// removed, and send `textDocument/didClose` to each server holding it
+    /// open.
+    ///
+    /// An apply can write a file the tool call never queried: a rename
+    /// anchored in one file rewrites every file referencing the symbol.
+    /// `DocumentTracker::ensure_open` refreshes only the path a call names,
+    /// and LSP makes the client authoritative for a document it has opened,
+    /// so the server ignores the change on disk. Left alone, both the
+    /// tracker and the server keep serving the pre-apply content forever,
+    /// and a later edit computed against it is spliced into the new text at
+    /// ranges that no longer mean what the server meant. Forgetting the
+    /// document makes the next call on it re-read disk and re-open it.
+    ///
+    /// A failed notify is logged rather than returned: the bytes are already
+    /// on disk, and the tracker entry is gone either way, so the next call
+    /// still re-opens the document from its current content.
+    async fn close_stale_documents(&self, paths: &[PathBuf]) {
+        for path in paths {
+            let Some(state) = self.document_tracker.close(path) else {
+                continue;
+            };
+            for server in state.synced_servers() {
+                let client = lock_std(&self.lsp_clients).get(&server).cloned();
+                let Some(client) = client else { continue };
+                let params = lsp_types::DidCloseTextDocumentParams {
+                    text_document: lsp_types::TextDocumentIdentifier {
+                        uri: state.uri().clone(),
+                    },
+                };
+                if let Err(error) = client.notify("textDocument/didClose", params).await {
+                    tracing::warn!(
+                        %server,
+                        path = %path.display(),
+                        %error,
+                        "could not tell the server that an applied file is closed"
+                    );
+                }
+            }
+        }
     }
 
     /// Mark the set of servers that are expected (configured + applicable)

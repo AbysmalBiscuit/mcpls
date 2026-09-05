@@ -129,6 +129,21 @@ pub(super) fn fake_lsp_client() -> (LspClient, FakeServer) {
     )
 }
 
+/// Reads framed messages until one carries an `id`, discarding the
+/// notifications mcpls interleaves with its replies -- an apply emits a
+/// `textDocument/didClose` for every file it rewrote before the request
+/// that triggered it is answered.
+pub(super) async fn read_framed_reply<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+) -> JsonValue {
+    loop {
+        let message = read_framed_message(reader).await;
+        if !message["id"].is_null() {
+            return message;
+        }
+    }
+}
+
 /// Writes `message` behind its `Content-Length` header, the framing every
 /// LSP message on the wire uses.
 async fn write_frame(stdin: &mut ChildStdin, message: &JsonValue) {
