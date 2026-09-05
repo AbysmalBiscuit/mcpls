@@ -240,6 +240,22 @@ impl<'a> Planner<'a> {
         fs::read_to_string(path).map_or(Presence::Opaque, Presence::Text)
     }
 
+    /// Refuse an operation that destroys `path`'s existing content unless
+    /// `apply.allow_file_deletion` permits it.
+    ///
+    /// An overwrite discards content as completely as a delete does, and any
+    /// server can ask for one, so both answer to the same key: a user who
+    /// turned deletion off is entitled to expect that nothing is destroyed.
+    fn require_destruction_allowed(&self, path: &Path, what: &str) -> Result<()> {
+        if self.config.allow_file_deletion {
+            return Ok(());
+        }
+        Err(Error::ApplyRefused(format!(
+            "{} would be {what}, but `apply.allow_file_deletion` is false",
+            path.display()
+        )))
+    }
+
     /// Note that `path`'s on-disk content no longer matches anything cached
     /// against it, so a caller tracking open documents must drop its entry.
     fn invalidate(&mut self, path: &Path) {
@@ -323,6 +339,7 @@ impl<'a> Planner<'a> {
                         path.display()
                     )));
                 }
+                self.require_destruction_allowed(&path, "truncated to empty")?;
                 match existing {
                     Presence::Text(text) => Some(text),
                     _ => {
@@ -376,6 +393,7 @@ impl<'a> Planner<'a> {
                     to.display()
                 )));
             }
+            self.require_destruction_allowed(&to, "replaced by a rename")?;
             let trash = self.trash_path(&to)?;
             self.steps.push(Step::Trash {
                 path: to.clone(),
@@ -755,6 +773,88 @@ mod tests {
             "the error names the key that would permit it: {error}"
         );
         assert!(path.exists(), "the file survives a refused deletion");
+    }
+
+    /// A create with `overwrite` truncates an existing file to empty, which
+    /// destroys its content as completely as a delete does.
+    #[tokio::test]
+    async fn test_refuses_an_overwriting_create_when_deletion_is_forbidden() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("existing.rs");
+        fs::write(&path, "keep me\n").expect("seed");
+
+        let config = ApplyConfig {
+            allow_file_deletion: false,
+            ..permissive()
+        };
+        let applier = Applier::new(vec![dir.path().to_path_buf()], config);
+        let plan = EditPlan::from_workspace_edit(WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Operations(vec![
+                DocumentChangeOperation::Op(ResourceOp::Create(CreateFile {
+                    uri: uri_for(&path),
+                    options: Some(lsp_types::CreateFileOptions {
+                        overwrite: Some(true),
+                        ignore_if_exists: None,
+                    }),
+                    annotation_id: None,
+                })),
+            ])),
+            ..WorkspaceEdit::default()
+        })
+        .expect("plan builds");
+
+        let error = applier
+            .apply(plan, PositionEncoding::Utf16)
+            .await
+            .expect_err("an overwriting create is a destruction");
+        assert!(
+            error.to_string().contains("apply.allow_file_deletion"),
+            "the error names the key that would permit it: {error}"
+        );
+        assert_eq!(fs::read_to_string(&path).expect("read"), "keep me\n");
+    }
+
+    /// A rename with `overwrite` trashes the destination, and a successful
+    /// run purges the trash, so the destination's content is gone for good.
+    #[tokio::test]
+    async fn test_refuses_an_overwriting_rename_when_deletion_is_forbidden() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let old = dir.path().join("old.rs");
+        let victim = dir.path().join("victim.rs");
+        fs::write(&old, "source\n").expect("seed source");
+        fs::write(&victim, "keep me\n").expect("seed destination");
+
+        let config = ApplyConfig {
+            allow_file_deletion: false,
+            ..permissive()
+        };
+        let applier = Applier::new(vec![dir.path().to_path_buf()], config);
+        let plan = EditPlan::from_workspace_edit(WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Operations(vec![
+                DocumentChangeOperation::Op(ResourceOp::Rename(RenameFile {
+                    old_uri: uri_for(&old),
+                    new_uri: uri_for(&victim),
+                    options: Some(lsp_types::RenameFileOptions {
+                        overwrite: Some(true),
+                        ignore_if_exists: None,
+                    }),
+                    annotation_id: None,
+                })),
+            ])),
+            ..WorkspaceEdit::default()
+        })
+        .expect("plan builds");
+
+        let error = applier
+            .apply(plan, PositionEncoding::Utf16)
+            .await
+            .expect_err("an overwriting rename is a destruction");
+        assert!(
+            error.to_string().contains("apply.allow_file_deletion"),
+            "the error names the key that would permit it: {error}"
+        );
+        assert_eq!(fs::read_to_string(&victim).expect("read"), "keep me\n");
+        assert!(old.exists(), "the source is untouched too");
     }
 
     #[tokio::test]
