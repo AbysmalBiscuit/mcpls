@@ -5,6 +5,7 @@
 
 use std::sync::{Mutex as StdMutex, MutexGuard, PoisonError};
 
+pub mod apply;
 mod encoding;
 mod notifications;
 pub mod resources;
