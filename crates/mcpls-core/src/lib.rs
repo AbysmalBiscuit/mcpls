@@ -978,6 +978,9 @@ fn spawn_lsp_servers_background(
 mod test_support {
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, MutexGuard, PoisonError};
+    use std::time::Duration;
+
+    use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt};
 
     static CWD_LOCK: Mutex<()> = Mutex::new(());
 
@@ -1023,9 +1026,130 @@ mod test_support {
         }
     }
 
+    /// How long [`read_framed_message`] waits for a message to arrive.
+    ///
+    /// Callers only ever read a frame the code under test has already been
+    /// driven to send, so a wait that actually elapses means something
+    /// upstream went wrong -- most often a handler that returned an error
+    /// before writing its request. Unbounded, that lands as a test binary
+    /// hung on a pipe, naming no test; bounded, it is a panic on the test
+    /// that stalled. The value sits far above any plausible scheduling delay
+    /// and well under nextest's own slow-test terminator.
+    const FRAME_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Reads one `Content-Length`-framed JSON-RPC message off `reader`.
+    ///
+    /// `reader` must be reused across calls, not recreated per message: a
+    /// fresh `BufReader` would silently drop any bytes of a later message it
+    /// over-read into its internal buffer while parsing an earlier one.
+    ///
+    /// Panics rather than blocking forever: once [`FRAME_READ_TIMEOUT`] of
+    /// wall-clock time passes with no message, or as soon as the stream
+    /// closes mid-message.
+    ///
+    /// The deadline is counted on a blocking thread rather than with
+    /// `tokio::time::timeout`, because callers run under
+    /// `#[tokio::test(start_paused = true)]`, where the runtime jumps its
+    /// virtual clock to the next timer as soon as it parks. Waiting on a
+    /// real pipe parks it, so a virtual deadline reports a timeout on every
+    /// read whose bytes are not already buffered.
+    pub async fn read_framed_message<R: AsyncBufRead + Unpin>(reader: &mut R) -> serde_json::Value {
+        read_framed_message_within(reader, FRAME_READ_TIMEOUT).await
+    }
+
+    /// [`read_framed_message`] with a caller-chosen deadline, so the test
+    /// covering the deadline itself need not wait out the real one.
+    async fn read_framed_message_within<R: AsyncBufRead + Unpin>(
+        reader: &mut R,
+        deadline: Duration,
+    ) -> serde_json::Value {
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        // Resolves on the deadline, or as soon as `done_tx` drops, so a read
+        // that returns normally leaves no thread sleeping behind it.
+        let watchdog = tokio::task::spawn_blocking(move || done_rx.recv_timeout(deadline));
+
+        tokio::select! {
+            message = read_frame(reader) => {
+                drop(done_tx);
+                message
+            }
+            _ = watchdog => panic!(
+                "no framed message arrived within {deadline:?}; the code under test most likely \
+                 failed before sending one"
+            ),
+        }
+    }
+
+    async fn read_frame<R: AsyncBufRead + Unpin>(reader: &mut R) -> serde_json::Value {
+        let mut content_length = None;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            // A closed stream yields an empty line forever, which matches no
+            // branch below, so without this the loop spins reading EOF. The
+            // deadline cannot rescue that: a loop that never returns
+            // `Pending` never hands control back to the watchdog it races.
+            assert!(
+                reader.read_line(&mut line).await.unwrap() > 0,
+                "stream closed before a complete framed message arrived"
+            );
+            if line == "\r\n" || line == "\n" {
+                break;
+            }
+            if let Some((key, value)) = line.trim_end().split_once(':')
+                && key.trim().eq_ignore_ascii_case("content-length")
+            {
+                content_length = Some(value.trim().parse::<usize>().unwrap());
+            }
+        }
+        let mut buf = vec![0u8; content_length.unwrap()];
+        reader.read_exact(&mut buf).await.unwrap();
+        serde_json::from_slice(&buf).unwrap()
+    }
+
     #[cfg(test)]
     mod tests {
-        use super::CwdGuard;
+        use std::time::Duration;
+
+        use tokio::io::BufReader;
+
+        use super::{CwdGuard, read_framed_message, read_framed_message_within};
+
+        /// A silent-but-open stream must fail the one test that stalled
+        /// instead of parking the whole test binary on a pipe, where the
+        /// run dies by external timeout naming no test at all.
+        #[tokio::test]
+        async fn test_read_framed_message_panics_when_no_message_arrives() {
+            // The unread write half is held for the whole call, so the read
+            // half stays open and pending rather than reaching EOF.
+            let (silent, _write_half) = tokio::io::duplex(64);
+
+            let read = tokio::spawn(async move {
+                let mut reader = BufReader::new(silent);
+                read_framed_message_within(&mut reader, Duration::from_millis(50)).await
+            });
+
+            assert!(
+                read.await.is_err_and(|joined| joined.is_panic()),
+                "a message that never arrives must panic, not hang"
+            );
+        }
+
+        /// A server that dies mid-conversation closes its stdout, and every
+        /// subsequent read returns EOF immediately. That must end the read,
+        /// not spin it.
+        #[tokio::test]
+        async fn test_read_framed_message_panics_when_stream_closes() {
+            let read = tokio::spawn(async move {
+                let mut reader = BufReader::new(tokio::io::empty());
+                read_framed_message(&mut reader).await
+            });
+
+            assert!(
+                read.await.is_err_and(|joined| joined.is_panic()),
+                "a closed stream must panic, not spin on EOF"
+            );
+        }
 
         #[test]
         fn test_cwd_guard_restores_cwd_on_panic() {

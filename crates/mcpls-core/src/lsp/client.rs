@@ -1108,7 +1108,7 @@ mod tests {
     mod retry_behavior {
         use std::process::Stdio;
 
-        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        use tokio::io::{AsyncWriteExt, BufReader};
         use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
         use super::*;
@@ -1154,26 +1154,7 @@ mod tests {
             )
         }
 
-        /// Reads one `Content-Length`-framed JSON-RPC message off `reader`.
-        async fn read_framed_message(reader: &mut BufReader<&mut ChildStdout>) -> Value {
-            let mut content_length = None;
-            let mut line = String::new();
-            loop {
-                line.clear();
-                reader.read_line(&mut line).await.unwrap();
-                if line == "\r\n" || line == "\n" {
-                    break;
-                }
-                if let Some((key, value)) = line.trim_end().split_once(':')
-                    && key.trim().eq_ignore_ascii_case("content-length")
-                {
-                    content_length = Some(value.trim().parse::<usize>().unwrap());
-                }
-            }
-            let mut buf = vec![0u8; content_length.unwrap()];
-            reader.read_exact(&mut buf).await.unwrap();
-            serde_json::from_slice(&buf).unwrap()
-        }
+        use crate::test_support::read_framed_message;
 
         /// Writes a framed JSON-RPC `ServerCancelled` (-32802) error response.
         async fn write_server_cancelled_response(

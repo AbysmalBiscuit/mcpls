@@ -7,7 +7,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 use tempfile::TempDir;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 use super::Translator;
@@ -17,6 +17,7 @@ use crate::bridge::state::ResourceLimits;
 use crate::bridge::{DiagnosticInfo, DocumentTracker};
 use crate::config::{LspServerConfig, ServerId, ToolRouter};
 use crate::lsp::{LspClient, LspServer, LspTransport};
+pub(super) use crate::test_support::read_framed_message;
 
 type JsonValue = serde_json::Value;
 
@@ -126,31 +127,6 @@ pub(super) fn fake_lsp_client() -> (LspClient, FakeServer) {
             write_stdout,
         },
     )
-}
-
-/// Reads one `Content-Length`-framed JSON-RPC message off `reader`.
-///
-/// `reader` must be reused across calls, not recreated per message: a
-/// fresh `BufReader` would silently drop any bytes of a later message it
-/// over-read into its internal buffer while parsing an earlier one.
-pub(super) async fn read_framed_message(reader: &mut BufReader<&mut ChildStdout>) -> JsonValue {
-    let mut content_length = None;
-    let mut line = String::new();
-    loop {
-        line.clear();
-        reader.read_line(&mut line).await.unwrap();
-        if line == "\r\n" || line == "\n" {
-            break;
-        }
-        if let Some((key, value)) = line.trim_end().split_once(':')
-            && key.trim().eq_ignore_ascii_case("content-length")
-        {
-            content_length = Some(value.trim().parse::<usize>().unwrap());
-        }
-    }
-    let mut buf = vec![0u8; content_length.unwrap()];
-    reader.read_exact(&mut buf).await.unwrap();
-    serde_json::from_slice(&buf).unwrap()
 }
 
 /// Writes a framed JSON-RPC success response, as a real LSP server would.
