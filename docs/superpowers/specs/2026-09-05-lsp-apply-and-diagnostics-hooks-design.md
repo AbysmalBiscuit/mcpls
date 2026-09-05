@@ -178,7 +178,7 @@ later, and the request is handed to that task while the loop keeps polling. The 
 forwards the edit to the applier through a sink:
 
 ```rust
-type ApplySink = mpsc::Sender<(WorkspaceEdit, oneshot::Sender<ApplyOutcome>)>;
+type ApplySink = mpsc::Sender<(WorkspaceEdit, oneshot::Sender<bool>)>;
 ```
 
 The sink's `Sender` is installed only while the global apply mutex is held by a code-action
