@@ -395,12 +395,48 @@ pub(crate) async fn run_stdio(
 /// covers the post-transport cleanup window, not the drain wait inside this
 /// one; see #329 and the TODO on the closure below for that gap.
 #[cfg(feature = "transport-http")]
+pub(crate) async fn run_http(
+    mcp_server: crate::mcp::McplsServer,
+    cfg: HttpConfig,
+    shutdown_signal: ShutdownSignal,
+) -> Result<(), crate::Error> {
+    let listener = tokio::net::TcpListener::bind(cfg.bind)
+        .await
+        .map_err(|e| crate::Error::McpServer(format!("bind {}: {e}", cfg.bind)))?;
+
+    tracing::info!(addr = %cfg.bind, path = %cfg.path, "MCP HTTP transport listening");
+    if !cfg.bind.ip().is_loopback() {
+        tracing::warn!(
+            addr = %cfg.bind,
+            "binding to a non-loopback address: mcpls performs no authentication of its own on \
+             any transport — place this endpoint behind a reverse proxy that enforces \
+             authentication. The proxy must also rewrite the Host header, since rmcp's Host \
+             validation allows only localhost/127.0.0.1/::1 by default"
+        );
+    }
+
+    serve_http_on(listener, mcp_server, cfg, shutdown_signal).await
+}
+
+/// Serves the MCP protocol over an already-bound `listener` until
+/// `shutdown_signal` fires.
+///
+/// Split from [`run_http`] so a caller holding its own listener can serve on
+/// it. Tests depend on that: `run_http` picks its own port, so a test could
+/// only name one by binding a probe listener and closing it again, leaving a
+/// window for another binder to claim it. A port lost that way surfaces as a
+/// refused connection much further along, blamed on whatever the test went
+/// on to assert. Handing over a listener that was never released removes the
+/// window rather than narrowing it, and leaves nothing to wait for either:
+/// the socket is already accepting when this is called.
+#[cfg(feature = "transport-http")]
 // `session_manager` and `service` are moved into `app`, which is served until
-// shutdown — clippy's drop-tightening heuristic misreads that as an
+// shutdown -- clippy's drop-tightening heuristic misreads that as an
 // early-droppable temporary because both types embed `tokio::sync` lock types
 // (`CappedSessionManager`'s `Mutex`, `StreamableHttpService`'s `RwLock`s).
 #[allow(clippy::significant_drop_tightening)]
-pub(crate) async fn run_http(
+pub(crate) async fn serve_http_on(
+    listener: tokio::net::TcpListener,
     mcp_server: crate::mcp::McplsServer,
     cfg: HttpConfig,
     mut shutdown_signal: ShutdownSignal,
@@ -431,21 +467,6 @@ pub(crate) async fn run_http(
         .nest_service(&cfg.path, service.clone())
         .route_service("/", service)
         .layer(axum::middleware::from_fn(enforce_session_cap));
-
-    let listener = tokio::net::TcpListener::bind(cfg.bind)
-        .await
-        .map_err(|e| crate::Error::McpServer(format!("bind {}: {e}", cfg.bind)))?;
-
-    tracing::info!(addr = %cfg.bind, path = %cfg.path, "MCP HTTP transport listening");
-    if !cfg.bind.ip().is_loopback() {
-        tracing::warn!(
-            addr = %cfg.bind,
-            "binding to a non-loopback address: mcpls performs no authentication of its own on \
-             any transport — place this endpoint behind a reverse proxy that enforces \
-             authentication. The proxy must also rewrite the Host header, since rmcp's Host \
-             validation allows only localhost/127.0.0.1/::1 by default"
-        );
-    }
 
     // `cancel` is cancelled exactly once, when the shutdown signal fires
     // (below). Cloned first so the force-timeout branch can observe that
@@ -892,43 +913,26 @@ mod tests {
             );
         }
 
-        /// Verifies `run_http` binds successfully and accepts TCP connections.
+        /// The transport must answer MCP requests on the listener it is
+        /// given, not merely hold it open: an `initialize` handshake proves
+        /// the service is mounted at the configured path and reachable.
         #[tokio::test]
-        async fn test_run_http_binds() {
-            use std::path::PathBuf;
-            use std::sync::Arc;
+        async fn test_serve_http_on_answers_mcp_requests() {
+            let (addr, server_task) =
+                serve_http_for_test(|addr| HttpConfig::new(addr, "/mcp")).await;
 
-            use tokio::sync::Mutex;
+            let initialize_body = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}"#;
+            let response = raw_http_post(
+                addr,
+                "/mcp",
+                "Accept: application/json, text/event-stream\r\nContent-Type: application/json\r\n",
+                initialize_body,
+            )
+            .await;
 
-            use crate::bridge::{NotificationCache, ResourceSubscriptions, Translator};
-            use crate::mcp::McplsServer;
-
-            let translator = Arc::new(Translator::new());
-            let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
-            let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
-            let subs = Arc::new(ResourceSubscriptions::new());
-            let server =
-                McplsServer::new(translator, notification_cache, workspace_roots, subs, false);
-
-            // Bind port 0 so the OS assigns a free port.
-            let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = probe.local_addr().unwrap();
-            drop(probe);
-
-            let cfg = HttpConfig::new(addr, "/mcp");
-
-            let server_task = tokio::spawn(super::super::run_http(
-                server,
-                cfg,
-                super::super::ShutdownSignal::new(),
-            ));
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-            // A successful TCP connect proves the listener is up.
-            let connected = tokio::net::TcpStream::connect(addr).await;
             assert!(
-                connected.is_ok(),
-                "HTTP listener should accept TCP connections"
+                response.starts_with("HTTP/1.1 200"),
+                "the mounted MCP service should answer an initialize handshake, got: {response}"
             );
 
             server_task.abort();
@@ -952,20 +956,11 @@ mod tests {
         /// must still be running.
         #[tokio::test(start_paused = true)]
         async fn test_run_http_does_not_self_terminate_without_signal() {
-            let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = probe.local_addr().unwrap();
-            drop(probe);
+            let (_addr, server_task) =
+                serve_http_for_test(|addr| HttpConfig::new(addr, "/mcp")).await;
 
-            let cfg = HttpConfig::new(addr, "/mcp");
-            let server_task = tokio::spawn(super::super::run_http(
-                test_server(),
-                cfg,
-                super::super::ShutdownSignal::new(),
-            ));
-
-            // Let the spawned task make initial progress (bind the
-            // listener, enter its `select!`) without depending on any real
-            // or virtual delay.
+            // Let the spawned task make initial progress (enter its
+            // `select!`) without depending on any real or virtual delay.
             for _ in 0..10 {
                 tokio::task::yield_now().await;
             }
@@ -1041,6 +1036,32 @@ mod tests {
             McplsServer::new(translator, notification_cache, workspace_roots, subs, false)
         }
 
+        /// Serves the MCP HTTP transport on a fresh loopback port, returning
+        /// the address it is already accepting connections on.
+        ///
+        /// The listener is bound here and handed straight to the server
+        /// without ever being closed, so no other binder can take the port
+        /// and a connect needs no wait to succeed -- see
+        /// [`super::super::serve_http_on`].
+        async fn serve_http_for_test(
+            make_cfg: impl FnOnce(SocketAddr) -> HttpConfig,
+        ) -> (
+            SocketAddr,
+            tokio::task::JoinHandle<Result<(), crate::Error>>,
+        ) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let task = tokio::spawn(super::super::serve_http_on(
+                listener,
+                test_server(),
+                make_cfg(addr),
+                super::super::ShutdownSignal::new(),
+            ));
+
+            (addr, task)
+        }
+
         /// Sends a raw HTTP/1.1 POST request over TCP and returns the raw response
         /// text (status line, headers, and body). Used because neither `reqwest`
         /// nor `tower`/`http-body-util` are available as dev-dependencies here.
@@ -1079,17 +1100,10 @@ mod tests {
         /// `StreamableHttpServerConfig::max_request_body_bytes`.
         #[tokio::test]
         async fn test_run_http_rejects_oversized_body_with_413() {
-            let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = probe.local_addr().unwrap();
-            drop(probe);
-
-            let cfg = HttpConfig::new(addr, "/mcp").with_max_request_body_bytes(64);
-            let server_task = tokio::spawn(super::super::run_http(
-                test_server(),
-                cfg,
-                super::super::ShutdownSignal::new(),
-            ));
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let (addr, server_task) = serve_http_for_test(|addr| {
+                HttpConfig::new(addr, "/mcp").with_max_request_body_bytes(64)
+            })
+            .await;
 
             let oversized_body = vec![b'a'; 65];
             let response = raw_http_post(
@@ -1114,17 +1128,10 @@ mod tests {
         /// "passed the size check" from "was a valid request").
         #[tokio::test]
         async fn test_run_http_accepts_body_within_limit() {
-            let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = probe.local_addr().unwrap();
-            drop(probe);
-
-            let cfg = HttpConfig::new(addr, "/mcp").with_max_request_body_bytes(64);
-            let server_task = tokio::spawn(super::super::run_http(
-                test_server(),
-                cfg,
-                super::super::ShutdownSignal::new(),
-            ));
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let (addr, server_task) = serve_http_for_test(|addr| {
+                HttpConfig::new(addr, "/mcp").with_max_request_body_bytes(64)
+            })
+            .await;
 
             let small_body = vec![b'a'; 32];
             let response = raw_http_post(
@@ -1236,10 +1243,12 @@ mod tests {
 
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
+            // `bind` above already put the socket in the listening state, so
+            // the connect below lands in the backlog whether or not
+            // `axum::serve` has been polled yet. Nothing to wait for.
             let server_task = tokio::spawn(async move {
                 axum::serve(listener, app).await.unwrap();
             });
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
             let response = raw_http_post(addr, "/", "", b"{}").await;
             assert!(
@@ -1274,10 +1283,12 @@ mod tests {
 
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
+            // `bind` above already put the socket in the listening state, so
+            // the connect below lands in the backlog whether or not
+            // `axum::serve` has been polled yet. Nothing to wait for.
             let server_task = tokio::spawn(async move {
                 axum::serve(listener, app).await.unwrap();
             });
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
             let response = raw_http_post(addr, "/", "", b"{}").await;
             assert!(
@@ -1293,17 +1304,10 @@ mod tests {
         /// once the first session is established.
         #[tokio::test]
         async fn test_run_http_rejects_new_session_at_capacity_with_429() {
-            let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = probe.local_addr().unwrap();
-            drop(probe);
-
-            let cfg = HttpConfig::new(addr, "/mcp").with_max_concurrent_sessions(1);
-            let server_task = tokio::spawn(super::super::run_http(
-                test_server(),
-                cfg,
-                super::super::ShutdownSignal::new(),
-            ));
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let (addr, server_task) = serve_http_for_test(|addr| {
+                HttpConfig::new(addr, "/mcp").with_max_concurrent_sessions(1)
+            })
+            .await;
 
             let initialize_body = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}"#;
             let accept_headers =
@@ -1335,17 +1339,10 @@ mod tests {
         /// sniffing for the cap decision (the bug this design replaced).
         #[tokio::test]
         async fn test_run_http_stateless_request_bypasses_session_cap() {
-            let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = probe.local_addr().unwrap();
-            drop(probe);
-
-            let cfg = HttpConfig::new(addr, "/mcp").with_max_concurrent_sessions(1);
-            let server_task = tokio::spawn(super::super::run_http(
-                test_server(),
-                cfg,
-                super::super::ShutdownSignal::new(),
-            ));
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let (addr, server_task) = serve_http_for_test(|addr| {
+                HttpConfig::new(addr, "/mcp").with_max_concurrent_sessions(1)
+            })
+            .await;
 
             let accept_headers =
                 "Accept: application/json, text/event-stream\r\nContent-Type: application/json\r\n";
