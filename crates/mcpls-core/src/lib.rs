@@ -2350,13 +2350,18 @@ mod tests {
             let (_cancel_tx, cancel_rx) = watch::channel(false);
 
             // Simulate a slow in-flight MCP request (e.g. `pull_diagnostics`)
-            // holding the translator lock across an LSP round-trip.
+            // holding the translator lock across an LSP round-trip. It holds
+            // until released below rather than for a fixed span, so the lock
+            // is provably still held for the whole observation window
+            // instead of only probably outlasting it.
             let lock_acquired = Arc::new(tokio::sync::Notify::new());
-            let notify = Arc::clone(&lock_acquired);
+            let release_lock = Arc::new(tokio::sync::Notify::new());
+            let acquired = Arc::clone(&lock_acquired);
+            let release = Arc::clone(&release_lock);
             let holder = tokio::spawn(async move {
                 let _guard = translator.lock().await;
-                notify.notify_one();
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                acquired.notify_one();
+                release.notified().await;
             });
             lock_acquired.notified().await;
 
@@ -2385,9 +2390,11 @@ mod tests {
             .unwrap();
             drop(tx);
 
-            // Well within the 2 s translator lock hold: a translator-locking
-            // pump would still be blocked at this point.
-            tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            // The holder above still owns the translator lock throughout, so
+            // a translator-locking pump could not have got here. The bound is
+            // generous because it only has to catch a pump that never
+            // progresses, not one that is merely slow on a loaded machine.
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 loop {
                     {
                         let guard = cache.lock().await;
@@ -2401,6 +2408,7 @@ mod tests {
             .await
             .expect("pump stalled behind translator lock");
 
+            release_lock.notify_one();
             holder.await.unwrap();
         }
     }
