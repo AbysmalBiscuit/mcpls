@@ -19,10 +19,10 @@ use tokio::sync::Mutex;
 
 use super::handlers::BridgeContext;
 use super::tools::{
-    CachedDiagnosticsParams, CallHierarchyCallsParams, CodeActionsParams, CompletionsParams,
-    DiagnosticsParams, DocumentSymbolsParams, FormatDocumentParams, InlayHintsParams,
-    PositionParams, RangeParams, ReferencesParams, RenameParams, ServerLogsParams,
-    ServerMessagesParams, WorkspaceSymbolParams,
+    ApplyCodeActionParams, CachedDiagnosticsParams, CallHierarchyCallsParams, CodeActionsParams,
+    CompletionsParams, DiagnosticsParams, DocumentSymbolsParams, FormatDocumentParams,
+    InlayHintsParams, PositionParams, RangeParams, ReferencesParams, RenameParams,
+    ServerLogsParams, ServerMessagesParams, WorkspaceSymbolParams,
 };
 use crate::bridge::resources::{make_uri, parse_uri};
 use crate::bridge::{
@@ -416,8 +416,10 @@ impl McplsServer {
     }
 
     /// Get code actions for a range.
-    // read-only: returns proposed CodeAction edits, does not apply them --
-    // mcpls has no write-back path today; revisit if that changes.
+    // read-only: returns proposed CodeAction edits, does not apply them.
+    // `apply_code_action` re-issues the same request and applies one by
+    // index or title, since a list has no defined meaning for an `apply`
+    // flag of its own.
     #[tool(
         description = "Code actions for range. Returns quick fixes, refactorings, and source actions with edits.",
         title = "Code Actions"
@@ -446,6 +448,52 @@ impl McplsServer {
                     end_line,
                     end_character,
                     kind_filter,
+                )
+                .await,
+        )
+    }
+
+    /// Apply one of the code actions available for a range.
+    #[tool(
+        description = "Apply one code action from get_code_actions for the same range and \
+                       kind_filter, by index or exact title. Requires apply.code_actions = \
+                       true in config. Writes the action's edits to disk.",
+        title = "Apply Code Action",
+        annotations(
+            title = "Apply Code Action",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
+    )]
+    async fn apply_code_action(
+        &self,
+        Parameters(ApplyCodeActionParams {
+            file_path,
+            range:
+                RangeParams {
+                    start_line,
+                    start_character,
+                    end_line,
+                    end_character,
+                },
+            kind_filter,
+            action_index,
+            action_title,
+        }): Parameters<ApplyCodeActionParams>,
+    ) -> Result<String, McpError> {
+        to_tool_result(
+            self.context
+                .translator
+                .handle_apply_code_action(
+                    file_path,
+                    start_line,
+                    start_character,
+                    end_line,
+                    end_character,
+                    kind_filter,
+                    action_index,
+                    action_title,
                 )
                 .await,
         )
@@ -1649,6 +1697,7 @@ mod tests {
             ("format_document", false, true, true),
             ("workspace_symbol_search", true, false, true),
             ("get_code_actions", true, false, true),
+            ("apply_code_action", false, true, false),
             ("prepare_call_hierarchy", true, false, true),
             ("get_incoming_calls", true, false, true),
             ("get_outgoing_calls", true, false, true),

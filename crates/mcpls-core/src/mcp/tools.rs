@@ -169,6 +169,43 @@ pub struct CodeActionsParams {
     pub kind_filter: Option<String>,
 }
 
+/// Parameters for the `apply_code_action` tool.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(description = "Parameters for applying one code action from a range.")]
+pub struct ApplyCodeActionParams {
+    /// Absolute path to the file.
+    #[schemars(description = "Absolute path to the file.")]
+    pub file_path: String,
+    /// Range in the file to operate on.
+    #[serde(flatten)]
+    pub range: RangeParams,
+    /// Optional filter by action kind (quickfix, refactor, source, etc.),
+    /// matched to the `get_code_actions` call this action's index or title
+    /// came from.
+    #[schemars(
+        description = "Optional filter by action kind (quickfix, refactor, source, etc.). \
+                       Must match the kind_filter used in the get_code_actions call this \
+                       action_index or action_title came from, or the index numbers a \
+                       different list."
+    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind_filter: Option<String>,
+    /// Position of the action in the `get_code_actions` list.
+    #[schemars(
+        description = "Position of the action in the get_code_actions list for this same \
+                       range. Give this or action_title, not both."
+    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_index: Option<usize>,
+    /// Exact title of the action.
+    #[schemars(
+        description = "Exact title of the action, which must match exactly one. Give this \
+                       or action_index, not both."
+    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_title: Option<String>,
+}
+
 /// Parameters for the `get_incoming_calls` and `get_outgoing_calls` tools.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[schemars(

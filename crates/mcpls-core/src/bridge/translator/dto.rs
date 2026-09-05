@@ -216,6 +216,24 @@ pub struct CodeAction {
     /// Whether this is the preferred action.
     #[serde(default)]
     pub is_preferred: bool,
+    /// Position in the returned list, so `apply_code_action` can name this
+    /// action without the caller repeating its title.
+    pub index: usize,
+}
+
+/// Result of applying one code action.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplyCodeActionResult {
+    /// Title of the action that ran.
+    pub title: String,
+    /// Whether an edit reached the working tree.
+    pub applied: bool,
+    /// Files written, when `applied`.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub files_written: Vec<String>,
+    /// Command dispatched to the server, when the action carried one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub executed_command: Option<String>,
 }
 
 /// Description of a workspace edit.

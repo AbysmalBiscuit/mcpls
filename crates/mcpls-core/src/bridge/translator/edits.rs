@@ -10,8 +10,9 @@ use lsp_types::{
 use super::Translator;
 use super::diagnostics::diagnostic_to_mcp;
 use super::dto::{
-    CodeAction, CodeActionsResult, CommandDescription, DocumentChanges, FormatDocumentResult,
-    RenameResult, TextEdit, WorkspaceEditDescription, resource_operations_from_plan,
+    ApplyCodeActionResult, CodeAction, CodeActionsResult, CommandDescription, DocumentChanges,
+    FormatDocumentResult, RenameResult, TextEdit, WorkspaceEditDescription,
+    resource_operations_from_plan,
 };
 use super::encoding_ctx::EncodingCtx;
 use super::routing::{MAX_POSITION_VALUE, MAX_RANGE_LINES};
@@ -174,6 +175,73 @@ async fn convert_code_action(
         edit,
         command,
         is_preferred: action.is_preferred.unwrap_or(false),
+        index: 0,
+    }
+}
+
+/// How a caller names the code action to apply.
+///
+/// Internal: the MCP surface takes two flat optional fields, which
+/// [`selector_from_params`] narrows to this.
+#[derive(Debug, Clone)]
+enum CodeActionSelector {
+    /// Position in the list `get_code_actions` returned.
+    Index(usize),
+    /// Exact title, which must match exactly one action.
+    Title(String),
+}
+
+/// Narrow the tool's two optional selector fields to exactly one selector.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidToolParams`] when neither or both are given.
+fn selector_from_params(
+    action_index: Option<usize>,
+    action_title: Option<String>,
+) -> Result<CodeActionSelector> {
+    match (action_index, action_title) {
+        (Some(index), None) => Ok(CodeActionSelector::Index(index)),
+        (None, Some(title)) => Ok(CodeActionSelector::Title(title)),
+        (Some(_), Some(_)) => Err(Error::InvalidToolParams(
+            "give either action_index or action_title, not both".to_string(),
+        )),
+        (None, None) => Err(Error::InvalidToolParams(
+            "give one of action_index or action_title to name the action to apply".to_string(),
+        )),
+    }
+}
+
+/// Pick the action `selector` names.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidToolParams`] when the index is out of range, no
+/// title matches, or a title matches more than one action.
+fn select_action<'a>(
+    actions: &'a [CodeAction],
+    selector: &CodeActionSelector,
+) -> Result<&'a CodeAction> {
+    match selector {
+        CodeActionSelector::Index(index) => actions.get(*index).ok_or_else(|| {
+            Error::InvalidToolParams(format!(
+                "action index {index} is out of range: {} actions available",
+                actions.len()
+            ))
+        }),
+        CodeActionSelector::Title(title) => {
+            let mut matches = actions.iter().filter(|a| a.title == *title);
+            let first = matches.next().ok_or_else(|| {
+                Error::InvalidToolParams(format!("no code action titled {title:?}"))
+            })?;
+            if matches.next().is_some() {
+                return Err(Error::InvalidToolParams(format!(
+                    "title {title:?} is ambiguous: more than one action shares it, \
+                     select by index instead"
+                )));
+            }
+            Ok(first)
+        }
     }
 }
 
@@ -451,8 +519,8 @@ impl Translator {
         let response_vec = response.unwrap_or_default();
         let mut actions = Vec::with_capacity(response_vec.len());
 
-        for action_or_command in response_vec {
-            let action = match action_or_command {
+        for (index, action_or_command) in response_vec.into_iter().enumerate() {
+            let mut action = match action_or_command {
                 lsp_types::CodeActionOrCommand::CodeAction(action) => {
                     convert_code_action(action, &ctx, &response_uri).await
                 }
@@ -469,13 +537,199 @@ impl Translator {
                             arguments,
                         }),
                         is_preferred: false,
+                        index: 0,
                     }
                 }
             };
+            action.index = index;
             actions.push(action);
         }
 
         Ok(CodeActionsResult { actions })
+    }
+
+    /// Apply one of the code actions available for a range.
+    ///
+    /// Re-issues `textDocument/codeAction` for the same range
+    /// `get_code_actions` used, selects one action by `action_index` or
+    /// `action_title`, resolves it if the server sent only `data`, and
+    /// applies its edit and/or runs its command. An action carrying both an
+    /// edit and a command applies the edit first, per the LSP specification.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ApplyDisabled`] when `apply.code_actions` is false,
+    /// [`Error::InvalidToolParams`] when the selector names no action or an
+    /// ambiguous one, [`Error::ApplyRefused`] when the resolved action
+    /// carries neither an edit nor a command or the edit is rejected before
+    /// anything is written, [`Error::ApplyPartiallyFailed`] if a write step
+    /// fails partway through, and whatever the LSP request itself returns
+    /// (e.g. the file cannot be opened, or the routed server does not
+    /// advertise `codeActionProvider` support).
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub async fn handle_apply_code_action(
+        &self,
+        file_path: String,
+        start_line: u32,
+        start_character: u32,
+        end_line: u32,
+        end_character: u32,
+        kind_filter: Option<String>,
+        action_index: Option<usize>,
+        action_title: Option<String>,
+    ) -> Result<ApplyCodeActionResult> {
+        validate_code_action_params(
+            start_line,
+            start_character,
+            end_line,
+            end_character,
+            kind_filter.as_deref(),
+        )?;
+        let selector = selector_from_params(action_index, action_title)?;
+        let write_permit = self.applier_for(
+            ToolKind::CodeActions,
+            "apply_code_action",
+            "apply.code_actions",
+        )?;
+
+        let (server_id, client, uri) = self
+            .prepare_gated_document(
+                &file_path,
+                ToolKind::CodeActions,
+                "codeActionProvider",
+                |caps| {
+                    matches!(
+                        caps.code_action_provider,
+                        Some(
+                            lsp_types::CodeActionProviderCapability::Simple(true)
+                                | lsp_types::CodeActionProviderCapability::Options(_)
+                        )
+                    )
+                },
+            )
+            .await?;
+        let ctx = self.encoding_ctx(&server_id);
+
+        let range = lsp_types::Range {
+            start: ctx.to_lsp(&uri, start_line, start_character).await,
+            end: ctx.to_lsp(&uri, end_line, end_character).await,
+        };
+
+        // Built identically to `handle_code_actions`'s `only`, so this
+        // re-issued request returns the same numbered list the caller read
+        // `action_index`/`action_title` from: a differing filter would
+        // shift or drop entries and silently apply the wrong action.
+        let only = kind_filter.map(|k| vec![lsp_types::CodeActionKind::from(k)]);
+
+        let params = lsp_types::CodeActionParams {
+            text_document: TextDocumentIdentifier { uri },
+            range,
+            context: lsp_types::CodeActionContext {
+                diagnostics: vec![],
+                only,
+                trigger_kind: Some(lsp_types::CodeActionTriggerKind::INVOKED),
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+
+        let response: Option<lsp_types::CodeActionResponse> = client
+            .request("textDocument/codeAction", params, client.request_timeout())
+            .await?;
+        let entries = response.unwrap_or_default();
+
+        // Numbered exactly as `handle_code_actions` numbers its output, so
+        // an index the caller read from that listing names the same entry
+        // here. Legacy `Command` entries occupy positions in that list, so
+        // they are numbered too rather than filtered out.
+        let selectable: Vec<CodeAction> = entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let title = match entry {
+                    lsp_types::CodeActionOrCommand::CodeAction(action) => action.title.clone(),
+                    lsp_types::CodeActionOrCommand::Command(cmd) => cmd.title.clone(),
+                };
+                CodeAction {
+                    title,
+                    kind: None,
+                    diagnostics: Vec::new(),
+                    edit: None,
+                    command: None,
+                    is_preferred: false,
+                    index,
+                }
+            })
+            .collect();
+        let chosen_index = select_action(&selectable, &selector)?.index;
+
+        let (title, edit, command) = match entries[chosen_index].clone() {
+            lsp_types::CodeActionOrCommand::Command(cmd) => (cmd.title.clone(), None, Some(cmd)),
+            lsp_types::CodeActionOrCommand::CodeAction(action) => {
+                let resolved = if action.edit.is_none() && action.data.is_some() {
+                    client
+                        .request::<_, lsp_types::CodeAction>(
+                            "codeAction/resolve",
+                            action,
+                            client.request_timeout(),
+                        )
+                        .await?
+                } else {
+                    action
+                };
+                (resolved.title, resolved.edit, resolved.command)
+            }
+        };
+
+        let mut files_written = Vec::new();
+        let mut applied = false;
+        if let Some(edit) = edit {
+            let plan = EditPlan::from_workspace_edit(edit)?;
+            let summary = self.apply_locked(&write_permit, plan, &server_id).await?;
+            // `applied` means bytes were written, not that the pipeline
+            // ran: an edit with no changes plans zero operations and
+            // writes nothing.
+            applied = !summary.files_changed.is_empty();
+            files_written.extend(
+                summary
+                    .files_changed
+                    .iter()
+                    .map(|change| change.path.display().to_string()),
+            );
+        }
+
+        // A command-only action still reaches `workspace/executeCommand`
+        // even with no edit to write: an organize-imports-style action can
+        // legitimately carry a command and nothing else.
+        let executed_command = if let Some(command) = command {
+            client
+                .request::<_, serde_json::Value>(
+                    "workspace/executeCommand",
+                    lsp_types::ExecuteCommandParams {
+                        command: command.command.clone(),
+                        arguments: command.arguments.unwrap_or_default(),
+                        work_done_progress_params: WorkDoneProgressParams::default(),
+                    },
+                    client.request_timeout(),
+                )
+                .await?;
+            Some(command.command)
+        } else {
+            None
+        };
+
+        if !applied && executed_command.is_none() {
+            return Err(Error::ApplyRefused(format!(
+                "code action {title:?} resolved to neither an edit nor a command"
+            )));
+        }
+
+        Ok(ApplyCodeActionResult {
+            title,
+            applied,
+            files_written,
+            executed_command,
+        })
     }
 }
 
@@ -1055,5 +1309,106 @@ mod tests {
         assert_eq!(edit.changes[0].uri, "file:///test.rs");
         assert_eq!(edit.changes[0].edits.len(), 1);
         assert_eq!(edit.changes[0].edits[0].new_text, "fixed");
+    }
+
+    fn stub_action(index: usize, title: &str) -> CodeAction {
+        CodeAction {
+            title: title.to_string(),
+            kind: None,
+            diagnostics: Vec::new(),
+            edit: None,
+            command: None,
+            is_preferred: false,
+            index,
+        }
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_code_action_selector_matches_by_index() {
+        let actions = vec![
+            stub_action(0, "Add missing import"),
+            stub_action(1, "Extract into function"),
+        ];
+        let chosen = select_action(&actions, &CodeActionSelector::Index(1))
+            .expect("index 1 selects the second action");
+        assert_eq!(chosen.title, "Extract into function");
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_code_action_selector_matches_by_exact_title() {
+        let actions = vec![
+            stub_action(0, "Add missing import"),
+            stub_action(1, "Extract into function"),
+        ];
+        let chosen = select_action(
+            &actions,
+            &CodeActionSelector::Title("Add missing import".to_string()),
+        )
+        .expect("exact title selects");
+        assert_eq!(chosen.index, 0);
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_code_action_selector_rejects_an_ambiguous_title() {
+        let actions = vec![
+            stub_action(0, "Fill match arms"),
+            stub_action(1, "Fill match arms"),
+        ];
+        let error = select_action(
+            &actions,
+            &CodeActionSelector::Title("Fill match arms".to_string()),
+        )
+        .expect_err("two actions share the title");
+        assert!(error.to_string().contains("ambiguous"));
+    }
+
+    #[test]
+    fn test_code_action_selector_rejects_an_out_of_range_index() {
+        let actions = vec![stub_action(0, "Only one")];
+        assert!(select_action(&actions, &CodeActionSelector::Index(7)).is_err());
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_selector_from_params_requires_exactly_one_field() {
+        assert!(matches!(
+            selector_from_params(Some(2), None).expect("index alone is valid"),
+            CodeActionSelector::Index(2)
+        ));
+        assert!(matches!(
+            selector_from_params(None, Some("Fill".to_string())).expect("title alone is valid"),
+            CodeActionSelector::Title(_)
+        ));
+        assert!(selector_from_params(Some(0), Some("Fill".to_string())).is_err());
+        assert!(selector_from_params(None, None).is_err());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::expect_used)]
+    async fn test_apply_code_action_is_refused_when_config_forbids_it() {
+        let translator = Translator::new();
+        let error = translator
+            .handle_apply_code_action("/w/a.rs".to_string(), 1, 1, 1, 5, None, Some(0), None)
+            .await
+            .expect_err("apply must be refused by a read-only translator");
+        assert!(
+            error.to_string().contains("apply.code_actions"),
+            "the error names the config key"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_code_action_selector_rejects_a_title_matching_nothing() {
+        let actions = vec![stub_action(0, "Only one")];
+        let error = select_action(
+            &actions,
+            &CodeActionSelector::Title("Not present".to_string()),
+        )
+        .expect_err("no action has this title");
+        assert!(error.to_string().contains("Not present"));
     }
 }

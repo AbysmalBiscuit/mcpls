@@ -1,5 +1,80 @@
 [
   {
+    "name": "apply_code_action",
+    "title": "Apply Code Action",
+    "description": "Apply one code action from get_code_actions for the same range and kind_filter, by index or exact title. Requires apply.code_actions = true in config. Writes the action's edits to disk.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "action_index": {
+          "description": "Position of the action in the get_code_actions list for this same range. Give this or action_title, not both.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "action_title": {
+          "description": "Exact title of the action, which must match exactly one. Give this or action_index, not both.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "end_character": {
+          "description": "End character (1-based).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "end_line": {
+          "description": "End line (1-based).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "file_path": {
+          "description": "Absolute path to the file.",
+          "type": "string"
+        },
+        "kind_filter": {
+          "description": "Optional filter by action kind (quickfix, refactor, source, etc.). Must match the kind_filter used in the get_code_actions call this action_index or action_title came from, or the index numbers a different list.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "start_character": {
+          "description": "Start character (1-based).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "start_line": {
+          "description": "Start line (1-based).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "file_path",
+        "start_line",
+        "start_character",
+        "end_line",
+        "end_character"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "title": "Apply Code Action",
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false
+    }
+  },
+  {
     "name": "format_document",
     "title": "Format Document",
     "description": "Format document with language-specific rules. Returns text edits for indentation, spacing, and style. With apply=true, and apply.format_document enabled in config, writes those edits to disk.",

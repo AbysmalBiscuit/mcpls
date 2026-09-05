@@ -229,8 +229,9 @@ impl Translator {
     /// Write `plan` to disk through `applier`, using the `PositionEncoding`
     /// negotiated for `server_id`.
     ///
-    /// Held for the whole apply, so a second apply-enabled call cannot plan
-    /// against content this one is about to replace.
+    /// The apply lock is held for the whole apply, so a second
+    /// apply-enabled call cannot plan against content this one is about to
+    /// replace.
     ///
     /// # Errors
     ///
