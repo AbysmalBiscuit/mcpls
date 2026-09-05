@@ -54,21 +54,24 @@ impl Shell {
 /// the flags this build accepts: without the `transport-http` feature there is
 /// no `--listen` or `--http-path` to complete.
 ///
-/// `clap_complete::generate` panics when the write fails, which turns a reader
-/// that closes the pipe early (`mcpls completions bash | head`) into a crash.
-/// This runs the fallible generator instead and treats a broken pipe as the
-/// reader being done, not as an error.
+/// The script is rendered into memory before it reaches `out`, because the
+/// generators panic on a failed write rather than reporting it: fish's
+/// `try_generate` writes its subcommand helpers through a nested
+/// `expect`, so the fallible entry point is only fallible in part. A `Vec`
+/// never fails that write, which leaves the single write below as the only
+/// one that can, and there a reader that closed the pipe early
+/// (`mcpls completions fish | head`) counts as the reader being done rather
+/// than as an error.
 pub fn emit(shell: Shell, out: &mut impl Write) -> io::Result<()> {
     let mut command = Args::command();
     let bin_name = command.get_name().to_string();
     command.set_bin_name(bin_name);
     command.build();
 
-    match shell
-        .generator()
-        .try_generate(&command, out)
-        .and_then(|()| out.flush())
-    {
+    let mut script = Vec::new();
+    shell.generator().try_generate(&command, &mut script)?;
+
+    match out.write_all(&script).and_then(|()| out.flush()) {
         Err(err) if err.kind() == io::ErrorKind::BrokenPipe => Ok(()),
         other => other,
     }

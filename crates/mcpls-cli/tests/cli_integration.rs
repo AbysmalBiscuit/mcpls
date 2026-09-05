@@ -499,34 +499,48 @@ fn test_completions_rejects_unknown_shell() {
 }
 
 /// A reader that closes the pipe early (`mcpls completions bash | head`) must
-/// not crash the writer. `clap_complete::generate` panics on the failed write,
-/// so `completions::emit` uses the fallible generator and treats a broken pipe
-/// as a clean exit.
+/// not crash the writer. The generators panic on a failed write -- some of
+/// them from inside the fallible `try_generate` as well -- so
+/// `completions::emit` renders into memory and performs the one write to
+/// stdout itself, treating a broken pipe as the reader being done.
+///
+/// Every shell is covered because each has its own generator, and the write
+/// that panics lives in that per-shell code: passing for one says nothing
+/// about the rest.
 #[cfg(unix)]
 #[test]
 fn test_completions_survives_a_closed_pipe() {
     use std::process::Stdio;
 
-    let mut cmd = Command::cargo_bin("mcpls").unwrap();
-    let mut child = clear_ambient_env(&mut cmd)
-        .arg("completions")
-        .arg("zsh")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    drop(child.stdout.take().unwrap());
+    for shell in ["bash", "elvish", "fish", "nushell", "powershell", "zsh"] {
+        // A pipe whose read end is already gone, so the very first write
+        // fails. Handing the child a live pipe and closing the read end here
+        // instead would race: the whole script fits in the kernel's pipe
+        // buffer, so a child that wins gets no error at all.
+        let mut departed_reader = Command::new("true").stdin(Stdio::piped()).spawn().unwrap();
+        let closed_pipe = departed_reader.stdin.take().unwrap();
+        departed_reader.wait().unwrap();
 
-    let output = child.wait_with_output().unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr);
+        let mut cmd = Command::cargo_bin("mcpls").unwrap();
+        let output = clear_ambient_env(&mut cmd)
+            .arg("completions")
+            .arg(shell)
+            .stdout(Stdio::from(closed_pipe))
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+            .wait_with_output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert!(
-        !stderr.contains("panicked"),
-        "a closed pipe must not panic: {stderr}"
-    );
-    assert!(
-        output.status.success(),
-        "a closed pipe is a clean exit, got {:?}: {stderr}",
-        output.status
-    );
+        assert!(
+            !stderr.contains("panicked"),
+            "{shell}: a closed pipe must not panic: {stderr}"
+        );
+        assert!(
+            output.status.success(),
+            "{shell}: a closed pipe is a clean exit, got {:?}: {stderr}",
+            output.status
+        );
+    }
 }
