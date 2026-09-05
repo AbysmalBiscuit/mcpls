@@ -19,6 +19,7 @@ use super::dto::{
 use super::encoding_ctx::EncodingCtx;
 use super::routing::{MAX_POSITION_VALUE, MAX_RANGE_LINES};
 use crate::bridge::apply::{Applier, ApplySummary, EditPlan, Operation};
+use crate::bridge::uri_to_path;
 use crate::config::{ServerId, ToolKind};
 use crate::error::{Error, Result};
 use crate::lsp::LspClient;
@@ -242,20 +243,36 @@ impl InboundEdits {
 
     /// Every path these applies changed, for an error that has to tell the
     /// caller which of its cached contents went stale.
+    ///
+    /// One form throughout: a resource operation records the URI the server
+    /// named, and a caller that has to re-read these before retrying cannot
+    /// hand `file:///C:/src/a.rs` to a file API. Each is converted to a
+    /// filesystem path, matching what `files_written` already carries.
     fn changed_paths(&self) -> Vec<String> {
         let mut paths = self.files_written.clone();
-        for operation in &self.resource_operations {
-            for path in [Some(&operation.uri), operation.new_uri.as_ref()]
+        let operation_paths = self.resource_operations.iter().flat_map(|operation| {
+            [Some(&operation.uri), operation.new_uri.as_ref()]
                 .into_iter()
                 .flatten()
-            {
-                if !paths.contains(path) {
-                    paths.push(path.clone());
-                }
+                .map(|uri| as_file_path(uri))
+        });
+        for path in operation_paths {
+            if !paths.contains(&path) {
+                paths.push(path);
             }
         }
         paths
     }
+}
+
+/// `uri` as a filesystem path a caller can act on, or the URI itself when it
+/// names no file (which a `file://` URI from a resource operation always
+/// does, so this is a fallback rather than a case).
+fn as_file_path(uri: &str) -> String {
+    uri.parse::<lsp_types::Uri>()
+        .ok()
+        .and_then(|parsed| uri_to_path(&parsed))
+        .map_or_else(|| uri.to_string(), |path| display_path(&path))
 }
 
 /// Whether an apply changed the working tree.
