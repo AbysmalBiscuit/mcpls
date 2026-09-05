@@ -15,7 +15,7 @@ use tokio::sync::Mutex;
 use self::clock::{Clock, SystemClock};
 use self::encoding_ctx::EncodingCtx;
 use self::respawn::RespawnBackoff;
-use crate::bridge::apply::Applier;
+use crate::bridge::apply::{Applier, ApplySummary, EditPlan};
 use crate::bridge::encoding::PositionEncoding;
 use crate::bridge::state::ResourceLimits;
 use crate::bridge::{DocumentTracker, NotificationCache, lock_std};
@@ -224,6 +224,29 @@ impl Translator {
                 config_key,
             })
         }
+    }
+
+    /// Write `plan` to disk through `applier`, using the `PositionEncoding`
+    /// negotiated for `server_id`.
+    ///
+    /// Held for the whole apply, so a second apply-enabled call cannot plan
+    /// against content this one is about to replace.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`Applier::apply`] returns: [`Error::ApplyRefused`]
+    /// when the edit is rejected before anything is written, or
+    /// [`Error::ApplyPartiallyFailed`] when a step fails partway through.
+    async fn apply_locked(
+        &self,
+        applier: &Applier,
+        plan: EditPlan,
+        server_id: &ServerId,
+    ) -> Result<ApplySummary> {
+        let _guard = self.apply_lock.lock().await;
+        applier
+            .apply(plan, self.position_encoding_for(server_id))
+            .await
     }
 
     /// Mark the set of servers that are expected (configured + applicable)

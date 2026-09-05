@@ -252,12 +252,7 @@ impl Translator {
             }
 
             let (applied, files_written) = if let Some(applier) = write_permit {
-                // Held for the whole apply, so a second apply-enabled call
-                // cannot plan against content this one is about to replace.
-                let _guard = self.apply_lock.lock().await;
-                let summary = applier
-                    .apply(plan, self.position_encoding_for(&server_id))
-                    .await?;
+                let summary = self.apply_locked(&applier, plan, &server_id).await?;
                 (
                     true,
                     summary
@@ -370,12 +365,7 @@ impl Translator {
                 }])),
                 ..WorkspaceEdit::default()
             })?;
-            // Held for the whole apply, so a second apply-enabled call
-            // cannot plan against content this one is about to replace.
-            let _guard = self.apply_lock.lock().await;
-            applier
-                .apply(plan, self.position_encoding_for(&server_id))
-                .await?;
+            self.apply_locked(&applier, plan, &server_id).await?;
             true
         } else {
             false
