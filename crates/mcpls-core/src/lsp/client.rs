@@ -62,6 +62,11 @@ const COMPLETION_TIMEOUT_CAP: Duration = Duration::from_secs(10);
 /// Type alias for pending request tracking map.
 type PendingRequests = HashMap<RequestId, oneshot::Sender<Result<Value>>>;
 
+/// Channel a code-action apply installs so an inbound `workspace/applyEdit`
+/// can reach the applier. The `oneshot` carries the LSP `applied` answer
+/// back to the server.
+pub type ApplySink = mpsc::Sender<(lsp_types::WorkspaceEdit, oneshot::Sender<bool>)>;
+
 /// LSP client with async request/response handling.
 ///
 /// This client manages communication with an LSP server, handling:
@@ -92,6 +97,12 @@ pub struct LspClient {
     /// that only when its own timeout elapses.
     pending_requests: Arc<Mutex<PendingRequests>>,
 
+    /// Installed only while an apply-enabled code action is in flight. When
+    /// `None`, an inbound `workspace/applyEdit` is answered `applied:
+    /// false`, so a server cannot write to the tree at a moment of its own
+    /// choosing.
+    apply_sink: Arc<Mutex<Option<ApplySink>>>,
+
     /// Background receiver task handle.
     receiver_task: Option<JoinHandle<Result<()>>>,
 }
@@ -108,6 +119,7 @@ impl Clone for LspClient {
             request_counter: Arc::clone(&self.request_counter),
             command_tx: self.command_tx.clone(),
             pending_requests: Arc::clone(&self.pending_requests),
+            apply_sink: Arc::clone(&self.apply_sink),
             receiver_task: None,
         }
     }
@@ -124,6 +136,12 @@ enum ClientCommand {
     SendNotification {
         method: String,
         params: Option<Value>,
+    },
+    /// Write a response the message loop did not produce itself, so a
+    /// request that needs async work does not block the loop.
+    SendResponse {
+        /// Response to write to the transport.
+        response: JsonRpcResponse,
     },
     /// Shutdown the client.
     Shutdown,
@@ -147,6 +165,7 @@ impl LspClient {
             request_counter: Arc::new(AtomicI64::new(1)),
             command_tx,
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
+            apply_sink: Arc::new(Mutex::new(None)),
             receiver_task: None,
         }
     }
@@ -159,13 +178,16 @@ impl LspClient {
         let state = Arc::new(Mutex::new(super::ServerState::Initializing));
         let request_counter = Arc::new(AtomicI64::new(1));
         let pending_requests = Arc::new(Mutex::new(HashMap::new()));
+        let apply_sink = Arc::new(Mutex::new(None));
 
         let (command_tx, command_rx) = mpsc::channel(100);
 
         let receiver_task = tokio::spawn(Self::message_loop(
             transport,
             command_rx,
+            command_tx.clone(),
             Arc::clone(&pending_requests),
+            Arc::clone(&apply_sink),
             None,
         ));
 
@@ -175,6 +197,7 @@ impl LspClient {
             request_counter,
             command_tx,
             pending_requests,
+            apply_sink,
             receiver_task: Some(receiver_task),
         }
     }
@@ -191,13 +214,16 @@ impl LspClient {
         let state = Arc::new(Mutex::new(super::ServerState::Initializing));
         let request_counter = Arc::new(AtomicI64::new(1));
         let pending_requests = Arc::new(Mutex::new(HashMap::new()));
+        let apply_sink = Arc::new(Mutex::new(None));
 
         let (command_tx, command_rx) = mpsc::channel(100);
 
         let receiver_task = tokio::spawn(Self::message_loop(
             transport,
             command_rx,
+            command_tx.clone(),
             Arc::clone(&pending_requests),
+            Arc::clone(&apply_sink),
             Some(notification_tx),
         ));
 
@@ -207,6 +233,7 @@ impl LspClient {
             request_counter,
             command_tx,
             pending_requests,
+            apply_sink,
             receiver_task: Some(receiver_task),
         }
     }
@@ -220,6 +247,11 @@ impl LspClient {
     /// Get the current server state.
     pub async fn state(&self) -> super::ServerState {
         *self.state.lock().await
+    }
+
+    /// Install or remove the sink an inbound `workspace/applyEdit` reaches.
+    pub async fn set_apply_sink(&self, sink: Option<ApplySink>) {
+        *self.apply_sink.lock().await = sink;
     }
 
     /// The timeout applied to a single LSP request attempt, derived from
@@ -488,14 +520,18 @@ impl LspClient {
     async fn message_loop(
         mut transport: LspTransport,
         mut command_rx: mpsc::Receiver<ClientCommand>,
+        command_tx: mpsc::Sender<ClientCommand>,
         pending_requests: Arc<Mutex<PendingRequests>>,
+        apply_sink: Arc<Mutex<Option<ApplySink>>>,
         notification_tx: Option<mpsc::Sender<LspNotification>>,
     ) -> Result<()> {
         debug!("Message loop started");
         let result = Self::message_loop_inner(
             &mut transport,
             &mut command_rx,
+            &command_tx,
             &pending_requests,
+            &apply_sink,
             notification_tx.as_ref(),
         )
         .await;
@@ -521,7 +557,9 @@ impl LspClient {
     async fn message_loop_inner(
         transport: &mut LspTransport,
         command_rx: &mut mpsc::Receiver<ClientCommand>,
+        command_tx: &mpsc::Sender<ClientCommand>,
         pending_requests: &Arc<Mutex<PendingRequests>>,
+        apply_sink: &Arc<Mutex<Option<ApplySink>>>,
         notification_tx: Option<&mpsc::Sender<LspNotification>>,
     ) -> Result<()> {
         loop {
@@ -544,6 +582,10 @@ impl LspClient {
                                 "params": params,
                             });
                             transport.send(&notification).await?;
+                        }
+                        ClientCommand::SendResponse { response } => {
+                            let value = serde_json::to_value(&response)?;
+                            transport.send(&value).await?;
                         }
                         ClientCommand::Shutdown => {
                             debug!("Client shutdown requested");
@@ -601,9 +643,12 @@ impl LspClient {
                                 "Received server request: {} (id={:?})",
                                 request.method, request.id
                             );
-                            let response = Self::server_request_response(request);
-                            let value = serde_json::to_value(&response)?;
-                            transport.send(&value).await?;
+                            // Answered off the loop: the applier this may
+                            // reach sends its own notifications back
+                            // through `command_tx`, so awaiting it here
+                            // would deadlock against a full channel.
+                            let sink = apply_sink.lock().await.clone();
+                            Self::spawn_server_request_responder(command_tx.clone(), sink, request);
                         }
                         InboundMessage::Notification(notification) => {
                             debug!("Received notification: {}", notification.method);
@@ -638,7 +683,44 @@ impl LspClient {
         Ok(())
     }
 
-    fn server_request_response(request: JsonRpcRequest) -> JsonRpcResponse {
+    /// Answers an inbound server request on a spawned task and writes the
+    /// answer back through `command_tx` as a `SendResponse`, so the message
+    /// loop's `select!` arm that received the request never awaits the
+    /// applier this may reach.
+    fn spawn_server_request_responder(
+        command_tx: mpsc::Sender<ClientCommand>,
+        apply_sink: Option<ApplySink>,
+        request: JsonRpcRequest,
+    ) {
+        tokio::spawn(async move {
+            let response = Self::server_request_response(request, apply_sink).await;
+            let id = response.id.clone();
+            if command_tx
+                .send(ClientCommand::SendResponse { response })
+                .await
+                .is_err()
+            {
+                debug!(
+                    "Message loop gone before response to server request (id={:?}) could be sent",
+                    id
+                );
+            }
+        });
+    }
+
+    async fn server_request_response(
+        request: JsonRpcRequest,
+        apply_sink: Option<ApplySink>,
+    ) -> JsonRpcResponse {
+        if request.method == "workspace/applyEdit" {
+            let applied = Self::forward_apply_edit(request.params.as_ref(), apply_sink).await;
+            return JsonRpcResponse {
+                jsonrpc: JSONRPC_VERSION.to_string(),
+                id: request.id,
+                result: Some(serde_json::json!({ "applied": applied })),
+                error: None,
+            };
+        }
         match Self::server_request_result(&request.method, request.params.as_ref()) {
             Ok(result) => JsonRpcResponse {
                 jsonrpc: JSONRPC_VERSION.to_string(),
@@ -655,6 +737,28 @@ impl LspClient {
         }
     }
 
+    /// Hand an inbound edit to whatever apply is in flight, or refuse it.
+    ///
+    /// Every failure answers `false` rather than erroring: the server asked
+    /// a yes-or-no question and an unparseable edit, an absent sink, and a
+    /// dropped receiver are all "no".
+    async fn forward_apply_edit(params: Option<&Value>, apply_sink: Option<ApplySink>) -> bool {
+        let Some(sink) = apply_sink else {
+            return false;
+        };
+        let Some(edit) = params
+            .and_then(|p| p.get("edit"))
+            .and_then(|e| serde_json::from_value::<lsp_types::WorkspaceEdit>(e.clone()).ok())
+        else {
+            return false;
+        };
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if sink.send((edit, reply_tx)).await.is_err() {
+            return false;
+        }
+        reply_rx.await.unwrap_or(false)
+    }
+
     fn server_request_result(
         method: &str,
         params: Option<&Value>,
@@ -669,7 +773,6 @@ impl LspClient {
             | "workspace/codeLens/refresh"
             | "window/showMessageRequest" => Ok(Value::Null),
             "workspace/configuration" => Ok(Self::workspace_configuration_result(params)),
-            "workspace/applyEdit" => Ok(serde_json::json!({ "applied": false })),
             _ => Err(JsonRpcError {
                 code: -32601,
                 message: format!("Unhandled server request: {method}"),
@@ -790,8 +893,8 @@ mod tests {
         assert_eq!(client_b.request_timeout(), Duration::from_secs(15));
     }
 
-    #[test]
-    fn test_register_capability_request_is_acknowledged() {
+    #[tokio::test]
+    async fn test_register_capability_request_is_acknowledged() {
         let request = JsonRpcRequest {
             jsonrpc: JSONRPC_VERSION.to_string(),
             id: RequestId::String("ts1".to_string()),
@@ -799,7 +902,7 @@ mod tests {
             params: Some(serde_json::json!({ "registrations": [] })),
         };
 
-        let response = LspClient::server_request_response(request);
+        let response = LspClient::server_request_response(request, None).await;
 
         assert_eq!(response.id, RequestId::String("ts1".to_string()));
         assert_eq!(response.result, Some(Value::Null));
@@ -815,8 +918,8 @@ mod tests {
         assert_eq!(result, serde_json::json!([null, null]));
     }
 
-    #[test]
-    fn test_unknown_server_request_returns_method_not_found() {
+    #[tokio::test]
+    async fn test_unknown_server_request_returns_method_not_found() {
         let request = JsonRpcRequest {
             jsonrpc: JSONRPC_VERSION.to_string(),
             id: RequestId::String("unknown-1".to_string()),
@@ -824,7 +927,7 @@ mod tests {
             params: None,
         };
 
-        let response = LspClient::server_request_response(request);
+        let response = LspClient::server_request_response(request, None).await;
 
         assert!(response.result.is_none());
         match response.error {
@@ -834,6 +937,69 @@ mod tests {
             }
             None => panic!("unknown request should return error"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_apply_edit_is_refused_when_no_sink_is_installed() {
+        let request = JsonRpcRequest {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id: RequestId::Number(1),
+            method: "workspace/applyEdit".to_string(),
+            params: Some(serde_json::json!({ "edit": { "changes": {} } })),
+        };
+
+        let response = LspClient::server_request_response(request, None).await;
+
+        assert_eq!(
+            response.result,
+            Some(serde_json::json!({ "applied": false })),
+            "with no apply in flight the server is told no"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::expect_used)]
+    async fn test_apply_edit_is_forwarded_to_an_installed_sink() {
+        let (tx, mut rx): (ApplySink, _) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(async move {
+            let (_edit, reply) = rx.recv().await.expect("the request arrives");
+            reply.send(true).expect("the applier answers");
+        });
+
+        let request = JsonRpcRequest {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id: RequestId::Number(1),
+            method: "workspace/applyEdit".to_string(),
+            params: Some(serde_json::json!({ "edit": { "changes": {} } })),
+        };
+
+        let response = LspClient::server_request_response(request, Some(tx)).await;
+
+        assert_eq!(
+            response.result,
+            Some(serde_json::json!({ "applied": true }))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_apply_edit_is_refused_when_the_sink_is_gone() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+
+        let request = JsonRpcRequest {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id: RequestId::Number(1),
+            method: "workspace/applyEdit".to_string(),
+            params: Some(serde_json::json!({ "edit": { "changes": {} } })),
+        };
+
+        let response = LspClient::server_request_response(request, Some(tx)).await;
+
+        assert_eq!(
+            response.result,
+            Some(serde_json::json!({ "applied": false })),
+            "a dropped receiver answers no rather than hanging"
+        );
     }
 
     #[tokio::test]
@@ -1065,6 +1231,7 @@ mod tests {
             request_counter: Arc::new(AtomicI64::new(1)),
             command_tx,
             pending_requests: Arc::clone(&pending_requests),
+            apply_sink: Arc::new(Mutex::new(None)),
             receiver_task: None,
         };
 
@@ -1084,6 +1251,84 @@ mod tests {
         assert!(pending_requests.lock().await.is_empty());
         assert!(matches!(rx1.await.unwrap(), Err(Error::ServerTerminated)));
         assert!(matches!(rx2.await.unwrap(), Err(Error::ServerTerminated)));
+    }
+
+    /// Covers the part of this task that can actually deadlock: the inbound
+    /// request is answered off a spawned task, and that task's answer has to
+    /// round-trip back through the command channel as a `SendResponse`
+    /// before it reaches the transport. `server_request_response` unit tests
+    /// above call the answering logic directly and never exercise that
+    /// spawn-and-round-trip path.
+    ///
+    /// Two `cat` subprocesses stitched together give a full-duplex pipe pair
+    /// without a real LSP server, the same trick `retry_behavior::fake_lsp_client`
+    /// uses.
+    #[tokio::test]
+    #[allow(clippy::expect_used)]
+    async fn test_apply_edit_round_trips_through_the_message_loop() {
+        use std::process::Stdio;
+
+        use tokio::io::{AsyncWriteExt, BufReader};
+        use tokio::process::Command;
+
+        let mut write_half = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn cat for the client's outbound half");
+        let write_stdin = write_half.stdin.take().expect("write_half stdin");
+        let write_stdout = write_half.stdout.take().expect("write_half stdout");
+
+        let mut read_half = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn cat for the client's inbound half");
+        let read_stdout = read_half.stdout.take().expect("read_half stdout");
+        let mut read_stdin = read_half.stdin.take().expect("read_half stdin");
+
+        let transport = LspTransport::new(write_stdin, read_stdout);
+        let client = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport);
+
+        let (tx, mut rx): (ApplySink, _) = mpsc::channel(1);
+        client.set_apply_sink(Some(tx)).await;
+        tokio::spawn(async move {
+            let (_edit, reply) = rx.recv().await.expect("the request arrives");
+            reply.send(true).expect("the applier answers");
+        });
+
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "workspace/applyEdit",
+            "params": { "edit": { "changes": {} } },
+        });
+        let content = serde_json::to_string(&request).expect("serialize request");
+        let header = format!("Content-Length: {}\r\n\r\n", content.len());
+        read_stdin
+            .write_all(header.as_bytes())
+            .await
+            .expect("write header");
+        read_stdin
+            .write_all(content.as_bytes())
+            .await
+            .expect("write body");
+        read_stdin.flush().await.expect("flush request");
+
+        let mut reader = BufReader::new(write_stdout);
+        let response = crate::test_support::read_framed_message(&mut reader).await;
+
+        assert_eq!(
+            response["result"],
+            serde_json::json!({ "applied": true }),
+            "the spawned responder's SendResponse must reach the transport"
+        );
+        assert_eq!(
+            response["id"], 1,
+            "the request id must survive the spawn-then-channel-then-transport hop"
+        );
     }
 
     #[test]

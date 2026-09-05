@@ -8,7 +8,7 @@ mod lifecycle;
 mod transport;
 pub(crate) mod types;
 
-pub use client::LspClient;
+pub use client::{ApplySink, LspClient};
 #[cfg(test)]
 pub(crate) use lifecycle::fake_lsp_server;
 pub use lifecycle::{LspServer, ServerInitConfig, ServerInitResult, ServerState};
