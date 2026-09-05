@@ -1858,7 +1858,7 @@ mod tests {
 
     use crate::config::LspServerConfig;
     use crate::lsp::LspTransport;
-    use crate::test_support::read_framed_message;
+    use crate::test_support::{assert_no_frame_within, read_framed_message};
 
     /// Holds both fake-transport child processes alive for a test.
     ///
@@ -2567,12 +2567,12 @@ mod tests {
 
         // No further notification should have been queued -- proves the 8
         // concurrent callers collapsed into exactly one `didOpen`.
-        let extra =
-            tokio::time::timeout(Duration::from_millis(200), read_framed_message(&mut wire)).await;
-        assert!(
-            extra.is_err(),
-            "expected no additional notification after the single didOpen"
-        );
+        assert_no_frame_within(
+            &mut wire,
+            Duration::from_millis(200),
+            "expected no additional notification after the single didOpen",
+        )
+        .await;
 
         assert_eq!(tracker.get(&path).unwrap().synced_version(&id), Some(1));
         assert_eq!(tracker.get(&path).unwrap().version(), 1);

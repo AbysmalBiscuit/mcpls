@@ -966,13 +966,18 @@ fn spawn_lsp_servers_background(
     })
 }
 
-/// Shared by any `#[cfg(test)]` module in this crate that needs to mutate
-/// the process-wide working directory (`std::env::set_current_dir`). Such
-/// tests must not run concurrently with each other or with any other test
-/// that relies on cwd -- nextest runs each test in its own process, so this
-/// only matters under a plain `cargo test`, but a single shared lock is what
-/// makes that true across every module's tests in this crate, not just
-/// within one module (#348).
+/// Test helpers shared by the `#[cfg(test)]` modules across this crate,
+/// living here rather than in any one of them so all of them get the same
+/// behavior: [`CwdGuard`] for tests that mutate the process-wide working
+/// directory, and the framed-message readers for tests that talk to a fake
+/// LSP server over a pipe.
+///
+/// The cwd lock has to be crate-wide (#348). Tests that call
+/// `std::env::set_current_dir` must not run concurrently with each other or
+/// with any other test that reads the cwd -- nextest runs each test in its
+/// own process, so this only matters under a plain `cargo test`, and a
+/// single shared lock is what makes it hold across every module's tests
+/// rather than only within one module.
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod test_support {
@@ -1077,6 +1082,30 @@ mod test_support {
                 "no framed message arrived within {deadline:?}; the code under test most likely \
                  failed before sending one"
             ),
+        }
+    }
+
+    /// Asserts that no framed message reaches `reader` within `window`,
+    /// panicking with `reason` if one does.
+    ///
+    /// This is the way to make that assertion, rather than an `is_err` check
+    /// on `tokio::time::timeout(window, read_framed_message(..))`. A
+    /// `spawn_blocking` task in flight inhibits the auto-advance of a
+    /// `start_paused` runtime's clock, and the reads above keep one in flight
+    /// for their whole duration, so a `tokio::time::timeout` wrapped around
+    /// one never fires in a paused test: the read's own deadline elapses
+    /// first and panics.
+    pub async fn assert_no_frame_within<R: AsyncBufRead + Unpin>(
+        reader: &mut R,
+        window: Duration,
+        reason: &str,
+    ) {
+        let (_done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let elapsed = tokio::task::spawn_blocking(move || done_rx.recv_timeout(window));
+
+        tokio::select! {
+            message = read_frame(reader) => panic!("{reason}; got {message}"),
+            _ = elapsed => {}
         }
     }
 

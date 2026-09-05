@@ -1154,7 +1154,7 @@ mod tests {
             )
         }
 
-        use crate::test_support::read_framed_message;
+        use crate::test_support::{assert_no_frame_within, read_framed_message};
 
         /// Writes a framed JSON-RPC `ServerCancelled` (-32802) error response.
         async fn write_server_cancelled_response(
@@ -1294,13 +1294,12 @@ mod tests {
                 other => panic!("expected immediate ServerCancelled error, got {other:?}"),
             }
 
-            let second_request =
-                tokio::time::timeout(Duration::from_millis(200), read_framed_message(&mut reader))
-                    .await;
-            assert!(
-                second_request.is_err(),
-                "no retry should have been sent after retriggerRequest: false"
-            );
+            assert_no_frame_within(
+                &mut reader,
+                Duration::from_millis(200),
+                "no retry should have been sent after retriggerRequest: false",
+            )
+            .await;
         }
 
         #[tokio::test]
