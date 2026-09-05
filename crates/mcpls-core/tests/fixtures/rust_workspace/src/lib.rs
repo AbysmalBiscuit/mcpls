@@ -101,7 +101,7 @@ pub trait Greet {
 #[allow(dead_code)]
 pub struct CodeActionTarget;
 
-// split to multi-line so RA can offer "implement missing members" inside the block
+// An empty impl provides native pull diagnostics and a missing-members code action.
 impl Greet for CodeActionTarget {
 }
 

@@ -419,9 +419,7 @@ async fn test_diagnostics_with_error() {
     // Give rust-analyzer extra time to analyze and generate diagnostics
     wait_for_indexing_ready(&translator, &rust_workspace_path(), Duration::from_secs(30)).await;
 
-    // Get diagnostics from lib.rs (has intentional error on line 37). No
-    // push notifications are captured in this harness, so the cache is
-    // empty and handle_diagnostics falls back to the pull-only result.
+    // This harness has no push cache, so only native pull diagnostics are reachable.
     let notification_cache = Mutex::new(NotificationCache::new());
     let result = timeout(
         Duration::from_secs(10),
@@ -443,9 +441,8 @@ async fn test_diagnostics_with_error() {
     let diag_json = diag_result.unwrap();
     let diag_str = serde_json::to_string(&diag_json).unwrap();
 
-    // Should contain the error about undefined_variable
     assert!(
-        diag_str.contains("undefined_variable") || diag_str.contains("cannot find"),
+        diag_str.contains("not all trait items implemented") || diag_str.contains("E0046"),
         "Diagnostics should report the intentional error, got: {}",
         diag_str
     );
