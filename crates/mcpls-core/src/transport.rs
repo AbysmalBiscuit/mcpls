@@ -719,8 +719,10 @@ mod tests {
     /// dropped). Exercises this with a real self-sent `SIGTERM` via the
     /// external `kill` binary rather than mocking `ShutdownSignal`, since
     /// that's the exact mechanism `crate::shutdown`'s force-exit task relies
-    /// on. Safe under `cargo nextest`'s one-process-per-test model, so no
-    /// other test's signal disposition is affected.
+    /// on. That signal goes to the whole process, so this needs `cargo
+    /// nextest`'s one-process-per-test model to stay contained; under a
+    /// shared-process harness it reaches every other test in the binary. The
+    /// guard in the body enforces that.
     ///
     /// Deliberately does not go through `crate::shutdown` itself: a signal
     /// caught there unconditionally calls `std::process::exit(1)`, which
@@ -734,6 +736,19 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn test_fresh_shutdown_signal_still_receives_sigterm_after_prior_instance_dropped() {
+        // Outside nextest the whole lib suite shares one process, and the
+        // SIGTERM below reaches whichever test is inside `crate::shutdown`,
+        // whose force-exit task answers it with `std::process::exit(1)` --
+        // killing the run with no failure summary, blaming whichever tests
+        // were in flight.
+        if std::env::var_os("NEXTEST").is_none() {
+            eprintln!(
+                "skipping the post-drop SIGTERM test: it signals its own process and \
+                 needs nextest's process-per-test isolation (`cargo nextest run`)"
+            );
+            return;
+        }
+
         let earlier = super::ShutdownSignal::new();
         drop(earlier);
 
