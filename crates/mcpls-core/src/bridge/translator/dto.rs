@@ -110,6 +110,9 @@ pub struct DocumentChanges {
 pub struct RenameResult {
     /// Changes to apply across documents.
     pub changes: Vec<DocumentChanges>,
+    /// File-system operations the edit performs alongside its text changes.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub resource_operations: Vec<ResourceOperation>,
 }
 
 /// A completion item.
@@ -210,6 +213,9 @@ pub struct CodeAction {
 pub struct WorkspaceEditDescription {
     /// Changes to apply to documents.
     pub changes: Vec<DocumentChanges>,
+    /// File-system operations the edit performs alongside its text changes.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub resource_operations: Vec<ResourceOperation>,
 }
 
 /// Description of a command.
@@ -222,6 +228,49 @@ pub struct CommandDescription {
     /// Command arguments.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub arguments: Vec<serde_json::Value>,
+}
+
+/// A file-system change carried by a `WorkspaceEdit`, described for a
+/// caller previewing the edit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceOperation {
+    /// One of `create`, `rename`, or `delete`.
+    pub kind: String,
+    /// Path the operation acts on. For a rename, the source.
+    pub uri: String,
+    /// Destination of a rename. `None` for create and delete.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_uri: Option<String>,
+}
+
+/// Describe the file-system operations in `plan` for a preview response.
+#[must_use]
+pub fn resource_operations_from_plan(
+    plan: &crate::bridge::apply::EditPlan,
+) -> Vec<ResourceOperation> {
+    use crate::bridge::apply::Operation;
+
+    plan.operations()
+        .iter()
+        .filter_map(|op| match op {
+            Operation::Edit { .. } => None,
+            Operation::Create { uri, .. } => Some(ResourceOperation {
+                kind: "create".to_string(),
+                uri: uri.to_string(),
+                new_uri: None,
+            }),
+            Operation::Rename { old, new, .. } => Some(ResourceOperation {
+                kind: "rename".to_string(),
+                uri: old.to_string(),
+                new_uri: Some(new.to_string()),
+            }),
+            Operation::Delete { uri, .. } => Some(ResourceOperation {
+                kind: "delete".to_string(),
+                uri: uri.to_string(),
+                new_uri: None,
+            }),
+        })
+        .collect()
 }
 
 /// Result of code actions request.

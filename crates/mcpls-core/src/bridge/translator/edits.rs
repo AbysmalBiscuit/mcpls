@@ -11,7 +11,9 @@ use super::diagnostics::diagnostic_to_mcp;
 use super::dto::{
     CodeAction, CodeActionsResult, CommandDescription, DocumentChanges, FormatDocumentResult,
     RenameResult, TextEdit, WorkspaceEditDescription,
+    resource_operations_from_plan,
 };
+use crate::bridge::apply::{EditPlan, Operation};
 use super::encoding_ctx::EncodingCtx;
 use super::routing::{MAX_POSITION_VALUE, MAX_RANGE_LINES};
 use crate::config::ToolKind;
@@ -117,28 +119,41 @@ async fn convert_code_action(
     };
 
     let edit = match action.edit {
-        Some(edit) => {
-            let changes = match edit.changes {
-                Some(changes_map) => {
-                    let mut result = Vec::with_capacity(changes_map.len());
-                    for (uri, edits) in changes_map {
-                        let mut text_edits = Vec::with_capacity(edits.len());
-                        for e in edits {
-                            text_edits.push(TextEdit {
-                                range: ctx.normalize_range(&uri, e.range).await,
-                                new_text: e.new_text,
+        Some(workspace_edit) => {
+            let plan = EditPlan::from_workspace_edit(workspace_edit).ok();
+            match plan {
+                Some(plan) => {
+                    let mut changes = Vec::new();
+                    for operation in plan.operations() {
+                        if let Operation::Edit {
+                            uri: edit_uri,
+                            edits,
+                            ..
+                        } = operation
+                        {
+                            let mut text_edits = Vec::with_capacity(edits.len());
+                            for e in edits {
+                                text_edits.push(TextEdit {
+                                    range: ctx.normalize_range(edit_uri, e.range).await,
+                                    new_text: e.new_text.clone(),
+                                });
+                            }
+                            changes.push(DocumentChanges {
+                                uri: edit_uri.to_string(),
+                                edits: text_edits,
                             });
                         }
-                        result.push(DocumentChanges {
-                            uri: uri.to_string(),
-                            edits: text_edits,
-                        });
                     }
-                    result
+                    Some(WorkspaceEditDescription {
+                        resource_operations: resource_operations_from_plan(&plan),
+                        changes,
+                    })
                 }
-                None => Vec::new(),
-            };
-            Some(WorkspaceEditDescription { changes })
+                // An edit this malformed cannot be applied either, so the
+                // preview says the action carries no usable edit rather
+                // than failing the whole listing.
+                None => None,
+            }
         }
         None => None,
     };
@@ -203,17 +218,17 @@ impl Translator {
             .request("textDocument/rename", params, client.request_timeout())
             .await?;
 
-        let changes = if let Some(edit) = response {
+        let (changes, resource_operations) = if let Some(edit) = response {
+            let plan = EditPlan::from_workspace_edit(edit)?;
+            let resource_operations = resource_operations_from_plan(&plan);
             let mut result_changes = Vec::new();
-
-            // Prefer the legacy `changes` map (HashMap<Uri, Vec<TextEdit>>).
-            if let Some(changes_map) = edit.changes {
-                for (uri, edits) in changes_map {
+            for operation in plan.operations() {
+                if let Operation::Edit { uri, edits, .. } = operation {
                     let mut text_edits = Vec::with_capacity(edits.len());
                     for e in edits {
                         text_edits.push(TextEdit {
-                            range: ctx.normalize_range(&uri, e.range).await,
-                            new_text: e.new_text,
+                            range: ctx.normalize_range(uri, e.range).await,
+                            new_text: e.new_text.clone(),
                         });
                     }
                     result_changes.push(DocumentChanges {
@@ -222,48 +237,15 @@ impl Translator {
                     });
                 }
             }
-
-            // Also handle `documentChanges` (array format returned by rust-analyzer).
-            if result_changes.is_empty() {
-                let text_doc_edits = match edit.document_changes {
-                    Some(lsp_types::DocumentChanges::Edits(edits)) => edits,
-                    Some(lsp_types::DocumentChanges::Operations(ops)) => ops
-                        .into_iter()
-                        .filter_map(|op| match op {
-                            lsp_types::DocumentChangeOperation::Edit(e) => Some(e),
-                            lsp_types::DocumentChangeOperation::Op(_) => None,
-                        })
-                        .collect(),
-                    None => vec![],
-                };
-                for tde in text_doc_edits {
-                    let edit_uri = &tde.text_document.uri;
-                    let mut text_edits = Vec::with_capacity(tde.edits.len());
-                    for one_of in tde.edits {
-                        text_edits.push(match one_of {
-                            lsp_types::OneOf::Left(te) => TextEdit {
-                                range: ctx.normalize_range(edit_uri, te.range).await,
-                                new_text: te.new_text,
-                            },
-                            lsp_types::OneOf::Right(ate) => TextEdit {
-                                range: ctx.normalize_range(edit_uri, ate.text_edit.range).await,
-                                new_text: ate.text_edit.new_text,
-                            },
-                        });
-                    }
-                    result_changes.push(DocumentChanges {
-                        uri: edit_uri.to_string(),
-                        edits: text_edits,
-                    });
-                }
-            }
-
-            result_changes
+            (result_changes, resource_operations)
         } else {
-            vec![]
+            (vec![], vec![])
         };
 
-        Ok(RenameResult { changes })
+        Ok(RenameResult {
+            changes,
+            resource_operations,
+        })
     }
 
     /// Handle format document request.
@@ -822,5 +804,84 @@ mod tests {
         assert_eq!(cmd.title, "Execute refactor");
         assert_eq!(cmd.command, "refactor.extract");
         assert_eq!(cmd.arguments.len(), 2);
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_preview_reports_file_rename_operations() {
+        use std::str::FromStr;
+
+        use lsp_types::{
+            DocumentChangeOperation, DocumentChanges, RenameFile, ResourceOp, Uri, WorkspaceEdit,
+        };
+
+        use crate::bridge::apply::EditPlan;
+        use crate::bridge::translator::dto::resource_operations_from_plan;
+
+        let edit = WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Operations(vec![
+                DocumentChangeOperation::Op(ResourceOp::Rename(RenameFile {
+                    old_uri: Uri::from_str("file:///w/foo.rs").expect("valid uri"),
+                    new_uri: Uri::from_str("file:///w/bar.rs").expect("valid uri"),
+                    options: None,
+                    annotation_id: None,
+                })),
+            ])),
+            ..WorkspaceEdit::default()
+        };
+        let plan = EditPlan::from_workspace_edit(edit).expect("plan builds");
+        let ops = resource_operations_from_plan(&plan);
+
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].kind, "rename");
+        assert_eq!(ops[0].uri, "file:///w/foo.rs");
+        assert_eq!(ops[0].new_uri.as_deref(), Some("file:///w/bar.rs"));
+    }
+
+    #[tokio::test]
+    async fn test_convert_code_action_with_document_changes_only() {
+        use std::str::FromStr;
+
+        use lsp_types::{
+            DocumentChanges, OneOf, OptionalVersionedTextDocumentIdentifier, Position, Range,
+            TextDocumentEdit, TextEdit as LspTextEdit, Uri,
+        };
+
+        let uri = Uri::from_str("file:///test.rs").expect("valid uri");
+
+        let lsp_action = lsp_types::CodeAction {
+            title: "Fix issue".to_string(),
+            kind: Some(lsp_types::CodeActionKind::QUICKFIX),
+            diagnostics: None,
+            edit: Some(lsp_types::WorkspaceEdit {
+                document_changes: Some(DocumentChanges::Edits(vec![TextDocumentEdit {
+                    text_document: OptionalVersionedTextDocumentIdentifier {
+                        uri: uri.clone(),
+                        version: None,
+                    },
+                    edits: vec![OneOf::Left(LspTextEdit {
+                        range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                        new_text: "fixed".to_string(),
+                    })],
+                }])),
+                changes: None,
+                change_annotations: None,
+            }),
+            command: None,
+            is_preferred: None,
+            disabled: None,
+            data: None,
+        };
+
+        let result = convert_code_action(lsp_action, &test_ctx(), &uri).await;
+        assert!(
+            result.edit.is_some(),
+            "code action with document_changes-only edit must not preview as empty"
+        );
+        let edit = result.edit.unwrap();
+        assert_eq!(edit.changes.len(), 1);
+        assert_eq!(edit.changes[0].uri, "file:///test.rs");
+        assert_eq!(edit.changes[0].edits.len(), 1);
+        assert_eq!(edit.changes[0].edits[0].new_text, "fixed");
     }
 }

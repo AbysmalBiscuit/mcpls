@@ -26,7 +26,8 @@ pub(crate) use translator::validate_path_against_roots;
 pub use translator::{
     Completion, CompletionsResult, DefinitionResult, Diagnostic, DiagnosticSeverity,
     DiagnosticsResult, DocumentChanges, DocumentSymbolsResult, FormatDocumentResult, HoverResult,
-    Location, Position2D, Range, ReferencesResult, RenameResult, Symbol, TextEdit, Translator,
+    Location, Position2D, Range, ReferencesResult, RenameResult, ResourceOperation, Symbol,
+    TextEdit, Translator,
 };
 
 /// Lock a `std::sync::Mutex`, recovering the guard if a previous holder
