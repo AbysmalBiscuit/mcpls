@@ -217,7 +217,9 @@ Yes! Configure as many language servers as needed in `mcpls.toml`. mcpls will ro
 
 ### Does mcpls modify my code?
 
-Only when you explicitly ask for changes (like rename_symbol or format_document). All other tools are read-only and provide information without modifying files.
+Not unless you configure it to. With no `[apply]` table in `mcpls.toml`, every tool is read-only: `rename_symbol` and `format_document` return an edit for you to read, `apply_code_action` refuses, and nothing on disk changes.
+
+Enabling a key in that table lets the language server write to your working tree through the matching tool, and there is no undo. See [Apply Section](configuration.md#apply-section).
 
 ### Can I use mcpls with other MCP clients?
 

@@ -401,7 +401,7 @@ Claude: [Uses rename_symbol] Found 47 occurrences across 12 files. This is
         a large refactoring. Shall I proceed?
 ```
 
-With `apply: true` the response also carries `applied`, `files_written` (absolute paths whose content changed), and `resource_operations` (files the rename created, moved, or deleted). Every path in `files_written` is stale in any cache you hold.
+`resource_operations` lists the files the edit creates, moves, or deletes. It is part of the plan, so it is present whether or not you apply, and with `apply: false` it describes what applying would do. With `apply: true` the response also carries `applied` and `files_written`, the absolute paths whose content actually changed — every one of them is stale in any cache you hold. `files_written` reports what the applier did; `resource_operations` reports what the server asked for, so an operation the applier skipped is listed there and nowhere else.
 
 ### Notes
 

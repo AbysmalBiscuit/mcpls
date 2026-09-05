@@ -53,9 +53,12 @@ pub struct ApplyConfig {
     #[serde(default)]
     pub code_actions: bool,
 
-    /// Delete operations inside an otherwise permitted `WorkspaceEdit` are
-    /// honored. Gates deletion for every tool above rather than any one of
-    /// them, because a delete destroys content no other operation does.
+    /// Operations that destroy a file's content inside an otherwise
+    /// permitted `WorkspaceEdit` are honored: an explicit delete, a create
+    /// that overwrites an existing file, and a rename onto an existing
+    /// destination, all of which leave nothing of what was there. Gates all
+    /// three for every tool above rather than any one of them, because
+    /// losing a file is not the kind of mistake a bad edit is.
     #[serde(default)]
     pub allow_file_deletion: bool,
 }

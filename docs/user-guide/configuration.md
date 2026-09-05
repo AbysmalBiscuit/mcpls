@@ -543,7 +543,7 @@ Turning a key on hands the write to the language server. The server decides whic
 > [!WARNING]
 > There is no undo. mcpls rolls an edit back only while that one apply is still running: if a step fails partway, the completed steps are reversed and the error names any file it could not restore. Once an apply has returned successfully the change is on disk and mcpls has no record of what was there before. Commit your work before letting a tool write, and read the `files_written` list it returns.
 
-An edit is refused outright — nothing is written — when the applier has no `workspace.roots` configured, when any path in it resolves outside those roots (following symlinks), when it would rewrite a read-only file, when a file it edits has no readable text, or when two edits to one document overlap.
+An edit is refused outright — nothing is written — when the applier has no `workspace.roots` configured, when any path in it resolves outside those roots (following symlinks), when it would change or destroy a file the filesystem marks read-only (the refusal names every such file at once), when a file it edits has no readable text, or when two edits to one document overlap.
 
 ```toml
 [apply]

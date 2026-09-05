@@ -96,7 +96,7 @@ Turning a key on hands the write to the language server: it decides which files 
 
 There is no undo beyond the run itself. A step failing partway through one apply reverses the completed steps and the error names any file it could not restore; once an apply returns successfully the change is on disk and mcpls holds no record of what was there before.
 
-An edit is refused outright when there are no `workspace.roots`, when a path resolves outside them, when it would rewrite a read-only file, when a file it edits holds no readable text, when two edits to one document overlap, when it creates a file in a directory that does not exist, or when it edits a file under a directory the same edit moves.
+An edit is refused outright when there are no `workspace.roots`, when a path resolves outside them, when it would change or destroy a file the filesystem marks read-only (all such files are named in one refusal, rather than one per attempt), when a file it edits holds no readable text, when two entries address one document, when it creates a file in a directory that does not exist, or when it edits a file under a directory the same edit moves.
 
 ## Environment passthrough (`env`)
 
