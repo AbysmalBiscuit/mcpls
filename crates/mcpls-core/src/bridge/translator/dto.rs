@@ -113,6 +113,13 @@ pub struct RenameResult {
     /// File-system operations the edit performs alongside its text changes.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub resource_operations: Vec<ResourceOperation>,
+    /// Whether the edits were written to disk.
+    #[serde(default)]
+    pub applied: bool,
+    /// Files written, when `applied`. The caller's cached contents for
+    /// these paths are stale.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub files_written: Vec<String>,
 }
 
 /// A completion item.

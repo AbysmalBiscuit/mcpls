@@ -112,7 +112,6 @@ pub struct Translator {
     /// Serializes every apply-enabled tool call. Two concurrent applies to
     /// one file would otherwise both plan against the same pre-edit
     /// content and the second would overwrite the first.
-    #[allow(dead_code)]
     apply_lock: Arc<Mutex<()>>,
     /// Writes a permitted `WorkspaceEdit` to the working tree. Always
     /// present; a translator that may not write carries one whose
@@ -211,7 +210,6 @@ impl Translator {
     ///
     /// Returns [`Error::ApplyDisabled`] naming `config_key` when the tool's
     /// key is `false`.
-    #[allow(dead_code)]
     pub(crate) fn applier_for(
         &self,
         tool: ToolKind,

@@ -177,21 +177,34 @@ async fn convert_code_action(
 }
 
 impl Translator {
-    /// Handle rename request.
+    /// Handle rename request. With `apply` true, writes the resulting edits
+    /// to disk instead of only describing them.
     ///
     /// # Errors
     ///
     /// Returns an error if `new_name` exceeds the maximum allowed length,
     /// the LSP request fails, the file cannot be opened, or the routed
-    /// server does not advertise `renameProvider` support.
+    /// server does not advertise `renameProvider` support. When `apply` is
+    /// true, also returns [`Error::ApplyDisabled`] if config forbids
+    /// `rename_symbol` from writing, [`Error::ApplyRefused`] if the edit is
+    /// rejected before anything is written, or
+    /// [`Error::ApplyPartiallyFailed`] if a write step fails partway
+    /// through.
     pub async fn handle_rename(
         &self,
         file_path: String,
         line: u32,
         character: u32,
         new_name: String,
+        apply: bool,
     ) -> Result<RenameResult> {
         validate_rename_params(&new_name)?;
+
+        let write_permit = if apply {
+            Some(self.applier_for(ToolKind::Rename, "rename_symbol", "apply.rename")?)
+        } else {
+            None
+        };
 
         let (server_id, client, uri) = self
             .prepare_gated_document(&file_path, ToolKind::Rename, "renameProvider", |caps| {
@@ -217,7 +230,7 @@ impl Translator {
             .request("textDocument/rename", params, client.request_timeout())
             .await?;
 
-        let (changes, resource_operations) = if let Some(edit) = response {
+        let (changes, resource_operations, applied, files_written) = if let Some(edit) = response {
             let plan = EditPlan::from_workspace_edit(edit)?;
             let resource_operations = resource_operations_from_plan(&plan);
             let mut result_changes = Vec::new();
@@ -236,14 +249,36 @@ impl Translator {
                     });
                 }
             }
-            (result_changes, resource_operations)
+
+            let (applied, files_written) = if let Some(applier) = write_permit {
+                // Held for the whole apply, so a second apply-enabled call
+                // cannot plan against content this one is about to replace.
+                let _guard = self.apply_lock.lock().await;
+                let summary = applier
+                    .apply(plan, self.position_encoding_for(&server_id))
+                    .await?;
+                (
+                    true,
+                    summary
+                        .files_changed
+                        .iter()
+                        .map(|change| change.path.display().to_string())
+                        .collect(),
+                )
+            } else {
+                (false, Vec::new())
+            };
+
+            (result_changes, resource_operations, applied, files_written)
         } else {
-            (vec![], vec![])
+            (vec![], vec![], false, vec![])
         };
 
         Ok(RenameResult {
             changes,
             resource_operations,
+            applied,
+            files_written,
         })
     }
 
@@ -803,6 +838,21 @@ mod tests {
         assert_eq!(cmd.title, "Execute refactor");
         assert_eq!(cmd.command, "refactor.extract");
         assert_eq!(cmd.arguments.len(), 2);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::expect_used)]
+    async fn test_rename_with_apply_is_refused_when_config_forbids_it() {
+        let translator = Translator::new();
+        let error = translator
+            .handle_rename("/w/a.rs".to_string(), 1, 1, "new".to_string(), true)
+            .await
+            .expect_err("apply must be refused by a read-only translator");
+        let message = error.to_string();
+        assert!(
+            message.contains("apply.rename"),
+            "the error names the config key that would permit it: {message}"
+        );
     }
 
     #[test]

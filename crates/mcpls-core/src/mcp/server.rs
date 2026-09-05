@@ -179,16 +179,16 @@ impl McplsServer {
         Self { context }
     }
 
-    /// Router for every MCP tool, with the read-only classification applied.
+    /// Router for every MCP tool, with the read-only classification applied
+    /// as a default.
     ///
-    /// Every mcpls tool is a read-only LSP query: `rename_symbol`,
-    /// `format_document` and `get_code_actions` return a *proposed*
-    /// `WorkspaceEdit` and never write to disk. Applying that once here
-    /// replaces an identical `annotations(...)` block on all 20 `#[tool]`
-    /// attributes. A tool declaring its own annotations keeps them;
-    /// `test_tool_annotation_classifications_match_intent` forces a future
-    /// mutating tool to write down an explicit classification rather than
-    /// inherit this default silently.
+    /// Most mcpls tools are read-only LSP queries, so applying that once
+    /// here replaces an identical `annotations(...)` block on each `#[tool]`
+    /// attribute. A tool that can write to disk declares its own
+    /// annotations and keeps them;
+    /// `test_tool_annotation_classifications_match_intent` forces any such
+    /// tool to write down an explicit classification rather than inherit
+    /// this default silently.
     fn tool_router() -> ToolRouter<Self> {
         let mut router = Self::declared_tool_router();
         for route in router.map.values_mut() {
@@ -287,12 +287,18 @@ impl McplsServer {
         )
     }
 
-    /// Rename a symbol across the workspace.
-    // read-only: returns a proposed WorkspaceEdit, does not apply it -- mcpls
-    // has no write-back path today; revisit if that changes.
+    /// Rename a symbol across the workspace, optionally writing the edits.
     #[tool(
-        description = "Rename symbol across workspace. Returns text edits for all files where symbol is used.",
-        title = "Rename Symbol"
+        description = "Rename symbol across workspace. Returns text edits for all files \
+                       where symbol is used. With apply=true, and apply.rename enabled in \
+                       config, writes those edits to disk.",
+        title = "Rename Symbol",
+        annotations(
+            title = "Rename Symbol",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
     )]
     async fn rename_symbol(
         &self,
@@ -304,12 +310,13 @@ impl McplsServer {
                     character,
                 },
             new_name,
+            apply,
         }): Parameters<RenameParams>,
     ) -> Result<String, McpError> {
         to_tool_result(
             self.context
                 .translator
-                .handle_rename(file_path, line, character, new_name)
+                .handle_rename(file_path, line, character, new_name, apply)
                 .await,
         )
     }
@@ -965,6 +972,7 @@ mod tests {
                 character: 5,
             },
             new_name: "new_name".to_string(),
+            apply: false,
         });
 
         let result = server.rename_symbol(params).await;
@@ -1626,7 +1634,7 @@ mod tests {
             ("get_definition", true, false, true),
             ("get_references", true, false, true),
             ("get_diagnostics", true, false, true),
-            ("rename_symbol", true, false, true),
+            ("rename_symbol", false, true, false),
             ("get_completions", true, false, true),
             ("get_document_symbols", true, false, true),
             ("format_document", true, false, true),

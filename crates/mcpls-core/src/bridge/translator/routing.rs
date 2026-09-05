@@ -836,7 +836,7 @@ mod tests {
         // rename is claimed by neither server -> NoServerForTool, checked
         // first so it can't be masked by either server's wire state.
         let rename_result = translator
-            .handle_rename(path_str.clone(), 1, 1, "renamed".to_string())
+            .handle_rename(path_str.clone(), 1, 1, "renamed".to_string(), false)
             .await;
         assert!(
             matches!(
@@ -953,7 +953,7 @@ mod tests {
         let new_name = "a".repeat(MAX_NEW_NAME_LENGTH + 1);
 
         let result = translator
-            .handle_rename("/main.rs".to_string(), 1, 1, new_name)
+            .handle_rename("/main.rs".to_string(), 1, 1, new_name, false)
             .await;
 
         assert!(matches!(result, Err(Error::InvalidToolParams(_))));
@@ -978,6 +978,7 @@ mod tests {
                 1,
                 1,
                 "renamed".to_string(),
+                false,
             )
             .await;
 
@@ -1472,7 +1473,7 @@ mod tests {
             let translator = Arc::clone(&translator);
             tokio::spawn(async move {
                 translator
-                    .handle_rename(path_str, 1, 1, "renamed".to_string())
+                    .handle_rename(path_str, 1, 1, "renamed".to_string(), false)
                     .await
             })
         };

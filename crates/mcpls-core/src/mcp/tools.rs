@@ -68,6 +68,13 @@ pub struct RenameParams {
     /// New name for the symbol.
     #[schemars(description = "New name for the symbol.")]
     pub new_name: String,
+    /// Write the edits to disk instead of only describing them.
+    #[schemars(
+        description = "Write the edits to disk instead of only describing them. \
+                       Requires apply.rename = true in mcpls.toml."
+    )]
+    #[serde(default)]
+    pub apply: bool,
 }
 
 /// Parameters for the `get_completions` tool.

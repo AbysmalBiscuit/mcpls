@@ -638,10 +638,15 @@
   {
     "name": "rename_symbol",
     "title": "Rename Symbol",
-    "description": "Rename symbol across workspace. Returns text edits for all files where symbol is used.",
+    "description": "Rename symbol across workspace. Returns text edits for all files where symbol is used. With apply=true, and apply.rename enabled in config, writes those edits to disk.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
+        "apply": {
+          "default": false,
+          "description": "Write the edits to disk instead of only describing them. Requires apply.rename = true in mcpls.toml.",
+          "type": "boolean"
+        },
         "character": {
           "description": "Character/column number (1-based).",
           "format": "uint32",
@@ -673,9 +678,9 @@
     },
     "annotations": {
       "title": "Rename Symbol",
-      "readOnlyHint": true,
-      "destructiveHint": false,
-      "idempotentHint": true
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false
     }
   },
   {
