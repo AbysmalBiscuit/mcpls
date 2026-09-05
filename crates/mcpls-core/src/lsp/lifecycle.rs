@@ -406,63 +406,9 @@ impl LspServer {
             #[allow(deprecated)]
             root_uri: None,
             initialization_options: config.initialization_options.clone(),
-            capabilities: ClientCapabilities {
-                general: Some(GeneralClientCapabilities {
-                    position_encodings: Some(resolve_position_encodings(
-                        &config.position_encodings,
-                    )),
-                    ..Default::default()
-                }),
-                text_document: Some(lsp_types::TextDocumentClientCapabilities {
-                    hover: Some(lsp_types::HoverClientCapabilities {
-                        dynamic_registration: Some(false),
-                        content_format: Some(vec![
-                            lsp_types::MarkupKind::Markdown,
-                            lsp_types::MarkupKind::PlainText,
-                        ]),
-                    }),
-                    definition: Some(lsp_types::GotoCapability {
-                        dynamic_registration: Some(false),
-                        link_support: Some(true),
-                    }),
-                    references: Some(lsp_types::ReferenceClientCapabilities {
-                        dynamic_registration: Some(false),
-                    }),
-                    code_action: Some(lsp_types::CodeActionClientCapabilities {
-                        dynamic_registration: Some(false),
-                        data_support: Some(true),
-                        resolve_support: Some(lsp_types::CodeActionCapabilityResolveSupport {
-                            properties: vec!["edit".to_string()],
-                        }),
-                        // Declare supported action kinds so the server returns
-                        // CodeAction objects (not just legacy Command objects).
-                        code_action_literal_support: Some(lsp_types::CodeActionLiteralSupport {
-                            code_action_kind: lsp_types::CodeActionKindLiteralSupport {
-                                value_set: [
-                                    lsp_types::CodeActionKind::EMPTY,
-                                    lsp_types::CodeActionKind::QUICKFIX,
-                                    lsp_types::CodeActionKind::REFACTOR,
-                                    lsp_types::CodeActionKind::REFACTOR_EXTRACT,
-                                    lsp_types::CodeActionKind::REFACTOR_INLINE,
-                                    lsp_types::CodeActionKind::REFACTOR_REWRITE,
-                                    lsp_types::CodeActionKind::SOURCE,
-                                    lsp_types::CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
-                                ]
-                                .iter()
-                                .map(|k| k.as_str().to_string())
-                                .collect(),
-                            },
-                        }),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
-                workspace: Some(lsp_types::WorkspaceClientCapabilities {
-                    workspace_folders: Some(true),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
+            capabilities: build_client_capabilities(resolve_position_encodings(
+                &config.position_encodings,
+            )),
             client_info: Some(ClientInfo {
                 name: "mcpls".to_string(),
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),
@@ -691,6 +637,89 @@ impl LspServer {
     }
 }
 
+/// Client capabilities mcpls declares during `initialize`.
+///
+/// A free function rather than an inline literal so the declaration can be
+/// asserted directly: several servers change behavior based on these, and a
+/// silent regression is invisible until a tool quietly returns less than it
+/// should.
+fn build_client_capabilities(
+    position_encodings: Vec<lsp_types::PositionEncodingKind>,
+) -> ClientCapabilities {
+    ClientCapabilities {
+        general: Some(GeneralClientCapabilities {
+            position_encodings: Some(position_encodings),
+            ..Default::default()
+        }),
+        text_document: Some(lsp_types::TextDocumentClientCapabilities {
+            synchronization: Some(lsp_types::TextDocumentSyncClientCapabilities {
+                dynamic_registration: Some(false),
+                did_save: Some(true),
+                will_save: Some(false),
+                will_save_wait_until: Some(false),
+            }),
+            hover: Some(lsp_types::HoverClientCapabilities {
+                dynamic_registration: Some(false),
+                content_format: Some(vec![
+                    lsp_types::MarkupKind::Markdown,
+                    lsp_types::MarkupKind::PlainText,
+                ]),
+            }),
+            definition: Some(lsp_types::GotoCapability {
+                dynamic_registration: Some(false),
+                link_support: Some(true),
+            }),
+            references: Some(lsp_types::ReferenceClientCapabilities {
+                dynamic_registration: Some(false),
+            }),
+            code_action: Some(lsp_types::CodeActionClientCapabilities {
+                dynamic_registration: Some(false),
+                data_support: Some(true),
+                resolve_support: Some(lsp_types::CodeActionCapabilityResolveSupport {
+                    properties: vec!["edit".to_string()],
+                }),
+                // Declare supported action kinds so the server returns
+                // CodeAction objects (not just legacy Command objects).
+                code_action_literal_support: Some(lsp_types::CodeActionLiteralSupport {
+                    code_action_kind: lsp_types::CodeActionKindLiteralSupport {
+                        value_set: [
+                            lsp_types::CodeActionKind::EMPTY,
+                            lsp_types::CodeActionKind::QUICKFIX,
+                            lsp_types::CodeActionKind::REFACTOR,
+                            lsp_types::CodeActionKind::REFACTOR_EXTRACT,
+                            lsp_types::CodeActionKind::REFACTOR_INLINE,
+                            lsp_types::CodeActionKind::REFACTOR_REWRITE,
+                            lsp_types::CodeActionKind::SOURCE,
+                            lsp_types::CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
+                        ]
+                        .iter()
+                        .map(|k| k.as_str().to_string())
+                        .collect(),
+                    },
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        workspace: Some(lsp_types::WorkspaceClientCapabilities {
+            workspace_folders: Some(true),
+            apply_edit: Some(true),
+            workspace_edit: Some(lsp_types::WorkspaceEditClientCapabilities {
+                document_changes: Some(true),
+                resource_operations: Some(vec![
+                    lsp_types::ResourceOperationKind::Create,
+                    lsp_types::ResourceOperationKind::Rename,
+                    lsp_types::ResourceOperationKind::Delete,
+                ]),
+                failure_handling: Some(lsp_types::FailureHandlingKind::Abort),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
 /// Convert configured position-encoding strings into the ordered
 /// [`PositionEncodingKind`] list offered during the `initialize` handshake.
 ///
@@ -846,9 +875,61 @@ impl LspServer {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_client_capabilities_declare_edit_application() {
+        let caps = build_client_capabilities(vec![]);
+        let workspace = caps.workspace.expect("workspace capabilities are declared");
+
+        assert_eq!(workspace.apply_edit, Some(true));
+
+        let edit = workspace
+            .workspace_edit
+            .expect("workspaceEdit capabilities are declared");
+        assert_eq!(edit.document_changes, Some(true));
+        let ops = edit
+            .resource_operations
+            .expect("resource operations are declared");
+        assert!(ops.contains(&lsp_types::ResourceOperationKind::Create));
+        assert!(ops.contains(&lsp_types::ResourceOperationKind::Rename));
+        assert!(ops.contains(&lsp_types::ResourceOperationKind::Delete));
+
+        let sync = caps
+            .text_document
+            .expect("textDocument capabilities are declared")
+            .synchronization
+            .expect("synchronization capabilities are declared");
+        assert_eq!(sync.did_save, Some(true));
+    }
+
+    #[test]
+    fn test_client_capabilities_do_not_claim_dynamic_file_watching() {
+        let caps = build_client_capabilities(vec![]);
+        let declared = caps
+            .workspace
+            .and_then(|w| w.did_change_watched_files)
+            .and_then(|w| w.dynamic_registration);
+        assert_ne!(
+            declared,
+            Some(true),
+            "advertising this without sending the notification blinds gopls and tsgo"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_client_capabilities_pass_through_position_encodings() {
+        let caps = build_client_capabilities(vec![lsp_types::PositionEncodingKind::UTF8]);
+        let general = caps.general.expect("general capabilities are declared");
+        let encodings = general
+            .position_encodings
+            .expect("position encodings are declared");
+        assert_eq!(encodings, vec![lsp_types::PositionEncodingKind::UTF8]);
+    }
 
     #[test]
     fn test_resolve_position_encodings_preserves_configured_order() {
