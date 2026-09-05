@@ -22,6 +22,24 @@ const RENAME_ATTEMPTS: u32 = 3;
 /// short enough that three of them are imperceptible.
 const RENAME_RETRY_DELAY: Duration = Duration::from_millis(50);
 
+/// Whether a rename failure could plausibly clear on its own.
+///
+/// A missing source, a cross-device move or an invalid destination fails
+/// identically however many times it is tried, and retrying only delays the
+/// real error by the full retry budget. `PermissionDenied` is the one
+/// ambiguous kind: on Windows it is what a sharing violation surfaces as,
+/// which is precisely the case the retry exists for, and a permanent denial
+/// is indistinguishable from it — so that one costs a retry window and
+/// nothing else.
+const fn is_transient(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::ResourceBusy
+            | std::io::ErrorKind::Interrupted
+    )
+}
+
 /// `fs::rename` with a short bounded retry, for the transient failures
 /// described on [`RENAME_ATTEMPTS`].
 ///
@@ -31,7 +49,8 @@ fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
     for _ in 1..RENAME_ATTEMPTS {
         match fs::rename(from, to) {
             Ok(()) => return Ok(()),
-            Err(_) => std::thread::sleep(RENAME_RETRY_DELAY),
+            Err(error) if is_transient(error.kind()) => std::thread::sleep(RENAME_RETRY_DELAY),
+            Err(error) => return Err(error),
         }
     }
     fs::rename(from, to)
@@ -230,6 +249,29 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{Step, execute};
+
+    /// Retrying a failure that cannot clear only delays the real error by
+    /// the whole retry budget.
+    #[test]
+    fn test_only_failures_that_can_clear_are_retried() {
+        use std::io::ErrorKind;
+
+        assert!(
+            super::is_transient(ErrorKind::PermissionDenied),
+            "a Windows sharing violation arrives as PermissionDenied"
+        );
+        for permanent in [
+            ErrorKind::NotFound,
+            ErrorKind::CrossesDevices,
+            ErrorKind::InvalidInput,
+            ErrorKind::NotADirectory,
+        ] {
+            assert!(
+                !super::is_transient(permanent),
+                "{permanent:?} fails the same way however many times it is tried"
+            );
+        }
+    }
 
     #[test]
     fn test_writes_new_content_to_each_path() {
