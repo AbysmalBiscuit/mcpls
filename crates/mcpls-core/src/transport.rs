@@ -385,15 +385,9 @@ pub(crate) async fn run_stdio(
 /// startup work runs (see [`ShutdownSignal`]'s docs), so its registration
 /// predates this function's own `TcpListener::bind` call — a signal between
 /// bind and the graceful-shutdown future's first poll is still caught.
-/// `shutdown_signal` is moved into (and dropped by) the
-/// `with_graceful_shutdown` closure in [`serve_http_on`] once it resolves —
-/// i.e. as soon as the *first* signal is received, well before this function
-/// returns — so there is no listener at all for a repeat signal arriving
-/// during the connection-drain wait that follows (bounded by
-/// [`HTTP_GRACEFUL_SHUTDOWN_TIMEOUT`]). [`crate::shutdown`]'s own
-/// registration only takes effect once *this* function returns, so it
-/// covers the post-transport cleanup window, not the drain wait inside this
-/// one; see #329 and the TODO on that closure for the gap.
+/// After the first signal starts draining connections, a fresh listener in
+/// [`serve_http_on`] lets a repeat signal end that wait. The caller then
+/// performs normal LSP cleanup, where further signals can force process exit.
 #[cfg(feature = "transport-http")]
 pub(crate) async fn run_http(
     mcp_server: crate::mcp::McplsServer,
@@ -469,17 +463,11 @@ pub(crate) async fn serve_http_on(
         .layer(axum::middleware::from_fn(enforce_session_cap));
 
     // `cancel` is cancelled exactly once, when the shutdown signal fires
-    // (below). Cloned first so the force-timeout branch can observe that
-    // same moment independently of the `with_graceful_shutdown` closure,
-    // which consumes its own clone.
-    // TODO(#349): `shutdown_signal` is dropped
-    // once this closure resolves, leaving the connection-drain wait below
-    // (up to `HTTP_GRACEFUL_SHUTDOWN_TIMEOUT`) with no signal listener at
-    // all -- a repeat signal there is silently discarded the same way a
-    // repeat signal during post-transport cleanup used to be, before this
-    // fix added one there. Not addressed here; this fix only covers the
-    // window after `run_http` returns.
+    // (below). Cloned first so the force-timeout and repeat-signal branches
+    // can each observe that same moment independently of the
+    // `with_graceful_shutdown` closure, which consumes its own clone.
     let cancel_for_force_timeout = cancel.clone();
+    let cancel_for_repeat_signal = cancel.clone();
     let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
         shutdown_signal.recv().await;
         cancel.cancel();
@@ -503,6 +491,17 @@ pub(crate) async fn serve_http_on(
             tracing::warn!(
                 timeout = ?HTTP_GRACEFUL_SHUTDOWN_TIMEOUT,
                 "HTTP graceful shutdown did not complete in time, proceeding with shutdown anyway"
+            );
+            Ok(())
+        }
+        // Register after cancellation so the first signal cannot also count as a repeat.
+        () = async move {
+            cancel_for_repeat_signal.cancelled().await;
+            let mut repeat_signal = ShutdownSignal::new();
+            repeat_signal.recv().await;
+        } => {
+            tracing::warn!(
+                "repeat shutdown signal received during HTTP connection drain, cutting drain short"
             );
             Ok(())
         }
@@ -1004,6 +1003,96 @@ mod tests {
             );
 
             server_task.abort();
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn test_serve_http_on_repeat_signal_ends_active_drain() {
+            use std::io::ErrorKind;
+            use std::time::Duration;
+
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            use tokio::net::TcpStream;
+            use tokio::time::timeout;
+
+            if std::env::var_os("NEXTEST").is_none() {
+                eprintln!("skipping self-SIGTERM test: requires nextest process isolation");
+                return;
+            }
+
+            let deadline = Duration::from_secs(5);
+            let (addr, mut server_task) =
+                serve_http_for_test(|addr| HttpConfig::new(addr, "/mcp")).await;
+            let mut stream = timeout(deadline, TcpStream::connect(addr))
+                .await
+                .expect("HTTP listener should accept the request")
+                .unwrap();
+            let request = format!(
+                "POST /mcp HTTP/1.1\r\n\
+                 Host: {addr}\r\n\
+                 Accept: application/json, text/event-stream\r\n\
+                 Content-Type: application/json\r\n\
+                 Expect: 100-continue\r\n\
+                 Content-Length: 1024\r\n\r\n"
+            );
+            timeout(deadline, stream.write_all(request.as_bytes()))
+                .await
+                .expect("request headers should be sent")
+                .unwrap();
+
+            // Acknowledging Expect proves the handler is waiting for the unfinished body.
+            let expected = b"HTTP/1.1 100 Continue\r\n\r\n";
+            let mut response = vec![0; expected.len()];
+            timeout(deadline, stream.read_exact(&mut response))
+                .await
+                .expect("HTTP handler should request the body")
+                .unwrap();
+            assert_eq!(response.as_slice(), expected);
+
+            let send_sigterm = || async {
+                let status = timeout(
+                    deadline,
+                    tokio::process::Command::new("kill")
+                        .arg("-TERM")
+                        .arg(std::process::id().to_string())
+                        .kill_on_drop(true)
+                        .status(),
+                )
+                .await
+                .expect("sending SIGTERM should finish promptly")
+                .expect("kill should launch");
+                assert!(status.success(), "sending SIGTERM should succeed");
+            };
+            send_sigterm().await;
+
+            timeout(deadline, async {
+                loop {
+                    match TcpStream::connect(addr).await {
+                        Err(error) if error.kind() == ErrorKind::ConnectionRefused => break,
+                        Ok(probe) => drop(probe),
+                        Err(error) if error.kind() == ErrorKind::ConnectionReset => {}
+                        Err(error) => panic!("checking HTTP listener failed: {error}"),
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the first signal should close the HTTP listener");
+            assert!(
+                timeout(Duration::from_millis(200), &mut server_task)
+                    .await
+                    .is_err(),
+                "the unfinished request should keep draining after the first signal"
+            );
+
+            send_sigterm().await;
+            let result = timeout(deadline, &mut server_task).await;
+            drop(stream);
+            server_task.abort();
+            result
+                .expect("the second signal should end the active HTTP drain promptly")
+                .expect("the HTTP transport task should not panic")
+                .expect("interrupting the drain should allow normal cleanup");
         }
 
         /// Verifies `run_http` returns an error when the bind address is already in use.
