@@ -6,10 +6,23 @@ use std::collections::HashMap;
 use lsp_types::{ChangeAnnotation, ChangeAnnotationIdentifier, TextEdit, Uri, WorkspaceEdit};
 use tracing::warn;
 
+use crate::bridge::uri_to_path;
 use crate::error::{Error, Result};
 
 /// The `changeAnnotations` map of the `WorkspaceEdit` being normalized.
 type Annotations = HashMap<ChangeAnnotationIdentifier, ChangeAnnotation>;
+
+/// Identity of the document an entry addresses, for comparing two entries.
+///
+/// The filesystem path the URI resolves to, so two spellings of one file
+/// that differ only in percent-encoding compare equal; the URI itself for a
+/// URI that names no file, which keeps it comparable with itself.
+fn document_key(uri: &Uri) -> String {
+    uri_to_path(uri).map_or_else(
+        || uri.as_str().to_string(),
+        |path| path.to_string_lossy().into_owned(),
+    )
+}
 
 /// One step of an edit, in the order it must be performed.
 #[derive(Debug)]
@@ -84,8 +97,8 @@ impl EditPlan {
         // before the whole edit, so a second entry for a document already
         // edited would splice its ranges into text the first entry already
         // changed. The LSP specification says entries address distinct
-        // documents; a resource operation in between resets that, since
-        // the document at that path is a different one afterwards.
+        // documents; a resource operation on *that* path clears it, since
+        // the document there is a different one afterwards.
         let mut already_edited: Vec<String> = Vec::new();
 
         match edit.document_changes {
@@ -103,7 +116,7 @@ impl EditPlan {
                             Self::text_document_edit(tde, &annotations)?
                         }
                         lsp_types::DocumentChangeOperation::Op(resource) => {
-                            already_edited.clear();
+                            Self::release_documents(&mut already_edited, &resource);
                             Self::resource_operation(resource)
                         }
                     });
@@ -122,18 +135,37 @@ impl EditPlan {
     }
 
     /// Record that `uri` is being edited, refusing a second entry for a
-    /// document already edited since the last resource operation.
+    /// document already edited and not since replaced.
     fn claim_document(already_edited: &mut Vec<String>, uri: &Uri) -> Result<()> {
-        let uri = uri.as_str().to_string();
-        if already_edited.contains(&uri) {
+        let key = document_key(uri);
+        if already_edited.contains(&key) {
             return Err(Error::ApplyRefused(format!(
-                "{uri} is addressed by two entries of one workspace edit: the second's ranges \
+                "{} is addressed by two entries of one workspace edit: the second's ranges \
                  were computed against the text before the first, so applying both would \
-                 corrupt it"
+                 corrupt it",
+                uri.as_str()
             )));
         }
-        already_edited.push(uri);
+        already_edited.push(key);
         Ok(())
+    }
+
+    /// Forget the paths `resource` replaces, so a later entry may address
+    /// them again.
+    ///
+    /// Only the paths this operation actually touches: an unrelated create
+    /// or delete elsewhere in the edit says nothing about the document a
+    /// previous entry edited, and clearing everything would let
+    /// `edit a.rs; create b.rs; edit a.rs` through.
+    fn release_documents(already_edited: &mut Vec<String>, resource: &lsp_types::ResourceOp) {
+        let replaced: Vec<String> = match resource {
+            lsp_types::ResourceOp::Create(create) => vec![document_key(&create.uri)],
+            lsp_types::ResourceOp::Rename(rename) => {
+                vec![document_key(&rename.old_uri), document_key(&rename.new_uri)]
+            }
+            lsp_types::ResourceOp::Delete(delete) => vec![document_key(&delete.uri)],
+        };
+        already_edited.retain(|key| !replaced.contains(key));
     }
 
     /// The normalized operations, in execution order.
@@ -462,6 +494,64 @@ mod tests {
             ..WorkspaceEdit::default()
         });
         assert!(result.is_err(), "the second entry would corrupt the file");
+    }
+
+    /// A resource operation on some *other* path says nothing about the
+    /// document an earlier entry edited, so it must not license a second
+    /// entry for that document.
+    #[test]
+    fn test_an_unrelated_resource_operation_does_not_license_a_second_entry() {
+        let entry = |path: &str| {
+            DocumentChangeOperation::Edit(TextDocumentEdit {
+                text_document: OptionalVersionedTextDocumentIdentifier {
+                    uri: uri(path),
+                    version: None,
+                },
+                edits: vec![OneOf::Left(edit(0, 0, "x"))],
+            })
+        };
+
+        let result = EditPlan::from_workspace_edit(WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Operations(vec![
+                entry("/w/a.rs"),
+                DocumentChangeOperation::Op(ResourceOp::Create(CreateFile {
+                    uri: uri("/w/b.rs"),
+                    options: None,
+                    annotation_id: None,
+                })),
+                entry("/w/a.rs"),
+            ])),
+            ..WorkspaceEdit::default()
+        });
+        assert!(
+            result.is_err(),
+            "creating b.rs does not make a second entry for a.rs safe"
+        );
+    }
+
+    /// Two URIs that differ only in percent-encoding name one file, so the
+    /// second entry corrupts it exactly as an identical spelling would.
+    #[test]
+    fn test_two_spellings_of_one_path_are_still_two_entries() {
+        let entry = |path: &str| TextDocumentEdit {
+            text_document: OptionalVersionedTextDocumentIdentifier {
+                uri: uri(path),
+                version: None,
+            },
+            edits: vec![OneOf::Left(edit(0, 0, "x"))],
+        };
+
+        let result = EditPlan::from_workspace_edit(WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Edits(vec![
+                entry("/w/a%2Eb.rs"),
+                entry("/w/a.b.rs"),
+            ])),
+            ..WorkspaceEdit::default()
+        });
+        assert!(
+            result.is_err(),
+            "the two URIs resolve to the same path, so this is one document twice"
+        );
     }
 
     /// A resource operation between two entries makes the second address a
