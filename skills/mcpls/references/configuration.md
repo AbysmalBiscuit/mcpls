@@ -52,7 +52,7 @@ a few map many-to-one:
 | `document_symbols` | `get_document_symbols` |
 | `workspace_symbols` | `workspace_symbol_search` (see the special case below) |
 | `format_document` | `format_document` |
-| `code_actions` | `get_code_actions` |
+| `code_actions` | `get_code_actions` **and** `apply_code_action` (same route serves both) |
 | `call_hierarchy` | `prepare_call_hierarchy`, `get_incoming_calls`, `get_outgoing_calls`, sharing one route: an incoming/outgoing-calls lookup only makes sense against the server that produced the originating call-hierarchy item |
 | `inlay_hints` | `get_inlay_hints` |
 
@@ -80,6 +80,23 @@ claiming an identical tool — mcpls refuses to start rather than pick one arbit
 and the error names the conflicting `[[lsp_servers]]` entries. Two servers whose
 `heuristics.project_markers` are mutually exclusive never overlap in one workspace, so
 that combination is not flagged and starts fine.
+
+## `[apply]` fields
+
+The only table that lets mcpls write to the source tree. Omit it and mcpls is read-only: every tool returns an edit to read, and nothing on disk changes. Every field defaults to `false`.
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `rename` | boolean | `false` | `rename_symbol` may write when called with `apply: true`. A workspace-wide rename rewrites every file referencing the symbol, not just the one named. |
+| `format_document` | boolean | `false` | `format_document` may write when called with `apply: true`. Confined to the file named. |
+| `code_actions` | boolean | `false` | Enables the `apply_code_action` tool. The widest of the three: an action can create, move, or delete files as well as edit them, and can carry a command the server runs itself, which may send further edits back while it runs. |
+| `allow_file_deletion` | boolean | `false` | Permits any operation that destroys a file's content — an explicit delete, a create that overwrites an existing file, or a rename onto an existing destination. Gates all three for every tool above rather than any one of them. With it `false`, an edit containing any of them is refused whole and nothing is written. |
+
+Turning a key on hands the write to the language server: it decides which files the edit touches and what goes in them. mcpls confines every path to `workspace.roots` (resolving symlinks first), applies the whole edit or none of it, and reports what it wrote. It does not review the content.
+
+There is no undo beyond the run itself. A step failing partway through one apply reverses the completed steps and the error names any file it could not restore; once an apply returns successfully the change is on disk and mcpls holds no record of what was there before.
+
+An edit is refused outright when there are no `workspace.roots`, when a path resolves outside them, when it would rewrite a read-only file, when a file it edits holds no readable text, when two edits to one document overlap, when it creates a file in a directory that does not exist, or when it edits a file under a directory the same edit moves.
 
 ## Environment passthrough (`env`)
 

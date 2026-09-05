@@ -186,6 +186,7 @@ Claude: [get_references] Found 4 matches:
 |------|--------------|
 | `rename_symbol` | Workspace-wide rename with full reference tracking |
 | `format_document` | Apply language-specific formatting rules |
+| `apply_code_action` | Apply one action from a `get_code_actions` listing |
 | `prepare_call_hierarchy` | Get callable items at a position for call hierarchy |
 | `get_incoming_calls` | Find all callers of a function (who calls this?) |
 | `get_outgoing_calls` | Find all callees of a function (what does this call?) |
@@ -231,6 +232,28 @@ command = "rust-analyzer"
 [lsp_servers.heuristics]
 project_markers = ["Cargo.toml", "rust-toolchain.toml", ".rust-version"]
 ```
+
+</details>
+
+<details>
+<summary><strong>Writing to Your Source Tree</strong></summary>
+
+mcpls is read-only by default. The `[apply]` table is the only thing that changes that, one tool at a time:
+
+```toml
+[apply]
+rename = true               # rename_symbol may write when called with apply: true
+format_document = true      # format_document may write when called with apply: true
+code_actions = false        # enables the apply_code_action tool
+allow_file_deletion = false # permits deleting or overwriting a file
+```
+
+Leave the table out and nothing is ever written. Turning a key on hands the write to the language server: it decides which files the edit touches and what goes in them. mcpls checks that every path stays inside your `workspace.roots`, applies the whole edit or none of it, and reports what it wrote — it does not review the content.
+
+> [!WARNING]
+> There is no undo. A failure partway through one apply is rolled back, and the error names any file it could not restore; once an apply returns successfully the change is on disk and mcpls has no record of what was there before. Commit before letting a tool write.
+
+See [Apply Section](docs/user-guide/configuration.md#apply-section) for what each key permits.
 
 </details>
 
@@ -292,6 +315,13 @@ checkOnSave.command = "clippy"
 [[language_extensions]]
 extensions = ["nu"]
 language_id = "nushell"
+
+# Omit this table entirely to keep mcpls read-only.
+[apply]
+rename = true
+format_document = true
+code_actions = false
+allow_file_deletion = false
 ```
 
 See [Configuration Reference](docs/user-guide/configuration.md) for all options.

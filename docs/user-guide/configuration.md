@@ -72,6 +72,11 @@ request_timeout_seconds = 30
 # Optional: LSP server initialization options
 [lsp_servers.initialization_options]
 cargo.features = "all"
+
+# Optional: which tools may write to your source tree.
+# Leave this table out and mcpls never writes anything.
+[apply]
+rename = true
 ```
 
 ## Workspace Section
@@ -528,6 +533,57 @@ if neither an explicit claimer nor a catch-all exists anywhere in the
 workspace, the request fails naming the tool rather than being forwarded to
 an arbitrary server that declined it via `handles`. Add `workspace_symbols`
 to a server's `handles` list, or configure a catch-all, to enable this tool.
+
+## Apply Section
+
+The `[apply]` table is the only thing that lets mcpls write to your source tree. Leave it out and mcpls is read-only: every tool returns an edit for you to read, and nothing on disk changes.
+
+Turning a key on hands the write to the language server. The server decides which files the edit touches and what it puts in them; mcpls checks that every path stays inside a configured `workspace.roots` entry, applies the whole edit or none of it, and reports what it wrote. It does not review the content, and it cannot tell a correct rename from a wrong one.
+
+> [!WARNING]
+> There is no undo. mcpls rolls an edit back only while that one apply is still running: if a step fails partway, the completed steps are reversed and the error names any file it could not restore. Once an apply has returned successfully the change is on disk and mcpls has no record of what was there before. Commit your work before letting a tool write, and read the `files_written` list it returns.
+
+An edit is refused outright — nothing is written — when the applier has no `workspace.roots` configured, when any path in it resolves outside those roots (following symlinks), when it would rewrite a read-only file, when a file it edits has no readable text, or when two edits to one document overlap.
+
+```toml
+[apply]
+rename = true
+format_document = true
+code_actions = false
+allow_file_deletion = false
+```
+
+### `apply.rename`
+
+**Type**: Boolean
+**Default**: `false`
+
+Lets `rename_symbol` write its edit when called with `apply: true`. A workspace-wide rename typically rewrites every file that references the symbol, not just the one you named.
+
+### `apply.format_document`
+
+**Type**: Boolean
+**Default**: `false`
+
+Lets `format_document` write its edits when called with `apply: true`. The write is confined to the file you named.
+
+### `apply.code_actions`
+
+**Type**: Boolean
+**Default**: `false`
+
+Enables the `apply_code_action` tool, which applies one action from a `get_code_actions` listing.
+
+This is the widest of the three. A code action can carry a `WorkspaceEdit` that creates, moves, or deletes files as well as editing them, and it can carry a command the server runs itself — while that command runs, the server may send edits back, and mcpls applies them through the same checks. `get_code_actions` shows you the edit an action carries before you apply it, though an action the server resolves lazily reveals its edit only at apply time.
+
+### `apply.allow_file_deletion`
+
+**Type**: Boolean
+**Default**: `false`
+
+Permits an operation that destroys a file's content: an explicit delete, a create that overwrites an existing file, or a rename onto an existing destination. It gates all three for every tool above rather than any one of them, because losing a file is not the same kind of mistake as a bad edit. With it `false`, an edit containing any of them is refused as a whole and nothing is written.
+
+Deletion is performed by moving the file to a hidden sibling for the duration of the apply, so a later step failing can put it back. Once the apply succeeds, that sibling is removed and the file is gone.
 
 ## Environment Variables
 

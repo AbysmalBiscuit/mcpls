@@ -1,10 +1,12 @@
 # MCP Tools Reference
 
-Complete reference for all 20 MCP tools provided by mcpls.
+Complete reference for the MCP tools provided by mcpls.
 
 ## Overview
 
 mcpls exposes semantic code intelligence from Language Server Protocol (LSP) servers as MCP tools. Each tool corresponds to one or more LSP methods and provides rich code information to AI agents.
+
+Most tools only read. Three can write to your source tree, and only when the `[apply]` table in `mcpls.toml` permits it: `rename_symbol` and `format_document` take an `apply` parameter, and `apply_code_action` exists to write. With no `[apply]` table, all three refuse the write and every other tool is unaffected. See [Apply Section](configuration.md#apply-section) for what enabling it lets a language server do, and for the fact that there is no undo.
 
 ## Tool Index
 
@@ -33,6 +35,7 @@ mcpls exposes semantic code intelligence from Language Server Protocol (LSP) ser
 |------|------------|-------------|
 | [rename_symbol](#rename_symbol) | `textDocument/rename` | Workspace-wide symbol renaming |
 | [get_code_actions](#get_code_actions) | `textDocument/codeAction` | Quick fixes and refactorings |
+| [apply_code_action](#apply_code_action) | `textDocument/codeAction` + `codeAction/resolve` + `workspace/executeCommand` | Apply one action from a `get_code_actions` listing |
 
 ### Call Hierarchy Tools
 
@@ -337,7 +340,8 @@ Rename a symbol across the entire workspace.
   "file_path": "/absolute/path/to/file.rs",
   "line": 10,
   "character": 5,
-  "new_name": "new_identifier_name"
+  "new_name": "new_identifier_name",
+  "apply": false
 }
 ```
 
@@ -347,6 +351,7 @@ Rename a symbol across the entire workspace.
 | `line` | integer | Yes | Line number (1-based) |
 | `character` | integer | Yes | Character position (1-based, UTF-8) |
 | `new_name` | string | Yes | New name for the symbol |
+| `apply` | boolean | No | Write the edit to disk (default: false). Requires `apply.rename = true` in `mcpls.toml`, and fails naming that key otherwise |
 
 ### Returns
 
@@ -396,11 +401,14 @@ Claude: [Uses rename_symbol] Found 47 occurrences across 12 files. This is
         a large refactoring. Shall I proceed?
 ```
 
+With `apply: true` the response also carries `applied`, `files_written` (absolute paths whose content changed), and `resource_operations` (files the rename created, moved, or deleted). Every path in `files_written` is stale in any cache you hold.
+
 ### Notes
 
 - Validates that the new name is a valid identifier
 - Respects language-specific naming rules
-- Does not apply changes automatically - returns edit plan
+- Returns the edit plan without touching disk unless `apply: true` and `apply.rename = true`
+- A rename that only moves a file reports `applied: true` with an empty `files_written`: the move is in `resource_operations`
 - Some LSP servers may reject invalid renames
 
 ---
@@ -588,7 +596,8 @@ Format a document according to language server rules.
 {
   "file_path": "/absolute/path/to/file.rs",
   "tab_size": 4,
-  "insert_spaces": true
+  "insert_spaces": true,
+  "apply": false
 }
 ```
 
@@ -597,6 +606,7 @@ Format a document according to language server rules.
 | `file_path` | string | Yes | Absolute path to the file |
 | `tab_size` | integer | No | Tab size for formatting (default: 4) |
 | `insert_spaces` | boolean | No | Use spaces instead of tabs (default: true) |
+| `apply` | boolean | No | Write the edits to disk (default: false). Requires `apply.format_document = true` in `mcpls.toml`, and fails naming that key otherwise |
 
 ### Returns
 
@@ -634,7 +644,9 @@ Claude: [Uses format_document] The file needs formatting changes:
 ### Notes
 
 - Uses language-specific formatter (rustfmt, black, prettier, etc.)
-- Does not apply changes automatically - returns edit plan
+- Returns the edit plan without touching disk unless `apply: true` and `apply.format_document = true`
+- With `apply: true` the response carries `applied` alongside the edits; an already-formatted file yields no edits and reports `applied: false`
+- The write is confined to the file you named
 - May fail if formatter is not available
 - Respects `.editorconfig` and formatter configuration files
 
@@ -713,6 +725,81 @@ Claude: [Uses get_code_actions] Available fixes:
         - Import missing module
         - Add derive macro
 ```
+
+---
+
+## apply_code_action
+
+Apply one of the actions `get_code_actions` listed, writing its edits to disk.
+
+Requires `apply.code_actions = true` in `mcpls.toml`; without it the call fails naming that key and nothing is written. This is the widest of the three write paths: an action can create, move, or delete files as well as edit them, and it can carry a command the server runs itself, which may send further edits back while it runs. See [Apply Section](configuration.md#apply-section).
+
+### Parameters
+
+```json
+{
+  "file_path": "/path/to/file.rs",
+  "start_line": 10,
+  "start_character": 5,
+  "end_line": 10,
+  "end_character": 15,
+  "kind_filter": null,
+  "action_index": 0,
+  "action_title": "Import missing module"
+}
+```
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `file_path` | string | Yes | Absolute path to the file |
+| `start_line` | integer | Yes | Start line (1-based) |
+| `start_character` | integer | Yes | Start character (1-based) |
+| `end_line` | integer | Yes | End line (1-based) |
+| `end_character` | integer | Yes | End character (1-based) |
+| `kind_filter` | string | No | Filter by action kind. Must match the `kind_filter` of the `get_code_actions` call the index came from, or the index numbers a different list |
+| `action_index` | integer | No | Position in the `get_code_actions` listing |
+| `action_title` | string | No | Exact title. On its own it must match exactly one action; alongside `action_index` it confirms that position |
+
+Give `action_index`, `action_title`, or both. Giving both is the safe form: the tool applies the index and refuses the call if the action there no longer carries that title. Nothing links the two calls, so the file can change between them and an index alone can name a different action than the one you read.
+
+The range is re-queried before anything is applied, so the listing this tool selects from is the server's current answer, not a cached one.
+
+### Returns
+
+```json
+{
+  "title": "Import missing module",
+  "applied": true,
+  "files_written": ["/path/to/file.rs"],
+  "resource_operations": [],
+  "executed_command": null
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `title` | Title of the action that ran |
+| `applied` | Whether the working tree changed |
+| `files_written` | Absolute paths whose content changed |
+| `resource_operations` | Files the action created, moved, or deleted |
+| `executed_command` | The command dispatched to the server, when the action carried one |
+
+### Example Use Cases
+
+**Apply a quick fix:**
+```
+User: Fix the missing import on line 12
+Claude: [Uses get_code_actions] Action 0 is "Import missing module".
+        [Uses apply_code_action with action_index 0 and that title]
+        Applied. Wrote src/handler.rs.
+```
+
+### Notes
+
+- Fails if the action resolves to neither an edit nor a command
+- An action the server resolves lazily reveals its edit only at apply time, so `get_code_actions` cannot always preview it
+- If the action's command fails after its edits landed, the error names the paths that changed — re-read them before retrying
+- Deleting or overwriting a file additionally requires `apply.allow_file_deletion = true`
 
 ---
 
