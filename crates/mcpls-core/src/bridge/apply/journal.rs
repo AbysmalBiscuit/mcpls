@@ -56,6 +56,68 @@ fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
     fs::rename(from, to)
 }
 
+/// A rendezvous a test installs to hold the journal still just before it
+/// performs the step for one path.
+///
+/// `arrived` releases once the journal reaches that step, which is after
+/// [`crate::bridge::apply::Applier::apply`] has recorded everything the run
+/// will change and before any byte of it is written; `resume` releases when
+/// the test lets the write go. That is what makes "the caller gave up
+/// before a single byte landed" an arrangement rather than a race.
+///
+/// Scoped to one path, so a test that installs it cannot stall the journal
+/// of another test running beside it.
+#[cfg(test)]
+pub(crate) struct StepBarrier {
+    /// The step target to pause at.
+    pub(crate) path: PathBuf,
+    /// Released when the journal arrives at that step.
+    pub(crate) arrived: std::sync::Arc<std::sync::Barrier>,
+    /// Released when the test lets the step proceed.
+    pub(crate) resume: std::sync::Arc<std::sync::Barrier>,
+}
+
+#[cfg(test)]
+static STEP_BARRIER: std::sync::Mutex<Option<StepBarrier>> = std::sync::Mutex::new(None);
+
+/// Install `barrier`, or clear whatever is installed.
+#[cfg(test)]
+pub(crate) fn install_step_barrier(barrier: Option<StepBarrier>) {
+    *crate::bridge::lock_std(&STEP_BARRIER) = barrier;
+}
+
+/// The path a step acts on.
+#[cfg(test)]
+const fn step_target(step: &Step) -> &PathBuf {
+    match step {
+        Step::Write { path, .. } | Step::Trash { path, .. } => path,
+        Step::Move { from, .. } => from,
+    }
+}
+
+/// Hold the journal at `step` if a test asked to be let in there.
+#[cfg(test)]
+fn pause_at(step: &Step) {
+    // Bound to a local so the lock is released before either wait.
+    let rendezvous = crate::bridge::lock_std(&STEP_BARRIER)
+        .as_ref()
+        .filter(|barrier| barrier.path == *step_target(step))
+        .map(|barrier| {
+            (
+                std::sync::Arc::clone(&barrier.arrived),
+                std::sync::Arc::clone(&barrier.resume),
+            )
+        });
+    if let Some((arrived, resume)) = rendezvous {
+        arrived.wait();
+        resume.wait();
+    }
+}
+
+/// No-op outside test builds, where nothing can install a barrier.
+#[cfg(not(test))]
+const fn pause_at(_step: &Step) {}
+
 /// One reversible file-system change, in the order it must be performed.
 #[derive(Debug)]
 pub enum Step {
@@ -95,6 +157,7 @@ pub enum Step {
 /// not return to its original state and says where it actually is.
 pub fn execute(steps: &[Step]) -> Result<()> {
     for (completed, step) in steps.iter().enumerate() {
+        pause_at(step);
         if let Err(reason) = perform(step) {
             return Err(roll_back(&steps[..completed], reason));
         }

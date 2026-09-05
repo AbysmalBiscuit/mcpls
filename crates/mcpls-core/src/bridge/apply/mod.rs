@@ -1032,14 +1032,28 @@ mod tests {
     /// future cannot cancel, so what it changed must not be carried only by
     /// the summary that future would have returned. Pressing Esc during a
     /// slow workspace rename is exactly this.
+    ///
+    /// The journal is held at the step until the caller's future has
+    /// actually been dropped, so the cancellation lands strictly before any
+    /// byte is written instead of racing the write.
     #[tokio::test]
-    async fn test_a_dropped_apply_still_records_what_it_changed() {
-        use tokio::time::{Duration, sleep, timeout};
+    async fn test_an_apply_dropped_before_it_writes_still_records_what_it_changed() {
+        use std::sync::{Arc, Barrier};
+
+        use tokio::time::{Duration, sleep};
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("a.rs");
         fs::write(&path, "fn old() {}\n").expect("seed");
         let canonical = path.canonicalize().expect("the fixture exists");
+
+        let arrived = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        super::journal::install_step_barrier(Some(super::journal::StepBarrier {
+            path: canonical.clone(),
+            arrived: Arc::clone(&arrived),
+            resume: Arc::clone(&resume),
+        }));
 
         let applier = Applier::new(vec![dir.path().to_path_buf()], permissive());
         let queue = InvalidationQueue::default();
@@ -1048,35 +1062,57 @@ mod tests {
             Range::new(Position::new(0, 3), Position::new(0, 6)),
             "new",
         );
+        let task = {
+            let queue = queue.clone();
+            tokio::spawn(async move { applier.apply(plan, PositionEncoding::Utf16, &queue).await })
+        };
 
-        // Stops awaiting the apply. The blocking task carries on.
-        drop(
-            timeout(
-                Duration::from_millis(1),
-                applier.apply(plan, PositionEncoding::Utf16, &queue),
-            )
-            .await,
+        // Returns once the journal is at the step: planning is done, the
+        // paths are recorded, and nothing has been written.
+        let waiting = Arc::clone(&arrived);
+        tokio::task::spawn_blocking(move || waiting.wait())
+            .await
+            .expect("the journal reaches the step");
+        assert_eq!(
+            fs::read_to_string(&path).expect("read"),
+            "fn old() {}\n",
+            "the barrier holds the journal before it writes anything"
         );
 
-        let mut recorded = Vec::new();
+        // The caller stops awaiting. Awaiting the aborted handle returns
+        // only once the future has actually been dropped, so the write is
+        // released strictly afterwards.
+        task.abort();
+        assert!(task.await.is_err(), "the caller's future is dropped");
+
+        let waiting = Arc::clone(&resume);
+        tokio::task::spawn_blocking(move || waiting.wait())
+            .await
+            .expect("the journal resumes");
+
+        // The queue is filled before the write, so the write is what has to
+        // be waited for -- reading it as soon as the queue fills would race
+        // the whole journal.
+        let mut content = String::new();
         for _ in 0..500 {
-            recorded.extend(queue.take());
-            if !recorded.is_empty() {
+            content = fs::read_to_string(&path).expect("read");
+            if content == "fn new() {}\n" {
                 break;
             }
             sleep(Duration::from_millis(10)).await;
         }
 
         assert_eq!(
-            recorded,
-            vec![canonical],
-            "the path the abandoned apply changed is still queued for whoever drains next"
+            content, "fn new() {}\n",
+            "the write completed without anyone awaiting it"
         );
         assert_eq!(
-            fs::read_to_string(&path).expect("read"),
-            "fn new() {}\n",
-            "the write itself completed, which is why the path had to be recorded"
+            queue.take(),
+            vec![canonical],
+            "and the path it changed is queued for whoever drains next"
         );
+
+        super::journal::install_step_barrier(None);
     }
 
     /// Mark `path` read-only, or writable again.
