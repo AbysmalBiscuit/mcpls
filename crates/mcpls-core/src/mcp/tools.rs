@@ -193,14 +193,17 @@ pub struct ApplyCodeActionParams {
     /// Position of the action in the `get_code_actions` list.
     #[schemars(
         description = "Position of the action in the get_code_actions list for this same \
-                       range. Give this or action_title, not both."
+                       range. Pass action_title alongside it to confirm that position still \
+                       holds the action you read."
     )]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action_index: Option<usize>,
     /// Exact title of the action.
     #[schemars(
-        description = "Exact title of the action, which must match exactly one. Give this \
-                       or action_index, not both."
+        description = "Exact title of the action. On its own it must match exactly one \
+                       action; alongside action_index it confirms that position, and the \
+                       call is refused if the list changed since you read it. Give at least \
+                       one of the two."
     )]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action_title: Option<String>,

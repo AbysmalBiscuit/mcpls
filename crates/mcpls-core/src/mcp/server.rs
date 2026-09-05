@@ -456,8 +456,9 @@ impl McplsServer {
     /// Apply one of the code actions available for a range.
     #[tool(
         description = "Apply one code action from get_code_actions for the same range and \
-                       kind_filter, by index or exact title. Requires apply.code_actions = \
-                       true in config. Writes the action's edits to disk.",
+                       kind_filter, by index, by exact title, or by index confirmed with the \
+                       title you read at it. Requires apply.code_actions = true in config. \
+                       Writes the action's edits to disk.",
         title = "Apply Code Action",
         annotations(
             title = "Apply Code Action",

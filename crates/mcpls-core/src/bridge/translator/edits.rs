@@ -197,6 +197,19 @@ enum CodeActionSelector {
     Index(usize),
     /// Exact title, which must match exactly one action.
     Title(String),
+    /// Position, confirmed against the title the caller read at it.
+    ///
+    /// The tool is stateless: between the `get_code_actions` that produced
+    /// an index and the `apply_code_action` that consumes it the file may
+    /// have changed, so the index can name a different action and would
+    /// otherwise apply it with no signal. Giving both fields turns that
+    /// into a refusal, for one string comparison.
+    ConfirmedIndex {
+        /// Position to apply.
+        index: usize,
+        /// Title that position must still carry.
+        title: String,
+    },
 }
 
 /// Everything one `apply_code_action` call wrote, across its own edit and
@@ -236,11 +249,11 @@ const fn changed_the_tree(summary: &ApplySummary) -> bool {
     !summary.files_changed.is_empty() || !summary.resource_operations.is_empty()
 }
 
-/// Narrow the tool's two optional selector fields to exactly one selector.
+/// Narrow the tool's two optional selector fields to a selector.
 ///
 /// # Errors
 ///
-/// Returns [`Error::InvalidToolParams`] when neither or both are given.
+/// Returns [`Error::InvalidToolParams`] when neither is given.
 fn selector_from_params(
     action_index: Option<usize>,
     action_title: Option<String>,
@@ -248,13 +261,21 @@ fn selector_from_params(
     match (action_index, action_title) {
         (Some(index), None) => Ok(CodeActionSelector::Index(index)),
         (None, Some(title)) => Ok(CodeActionSelector::Title(title)),
-        (Some(_), Some(_)) => Err(Error::InvalidToolParams(
-            "give either action_index or action_title, not both".to_string(),
-        )),
+        (Some(index), Some(title)) => Ok(CodeActionSelector::ConfirmedIndex { index, title }),
         (None, None) => Err(Error::InvalidToolParams(
             "give one of action_index or action_title to name the action to apply".to_string(),
         )),
     }
+}
+
+/// The action at `index`, or an error naming how many there are.
+fn action_at(actions: &[CodeAction], index: usize) -> Result<&CodeAction> {
+    actions.get(index).ok_or_else(|| {
+        Error::InvalidToolParams(format!(
+            "action index {index} is out of range: {} actions available",
+            actions.len()
+        ))
+    })
 }
 
 /// Pick the action `selector` names.
@@ -262,18 +283,25 @@ fn selector_from_params(
 /// # Errors
 ///
 /// Returns [`Error::InvalidToolParams`] when the index is out of range, no
-/// title matches, or a title matches more than one action.
+/// title matches, a title matches more than one action, or a confirmed
+/// index no longer carries the title the caller gave.
 fn select_action<'a>(
     actions: &'a [CodeAction],
     selector: &CodeActionSelector,
 ) -> Result<&'a CodeAction> {
     match selector {
-        CodeActionSelector::Index(index) => actions.get(*index).ok_or_else(|| {
-            Error::InvalidToolParams(format!(
-                "action index {index} is out of range: {} actions available",
-                actions.len()
-            ))
-        }),
+        CodeActionSelector::Index(index) => action_at(actions, *index),
+        CodeActionSelector::ConfirmedIndex { index, title } => {
+            let chosen = action_at(actions, *index)?;
+            if chosen.title == *title {
+                return Ok(chosen);
+            }
+            Err(Error::InvalidToolParams(format!(
+                "action index {index} is now {:?}, not {title:?}: the list changed since \
+                 get_code_actions produced it, so read it again",
+                chosen.title
+            )))
+        }
         CodeActionSelector::Title(title) => {
             let mut matches = actions.iter().filter(|a| a.title == *title);
             let first = matches.next().ok_or_else(|| {
@@ -595,8 +623,9 @@ impl Translator {
     /// Apply one of the code actions available for a range.
     ///
     /// Re-issues `textDocument/codeAction` for the same range
-    /// `get_code_actions` used, selects one action by `action_index` or
-    /// `action_title`, resolves it if the server sent only `data`, and
+    /// `get_code_actions` used, selects one action by `action_index`,
+    /// `action_title`, or both (the index applied and the title confirming
+    /// it), resolves it if the server sent only `data`, and
     /// applies its edit and/or runs its command. An action carrying both an
     /// edit and a command applies the edit first, per the LSP specification.
     ///
@@ -1552,7 +1581,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::expect_used)]
-    fn test_selector_from_params_requires_exactly_one_field() {
+    fn test_selector_from_params_requires_at_least_one_field() {
         assert!(matches!(
             selector_from_params(Some(2), None).expect("index alone is valid"),
             CodeActionSelector::Index(2)
@@ -1561,8 +1590,47 @@ mod tests {
             selector_from_params(None, Some("Fill".to_string())).expect("title alone is valid"),
             CodeActionSelector::Title(_)
         ));
-        assert!(selector_from_params(Some(0), Some("Fill".to_string())).is_err());
+        assert!(matches!(
+            selector_from_params(Some(0), Some("Fill".to_string()))
+                .expect("both together confirm the index"),
+            CodeActionSelector::ConfirmedIndex { index: 0, .. }
+        ));
         assert!(selector_from_params(None, None).is_err());
+    }
+
+    /// The list `action_index` came from can have changed before the call
+    /// that consumes it. A caller that also sends the title it read gets a
+    /// refusal instead of a different action applied in silence.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_a_confirmed_index_is_refused_when_the_title_no_longer_matches() {
+        let actions = vec![
+            stub_action(0, "Add missing import"),
+            stub_action(1, "Remove unused import"),
+        ];
+
+        let chosen = select_action(
+            &actions,
+            &CodeActionSelector::ConfirmedIndex {
+                index: 1,
+                title: "Remove unused import".to_string(),
+            },
+        )
+        .expect("the title still matches the position");
+        assert_eq!(chosen.index, 1);
+
+        let error = select_action(
+            &actions,
+            &CodeActionSelector::ConfirmedIndex {
+                index: 1,
+                title: "Extract into function".to_string(),
+            },
+        )
+        .expect_err("index 1 is a different action now");
+        assert!(
+            error.to_string().contains("Remove unused import"),
+            "the error says what is actually there: {error}"
+        );
     }
 
     #[tokio::test]
