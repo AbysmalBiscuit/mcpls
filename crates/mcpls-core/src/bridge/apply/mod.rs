@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use tokio::sync::Mutex;
 
@@ -17,9 +17,45 @@ pub use plan::{EditPlan, Operation};
 
 use crate::bridge::encoding::{EncodingConverter, PositionEncoding};
 use crate::bridge::translator::ResourceOperation;
-use crate::bridge::{uri_to_path, validate_path_against_roots};
+use crate::bridge::{lock_std, uri_to_path, validate_path_against_roots};
 use crate::config::ApplyConfig;
 use crate::error::{Error, Result};
+
+/// Paths an apply has committed to changing, held until whoever tracks open
+/// documents has dropped them.
+///
+/// [`Applier::apply`] records them once planning succeeds and *before* the
+/// journal runs, so they outlive the caller: the write itself completes on a
+/// blocking thread whether or not anyone is still awaiting it, and dropping
+/// the awaiting future -- a cancelled request, a client disconnect, shutdown
+/// -- would otherwise lose the summary and with it every path that had to be
+/// forgotten. Whatever a cancelled apply leaves here, the next apply or the
+/// next tool call that opens a document takes and acts on.
+///
+/// Recorded from the plan rather than from the outcome, so a run that fails
+/// partway and rolls back is covered too: a rollback that could not restore
+/// a file leaves it holding the new content, and one that could still moved
+/// the file out and back.
+#[derive(Debug, Clone, Default)]
+pub struct InvalidationQueue(Arc<StdMutex<Vec<PathBuf>>>);
+
+impl InvalidationQueue {
+    /// Add every path in `paths` that is not already queued.
+    pub fn extend(&self, paths: &[PathBuf]) {
+        let mut queued = lock_std(&self.0);
+        for path in paths {
+            if !queued.contains(path) {
+                queued.push(path.clone());
+            }
+        }
+    }
+
+    /// Take everything queued, leaving the queue empty.
+    #[must_use]
+    pub fn take(&self) -> Vec<PathBuf> {
+        std::mem::take(&mut *lock_std(&self.0))
+    }
+}
 
 /// One file the applier wrote.
 #[derive(Debug, Clone)]
@@ -97,7 +133,17 @@ impl Applier {
     /// workspace, deletes a file without `apply.allow_file_deletion`, or
     /// resolves to an invalid range, and [`Error::ApplyPartiallyFailed`]
     /// when a step fails after another has already landed.
-    pub async fn apply(&self, plan: EditPlan, encoding: PositionEncoding) -> Result<ApplySummary> {
+    ///
+    /// Every path this is about to change is recorded in `invalidated`
+    /// before the journal runs, so a caller that stops awaiting this call
+    /// still leaves them somewhere the next caller will find them. See
+    /// [`InvalidationQueue`].
+    pub async fn apply(
+        &self,
+        plan: EditPlan,
+        encoding: PositionEncoding,
+        invalidated: &InvalidationQueue,
+    ) -> Result<ApplySummary> {
         // `validate_path_against_roots` treats an empty root list as "any
         // path is in bounds", which is fine for the read-only queries it
         // was written for but would let a misconfigured applier write
@@ -112,6 +158,7 @@ impl Applier {
 
         let roots = self.roots.clone();
         let config = self.config.clone();
+        let invalidated = invalidated.clone();
         // Taken here and moved into the blocking task, so the lock's
         // lifetime is the write's rather than this future's: a dropped
         // future cancels the await but not the task already writing.
@@ -121,6 +168,9 @@ impl Applier {
         tokio::task::spawn_blocking(move || {
             let _guard = guard;
             let outcome = Planner::new(&roots, &config, encoding).plan(&plan)?;
+            // Queued before the first step runs: from here on the tree is
+            // going to change whether or not anyone is still awaiting this.
+            invalidated.extend(&outcome.paths_invalidated);
             journal::execute(&outcome.steps)?;
             Ok(ApplySummary {
                 files_changed: outcome.files_changed,
@@ -577,7 +627,7 @@ mod tests {
         TextDocumentEdit, TextEdit, Uri, WorkspaceEdit,
     };
 
-    use super::{Applier, EditPlan};
+    use super::{Applier, EditPlan, InvalidationQueue};
     use crate::bridge::{PositionEncoding, path_to_uri};
     use crate::config::ApplyConfig;
 
@@ -624,7 +674,7 @@ mod tests {
         );
 
         let summary = applier
-            .apply(plan, PositionEncoding::Utf16)
+            .apply(plan, PositionEncoding::Utf16, &InvalidationQueue::default())
             .await
             .expect("apply succeeds");
 
@@ -653,6 +703,7 @@ mod tests {
             .apply(
                 plan_replacing(uri_for(&path), columns, "Z"),
                 PositionEncoding::Utf16,
+                &InvalidationQueue::default(),
             )
             .await
             .expect("apply succeeds");
@@ -663,6 +714,7 @@ mod tests {
             .apply(
                 plan_replacing(uri_for(&path), columns, "Z"),
                 PositionEncoding::Utf8,
+                &InvalidationQueue::default(),
             )
             .await
             .expect("apply succeeds");
@@ -703,7 +755,7 @@ mod tests {
 
         let applier = Applier::new(vec![dir.path().to_path_buf()], permissive());
         applier
-            .apply(plan, PositionEncoding::Utf16)
+            .apply(plan, PositionEncoding::Utf16, &InvalidationQueue::default())
             .await
             .expect("create-then-edit succeeds");
 
@@ -746,7 +798,7 @@ mod tests {
 
         let applier = Applier::new(vec![dir.path().to_path_buf()], permissive());
         applier
-            .apply(plan, PositionEncoding::Utf16)
+            .apply(plan, PositionEncoding::Utf16, &InvalidationQueue::default())
             .await
             .expect("rename-then-edit succeeds");
 
@@ -780,7 +832,7 @@ mod tests {
 
         let applier = Applier::new(vec![dir.path().to_path_buf()], permissive());
         applier
-            .apply(plan, PositionEncoding::Utf16)
+            .apply(plan, PositionEncoding::Utf16, &InvalidationQueue::default())
             .await
             .expect("an ignored create is not a failure");
 
@@ -801,7 +853,12 @@ mod tests {
             "y",
         );
 
-        assert!(applier.apply(plan, PositionEncoding::Utf16).await.is_err());
+        assert!(
+            applier
+                .apply(plan, PositionEncoding::Utf16, &InvalidationQueue::default())
+                .await
+                .is_err()
+        );
         assert_eq!(
             fs::read_to_string(&path).expect("read"),
             "x\n",
@@ -829,7 +886,12 @@ mod tests {
             "y",
         );
 
-        assert!(applier.apply(plan, PositionEncoding::Utf16).await.is_err());
+        assert!(
+            applier
+                .apply(plan, PositionEncoding::Utf16, &InvalidationQueue::default())
+                .await
+                .is_err()
+        );
         assert_eq!(
             fs::read_to_string(&target).expect("read"),
             "x\n",
@@ -858,7 +920,7 @@ mod tests {
         .expect("plan builds");
 
         let summary = applier
-            .apply(plan, PositionEncoding::Utf16)
+            .apply(plan, PositionEncoding::Utf16, &InvalidationQueue::default())
             .await
             .expect("the delete applies");
 
@@ -890,7 +952,12 @@ mod tests {
             "new",
         );
 
-        assert!(applier.apply(plan, PositionEncoding::Utf16).await.is_err());
+        assert!(
+            applier
+                .apply(plan, PositionEncoding::Utf16, &InvalidationQueue::default())
+                .await
+                .is_err()
+        );
         assert_eq!(
             fs::read_to_string(&path).expect("read"),
             "fn old() {}\n",
@@ -921,7 +988,7 @@ mod tests {
         .expect("plan builds");
 
         let error = applier
-            .apply(plan, PositionEncoding::Utf16)
+            .apply(plan, PositionEncoding::Utf16, &InvalidationQueue::default())
             .await
             .expect_err("deletion is refused");
         assert!(
@@ -929,6 +996,57 @@ mod tests {
             "the error names the key that would permit it: {error}"
         );
         assert!(path.exists(), "the file survives a refused deletion");
+    }
+
+    /// The write runs on a blocking thread that dropping the awaiting
+    /// future cannot cancel, so what it changed must not be carried only by
+    /// the summary that future would have returned. Pressing Esc during a
+    /// slow workspace rename is exactly this.
+    #[tokio::test]
+    async fn test_a_dropped_apply_still_records_what_it_changed() {
+        use tokio::time::{Duration, sleep, timeout};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("a.rs");
+        fs::write(&path, "fn old() {}\n").expect("seed");
+        let canonical = path.canonicalize().expect("the fixture exists");
+
+        let applier = Applier::new(vec![dir.path().to_path_buf()], permissive());
+        let queue = InvalidationQueue::default();
+        let plan = plan_replacing(
+            uri_for(&path),
+            Range::new(Position::new(0, 3), Position::new(0, 6)),
+            "new",
+        );
+
+        // Stops awaiting the apply. The blocking task carries on.
+        drop(
+            timeout(
+                Duration::from_millis(1),
+                applier.apply(plan, PositionEncoding::Utf16, &queue),
+            )
+            .await,
+        );
+
+        let mut recorded = Vec::new();
+        for _ in 0..500 {
+            recorded.extend(queue.take());
+            if !recorded.is_empty() {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(
+            recorded,
+            vec![canonical],
+            "the path the abandoned apply changed is still queued for whoever drains next"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).expect("read"),
+            "fn new() {}\n",
+            "the write itself completed, which is why the path had to be recorded"
+        );
     }
 
     /// A rename onto a read-only destination succeeds on Unix and fails
@@ -952,7 +1070,7 @@ mod tests {
         );
 
         let error = applier
-            .apply(plan, PositionEncoding::Utf16)
+            .apply(plan, PositionEncoding::Utf16, &InvalidationQueue::default())
             .await
             .expect_err("a read-only file is not rewritten");
         assert!(
@@ -986,7 +1104,7 @@ mod tests {
         .expect("plan builds");
 
         let error = applier
-            .apply(plan, PositionEncoding::Utf16)
+            .apply(plan, PositionEncoding::Utf16, &InvalidationQueue::default())
             .await
             .expect_err("mcpls does not create directories");
         assert!(
@@ -1033,7 +1151,7 @@ mod tests {
         .expect("plan builds");
 
         let error = applier
-            .apply(plan, PositionEncoding::Utf16)
+            .apply(plan, PositionEncoding::Utf16, &InvalidationQueue::default())
             .await
             .expect_err("an edit under a moved directory is unsupported");
         assert!(
@@ -1073,7 +1191,7 @@ mod tests {
         .expect("plan builds");
 
         let error = applier
-            .apply(plan, PositionEncoding::Utf16)
+            .apply(plan, PositionEncoding::Utf16, &InvalidationQueue::default())
             .await
             .expect_err("an overwriting create is a destruction");
         assert!(
@@ -1115,7 +1233,7 @@ mod tests {
         .expect("plan builds");
 
         let error = applier
-            .apply(plan, PositionEncoding::Utf16)
+            .apply(plan, PositionEncoding::Utf16, &InvalidationQueue::default())
             .await
             .expect_err("an overwriting rename is a destruction");
         assert!(
@@ -1155,7 +1273,12 @@ mod tests {
         .expect("plan builds");
 
         let applier = Applier::new(vec![dir.path().to_path_buf()], permissive());
-        assert!(applier.apply(plan, PositionEncoding::Utf16).await.is_err());
+        assert!(
+            applier
+                .apply(plan, PositionEncoding::Utf16, &InvalidationQueue::default())
+                .await
+                .is_err()
+        );
         assert_eq!(
             fs::read_to_string(&good).expect("read"),
             "fn a() {}\n",

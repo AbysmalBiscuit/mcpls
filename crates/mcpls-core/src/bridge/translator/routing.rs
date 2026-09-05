@@ -165,6 +165,12 @@ impl Translator {
         file_path: &str,
         tool: ToolKind,
     ) -> Result<(ServerId, LspClient, PathBuf)> {
+        // Before anything reads or opens a document: an apply whose caller
+        // stopped awaiting it leaves its changed paths queued, and this
+        // call must not go on to serve content from a tracked document one
+        // of those paths has already invalidated.
+        self.forget_changed_documents().await;
+
         let path = PathBuf::from(file_path);
         let validated_path = self.validate_path(&path)?;
         let (server_id, client) = self.resolve_client_for_file(&validated_path, tool).await?;

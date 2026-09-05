@@ -2005,6 +2005,115 @@ mod tests {
         );
     }
 
+    /// An apply whose caller stopped awaiting it -- Esc in the MCP client, a
+    /// `notifications/cancelled`, a disconnect -- completes its write on a
+    /// blocking thread but never reaches the close. The paths it queued must
+    /// be acted on by the next call, and before that call reads anything, or
+    /// the whole point of closing the document is lost to one keystroke.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn test_a_queued_invalidation_is_drained_before_the_next_call_opens_a_document() {
+        use std::sync::Arc;
+
+        use tokio::io::BufReader;
+        use tokio::time::{Duration, timeout};
+
+        use crate::config::ServerId;
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let caps = lsp_types::ServerCapabilities {
+            rename_provider: Some(lsp_types::OneOf::Left(true)),
+            ..Default::default()
+        };
+        let (translator, mut server) =
+            translator_with_capabilities(&dir, &ServerId::from("rust"), caps);
+        let translator = Arc::new(translator);
+
+        let stale = dir.path().join("stale.rs");
+        let next = dir.path().join("next.rs");
+        fs::write(&stale, "fn old() {}\n").expect("write the stale fixture");
+        fs::write(&next, "fn other() {}\n").expect("write the second fixture");
+        let stale_canonical = stale.canonicalize().expect("stale.rs exists");
+        let stale_uri =
+            crate::bridge::path_to_uri(&stale_canonical).expect("uri for the stale fixture");
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+
+        // A first call leaves stale.rs open in the server.
+        let opening = {
+            let translator = Arc::clone(&translator);
+            let path = stale.to_string_lossy().to_string();
+            tokio::spawn(async move {
+                translator
+                    .handle_rename(path, 1, 1, "x".to_string(), false)
+                    .await
+            })
+        };
+        assert_eq!(
+            read_framed_message(&mut wire).await["method"],
+            "textDocument/didOpen"
+        );
+        let first = read_framed_reply(&mut wire).await;
+        write_response(
+            &mut server.read_half_stdin,
+            &first["id"],
+            serde_json::Value::Null,
+        )
+        .await;
+        timeout(Duration::from_secs(5), opening)
+            .await
+            .expect("the opening call must not hang")
+            .expect("the opening task must not panic")
+            .expect("a rename with no edits still succeeds");
+
+        // What a cancelled apply leaves behind: the file was written, the
+        // paths were queued, and nobody closed the document.
+        fs::write(&stale, "fn written_by_a_cancelled_apply() {}\n").expect("rewrite stale.rs");
+        translator
+            .pending_invalidations
+            .extend(std::slice::from_ref(&stale_canonical));
+
+        // Any later call that opens a document has to drain that first.
+        let handle = {
+            let translator = Arc::clone(&translator);
+            let path = next.to_string_lossy().to_string();
+            tokio::spawn(async move {
+                translator
+                    .handle_rename(path, 1, 1, "y".to_string(), false)
+                    .await
+            })
+        };
+
+        let closed = read_framed_message(&mut wire).await;
+        assert_eq!(
+            closed["method"], "textDocument/didClose",
+            "the queued path must be closed before the next call opens anything"
+        );
+        assert_eq!(closed["params"]["textDocument"]["uri"], stale_uri.as_str());
+        assert!(
+            !translator.is_document_open(&stale_canonical),
+            "the queued path is no longer tracked"
+        );
+
+        assert_eq!(
+            read_framed_message(&mut wire).await["method"],
+            "textDocument/didOpen",
+            "only then does the new call open its own document"
+        );
+        let second = read_framed_reply(&mut wire).await;
+        write_response(
+            &mut server.read_half_stdin,
+            &second["id"],
+            serde_json::Value::Null,
+        )
+        .await;
+        timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("the handler must not hang")
+            .expect("the handler task must not panic")
+            .expect("the second call succeeds");
+    }
+
     /// An apply writes files the call never queried -- a rename anchored in
     /// one file rewrites every file referencing the symbol. Those files stay
     /// open in the routed server at their pre-apply content unless mcpls

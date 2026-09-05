@@ -15,7 +15,7 @@ use tokio::sync::Mutex;
 use self::clock::{Clock, SystemClock};
 use self::encoding_ctx::EncodingCtx;
 use self::respawn::RespawnBackoff;
-use crate::bridge::apply::{Applier, ApplySummary, EditPlan};
+use crate::bridge::apply::{Applier, ApplySummary, EditPlan, InvalidationQueue};
 use crate::bridge::encoding::PositionEncoding;
 use crate::bridge::state::ResourceLimits;
 use crate::bridge::{DocumentTracker, NotificationCache, lock_std};
@@ -126,6 +126,16 @@ pub struct Translator {
     /// present; a translator that may not write carries one whose
     /// `ApplyConfig` permits nothing.
     applier: Arc<Applier>,
+    /// Paths an apply changed that are still tracked as open documents.
+    ///
+    /// The applier fills this before it writes, so an apply whose caller
+    /// stopped awaiting it -- the user pressing Esc, a
+    /// `notifications/cancelled`, a client disconnect -- still leaves behind
+    /// the paths that have to be forgotten. Drained by
+    /// [`Self::forget_changed_documents`], which runs after every apply and
+    /// before every call that opens a document, so no tool call can read a
+    /// tracked document a completed write has already invalidated.
+    pending_invalidations: InvalidationQueue,
     /// Time source for respawn-backoff bookkeeping ([`respawn`](self::respawn)).
     /// Always [`SystemClock`] in production; overridden via
     /// [`Self::with_clock`] in tests so backoff-window tests can advance
@@ -163,6 +173,7 @@ impl Translator {
             notification_cache: None,
             apply_sink_lock: Arc::new(Mutex::new(())),
             applier: Arc::new(Applier::new(Vec::new(), ApplyConfig::default())),
+            pending_invalidations: InvalidationQueue::default(),
             clock: Arc::new(SystemClock),
         }
     }
@@ -236,11 +247,19 @@ impl Translator {
     }
 
     /// Write `plan` to disk through `applier`, using the `PositionEncoding`
-    /// negotiated for `server_id`, and forget every document it rewrote.
+    /// negotiated for `server_id`, and forget every document it changed.
     ///
     /// [`Applier::apply`] serializes applies against each other, so a second
     /// apply-enabled call cannot plan against content this one is about to
     /// replace.
+    ///
+    /// The forgetting is driven off [`Self::pending_invalidations`] rather
+    /// than off the returned summary, so it covers a run that failed partway
+    /// and rolled back -- a restore that failed leaves the file holding the
+    /// new content, and one that succeeded still moved it out and back --
+    /// and so that a caller who stops awaiting this does not take the list
+    /// of paths with it. The drain before the apply picks up whatever an
+    /// earlier cancelled apply left.
     ///
     /// # Errors
     ///
@@ -253,18 +272,15 @@ impl Translator {
         plan: EditPlan,
         server_id: &ServerId,
     ) -> Result<ApplySummary> {
+        self.forget_changed_documents().await;
         let outcome = applier
-            .apply(plan, self.position_encoding_for(server_id))
+            .apply(
+                plan,
+                self.position_encoding_for(server_id),
+                &self.pending_invalidations,
+            )
             .await;
-        match &outcome {
-            Ok(summary) => self.close_stale_documents(&summary.paths_invalidated).await,
-            // A rollback that could not restore a file leaves it holding the
-            // new content, which is exactly as stale as a successful write.
-            Err(Error::ApplyPartiallyFailed { written, .. }) => {
-                self.close_stale_documents(written).await;
-            }
-            Err(_) => {}
-        }
+        self.forget_changed_documents().await;
         outcome
     }
 
@@ -293,10 +309,10 @@ impl Translator {
     /// A failed notify is logged rather than returned: the bytes are already
     /// on disk, and the tracker entry is gone either way, so the next call
     /// still re-opens the document from its current content.
-    async fn close_stale_documents(&self, paths: &[PathBuf]) {
-        for path in paths {
-            let _path_guard = self.document_tracker.lock_path(path).await;
-            let Some(state) = self.document_tracker.close(path) else {
+    async fn forget_changed_documents(&self) {
+        for path in self.pending_invalidations.take() {
+            let _path_guard = self.document_tracker.lock_path(&path).await;
+            let Some(state) = self.document_tracker.close(&path) else {
                 continue;
             };
             for server in state.synced_servers() {
