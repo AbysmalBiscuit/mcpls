@@ -1,4 +1,4 @@
-//! End-to-end test suite exercising all 22 MCP tools against a real rust-analyzer.
+//! End-to-end test suite exercising mcpls's MCP tools against a real rust-analyzer.
 //!
 //! # Process model
 //!
