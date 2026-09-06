@@ -3,8 +3,11 @@
 //! This module provides a synchronous MCP client that spawns the mcpls binary
 //! and communicates via stdio using the JSON-RPC 2.0 protocol.
 
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
@@ -32,6 +35,87 @@ pub struct McpClient {
     /// Server-pushed notifications (no matching request `id`) collected while
     /// waiting for a request/response round-trip. Drained via `take_notifications`.
     pending_notifications: Vec<Value>,
+}
+
+/// The workspace root, from this crate's manifest directory.
+fn workspace_root() -> Result<&'static Path> {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .ok_or_else(|| anyhow::anyhow!("CARGO_MANIFEST_DIR has no workspace root above it"))
+}
+
+/// The newest modification time under `dir`, ignoring anything unreadable.
+fn newest_source_time(dir: &Path) -> Option<SystemTime> {
+    let mut newest = None;
+    let entries = fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let candidate = if path.is_dir() {
+            newest_source_time(&path)
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            path.metadata().ok().and_then(|meta| meta.modified().ok())
+        } else {
+            None
+        };
+        if candidate > newest {
+            newest = candidate;
+        }
+    }
+    newest
+}
+
+/// The mcpls binary these tests drive.
+///
+/// `MCPLS_E2E_BINARY` names one outright, which is how CI points at the
+/// artifact it downloaded. Otherwise the binary cargo built for this test
+/// target, and failing that the workspace's debug build.
+///
+/// That last one is the trap this guards: `cargo test -p mcpls-core` does not
+/// rebuild `mcpls`, so an e2e suite left to find it on its own can pass
+/// against a binary predating every change under test. It is checked against
+/// the newest file the binary is built from rather than trusted. Test sources
+/// are not among those, so editing a test does not force a rebuild.
+fn binary_under_test() -> Result<PathBuf> {
+    if let Ok(path) = std::env::var("MCPLS_E2E_BINARY") {
+        return Ok(PathBuf::from(path));
+    }
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_mcpls") {
+        return Ok(PathBuf::from(path));
+    }
+
+    let root = workspace_root()?;
+    let binary = root.join(format!(
+        "target/debug/mcpls{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    let built = binary
+        .metadata()
+        .and_then(|meta| meta.modified())
+        .with_context(|| {
+            format!(
+                "{} is not built. Run `cargo build --bin mcpls` before the e2e suite, or point \
+                 MCPLS_E2E_BINARY at a binary",
+                binary.display()
+            )
+        })?;
+
+    let newest_source = ["crates/mcpls-core/src", "crates/mcpls-cli/src"]
+        .iter()
+        .filter_map(|dir| newest_source_time(&root.join(dir)))
+        .max();
+    if let Some(newest) = newest_source
+        && newest > built
+    {
+        anyhow::bail!(
+            "{} is older than the sources it is built from, so the e2e suite would test an \
+             earlier version of mcpls. Run `cargo build --bin mcpls`, or point MCPLS_E2E_BINARY \
+             at a binary",
+            binary.display()
+        );
+    }
+
+    Ok(binary)
 }
 
 impl McpClient {
@@ -65,23 +149,7 @@ impl McpClient {
     /// - The mcpls binary cannot be found or spawned
     /// - stdin or stdout cannot be captured
     pub fn spawn_with_args(args: &[&str]) -> Result<Self> {
-        // Get binary path from cargo test environment
-        // CARGO_BIN_EXE_mcpls is only set for tests in the mcpls-cli crate.
-        // For tests in mcpls-core, compute workspace root from CARGO_MANIFEST_DIR.
-        let binary_path = std::env::var("CARGO_BIN_EXE_mcpls")
-            .ok()
-            .or_else(|| {
-                let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-                manifest_dir
-                    .ancestors()
-                    .nth(2) // mcpls-core -> crates -> workspace
-                    .map(|root| {
-                        root.join("target/debug/mcpls")
-                            .to_string_lossy()
-                            .into_owned()
-                    })
-            })
-            .unwrap_or_else(|| "target/debug/mcpls".to_string());
+        let binary_path = binary_under_test()?;
 
         let mut process = Command::new(binary_path)
             .args(args)

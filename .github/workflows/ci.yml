@@ -233,6 +233,10 @@ jobs:
       - name: Install rust-analyzer
         run: rustup component add rust-analyzer
       - name: Run e2e tests
+        # The suite otherwise resolves target/debug/mcpls itself and refuses a
+        # binary older than the sources, which the downloaded artifact is.
+        env:
+          MCPLS_E2E_BINARY: ${{ github.workspace }}/target/debug/mcpls${{ matrix.os == 'windows-latest' && '.exe' || '' }}
         run: cargo nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --run-ignored ignored-only -E 'kind(test) and test(e2e)'
 
   msrv:
