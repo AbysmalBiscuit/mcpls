@@ -16,22 +16,22 @@ and [Complete Examples](https://github.com/bug-ops/mcpls/blob/main/docs/user-gui
 
 ## `[[lsp_servers]]` fields
 
-Each entry defines one language server; a language may have multiple entries (see
-`handles` below).
+mcpls ships six built-in servers — rust-analyzer, pyright, the TypeScript language server, gopls, clangd, and zls, for `rust`, `python`, `typescript`, `go`, `cpp`, and `zig`. Each entry **merges onto** the built-in sharing its routing identity (`name` if set, else `language_id`): a field the entry omits is inherited, a field it sets overrides. Overriding `command` also clears the built-in's `args`, `env`, and `initialization_options`, since those belong to the binary being replaced. An entry whose identity matches no built-in defines a new server with nothing to inherit, so it must supply `command` itself. A language may have multiple entries (see `handles` below); the first claiming an identity merges, every later one appends another server.
 
 | Field | Type | Required | Default | Notes |
 |---|---|---|---|---|
-| `language_id` | string | yes | — | e.g. `rust`, `python`, `typescript`. |
-| `command` | string | yes | — | Executable name (resolved via `PATH`) or absolute path. |
-| `args` | array of strings | no | `[]` | e.g. `["--stdio"]` for servers that need it. |
-| `file_patterns` | array of glob strings | no | `[]` | e.g. `["**/*.rs"]`. Determines which files route to this server. |
+| `language_id` | string | only if unmatched and no `name` | — | e.g. `rust`, `python`, `typescript`. Also the default routing identity used to find the built-in to merge onto. |
+| `command` | string | only if matching no built-in | inherited from the built-in | Executable name (resolved via `PATH`) or absolute path. |
+| `args` | array of strings | no | `[]`, or inherited | e.g. `["--stdio"]` for servers that need it. |
+| `file_patterns` | array of glob strings | no | `[]`, or inherited | e.g. `["**/*.rs"]`. Determines which files route to this server. |
 | `name` | string | no | the `language_id` | Explicit routing identity. Required when two servers share one `language_id`, so each has a distinct identity. |
 | `handles` | array of routing values | no | unset = catch-all | Restricts a server to specific tools; see [Tool routing](#tool-routing-handles) below. |
-| `timeout_seconds` | integer | no | `30` | Timeout for the `initialize` handshake only. Rejects `0`. |
-| `request_timeout_seconds` | integer | no | `30` | Timeout per individual LSP request after initialization (hover, definition, etc.), independent of `timeout_seconds`. Rejects `0`. Worst case per tool call: `4 * request_timeout_seconds + 3.5s` (retry budget on `-32802` responses). The completions timeout is `min(request_timeout_seconds, 10s)` — a value below 10 lowers the completions cap too; only values above 10 get clamped down to it. |
-| `initialization_options` | table | no | `{}` | Server-specific options passed in the LSP `initialize` request, e.g. `cargo.features = "all"` for rust-analyzer. |
-| `env` | table | no | `{}` | See [Environment passthrough](#environment-passthrough-env) below. |
-| `heuristics.project_markers` | array of strings | no | unset | Marker files/directories that make this server applicable. mcpls searches for them recursively through the workspace tree up to `heuristics_max_depth` levels, skipping `node_modules`, `target`, and `.git`, e.g. `["pyproject.toml"]`. |
+| `timeout_seconds` | integer | no | `30`, or inherited | Timeout for the `initialize` handshake only. Rejects `0`. |
+| `request_timeout_seconds` | integer | no | `30`, or inherited | Timeout per individual LSP request after initialization (hover, definition, etc.), independent of `timeout_seconds`. Rejects `0`. Worst case per tool call: `4 * request_timeout_seconds + 3.5s` (retry budget on `-32802` responses). The completions timeout is `min(request_timeout_seconds, 10s)` — a value below 10 lowers the completions cap too; only values above 10 get clamped down to it. |
+| `initialization_options` | table | no | `{}`, or inherited | Server-specific options passed in the LSP `initialize` request, e.g. `cargo.features = "all"` for rust-analyzer. |
+| `env` | table | no | `{}`, or inherited | See [Environment passthrough](#environment-passthrough-env) below. |
+| `heuristics.project_markers` | array of strings | no | unset, or inherited | Marker files/directories that make this server applicable. mcpls searches for them recursively through the workspace tree up to `heuristics_max_depth` levels, skipping `node_modules`, `target`, and `.git`, e.g. `["pyproject.toml"]`. |
+| `enabled` | boolean | no | unset = stays enabled | Set to `false` to remove every server sharing this entry's identity, most commonly a built-in you don't want spawned. |
 
 ## Tool routing (`handles`)
 

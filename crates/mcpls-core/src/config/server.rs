@@ -1,12 +1,13 @@
 //! LSP server configuration types.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 
 use super::routing::{ServerId, ToolKind};
+use crate::error::{Error, Result};
 
 /// Default max depth for recursive marker search.
 pub const DEFAULT_HEURISTICS_MAX_DEPTH: usize = 10;
@@ -376,6 +377,202 @@ impl LspServerConfig {
             &["**/*.zig"],
             ["build.zig", "build.zig.zon"],
         )
+    }
+
+    /// The servers mcpls spawns when a configuration does not say otherwise.
+    #[must_use]
+    pub fn builtins() -> Vec<Self> {
+        vec![
+            Self::rust_analyzer(),
+            Self::pyright(),
+            Self::typescript(),
+            Self::gopls(),
+            Self::clangd(),
+            Self::zls(),
+        ]
+    }
+}
+
+/// One `[[lsp_servers]]` entry as written in a configuration file.
+///
+/// Every field is optional because an entry modifies a built-in rather than
+/// replacing it: what it omits, it inherits. See [`resolve_lsp_servers`].
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PartialLspServerConfig {
+    /// Language identifier. Required unless `name` identifies the entry.
+    #[serde(default)]
+    pub language_id: Option<String>,
+    /// Command to start the LSP server.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Arguments to pass to the command. An empty list is empty arguments,
+    /// not an absent key.
+    #[serde(default)]
+    pub args: Option<Vec<String>>,
+    /// Environment variables for the server process.
+    #[serde(default)]
+    pub env: Option<HashMap<String, String>>,
+    /// File patterns this server handles.
+    #[serde(default)]
+    pub file_patterns: Option<Vec<String>>,
+    /// Server-specific initialization options. Replaces the built-in's
+    /// value rather than merging into it.
+    #[serde(default)]
+    pub initialization_options: Option<serde_json::Value>,
+    /// Handshake timeout in seconds.
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
+    /// Per-request timeout in seconds.
+    #[serde(default)]
+    pub request_timeout_seconds: Option<u64>,
+    /// Spawn heuristics.
+    #[serde(default)]
+    pub heuristics: Option<ServerHeuristics>,
+    /// Routing identity, defaulting to `language_id`.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Tools this server handles.
+    #[serde(default)]
+    pub handles: Option<Vec<ToolKind>>,
+    /// Set to `false` to drop the server this entry names.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
+impl PartialLspServerConfig {
+    /// The routing identity this entry names, or `None` when it gives
+    /// neither a `name` nor a `language_id` to derive one from.
+    #[must_use]
+    pub fn id(&self) -> Option<ServerId> {
+        self.name
+            .clone()
+            .or_else(|| self.language_id.clone())
+            .map(ServerId::from)
+    }
+}
+
+/// Fold configuration entries onto the built-in servers.
+///
+/// An entry modifies the built-in sharing its [`LspServerConfig::id`]: what
+/// the entry omits, it inherits. An entry naming no built-in defines a new
+/// server, where nothing can be inherited and `command` is required. An
+/// entry with `enabled = false` removes every server it names.
+///
+/// Only the first entry claiming an id merges. A second entry with the same
+/// id appends another server, because two servers for one language,
+/// separated by their spawn heuristics, is a configuration mcpls supports
+/// (see `ToolRouter::from_configs`, which adjudicates the pair against the
+/// workspace). Folding the second onto the first would delete one of them.
+///
+/// Overriding `command` drops the built-in's `args`, `env`, and
+/// `initialization_options`, because those belong to the binary being
+/// replaced: pyright's `--stdio` means nothing to a different program, and
+/// inheriting it fails at spawn time rather than at load time. The file
+/// patterns describe the language rather than the binary, so they survive.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidConfig`] when an entry names no id at all, or
+/// when an entry matching no built-in gives no `command`.
+pub fn resolve_lsp_servers(partials: Vec<PartialLspServerConfig>) -> Result<Vec<LspServerConfig>> {
+    let mut resolved = LspServerConfig::builtins();
+    let mut claimed: HashSet<ServerId> = HashSet::new();
+
+    for partial in partials {
+        let id = partial.id().ok_or_else(|| {
+            Error::InvalidConfig(
+                "an [[lsp_servers]] entry needs a language_id or a name".to_string(),
+            )
+        })?;
+
+        if partial.enabled == Some(false) {
+            resolved.retain(|server| server.id() != id);
+            continue;
+        }
+
+        let existing = if claimed.contains(&id) {
+            None
+        } else {
+            resolved.iter().position(|server| server.id() == id)
+        };
+        claimed.insert(id.clone());
+
+        match existing {
+            Some(index) => resolved[index].merge(partial),
+            None => resolved.push(LspServerConfig::from_partial(&id, partial)?),
+        }
+    }
+
+    Ok(resolved)
+}
+
+impl LspServerConfig {
+    /// Overlay one configuration entry onto this server.
+    fn merge(&mut self, partial: PartialLspServerConfig) {
+        // A new binary does not want the old one's invocation.
+        if let Some(command) = partial.command {
+            self.command = command;
+            self.args = Vec::new();
+            self.env = HashMap::new();
+            self.initialization_options = None;
+        }
+        if let Some(language_id) = partial.language_id {
+            self.language_id = language_id;
+        }
+        if let Some(args) = partial.args {
+            self.args = args;
+        }
+        if let Some(env) = partial.env {
+            self.env = env;
+        }
+        if let Some(file_patterns) = partial.file_patterns {
+            self.file_patterns = file_patterns;
+        }
+        if let Some(options) = partial.initialization_options {
+            self.initialization_options = Some(options);
+        }
+        if let Some(timeout) = partial.timeout_seconds {
+            self.timeout_seconds = timeout;
+        }
+        if let Some(timeout) = partial.request_timeout_seconds {
+            self.request_timeout_seconds = timeout;
+        }
+        if let Some(heuristics) = partial.heuristics {
+            self.heuristics = Some(heuristics);
+        }
+        if let Some(name) = partial.name {
+            self.name = Some(name);
+        }
+        if let Some(handles) = partial.handles {
+            self.handles = Some(handles);
+        }
+    }
+
+    /// Build a server from an entry that matched no built-in.
+    fn from_partial(id: &ServerId, partial: PartialLspServerConfig) -> Result<Self> {
+        let command = partial.command.ok_or_else(|| {
+            Error::InvalidConfig(format!(
+                "[[lsp_servers]] entry '{id}' inherits from no built-in server, so it needs a command"
+            ))
+        })?;
+        let language_id = partial.language_id.unwrap_or_else(|| id.to_string());
+
+        Ok(Self {
+            language_id,
+            command,
+            args: partial.args.unwrap_or_default(),
+            env: partial.env.unwrap_or_default(),
+            file_patterns: partial.file_patterns.unwrap_or_default(),
+            initialization_options: partial.initialization_options,
+            timeout_seconds: partial.timeout_seconds.unwrap_or_else(default_timeout),
+            request_timeout_seconds: partial
+                .request_timeout_seconds
+                .unwrap_or_else(default_request_timeout),
+            heuristics: partial.heuristics,
+            name: partial.name,
+            handles: partial.handles,
+        })
     }
 }
 

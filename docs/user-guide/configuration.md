@@ -276,14 +276,18 @@ Useful when a project contains files larger than 10MB (e.g. generated code, data
 
 ## LSP Server Configuration
 
-Each `[[lsp_servers]]` section defines a language server.
+mcpls ships six built-in servers — rust-analyzer, pyright, the TypeScript language server, gopls, clangd, and zls, covering `rust`, `python`, `typescript`, `go`, `cpp`, and `zig` respectively. Each `[[lsp_servers]]` entry you write **merges onto** the built-in sharing its routing identity (`name` if set, otherwise `language_id`): whatever field the entry omits, it inherits from the built-in, and whatever it sets, it overrides. An entry whose identity matches no built-in defines a brand-new server instead, with nothing to inherit.
+
+Overriding `command` drops the built-in's `args`, `env`, and `initialization_options`, since those belong to the binary being replaced (pyright's `--stdio` means nothing to a different program) — `file_patterns` survive, since they describe the language rather than the binary.
+
+Two entries may name the same identity: the first merges onto the built-in (or founds a new server, if there is no matching built-in), and every subsequent one appends another server. This is how two servers for one language, distinguished by `heuristics` or `handles`, both end up loaded — see `name` and `handles` below.
 
 ### `language_id`
 
 **Type**: String
-**Required**: Yes
+**Required**: Only for a server matching no built-in and giving no `name`
 
-Language identifier for this server.
+Language identifier for this server. Also the default routing identity (see `name` below) an entry uses to find the built-in it merges onto.
 
 ```toml
 [[lsp_servers]]
@@ -293,9 +297,9 @@ language_id = "rust"  # Standard: rust, python, typescript, javascript, go, etc.
 ### `command`
 
 **Type**: String
-**Required**: Yes
+**Required**: Only for a server matching no built-in
 
-Command to execute the language server.
+Command to execute the language server. Inherited from the built-in an entry merges onto; required when the entry's identity matches no built-in, since there is then nothing to inherit from.
 
 ```toml
 [[lsp_servers]]
@@ -534,6 +538,19 @@ workspace, the request fails naming the tool rather than being forwarded to
 an arbitrary server that declined it via `handles`. Add `workspace_symbols`
 to a server's `handles` list, or configure a catch-all, to enable this tool.
 
+### `enabled`
+
+**Type**: Boolean
+**Default**: unset (the server, built-in or configured, stays enabled)
+
+Set to `false` to remove every server sharing this entry's identity, most commonly one of the six built-ins you don't want mcpls to spawn at all.
+
+```toml
+[[lsp_servers]]
+language_id = "go"
+enabled = false
+```
+
 ## Apply Section
 
 The `[apply]` table is the only thing that lets mcpls write to your source tree. Leave it out and mcpls is read-only: every tool returns an edit for you to read, and nothing on disk changes.
@@ -683,10 +700,13 @@ file_patterns = ["**/*.py", "**/*.pyi"]
 project_markers = ["pyproject.toml", "ty.toml"]
 ```
 
-To run pyright for everything except diagnostics, and a second server
-(`pylsp`) for diagnostics only:
+To run pyright for everything except diagnostics, and a second server (`pylsp`) for diagnostics only, disable the built-in `python` server first — otherwise its own catch-all collides with the `pyright` one below, both being catch-alls for `python`:
 
 ```toml
+[[lsp_servers]]
+language_id = "python"
+enabled = false
+
 [[lsp_servers]]
 name = "pyright"
 language_id = "python"

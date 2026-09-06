@@ -1,7 +1,31 @@
-# Empty configuration for E2E testing
-# No LSP servers configured - tests protocol only
+# Protocol-only configuration for E2E testing.
+#
+# Every built-in server is disabled: these tests exercise the MCP layer, and
+# spawning a language server here would make each of them wait on an index.
 
 [workspace]
 roots = []
 
-# No LSP servers - we're only testing the MCP protocol layer
+[[lsp_servers]]
+language_id = "rust"
+enabled = false
+
+[[lsp_servers]]
+language_id = "python"
+enabled = false
+
+[[lsp_servers]]
+language_id = "typescript"
+enabled = false
+
+[[lsp_servers]]
+language_id = "go"
+enabled = false
+
+[[lsp_servers]]
+language_id = "cpp"
+enabled = false
+
+[[lsp_servers]]
+language_id = "zig"
+enabled = false

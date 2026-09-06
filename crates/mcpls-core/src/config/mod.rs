@@ -15,7 +15,8 @@ pub use language::{base_language_id, react_variant_language_id};
 pub use routing::{NoServerReason, ServerId, ToolKind, ToolRouter};
 use serde::{Deserialize, Serialize};
 pub use server::{
-    DEFAULT_HEURISTICS_MAX_DEPTH, LspServerConfig, MAX_TIMEOUT_SECONDS, ServerHeuristics,
+    DEFAULT_HEURISTICS_MAX_DEPTH, LspServerConfig, MAX_TIMEOUT_SECONDS, PartialLspServerConfig,
+    ServerHeuristics, resolve_lsp_servers,
 };
 
 use crate::bridge::{DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE, ResourceLimits};
@@ -96,8 +97,11 @@ pub struct ServerConfig {
     #[serde(default)]
     pub workspace: WorkspaceConfig,
 
-    /// LSP server configurations.
-    #[serde(default)]
+    /// LSP server configurations, resolved against the built-ins.
+    #[serde(
+        default = "LspServerConfig::builtins",
+        deserialize_with = "deserialize_lsp_servers"
+    )]
     pub lsp_servers: Vec<LspServerConfig>,
 
     /// Which tools may write their edits to the working tree.
@@ -115,6 +119,17 @@ pub struct ServerConfig {
     /// typically invisible to an MCP client).
     #[serde(skip)]
     pub project_config_ignored: bool,
+}
+
+/// Deserialize `[[lsp_servers]]` entries and fold them onto the built-ins.
+fn deserialize_lsp_servers<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<LspServerConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let partials = Vec::<PartialLspServerConfig>::deserialize(deserializer)?;
+    resolve_lsp_servers(partials).map_err(serde::de::Error::custom)
 }
 
 /// Workspace-level configuration.
@@ -925,14 +940,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             workspace: WorkspaceConfig::default(),
-            lsp_servers: vec![
-                LspServerConfig::rust_analyzer(),
-                LspServerConfig::pyright(),
-                LspServerConfig::typescript(),
-                LspServerConfig::gopls(),
-                LspServerConfig::clangd(),
-                LspServerConfig::zls(),
-            ],
+            lsp_servers: LspServerConfig::builtins(),
             apply: ApplyConfig::default(),
             project_config_ignored: false,
         }
@@ -1000,8 +1008,13 @@ mod tests {
             vec![dunce::canonicalize(workspace_root).unwrap()]
         );
         assert_eq!(config.workspace.position_encodings, vec!["utf-8"]);
-        assert_eq!(config.lsp_servers.len(), 1);
-        assert_eq!(config.lsp_servers[0].language_id, "rust");
+        let rust = config
+            .lsp_servers
+            .iter()
+            .find(|s| s.language_id == "rust")
+            .unwrap();
+        assert_eq!(rust.timeout_seconds, 30);
+        assert_eq!(config.lsp_servers.len(), LspServerConfig::builtins().len());
     }
 
     #[test]
@@ -1574,10 +1587,14 @@ mod tests {
         fs::write(&config_path, toml_content).unwrap();
 
         let config = ServerConfig::load_from(&config_path).unwrap();
-        assert_eq!(config.lsp_servers.len(), 2);
-        assert_eq!(config.lsp_servers[0].language_id, "rust");
-        assert_eq!(config.lsp_servers[1].language_id, "python");
-        assert_eq!(config.lsp_servers[1].args, vec!["--stdio"]);
+        assert!(config.lsp_servers.iter().any(|s| s.language_id == "rust"));
+        let python = config
+            .lsp_servers
+            .iter()
+            .find(|s| s.language_id == "python")
+            .unwrap();
+        assert_eq!(python.args, vec!["--stdio"]);
+        assert_eq!(config.lsp_servers.len(), LspServerConfig::builtins().len());
     }
 
     #[test]
@@ -1607,7 +1624,7 @@ mod tests {
 
         let config = ServerConfig::load_from(&config_path).unwrap();
         assert!(config.workspace.roots.is_empty());
-        assert!(config.lsp_servers.is_empty());
+        assert_eq!(config.lsp_servers.len(), LspServerConfig::builtins().len());
     }
 
     #[test]
@@ -2012,8 +2029,8 @@ mod tests {
             config.workspace.roots,
             vec![dunce::canonicalize(custom_root).unwrap()]
         );
-        assert_eq!(config.lsp_servers.len(), 1);
-        assert_eq!(config.lsp_servers[0].language_id, "python");
+        assert!(config.lsp_servers.iter().any(|s| s.language_id == "python"));
+        assert_eq!(config.lsp_servers.len(), LspServerConfig::builtins().len());
     }
 
     #[test]
@@ -2306,5 +2323,128 @@ mod tests {
         let result: std::result::Result<ServerConfig, _> =
             toml::from_str("[apply]\nrenmae = true\n");
         assert!(result.is_err(), "typo in an apply key must fail to parse");
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_a_partial_entry_keeps_the_builtin_fields_it_omits() {
+        let config: ServerConfig = toml::from_str(
+            "[[lsp_servers]]\nlanguage_id = \"rust\"\nrequest_timeout_seconds = 60\n",
+        )
+        .expect("config parses");
+
+        let rust = config
+            .lsp_servers
+            .iter()
+            .find(|s| s.language_id == "rust")
+            .expect("rust server survives the merge");
+        assert_eq!(rust.request_timeout_seconds, 60);
+        assert_eq!(rust.command, "rust-analyzer");
+        assert_eq!(rust.file_patterns, vec!["**/*.rs".to_string()]);
+        assert_eq!(
+            config.lsp_servers.len(),
+            LspServerConfig::builtins().len(),
+            "the other built-ins are still there"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_a_config_without_a_server_table_keeps_every_builtin() {
+        let config: ServerConfig =
+            toml::from_str("[workspace]\nroots = []\n").expect("config parses");
+        assert_eq!(config.lsp_servers.len(), LspServerConfig::builtins().len());
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_disabling_a_builtin_removes_it() {
+        let config: ServerConfig =
+            toml::from_str("[[lsp_servers]]\nlanguage_id = \"python\"\nenabled = false\n")
+                .expect("config parses");
+        assert!(
+            !config.lsp_servers.iter().any(|s| s.language_id == "python"),
+            "python is gone"
+        );
+        assert!(config.lsp_servers.iter().any(|s| s.language_id == "rust"));
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_overriding_the_command_drops_the_builtin_arguments() {
+        // pyright's built-in carries `--stdio`, which means nothing to a
+        // different binary. The file patterns are not the binary's, so they
+        // survive: that is what distinguishes a merge from a replace here.
+        let config: ServerConfig =
+            toml::from_str("[[lsp_servers]]\nlanguage_id = \"python\"\ncommand = \"ty\"\n")
+                .expect("config parses");
+
+        let python = config
+            .lsp_servers
+            .iter()
+            .find(|s| s.language_id == "python")
+            .expect("python server survives");
+        assert_eq!(python.command, "ty");
+        assert!(
+            python.args.is_empty(),
+            "arguments belonged to the replaced binary, got {:?}",
+            python.args
+        );
+        assert_eq!(
+            python.file_patterns,
+            vec!["**/*.py".to_string()],
+            "file patterns are the language's, not the binary's, so they are inherited"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_an_explicit_empty_argument_list_is_not_unspecified() {
+        let config: ServerConfig =
+            toml::from_str("[[lsp_servers]]\nlanguage_id = \"python\"\nargs = []\n")
+                .expect("config parses");
+
+        let python = config
+            .lsp_servers
+            .iter()
+            .find(|s| s.language_id == "python")
+            .expect("python server survives");
+        assert_eq!(python.command, "pyright-langserver", "command is inherited");
+        assert!(python.args.is_empty(), "an explicit empty list wins");
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_a_second_entry_for_one_id_adds_a_server_instead_of_overwriting() {
+        // Two servers for one language, distinguished by heuristics, is a
+        // supported configuration. Folding the second onto the first would
+        // silently delete one of them.
+        let config: ServerConfig = toml::from_str(
+            "[[lsp_servers]]\nlanguage_id = \"python\"\ncommand = \"pyright-langserver\"\n\n\
+             [[lsp_servers]]\nlanguage_id = \"python\"\ncommand = \"pylsp\"\n",
+        )
+        .expect("config parses");
+
+        let commands: Vec<&str> = config
+            .lsp_servers
+            .iter()
+            .filter(|s| s.language_id == "python")
+            .map(|s| s.command.as_str())
+            .collect();
+        assert_eq!(commands, vec!["pyright-langserver", "pylsp"]);
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, clippy::unwrap_used)]
+    fn test_an_entry_matching_no_builtin_needs_a_command() {
+        let result: std::result::Result<ServerConfig, _> =
+            toml::from_str("[[lsp_servers]]\nlanguage_id = \"elixir\"\n");
+        let message = result
+            .expect_err("an unmatched entry without a command is rejected")
+            .to_string();
+        assert!(
+            message.contains("elixir"),
+            "the error names the id it could not find, got: {message}"
+        );
     }
 }

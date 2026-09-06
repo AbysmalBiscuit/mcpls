@@ -6,6 +6,30 @@
 roots = []
 
 [[lsp_servers]]
+language_id = "rust"
+enabled = false
+
+[[lsp_servers]]
+language_id = "python"
+enabled = false
+
+[[lsp_servers]]
+language_id = "typescript"
+enabled = false
+
+[[lsp_servers]]
+language_id = "go"
+enabled = false
+
+[[lsp_servers]]
+language_id = "cpp"
+enabled = false
+
+[[lsp_servers]]
+language_id = "zig"
+enabled = false
+
+[[lsp_servers]]
 name = "pyright"
 language_id = "python"
 command = "pyright-langserver"

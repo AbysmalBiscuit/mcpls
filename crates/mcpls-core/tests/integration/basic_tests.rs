@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use mcpls_core::bridge::Translator;
-use mcpls_core::config::{ServerConfig, ServerId, ToolKind, ToolRouter};
+use mcpls_core::config::{LspServerConfig, ServerConfig, ServerId, ToolKind, ToolRouter};
 
 #[allow(unused)]
 use crate::common::test_utils::{
@@ -23,8 +23,8 @@ fn test_config_loading_minimal() {
     let content = std::fs::read_to_string(&config_path).expect("Failed to read config");
     let config: ServerConfig = toml::from_str(&content).expect("Failed to parse config");
 
-    assert_eq!(config.lsp_servers.len(), 1);
-    assert_eq!(config.lsp_servers[0].language_id, "rust");
+    assert!(config.lsp_servers.iter().any(|s| s.language_id == "rust"));
+    assert_eq!(config.lsp_servers.len(), LspServerConfig::builtins().len());
 }
 
 #[test]
@@ -36,10 +36,16 @@ fn test_config_loading_multi_language() {
     let content = std::fs::read_to_string(&config_path).expect("Failed to read config");
     let config: ServerConfig = toml::from_str(&content).expect("Failed to parse config");
 
-    assert_eq!(config.lsp_servers.len(), 3);
-    assert_eq!(config.lsp_servers[0].language_id, "rust");
-    assert_eq!(config.lsp_servers[1].language_id, "python");
-    assert_eq!(config.lsp_servers[2].language_id, "typescript");
+    for language_id in ["rust", "python", "typescript"] {
+        assert!(
+            config
+                .lsp_servers
+                .iter()
+                .any(|s| s.language_id == language_id),
+            "{language_id} server should be present"
+        );
+    }
+    assert_eq!(config.lsp_servers.len(), LspServerConfig::builtins().len());
 }
 
 #[test]

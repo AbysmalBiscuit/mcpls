@@ -63,58 +63,52 @@ position_encodings = ["utf-8", "utf-16"]
 # - JSX: jsx
 # - TSX: tsx (TypeScript React)
 
-# Rust - rust-analyzer
+# mcpls ships six built-in servers, one per language below (rust, python,
+# typescript, go, cpp, zig) — all six are active by default, with no
+# [[lsp_servers]] entry needed. An entry you write MERGES onto the built-in
+# sharing its identity (`name` if set, else `language_id`): a field you omit
+# is inherited from the built-in, a field you set overrides it. Overriding
+# `command` also drops the built-in's `args`, `env` and
+# `initialization_options`, since those belong to the binary being replaced.
+# See docs/user-guide/configuration.md for the full semantics.
+
+# Rust - override the built-in's handshake timeout; command, args and
+# file_patterns are still rust-analyzer's.
 [[lsp_servers]]
 language_id = "rust"
-command = "rust-analyzer"
-args = []
-file_patterns = ["**/*.rs"]
 timeout_seconds = 30
-
-# Uncomment and configure as needed:
 
 # [lsp_servers.initialization_options]
 # cargo.features = "all"
 # checkOnSave.command = "clippy"
 
-# Python - pyright
-# [[lsp_servers]]
-# language_id = "python"
-# command = "pyright-langserver"
-# args = ["--stdio"]
-# file_patterns = ["**/*.py"]
-# timeout_seconds = 30
+# Don't want a built-in server to spawn at all? Disable it:
 
-# TypeScript/JavaScript - typescript-language-server
-# [[lsp_servers]]
-# language_id = "typescript"
-# command = "typescript-language-server"
-# args = ["--stdio"]
-# file_patterns = ["**/*.ts", "**/*.tsx", "**/*.js", "**/*.jsx"]
-# timeout_seconds = 30
-
-# Go - gopls
 # [[lsp_servers]]
 # language_id = "go"
-# command = "gopls"
-# args = ["serve"]
-# file_patterns = ["**/*.go"]
-# timeout_seconds = 30
+# enabled = false
 
-# C/C++ - clangd
+# Use a different Python server (ty) instead of the built-in pyright.
+# Overriding `command` drops pyright's `--stdio` argument; file_patterns
+# are inherited from the built-in, since they describe the language rather
+# than the binary.
 # [[lsp_servers]]
-# language_id = "c"
-# command = "clangd"
-# args = ["--background-index"]
-# file_patterns = ["**/*.c", "**/*.h", "**/*.cpp", "**/*.hpp"]
-# timeout_seconds = 30
+# language_id = "python"
+# command = "ty"
+# args = ["server"]
 
 # Explicit per-tool routing: run two servers for one language, each owning
 # a distinct subset of MCP tools. `name` gives each server a routing
 # identity (defaults to language_id, but two servers for one language must
 # not share it); `handles` restricts a server to exactly those tools --
 # omit `handles` for a catch-all that serves everything not claimed
-# elsewhere. See docs/user-guide/configuration.md for the full semantics.
+# elsewhere. The built-in `python` server is disabled first: its own
+# catch-all would otherwise collide with `pyright`'s below, since both are
+# catch-alls for `python`.
+# [[lsp_servers]]
+# language_id = "python"
+# enabled = false
+#
 # [[lsp_servers]]
 # name = "pyright"
 # language_id = "python"
