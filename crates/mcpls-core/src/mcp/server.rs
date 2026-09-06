@@ -1718,6 +1718,12 @@ mod tests {
     /// that were in fact never shown.
     #[test]
     fn test_routable_entries_excludes_unmappable_uri() {
+        // `Url::to_file_path` needs a drive letter on Windows, so a bare
+        // `file:///workspace/...` maps to no path there and would be
+        // excluded for the wrong reason.
+        #[cfg(windows)]
+        let ok_uri: lsp_types::Uri = "file:///C:/workspace/a.rs".parse().unwrap();
+        #[cfg(not(windows))]
         let ok_uri: lsp_types::Uri = "file:///workspace/a.rs".parse().unwrap();
         let bad_uri: lsp_types::Uri = "http://example.com/not-a-file.rs".parse().unwrap();
         let snapshot = vec![
@@ -1822,6 +1828,13 @@ mod tests {
         // A pre-existing error, as if a language server had reported it
         // before mcpls ever started -- the baseline task would have folded
         // this into the baseline once the servers went quiet.
+        // `Url::to_file_path` needs a drive letter on Windows, so a bare
+        // `file:///workspace/...` maps to no path there and would be
+        // dropped by `routable_entries` before any of this is exercised.
+        #[cfg(windows)]
+        let pre_existing_uri: lsp_types::Uri =
+            "file:///C:/workspace/pre_existing.rs".parse().unwrap();
+        #[cfg(not(windows))]
         let pre_existing_uri: lsp_types::Uri = "file:///workspace/pre_existing.rs".parse().unwrap();
         let pre_existing = diagnostic_at("pre-existing error");
         {
@@ -1855,7 +1868,16 @@ mod tests {
         }
 
         // A genuinely new error, arriving after the baseline was captured.
-        let new_uri: lsp_types::Uri = "file:///workspace/new_error.rs".parse().unwrap();
+        #[cfg(windows)]
+        let (new_uri, new_file_path): (lsp_types::Uri, &str) = (
+            "file:///C:/workspace/new_error.rs".parse().unwrap(),
+            r"C:\workspace\new_error.rs",
+        );
+        #[cfg(not(windows))]
+        let (new_uri, new_file_path): (lsp_types::Uri, &str) = (
+            "file:///workspace/new_error.rs".parse().unwrap(),
+            "/workspace/new_error.rs",
+        );
         {
             let mut cache = notification_cache.lock().await;
             cache.store_diagnostics(&owner, &new_uri, Some(1), vec![diagnostic_at("new error")]);
@@ -1874,7 +1896,7 @@ mod tests {
             "the pre-existing error must be suppressed by the baseline, only the new one \
              reported, got {report}"
         );
-        assert_eq!(changed[0]["file_path"], "/workspace/new_error.rs");
+        assert_eq!(changed[0]["file_path"], new_file_path);
         assert_eq!(changed[0]["diagnostics"][0]["message"], "new error");
     }
 
