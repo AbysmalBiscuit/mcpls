@@ -343,7 +343,7 @@ fn wait_until_ready(client: &mut McpClient, lib_rs: &Path) {
 // Sub-cases (one per MCP tool)
 // ---------------------------------------------------------------------------
 
-/// Tool 1: `get_hover` — hover over `add` declaration.
+/// `get_hover` — hover over `add` declaration.
 fn sc_get_hover(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
     let lib = workspace.join("src/lib.rs");
     let add_line = find_line(&lib, "pub fn add(");
@@ -375,7 +375,7 @@ fn sc_get_hover(client: &mut McpClient, workspace: &Path) -> Result<(), String> 
     Ok(())
 }
 
-/// Tool 2: `get_definition` — go to definition of `add` from inside `caller`.
+/// `get_definition` — go to definition of `add` from inside `caller`.
 fn sc_get_definition(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
     let lib = workspace.join("src/lib.rs");
     // Inside caller body: `    add(1, 2)` — "add" starts at col 5 (1-based).
@@ -411,7 +411,7 @@ fn sc_get_definition(client: &mut McpClient, workspace: &Path) -> Result<(), Str
     Ok(())
 }
 
-/// Tool 3: `get_references` — find references to `add`.
+/// `get_references` — find references to `add`.
 fn sc_get_references(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
     let lib = workspace.join("src/lib.rs");
     let add_line = find_line(&lib, "pub fn add(");
@@ -452,7 +452,7 @@ fn sc_get_references(client: &mut McpClient, workspace: &Path) -> Result<(), Str
     Ok(())
 }
 
-/// Tool 4: `get_diagnostics` — type error in broken.rs.
+/// `get_diagnostics` — type error in broken.rs.
 ///
 /// Also populates the cache used by sub-case 14.
 fn sc_get_diagnostics(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
@@ -530,7 +530,7 @@ fn sc_get_diagnostics(client: &mut McpClient, workspace: &Path) -> Result<(), St
     Ok(())
 }
 
-/// Tool 5: `rename_symbol` — rename `add` → `plus`.
+/// `rename_symbol` — rename `add` → `plus`.
 fn sc_rename_symbol(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
     let lib = workspace.join("src/lib.rs");
     let add_line = find_line(&lib, "pub fn add(");
@@ -561,7 +561,7 @@ fn sc_rename_symbol(client: &mut McpClient, workspace: &Path) -> Result<(), Stri
     Ok(())
 }
 
-/// Tool 6: `get_completions` — completions after `ad` inside `caller`.
+/// `get_completions` — completions after `ad` inside `caller`.
 fn sc_get_completions(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
     let lib = workspace.join("src/lib.rs");
     // Inside caller body: `    add(1, 2)` — col 6 is after 'a','d' (prefix "ad").
@@ -606,7 +606,7 @@ fn sc_get_completions(client: &mut McpClient, workspace: &Path) -> Result<(), St
     }
 }
 
-/// Tool 7: `get_document_symbols` — symbols in lib.rs include add, caller, Point.
+/// `get_document_symbols` — symbols in lib.rs include add, caller, Point.
 fn sc_get_document_symbols(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
     let lib = workspace.join("src/lib.rs");
     let resp = client
@@ -635,7 +635,7 @@ fn sc_get_document_symbols(client: &mut McpClient, workspace: &Path) -> Result<(
     Ok(())
 }
 
-/// Tool 8: `format_document` — format `bad_format.rs`, compare to golden.
+/// `format_document` — format `bad_format.rs`, compare to golden.
 fn sc_format_document(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
     let bad_fmt = workspace.join("src/bad_format.rs");
     let resp = client
@@ -680,7 +680,7 @@ fn sc_format_document(client: &mut McpClient, workspace: &Path) -> Result<(), St
     Ok(())
 }
 
-/// Tool 9: `workspace_symbol_search` — search for "add".
+/// `workspace_symbol_search` — search for "add".
 fn sc_workspace_symbol_search(client: &mut McpClient, _workspace: &Path) -> Result<(), String> {
     // Retry: workspace symbol search may return empty until rust-analyzer
     // has fully indexed all files in the workspace.
@@ -719,7 +719,7 @@ fn sc_workspace_symbol_search(client: &mut McpClient, _workspace: &Path) -> Resu
     }
 }
 
-/// Tool 10: `get_code_actions` — "Implement missing members" on an empty trait impl.
+/// `get_code_actions` — "Implement missing members" on an empty trait impl.
 ///
 /// Quickfix-style code actions require rust-analyzer to receive the diagnostic
 /// object with its internal `data` field in the request context — the bridge
@@ -776,7 +776,7 @@ fn sc_get_code_actions(client: &mut McpClient, workspace: &Path) -> Result<(), S
 // Call hierarchy helpers
 // ---------------------------------------------------------------------------
 
-/// Tool 11: `prepare_call_hierarchy` — on `add`.
+/// `prepare_call_hierarchy` — on `add`.
 ///
 /// Returns the prepared item for use by sub-cases 12 and 13.
 ///
@@ -821,7 +821,7 @@ fn sc_prepare_call_hierarchy(client: &mut McpClient, workspace: &Path) -> Result
     prepare_call_hierarchy_item(client, workspace).map(|_| ())
 }
 
-/// Tool 12: `get_incoming_calls` — `caller` must appear as incoming caller to `add`.
+/// `get_incoming_calls` — `caller` must appear as incoming caller to `add`.
 fn sc_get_incoming_calls(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
     let item = prepare_call_hierarchy_item(client, workspace)?;
     // Retry: callHierarchy/incomingCalls may return empty on first query while
@@ -866,7 +866,7 @@ fn sc_get_incoming_calls(client: &mut McpClient, workspace: &Path) -> Result<(),
     }
 }
 
-/// Tool 13: `get_outgoing_calls` — `add` calls nothing user-defined.
+/// `get_outgoing_calls` — `add` calls nothing user-defined.
 fn sc_get_outgoing_calls(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
     let item = prepare_call_hierarchy_item(client, workspace)?;
     let resp = client
@@ -903,7 +903,7 @@ fn sc_get_outgoing_calls(client: &mut McpClient, workspace: &Path) -> Result<(),
     Ok(())
 }
 
-/// Tool 14: `get_cached_diagnostics` — push cache populated during workspace indexing.
+/// `get_cached_diagnostics` — push cache populated during workspace indexing.
 ///
 /// Uses `lib.rs` rather than `broken.rs`: lib.rs is opened via hover during
 /// `wait_until_ready` (no pull-diagnostic request), so rust-analyzer sends
@@ -947,7 +947,7 @@ fn sc_get_cached_diagnostics(client: &mut McpClient, workspace: &Path) -> Result
     }
 }
 
-/// Tool 15: `get_server_logs` — returns `window/logMessage` entries.
+/// `get_server_logs` — returns `window/logMessage` entries.
 ///
 /// rust-analyzer does not emit `window/logMessage` by default; it uses
 /// `window/showMessage` and `$/progress` for user-visible status.  This
@@ -997,7 +997,7 @@ fn lib_rs_uri(client: &mut McpClient) -> Result<String, String> {
     resource_uri_ending_with(client, "/src/lib.rs")
 }
 
-/// Tool 17: `get_signature_help` — signature of `add` inside its call site.
+/// `get_signature_help` — signature of `add` inside its call site.
 fn sc_get_signature_help(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
     let lib = workspace.join("src/lib.rs");
     let line = find_line(&lib, "let s = add(");
@@ -1053,7 +1053,7 @@ fn sc_get_signature_help(client: &mut McpClient, workspace: &Path) -> Result<(),
     }
 }
 
-/// Tool 18: `go_to_implementation` — implementations of trait `Greet`.
+/// `go_to_implementation` — implementations of trait `Greet`.
 fn sc_go_to_implementation(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
     let lib = workspace.join("src/lib.rs");
     let line = find_line(&lib, "pub trait Greet {");
@@ -1126,7 +1126,7 @@ fn sc_go_to_implementation(client: &mut McpClient, workspace: &Path) -> Result<(
     }
 }
 
-/// Tool 19: `go_to_type_definition` — type definition of `p` (a `Point`).
+/// `go_to_type_definition` — type definition of `p` (a `Point`).
 fn sc_go_to_type_definition(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
     let lib = workspace.join("src/lib.rs");
     let line = find_line(&lib, "let p = Point {");
@@ -1195,7 +1195,7 @@ fn sc_go_to_type_definition(client: &mut McpClient, workspace: &Path) -> Result<
     }
 }
 
-/// Tool 20: `get_inlay_hints` — type hints in `lsp317_target`.
+/// `get_inlay_hints` — type hints in `lsp317_target`.
 fn sc_get_inlay_hints(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
     let lib = workspace.join("src/lib.rs");
     let start_line = find_line(&lib, "pub fn lsp317_target(");
@@ -1422,7 +1422,7 @@ fn sc_subscribe_no_replay_without_cached_diagnostics(
     Ok(())
 }
 
-/// Tool 16: `get_server_messages` — readiness gate already exercised this tool.
+/// `get_server_messages` — readiness gate already exercised this tool.
 fn sc_get_server_messages(client: &mut McpClient, _workspace: &Path) -> Result<(), String> {
     let resp = client
         .call_tool("get_server_messages", &json!({ "limit": 20 }))
@@ -1432,7 +1432,7 @@ fn sc_get_server_messages(client: &mut McpClient, _workspace: &Path) -> Result<(
     Ok(())
 }
 
-/// Tool 22: `get_new_diagnostics` — drains once and stays drained.
+/// `get_new_diagnostics` — drains once and stays drained.
 ///
 /// Scoped to the deduplication property rather than to a diagnostic
 /// appearing, because whether the workspace's known errors land before or
@@ -1519,7 +1519,7 @@ fn sc_get_new_diagnostics(client: &mut McpClient, _workspace: &Path) -> Result<(
     Ok(())
 }
 
-/// Tool 25: `rename_symbol` with `apply` — rename `add` → `plus` and check
+/// `rename_symbol` with `apply` — rename `add` → `plus` and check
 /// that the files really changed on disk.
 ///
 /// Registered last: it rewrites `pub fn add(`, which earlier sub-cases
