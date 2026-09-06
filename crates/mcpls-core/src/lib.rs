@@ -1382,6 +1382,55 @@ mod test_support {
         }
     }
 
+    /// Captures tracing event levels and messages.
+    #[derive(Clone, Default)]
+    pub struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
+
+    impl CapturedLogs {
+        /// Snapshot of everything captured so far, as `(level, message)` pairs.
+        pub fn entries(&self) -> Vec<(tracing::Level, String)> {
+            self.0.lock().unwrap().clone()
+        }
+
+        /// Snapshot of captured message text only, for callers that don't care
+        /// about severity.
+        pub fn messages(&self) -> Vec<String> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, message)| message.clone())
+                .collect()
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedLogs {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct MessageVisitor(String);
+            impl tracing::field::Visit for MessageVisitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut visitor = MessageVisitor(String::new());
+            event.record(&mut visitor);
+            self.0
+                .lock()
+                .unwrap()
+                .push((*event.metadata().level(), visitor.0));
+        }
+    }
+
     /// How long [`read_framed_message`] waits for a message to arrive.
     ///
     /// Callers only ever read a frame the code under test has already been
@@ -2519,7 +2568,7 @@ mod tests {
                 panic!("simulated background LSP init panic");
             });
 
-            let captured = CapturedMessages::default();
+            let captured = crate::test_support::CapturedLogs::default();
             let subscriber = tracing_subscriber::registry().with(captured.clone());
             let guard = tracing::subscriber::set_default(subscriber);
 
@@ -2527,7 +2576,7 @@ mod tests {
 
             drop(guard);
 
-            let messages = captured.0.lock().unwrap().clone();
+            let messages = captured.messages();
             assert!(
                 messages
                     .iter()
@@ -2545,7 +2594,7 @@ mod tests {
         async fn test_a_panicking_hook_task_is_reported() {
             use tracing_subscriber::layer::SubscriberExt as _;
 
-            let captured = CapturedMessages::default();
+            let captured = crate::test_support::CapturedLogs::default();
             let subscriber = tracing_subscriber::registry().with(captured.clone());
             let guard = tracing::subscriber::set_default(subscriber);
 
@@ -2556,7 +2605,7 @@ mod tests {
 
             drop(guard);
 
-            let messages = captured.0.lock().unwrap().clone();
+            let messages = captured.messages();
             assert!(
                 messages
                     .iter()
@@ -2564,37 +2613,6 @@ mod tests {
                 "a hook task that dies silently leaves a project with no owner and \
                  nothing to look at, got: {messages:?}"
             );
-        }
-
-        /// Captures `tracing` events emitted while a closure runs. Mirrors
-        /// `transport::tests::http_tests::CapturedMessages` — duplicated
-        /// rather than shared since this crate has no common test-support
-        /// module and the two live in separate, non-`pub` test submodules.
-        #[derive(Clone, Default)]
-        struct CapturedMessages(Arc<std::sync::Mutex<Vec<String>>>);
-
-        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedMessages {
-            fn on_event(
-                &self,
-                event: &tracing::Event<'_>,
-                _ctx: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                struct MessageVisitor(String);
-                impl tracing::field::Visit for MessageVisitor {
-                    fn record_debug(
-                        &mut self,
-                        field: &tracing::field::Field,
-                        value: &dyn std::fmt::Debug,
-                    ) {
-                        if field.name() == "message" {
-                            self.0 = format!("{value:?}");
-                        }
-                    }
-                }
-                let mut visitor = MessageVisitor(String::new());
-                event.record(&mut visitor);
-                self.0.lock().unwrap().push(visitor.0);
-            }
         }
     }
 

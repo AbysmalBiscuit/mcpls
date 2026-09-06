@@ -1082,36 +1082,6 @@ mod tests {
         );
     }
 
-    /// Captures `tracing` events emitted while a closure runs, mirroring
-    /// `transport::tests::http_tests::CapturedMessages` -- there is no
-    /// shared `tracing_test`-style helper in this codebase to reuse.
-    #[derive(Clone, Default)]
-    struct CapturedMessages(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
-
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedMessages {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            struct MessageVisitor(String);
-            impl tracing::field::Visit for MessageVisitor {
-                fn record_debug(
-                    &mut self,
-                    field: &tracing::field::Field,
-                    value: &dyn std::fmt::Debug,
-                ) {
-                    if field.name() == "message" {
-                        self.0 = format!("{value:?}");
-                    }
-                }
-            }
-            let mut visitor = MessageVisitor(String::new());
-            event.record(&mut visitor);
-            self.0.lock().unwrap().push(visitor.0);
-        }
-    }
-
     /// #311 S7 / M7: truncating the diagnostics list must not be silent --
     /// a caller with no visibility into this cache would otherwise have no
     /// way to know a `get_cached_diagnostics` result is incomplete.
@@ -1125,13 +1095,13 @@ mod tests {
             .map(|i| minimal_diagnostic(format!("diagnostic {i}: {}", "x".repeat(250))))
             .collect();
 
-        let captured = CapturedMessages::default();
+        let captured = crate::test_support::CapturedLogs::default();
         let subscriber = tracing_subscriber::registry().with(captured.clone());
         let guard = tracing::subscriber::set_default(subscriber);
         cache.store_diagnostics(&test_server(), &uri, Some(1), diagnostics);
         drop(guard);
 
-        let messages = captured.0.lock().unwrap().clone();
+        let messages = captured.messages();
         assert!(
             messages
                 .iter()
@@ -1154,13 +1124,13 @@ mod tests {
             "blob": "x".repeat(MAX_DIAGNOSTICS_ENTRY_BYTES + 1000),
         }));
 
-        let captured = CapturedMessages::default();
+        let captured = crate::test_support::CapturedLogs::default();
         let subscriber = tracing_subscriber::registry().with(captured.clone());
         let guard = tracing::subscriber::set_default(subscriber);
         cache.store_diagnostics(&test_server(), &uri, Some(1), vec![diagnostic]);
         drop(guard);
 
-        let messages = captured.0.lock().unwrap().clone();
+        let messages = captured.messages();
         assert!(
             messages.iter().any(|m| m.contains("code-action")),
             "expected a warning noting the code-action quick-fix impact, got: {messages:?}"
