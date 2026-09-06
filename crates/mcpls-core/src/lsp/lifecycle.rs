@@ -47,6 +47,20 @@ const ENV_PASSTHROUGH: &[&str] = &["PATH", "HOME", "USERPROFILE", "TMPDIR", "TEM
 /// `kill_on_drop`.
 const CHILD_EXIT_GRACE: Duration = Duration::from_secs(3);
 
+/// Queue depth of the per-server notification channel feeding
+/// `diagnostics_pump`.
+///
+/// One channel carries `textDocument/publishDiagnostics`, `window/logMessage`,
+/// `window/showMessage` and `$/progress`, and the producer drops on a full
+/// queue rather than blocking the message loop. The busiest stretch is
+/// startup, where a server emits a `$/progress` report per indexing step
+/// alongside its first wave of diagnostics. Both kinds of loss are silent and
+/// lasting: a dropped publish leaves the cache holding stale diagnostics that
+/// `get_new_diagnostics` reports as current until that file is republished,
+/// and a dropped progress `end` leaves an operation outstanding forever, so
+/// the settle debounce never fires and only the deadline lands a baseline.
+const NOTIFICATION_CHANNEL_CAPACITY: usize = 1024;
+
 /// Windows-only additions to [`ENV_PASSTHROUGH`].
 ///
 /// `SystemRoot`/`SystemDrive`/`windir` are required by the Windows process
@@ -335,7 +349,7 @@ impl LspServer {
             .ok_or_else(|| Error::Transport("Failed to capture stdout".to_string()))?;
 
         let transport = LspTransport::new(stdin, stdout);
-        let (notification_tx, notification_rx) = mpsc::channel(64);
+        let (notification_tx, notification_rx) = mpsc::channel(NOTIFICATION_CHANNEL_CAPACITY);
         let client = LspClient::from_transport_with_notifications(
             config.server_config.clone(),
             transport,
