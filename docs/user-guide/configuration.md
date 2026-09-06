@@ -629,7 +629,7 @@ severity = "warning"
 max_per_file = 10
 max_total = 50
 settle_quiet_ms = 1000
-settle_deadline_ms = 60000
+settle_deadline_ms = 300000
 ```
 
 ### `diagnostics.severity`
@@ -663,9 +663,11 @@ How long the language servers must report no work before their view of the works
 ### `diagnostics.settle_deadline_ms`
 
 **Type**: Integer (milliseconds)
-**Default**: `60000`
+**Default**: `300000`
 
 How long to wait for that quiet before giving up and baselining anyway. Bounds the damage from a server that never finishes, or from a progress notification dropped before its pump existed.
+
+Counted from the moment the language servers are spawned, so it covers indexing rather than the handshake that precedes it. It needs to outlast a full index of your workspace: firing before that captures a partial baseline, and every file analyzed afterwards then reads as newly changed. Firing late only costs the session a longer wait for its first baseline, and `get_new_diagnostics` says so while it waits — so when in doubt, raise it.
 
 ## Environment Variables
 

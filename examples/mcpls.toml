@@ -130,7 +130,7 @@ timeout_seconds = 30
 # max_per_file = 10  # 0 = unlimited
 # max_total = 50     # 0 = unlimited
 # settle_quiet_ms = 1000
-# settle_deadline_ms = 60000
+# settle_deadline_ms = 300000
 
 # Raise a single server's own floor above the global default -- "off" mutes
 # diagnostics for that server without disabling the server itself.

@@ -1037,6 +1037,15 @@ fn spawn_lsp_servers_background(
             .await
             .set_diagnostics_route_count(diagnostics_route_count);
 
+        // The settle deadline backstops indexing, which only starts here:
+        // everything before this point -- config load, and every server's
+        // `initialize` handshake, which `timeout_seconds` alone allows 30
+        // seconds each -- would otherwise come out of the same budget.
+        // Unconditional on this path by design, since a server that reports
+        // no progress at all is the case the backstop exists for and offers
+        // no event to hang the restart on.
+        shared.settle.restart_deadline();
+
         // Start diagnostics pump tasks now that servers are registered.
         let mut pumps: JoinSet<()> = JoinSet::new();
         for (id, rx) in registered.receivers {

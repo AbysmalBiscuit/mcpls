@@ -156,6 +156,12 @@ pub struct DiagnosticsConfig {
     /// How long to wait for that quiet before giving up and baselining
     /// anyway. Bounds the damage from a server that never finishes, or from
     /// a progress notification dropped before its pump existed.
+    ///
+    /// Counted from the moment the language servers are spawned, so it
+    /// covers indexing rather than the handshake that precedes it. It must
+    /// outlast a full index of the workspace: firing before that captures a
+    /// partial baseline, and every file analyzed afterwards then reads as
+    /// newly changed.
     #[serde(default = "default_settle_deadline_ms")]
     pub settle_deadline_ms: u64,
 }
@@ -179,8 +185,14 @@ const fn default_settle_quiet_ms() -> u64 {
     1_000
 }
 
+/// Five minutes, measured from the moment the servers are spawned rather
+/// than from process start. The asymmetry sets the size: firing late costs a
+/// session that waits longer for its first baseline and is told so by the
+/// startup response, while firing early captures a partial baseline and
+/// reports the rest of the workspace as newly changed, which is the flood
+/// the baseline exists to prevent.
 const fn default_settle_deadline_ms() -> u64 {
-    60_000
+    300_000
 }
 
 impl Default for DiagnosticsConfig {
