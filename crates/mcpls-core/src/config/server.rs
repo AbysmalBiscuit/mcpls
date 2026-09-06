@@ -479,11 +479,12 @@ pub fn resolve_lsp_servers(partials: Vec<PartialLspServerConfig>) -> Result<Vec<
     let mut resolved = LspServerConfig::builtins();
     let mut claimed: HashSet<ServerId> = HashSet::new();
 
-    for partial in partials {
+    for (position, partial) in partials.into_iter().enumerate() {
         let id = partial.id().ok_or_else(|| {
-            Error::InvalidConfig(
-                "an [[lsp_servers]] entry needs a language_id or a name".to_string(),
-            )
+            Error::InvalidConfig(format!(
+                "[[lsp_servers]] entry #{} needs a language_id or a name",
+                position + 1
+            ))
         })?;
 
         if partial.enabled == Some(false) {
@@ -509,42 +510,61 @@ pub fn resolve_lsp_servers(partials: Vec<PartialLspServerConfig>) -> Result<Vec<
 
 impl LspServerConfig {
     /// Overlay one configuration entry onto this server.
+    ///
+    /// Destructures `partial` field by field with no `..` so that a field
+    /// added to [`PartialLspServerConfig`] without a matching arm here fails
+    /// to compile instead of silently staying unsettable on a built-in.
     fn merge(&mut self, partial: PartialLspServerConfig) {
+        let PartialLspServerConfig {
+            language_id,
+            command,
+            args,
+            env,
+            file_patterns,
+            initialization_options,
+            timeout_seconds,
+            request_timeout_seconds,
+            heuristics,
+            name,
+            handles,
+            enabled: _,
+        } = partial;
+
         // A new binary does not want the old one's invocation.
-        if let Some(command) = partial.command {
+        if let Some(command) = command {
             self.command = command;
             self.args = Vec::new();
             self.env = HashMap::new();
             self.initialization_options = None;
         }
-        if let Some(language_id) = partial.language_id {
+        if let Some(language_id) = language_id {
             self.language_id = language_id;
         }
-        if let Some(args) = partial.args {
+        if let Some(args) = args {
             self.args = args;
         }
-        if let Some(env) = partial.env {
+        if let Some(env) = env {
             self.env = env;
         }
-        if let Some(file_patterns) = partial.file_patterns {
+        if let Some(file_patterns) = file_patterns {
             self.file_patterns = file_patterns;
         }
-        if let Some(options) = partial.initialization_options {
+        if let Some(options) = initialization_options {
             self.initialization_options = Some(options);
         }
-        if let Some(timeout) = partial.timeout_seconds {
+        if let Some(timeout) = timeout_seconds {
             self.timeout_seconds = timeout;
         }
-        if let Some(timeout) = partial.request_timeout_seconds {
+        if let Some(timeout) = request_timeout_seconds {
             self.request_timeout_seconds = timeout;
         }
-        if let Some(heuristics) = partial.heuristics {
+        if let Some(heuristics) = heuristics {
             self.heuristics = Some(heuristics);
         }
-        if let Some(name) = partial.name {
+        if let Some(name) = name {
             self.name = Some(name);
         }
-        if let Some(handles) = partial.handles {
+        if let Some(handles) = handles {
             self.handles = Some(handles);
         }
     }

@@ -2432,6 +2432,22 @@ mod tests {
             .map(|s| s.command.as_str())
             .collect();
         assert_eq!(commands, vec!["pyright-langserver", "pylsp"]);
+
+        let first = config
+            .lsp_servers
+            .iter()
+            .find(|s| s.language_id == "python" && s.command == "pyright-langserver")
+            .expect("first entry merges onto the built-in");
+        assert_eq!(
+            first.file_patterns,
+            vec!["**/*.py".to_string()],
+            "the first entry still inherited the built-in's other fields"
+        );
+        assert_eq!(
+            config.lsp_servers.len(),
+            LspServerConfig::builtins().len() + 1,
+            "one built-in absorbed the first entry, the second appended a new server"
+        );
     }
 
     #[test]
@@ -2445,6 +2461,20 @@ mod tests {
         assert!(
             message.contains("elixir"),
             "the error names the id it could not find, got: {message}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, clippy::unwrap_used)]
+    fn test_an_entry_naming_neither_language_id_nor_name_is_rejected() {
+        let result: std::result::Result<ServerConfig, _> =
+            toml::from_str("[[lsp_servers]]\ncommand = \"some-lsp\"\n");
+        let message = result
+            .expect_err("an entry with no language_id and no name is rejected")
+            .to_string();
+        assert!(
+            message.contains('1'),
+            "the error names the offending entry's position, got: {message}"
         );
     }
 }
