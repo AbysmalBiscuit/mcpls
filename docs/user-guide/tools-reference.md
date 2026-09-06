@@ -954,10 +954,21 @@ While the language servers are still starting up (before mcpls has a stable base
 }
 ```
 
+`note` also appears whenever the top-level `omitted` is non-zero, explaining how many files the caps held back and that calling again offers them:
+
+```json
+{
+  "changed": [ /* ... */ ],
+  "cleared": [],
+  "omitted": 2,
+  "note": "2 file(s) were held back by the diagnostics caps this call; call again to see them."
+}
+```
+
 ### Notes
 
 - Deduplicated per client session: calling it twice in a row with no edits in between returns an empty `changed`/`cleared` the second time
-- `changed[].omitted` counts admitted diagnostics the per-file/total caps held back for that file this call; the top-level `omitted` counts whole files the total budget could not fit. Both are offered again on a later call rather than dropped
+- `changed[].omitted` counts admitted diagnostics the per-file/total caps held back for that file this call; the top-level `omitted` counts whole files the total budget could not fit. Both are offered again on a later call rather than dropped; a non-zero top-level `omitted` also sets `note` to say so, since a bare count doesn't tell an agent that a retry gets the rest
 - `cleared` lists files that had diagnostics on a previous call and now report none
 - Filtered by the `[diagnostics]` config table's severity floor (and any per-server `diagnostics_severity` override), same as every other diagnostics tool
 - Positions use the same encoding conversion as `get_cached_diagnostics`, so the two tools never disagree about a column

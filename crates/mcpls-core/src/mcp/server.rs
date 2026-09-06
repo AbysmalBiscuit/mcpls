@@ -189,9 +189,13 @@ struct NewDiagnosticsResult {
     /// Whole files the total budget could not fit this call. The caps held
     /// them back; the next call offers them again in full.
     omitted: usize,
-    /// Set instead of a real report while the language servers are still
-    /// settling, so a caller cannot mistake "too early to tell" for
-    /// "nothing changed".
+    /// An explanation the payload's other fields can't carry on their own:
+    /// either that a real report isn't available yet (the language servers
+    /// are still settling, so a caller shouldn't mistake "too early to
+    /// tell" for "nothing changed"), or, on an otherwise real report, that
+    /// `omitted` is non-zero and a later call will offer those files again.
+    /// The two never overlap: the startup case returns before `omitted`
+    /// could be anything but zero.
     #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<String>,
 }
@@ -792,7 +796,13 @@ impl McplsServer {
             changed,
             cleared,
             omitted: report.omitted,
-            note: None,
+            note: (report.omitted > 0).then(|| {
+                format!(
+                    "{} file(s) were held back by the diagnostics caps this call; call again \
+                     to see them.",
+                    report.omitted
+                )
+            }),
         }
     }
 
@@ -1740,6 +1750,44 @@ mod tests {
             "the unmappable-URI file must be excluded before flush ever sees it"
         );
         assert_eq!(entries[0].key, "a");
+    }
+
+    /// A non-zero `omitted` count is meaningless to an agent unless the
+    /// payload itself says a later call offers those files again -- a doc
+    /// comment and a line in the user guide are invisible from inside a
+    /// tool response.
+    #[tokio::test]
+    async fn test_new_diagnostics_payload_notes_a_nonzero_omitted_count() {
+        let server = create_test_server();
+        let report = FlushReport {
+            omitted: 2,
+            ..Default::default()
+        };
+
+        let payload = server.new_diagnostics_payload(&report, &[]).await;
+
+        assert_eq!(payload.omitted, 2);
+        let note = payload
+            .note
+            .as_deref()
+            .unwrap_or_else(|| panic!("expected a note explaining the omitted count"));
+        assert!(
+            note.contains('2'),
+            "note should mention how many files were omitted, got {note:?}"
+        );
+    }
+
+    /// The other side of the same behavior: no note when nothing was
+    /// omitted, so a caller isn't left looking for files that don't exist.
+    #[tokio::test]
+    async fn test_new_diagnostics_payload_no_note_when_nothing_omitted() {
+        let server = create_test_server();
+        let report = FlushReport::default();
+
+        let payload = server.new_diagnostics_payload(&report, &[]).await;
+
+        assert_eq!(payload.omitted, 0);
+        assert!(payload.note.is_none());
     }
 
     /// Before a baseline exists, `get_new_diagnostics` must not call
