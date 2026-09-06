@@ -621,6 +621,42 @@ mod tests {
     }
 
     #[test]
+    fn test_an_unlimited_budget_still_applies_the_per_file_cap() {
+        let mut delivery = DiagnosticsDelivery::new(DiagnosticsConfig {
+            max_total: 0,
+            max_per_file: 3,
+            ..DiagnosticsConfig::default()
+        });
+        let session = SessionId::from("s".to_string());
+        let files: Vec<Vec<Diagnostic>> = (0..3)
+            .map(|f| {
+                (0..5)
+                    .map(|i| diagnostic(i, DiagnosticSeverity::ERROR, &format!("f{f}-{i}")))
+                    .collect()
+            })
+            .collect();
+        let keys: Vec<String> = (0..3).map(|f| format!("f{f}.rs")).collect();
+        let entries: Vec<FileEntry<'_>> = keys
+            .iter()
+            .zip(files.iter())
+            .map(|(key, diags)| entry(key, diags, SeverityFloor::Warning))
+            .collect();
+
+        let report = delivery.flush(&session, &entries);
+
+        assert_eq!(
+            report.changed.len(),
+            3,
+            "an unlimited budget defers nothing"
+        );
+        for changed in &report.changed {
+            assert_eq!(changed.diagnostics.len(), 3, "the per-file cap still bites");
+            assert_eq!(changed.omitted, 2, "and its drops are counted");
+        }
+        assert_eq!(report.omitted, 0, "no file was deferred for budget");
+    }
+
+    #[test]
     fn test_a_zero_per_file_cap_means_unlimited_not_zero() {
         let mut delivery = DiagnosticsDelivery::new(DiagnosticsConfig {
             max_per_file: 0,
