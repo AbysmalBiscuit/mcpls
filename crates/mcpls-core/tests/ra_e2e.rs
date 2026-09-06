@@ -454,7 +454,7 @@ fn sc_get_references(client: &mut McpClient, workspace: &Path) -> Result<(), Str
 
 /// `get_diagnostics` — type error in broken.rs.
 ///
-/// Also populates the cache used by sub-case 14.
+/// Also populates the cache `get_cached_diagnostics` reads.
 fn sc_get_diagnostics(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
     let broken = workspace.join("src/broken.rs");
     let resp = client
@@ -778,7 +778,7 @@ fn sc_get_code_actions(client: &mut McpClient, workspace: &Path) -> Result<(), S
 
 /// `prepare_call_hierarchy` — on `add`.
 ///
-/// Returns the prepared item for use by sub-cases 12 and 13.
+/// Returns the prepared item the incoming and outgoing call sub-cases reuse.
 ///
 /// Since `CallHierarchyItemResult` now serializes `selectionRange` in camelCase,
 /// the item round-trips correctly without any field renaming.
