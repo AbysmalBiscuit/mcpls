@@ -10,6 +10,7 @@ mod delivery;
 mod encoding;
 mod notifications;
 pub mod resources;
+mod settle;
 mod state;
 mod translator;
 
@@ -21,6 +22,7 @@ pub use notifications::{
     DiagnosticInfo, LogEntry, LogLevel, MessageType, NotificationCache, ServerMessage,
 };
 pub use resources::ResourceSubscriptions;
+pub use settle::ServerSettle;
 pub(crate) use state::try_path_to_uri;
 pub use state::{
     DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE, DocumentState, DocumentTracker, ResourceLimits,

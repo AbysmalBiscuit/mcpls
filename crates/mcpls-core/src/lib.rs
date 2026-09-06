@@ -126,6 +126,12 @@ pub(crate) struct PumpShared {
     pub(crate) workspace_roots: Arc<[PathBuf]>,
     /// Used to drop publishes describing text an edit has already replaced.
     pub(crate) document_tracker: Arc<bridge::DocumentTracker>,
+    /// Outstanding server work, so the baseline waits for a quiet workspace.
+    pub(crate) settle: Arc<bridge::ServerSettle>,
+    /// Per-session record of what has already been delivered.
+    pub(crate) delivery: Arc<Mutex<bridge::DiagnosticsDelivery>>,
+    /// The severity floor each server answers to.
+    pub(crate) floors: Arc<bridge::FloorTable>,
 }
 
 /// Background task that drains LSP notifications, writes them to the cache,
@@ -160,13 +166,6 @@ pub(crate) async fn diagnostics_pump(
     caches_diagnostics: bool,
     shared: PumpShared,
 ) {
-    let PumpShared {
-        notification_cache,
-        subs,
-        peer_cell,
-        workspace_roots,
-        document_tracker,
-    } = shared;
     loop {
         tokio::select! {
             // Exit when cancellation is requested or the sender is dropped.
@@ -180,78 +179,100 @@ pub(crate) async fn diagnostics_pump(
                 let Some(notif) = msg else { break };
                 match notif {
                     LspNotification::PublishDiagnostics(p) => {
-                        // Only the server the router resolves `Diagnostics` to for
-                        // this notification's language caches (and notifies
-                        // subscribers of) it -- see #174 §8. A server that was
-                        // never the diagnostics route, or lost it without a live
-                        // catch-all to rebind to, is not the authoritative source
-                        // for this language's diagnostics; skip publishing so it
-                        // doesn't overwrite (or spuriously notify about) another
-                        // server's cache entry.
-                        if !caches_diagnostics {
-                            continue;
-                        }
-                        if !diagnostic_path_in_workspace(&p.uri, &workspace_roots) {
-                            debug!(
-                                "dropping diagnostics for out-of-workspace URI: {}",
-                                p.uri.as_str()
-                            );
-                            continue;
-                        }
-                        if let Some(version) = p.version
-                            && let Some(path) = bridge::uri_to_path(&p.uri)
-                            && let Some(tracked_version) = document_tracker.version_of(&path)
-                            && tracked_version > version
-                        {
-                            debug!(
-                                "dropping diagnostics for {} at version {version}, tracker holds {tracked_version}",
-                                p.uri.as_str()
-                            );
-                            continue;
-                        }
-                        {
-                            let mut cache = notification_cache.lock().await;
-                            cache.store_diagnostics(&server_id, &p.uri, p.version, p.diagnostics);
-                        }
-
-                        // Fast path: skip URI construction when nothing is subscribed.
-                        if subs.is_empty().await {
-                            continue;
-                        }
-
-                        // Notify only when peer is ready and URI is subscribed.
-                        let Some(peer) = peer_cell.get() else { continue };
-                        let Some(path) = bridge::uri_to_path(&p.uri) else { continue };
-                        let Ok(mcp_uri) = make_uri(&path) else { continue };
-
-                        if !subs.contains(&mcp_uri).await {
-                            continue;
-                        }
-
-                        if peer
-                            .notify_resource_updated(ResourceUpdatedNotificationParam::new(
-                                mcp_uri,
-                            ))
-                            .await
-                            .is_err()
-                        {
-                            // Peer disconnected; stop the pump.
+                        if handle_publish_diagnostics(&server_id, caches_diagnostics, p, &shared).await {
                             break;
                         }
                     }
                     LspNotification::LogMessage(m) => {
-                        let mut cache = notification_cache.lock().await;
+                        let mut cache = shared.notification_cache.lock().await;
                         cache.store_log(m.typ.into(), m.message);
                     }
                     LspNotification::ShowMessage(m) => {
-                        let mut cache = notification_cache.lock().await;
+                        let mut cache = shared.notification_cache.lock().await;
                         cache.store_message(m.typ.into(), m.message);
                     }
-                    LspNotification::Progress { .. } | LspNotification::Other { .. } => {}
+                    LspNotification::Progress { token, value } => {
+                        match value.get("kind").and_then(serde_json::Value::as_str) {
+                            Some("begin") => shared.settle.begin(&server_id, &token),
+                            Some("end") => shared.settle.end(&server_id, &token),
+                            _ => {}
+                        }
+                    }
+                    LspNotification::Other { .. } => {}
                 }
             }
         }
     }
+}
+
+/// Handle one `PublishDiagnostics` notification: cache it (when this server
+/// owns the diagnostics route) and notify a subscribed peer.
+///
+/// Split out of [`diagnostics_pump`] to keep that function under clippy's
+/// line-count lint. Returns `true` when the pump should stop (peer
+/// disconnected).
+async fn handle_publish_diagnostics(
+    server_id: &ServerId,
+    caches_diagnostics: bool,
+    p: lsp_types::PublishDiagnosticsParams,
+    shared: &PumpShared,
+) -> bool {
+    // Only the server the router resolves `Diagnostics` to for this
+    // notification's language caches (and notifies subscribers of) it --
+    // see #174 §8. A server that was never the diagnostics route, or lost
+    // it without a live catch-all to rebind to, is not the authoritative
+    // source for this language's diagnostics; skip publishing so it doesn't
+    // overwrite (or spuriously notify about) another server's cache entry.
+    if !caches_diagnostics {
+        return false;
+    }
+    if !diagnostic_path_in_workspace(&p.uri, &shared.workspace_roots) {
+        debug!(
+            "dropping diagnostics for out-of-workspace URI: {}",
+            p.uri.as_str()
+        );
+        return false;
+    }
+    if let Some(version) = p.version
+        && let Some(path) = bridge::uri_to_path(&p.uri)
+        && let Some(tracked_version) = shared.document_tracker.version_of(&path)
+        && tracked_version > version
+    {
+        debug!(
+            "dropping diagnostics for {} at version {version}, tracker holds {tracked_version}",
+            p.uri.as_str()
+        );
+        return false;
+    }
+    {
+        let mut cache = shared.notification_cache.lock().await;
+        cache.store_diagnostics(server_id, &p.uri, p.version, p.diagnostics);
+    }
+
+    // Fast path: skip URI construction when nothing is subscribed.
+    if shared.subs.is_empty().await {
+        return false;
+    }
+
+    // Notify only when peer is ready and URI is subscribed.
+    let Some(peer) = shared.peer_cell.get() else {
+        return false;
+    };
+    let Some(path) = bridge::uri_to_path(&p.uri) else {
+        return false;
+    };
+    let Ok(mcp_uri) = make_uri(&path) else {
+        return false;
+    };
+
+    if !shared.subs.contains(&mcp_uri).await {
+        return false;
+    }
+
+    // `true` (pump stops) means the peer disconnected.
+    peer.notify_resource_updated(ResourceUpdatedNotificationParam::new(mcp_uri))
+        .await
+        .is_err()
 }
 
 /// Result of [`register_servers`]: everything the caller needs to start the
@@ -684,12 +705,27 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     // Cancellation for pump tasks: send `true` to request shutdown.
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
+    let settle = Arc::new(bridge::ServerSettle::new(
+        Duration::from_millis(config.diagnostics.settle_quiet_ms),
+        Duration::from_millis(config.diagnostics.settle_deadline_ms),
+    ));
+    let delivery = Arc::new(Mutex::new(bridge::DiagnosticsDelivery::new(
+        config.diagnostics,
+    )));
+    let floors = Arc::new(bridge::FloorTable::new(
+        &config.diagnostics,
+        &config.lsp_servers,
+    ));
+
     let pump_shared = PumpShared {
         notification_cache: Arc::clone(&notification_cache),
         subs: Arc::clone(&subscriptions),
         peer_cell: Arc::clone(&peer_cell),
         workspace_roots: Arc::clone(&workspace_roots_snapshot),
         document_tracker: Arc::clone(translator.document_tracker()),
+        settle,
+        delivery,
+        floors,
     };
 
     let lsp_init_handle = if applicable_configs.is_empty() {
@@ -1009,8 +1045,67 @@ fn spawn_lsp_servers_background(
                 shared.clone(),
             ));
         }
+        pumps.spawn(baseline_task(
+            Arc::clone(&shared.settle),
+            Arc::clone(&shared.notification_cache),
+            Arc::clone(&shared.delivery),
+            Arc::clone(&shared.floors),
+            cancel_rx.clone(),
+        ));
         while pumps.join_next().await.is_some() {}
     })
+}
+
+/// How often to ask whether the servers have gone quiet. The task stops once
+/// the baseline is taken, so this cost is bounded by the settle deadline
+/// rather than by the process lifetime.
+const BASELINE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Adopt the current cache as the baseline once the servers have stayed
+/// quiet, so a session's first flush reports what happened since startup
+/// rather than everything the workspace already knew.
+///
+/// Spawned once per `serve_with` run, alongside (not inside) the per-server
+/// diagnostics pumps: the pumps run once per server, but the baseline is a
+/// single snapshot for the whole session.
+async fn baseline_task(
+    settle: Arc<bridge::ServerSettle>,
+    cache: Arc<Mutex<NotificationCache>>,
+    delivery: Arc<Mutex<bridge::DiagnosticsDelivery>>,
+    floors: Arc<bridge::FloorTable>,
+    mut cancel_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            result = cancel_rx.changed() => {
+                if result.is_err() || *cancel_rx.borrow() {
+                    return;
+                }
+            }
+            () = tokio::time::sleep(BASELINE_POLL_INTERVAL) => {
+                if !settle.should_settle() {
+                    continue;
+                }
+                let snapshot = {
+                    let cache = cache.lock().await;
+                    cache.diagnostics_snapshot()
+                };
+                let baseline = snapshot
+                    .iter()
+                    .filter_map(|(key, info, owner)| {
+                        bridge::DiagnosticsDelivery::visible_hash(
+                            &info.diagnostics,
+                            floors.for_server(owner),
+                        )
+                        .map(|hash| (key.clone(), hash))
+                    })
+                    .collect();
+                delivery.lock().await.set_baseline(baseline);
+                debug!("diagnostics baseline taken over {} file(s)", snapshot.len());
+                return;
+            }
+        }
+    }
 }
 
 /// Test helpers shared by the `#[cfg(test)]` modules across this crate,
@@ -2239,6 +2334,26 @@ mod tests {
             ))
         }
 
+        fn make_settle() -> Arc<bridge::ServerSettle> {
+            Arc::new(bridge::ServerSettle::new(
+                Duration::from_secs(1),
+                Duration::from_secs(600),
+            ))
+        }
+
+        fn make_delivery() -> Arc<Mutex<bridge::DiagnosticsDelivery>> {
+            Arc::new(Mutex::new(bridge::DiagnosticsDelivery::new(
+                crate::config::DiagnosticsConfig::default(),
+            )))
+        }
+
+        fn make_floors() -> Arc<bridge::FloorTable> {
+            Arc::new(bridge::FloorTable::new(
+                &crate::config::DiagnosticsConfig::default(),
+                &[],
+            ))
+        }
+
         /// Empty workspace roots: `diagnostic_path_in_workspace` allows any
         /// URI in this mode, matching `validate_path_against_roots`, so these
         /// pump-mechanics tests don't need to construct real workspace paths.
@@ -2269,6 +2384,9 @@ mod tests {
                     peer_cell: Arc::clone(&peer_cell),
                     workspace_roots: no_workspace_roots(),
                     document_tracker: make_tracker(),
+                    settle: make_settle(),
+                    delivery: make_delivery(),
+                    floors: make_floors(),
                 },
             ));
 
@@ -2342,6 +2460,9 @@ mod tests {
                     peer_cell: Arc::clone(&peer_cell),
                     workspace_roots,
                     document_tracker: make_tracker(),
+                    settle: make_settle(),
+                    delivery: make_delivery(),
+                    floors: make_floors(),
                 },
             ));
 
@@ -2416,6 +2537,9 @@ mod tests {
                     peer_cell,
                     workspace_roots: no_workspace_roots(),
                     document_tracker: make_tracker(),
+                    settle: make_settle(),
+                    delivery: make_delivery(),
+                    floors: make_floors(),
                 },
             ));
 
@@ -2447,6 +2571,9 @@ mod tests {
                     peer_cell,
                     workspace_roots: no_workspace_roots(),
                     document_tracker: make_tracker(),
+                    settle: make_settle(),
+                    delivery: make_delivery(),
+                    floors: make_floors(),
                 },
             ));
 
@@ -2498,6 +2625,9 @@ mod tests {
                     peer_cell,
                     workspace_roots: no_workspace_roots(),
                     document_tracker: make_tracker(),
+                    settle: make_settle(),
+                    delivery: make_delivery(),
+                    floors: make_floors(),
                 },
             ));
 
@@ -2568,6 +2698,9 @@ mod tests {
                     peer_cell,
                     workspace_roots: no_workspace_roots(),
                     document_tracker: tracker,
+                    settle: make_settle(),
+                    delivery: make_delivery(),
+                    floors: make_floors(),
                 },
             ));
 
@@ -2644,6 +2777,9 @@ mod tests {
                     peer_cell,
                     workspace_roots: no_workspace_roots(),
                     document_tracker: tracker,
+                    settle: make_settle(),
+                    delivery: make_delivery(),
+                    floors: make_floors(),
                 },
             ));
 
@@ -2700,6 +2836,9 @@ mod tests {
                     peer_cell,
                     workspace_roots: no_workspace_roots(),
                     document_tracker: tracker,
+                    settle: make_settle(),
+                    delivery: make_delivery(),
+                    floors: make_floors(),
                 },
             ));
 
@@ -2726,6 +2865,65 @@ mod tests {
                 .cloned()
                 .expect("a publish for a path with no tracked entry must be kept");
             assert_eq!(stored.version, Some(7));
+        }
+
+        /// A matched `$/progress` begin/end pair must reach the shared
+        /// `ServerSettle`, not just get parsed and discarded.
+        #[tokio::test]
+        async fn test_pump_feeds_progress_begin_and_end_to_settle() {
+            let cache = make_cache();
+            let subs = make_subs();
+            let peer_cell = make_peer_cell();
+            let settle = make_settle();
+            let (tx, rx) = mpsc::channel(8);
+            let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+            let handle = tokio::spawn(diagnostics_pump(
+                ServerId::from("rust"),
+                rx,
+                cancel_rx,
+                true,
+                PumpShared {
+                    notification_cache: cache,
+                    subs,
+                    peer_cell,
+                    workspace_roots: no_workspace_roots(),
+                    document_tracker: make_tracker(),
+                    settle: Arc::clone(&settle),
+                    delivery: make_delivery(),
+                    floors: make_floors(),
+                },
+            ));
+
+            let token = serde_json::json!("indexing");
+            tx.send(LspNotification::Progress {
+                token: token.clone(),
+                value: serde_json::json!({"kind": "begin"}),
+            })
+            .await
+            .unwrap();
+            tx.send(LspNotification::Progress {
+                token,
+                value: serde_json::json!({"kind": "end"}),
+            })
+            .await
+            .unwrap();
+            drop(tx);
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+                .await
+                .expect("pump did not exit within 5 s")
+                .unwrap();
+
+            // `end` only clears the outstanding entry (and so only sets
+            // `quiet_since`) when it can find the matching `begin` --
+            // otherwise this stays permanently unsettled, since nothing
+            // else ever calls `end` for this token. A settled tracker here
+            // proves the pump fed both notifications through, not just one.
+            assert!(
+                settle.should_settle_at(std::time::Instant::now() + Duration::from_secs(5)),
+                "a matched begin/end pair must leave the settle tracker quiet"
+            );
         }
     }
 }

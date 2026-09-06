@@ -720,6 +720,22 @@ impl NotificationCache {
         self.diagnostics.get(uri_cache_key(uri).as_ref())
     }
 
+    /// Every cached entry with the key it is stored under and the server
+    /// that published it.
+    ///
+    /// Returns owned values so a caller can release the cache lock before
+    /// doing anything with them: the diagnostics pump needs the same lock.
+    #[must_use]
+    pub fn diagnostics_snapshot(&self) -> Vec<(String, DiagnosticInfo, ServerId)> {
+        self.diagnostics
+            .iter()
+            .filter_map(|(key, info)| {
+                let owner = self.diagnostics_owners.get(key)?;
+                Some((key.clone(), info.clone(), owner.clone()))
+            })
+            .collect()
+    }
+
     /// Server that published the currently cached diagnostics for `uri`, if
     /// any. Used to look up that server's negotiated position encoding for a
     /// cache-only read that has no live LSP round trip of its own to resolve
