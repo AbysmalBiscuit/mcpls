@@ -185,7 +185,7 @@ typescript-language-server --version
 
 ### "LSP server not available for file type"
 
-**Problem**: No LSP server configured for the file extension
+**Problem**: No LSP server configured for the file extension. This does not apply to the six built-in languages (rust, python, typescript, go, cpp, zig) — they work with no configuration at all; this is for a language mcpls has no built-in for, e.g. Java.
 
 **Solution**:
 
@@ -196,10 +196,9 @@ Create a config file in your platform's config directory:
 
 ```toml
 [[lsp_servers]]
-language_id = "python"
-command = "pyright-langserver"
-args = ["--stdio"]
-file_patterns = ["**/*.py"]
+language_id = "java"
+command = "/path/to/jdtls/bin/jdtls"
+file_patterns = ["**/*.java"]
 ```
 
 **Verify configuration**:
@@ -230,13 +229,10 @@ retry" message rather than a hard "no server configured" error. If requests
 are timing out *after* initialization completes, Solution 2, 3, or 4 are the
 relevant fixes.
 
-**Solution 1**: Increase the `initialize` handshake timeout:
+**Solution 1**: Increase the `initialize` handshake timeout. This overrides just that field on the built-in; `command`/`args`/`file_patterns` are still rust-analyzer's:
 ```toml
 [[lsp_servers]]
 language_id = "rust"
-command = "rust-analyzer"
-args = []
-file_patterns = ["**/*.rs"]
 timeout_seconds = 120  # Give a slow `initialize` handshake more time
 ```
 
@@ -244,9 +240,6 @@ timeout_seconds = 120  # Give a slow `initialize` handshake more time
 ```toml
 [[lsp_servers]]
 language_id = "rust"
-command = "rust-analyzer"
-args = []
-file_patterns = ["**/*.rs"]
 request_timeout_seconds = 60  # Give slow tool-call requests more time
 ```
 Note that `textDocument/completion` requests are capped at 10 s regardless of
@@ -442,6 +435,7 @@ rustup component add rust-analyzer
 **Solution 2**: Use absolute path:
 ```toml
 [[lsp_servers]]
+language_id = "rust"
 command = "/Users/username/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rust-analyzer"
 ```
 
@@ -465,12 +459,11 @@ export PATH="$HOME/.rustup/toolchains/stable-x86_64-apple-darwin/bin:$PATH"
 
 **Solutions**:
 
-1. **Configure only needed language servers**:
+1. **Disable language servers you don't use**: all six built-ins (rust, python, typescript, go, cpp, zig) spawn automatically, gated only by their project-marker heuristics — omitting a `[[lsp_servers]]` entry does not stop one from spawning. Disable it explicitly:
 ```toml
-# Don't configure servers you don't use
 [[lsp_servers]]
-language_id = "rust"  # Only if working with Rust
-# ...
+language_id = "go"  # Not used in this workspace
+enabled = false
 ```
 
 2. **Limit workspace roots**:
@@ -506,6 +499,7 @@ files.excludeDirs = ["target", "node_modules", ".git", "dist"]
 1. **Increase the per-request timeout** (this is what bounds tool calls, not `timeout_seconds`):
 ```toml
 [[lsp_servers]]
+language_id = "rust"  # the language whose server is slow
 request_timeout_seconds = 60
 ```
 

@@ -99,33 +99,20 @@ mcpls searches for configuration in:
 
 ### Example Configuration
 
-Create a configuration file in your platform's config directory (e.g., `~/.config/mcpls/mcpls.toml` on Linux or `~/Library/Application Support/mcpls/mcpls.toml` on macOS):
+Rust, Python, and TypeScript already work with no configuration file at all — mcpls ships rust-analyzer, pyright, and the TypeScript language server as built-ins. Write a config file only to override one of their fields or add a language they don't cover. To create one anyway, e.g. to raise rust-analyzer's handshake timeout, place it in your platform's config directory (e.g., `~/.config/mcpls/mcpls.toml` on Linux or `~/Library/Application Support/mcpls/mcpls.toml` on macOS):
 
 ```toml
 [workspace]
 roots = []  # Auto-detect from current directory
 
-# Rust - rust-analyzer (built-in)
+# Overrides the built-in rust-analyzer's handshake timeout; command, args,
+# and file_patterns are still inherited from the built-in.
 [[lsp_servers]]
 language_id = "rust"
-command = "rust-analyzer"
-args = []
-file_patterns = ["**/*.rs"]
-
-# Python - pyright
-[[lsp_servers]]
-language_id = "python"
-command = "pyright-langserver"
-args = ["--stdio"]
-file_patterns = ["**/*.py"]
-
-# TypeScript - typescript-language-server
-[[lsp_servers]]
-language_id = "typescript"
-command = "typescript-language-server"
-args = ["--stdio"]
-file_patterns = ["**/*.ts", "**/*.tsx"]
+timeout_seconds = 60
 ```
+
+See [Configuration Reference](configuration.md#lsp-server-configuration) for the full merge semantics and every field.
 
 ## Example Usage
 

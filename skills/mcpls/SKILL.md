@@ -207,7 +207,6 @@ language_id = "rust"
 command = "rust-analyzer"
 args = []
 file_patterns = ["**/*.rs"]
-name = "rust-analyzer"
 timeout_seconds = 30
 request_timeout_seconds = 30
 
@@ -216,10 +215,11 @@ language_id = "python"
 command = "pyright-langserver"
 args = ["--stdio"]
 file_patterns = ["**/*.py"]
-name = "pyright"
 timeout_seconds = 30
 request_timeout_seconds = 30
 ```
+
+Each entry here merges onto the built-in sharing its `language_id`, so leave `name` unset unless you're running a second server for the same language — setting it gives the entry a distinct identity that no longer matches the built-in, and the built-in then spawns alongside it.
 
 For the full field reference (`handles` routing, `initialization_options`, `env`
 allowlist, heuristics), see

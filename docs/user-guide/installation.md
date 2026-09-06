@@ -117,16 +117,12 @@ docker run -i ghcr.io/bug-ops/mcpls:latest
 For production use with configuration:
 
 ```bash
-# Create config file
+# Create config file. rust-analyzer is a built-in and needs no
+# [[lsp_servers]] entry; this one only sets workspace.roots for the
+# container's mount path.
 cat > mcpls.toml <<EOF
 [workspace]
 roots = ["/workspace"]
-
-[[lsp_servers]]
-language_id = "rust"
-command = "rust-analyzer"
-args = []
-file_patterns = ["**/*.rs"]
 EOF
 
 # Run with volume mount
@@ -166,19 +162,12 @@ npm install -g pyright
 pyright --version
 ```
 
-**Configuration:**
-
-Create `mcpls.toml` in your platform's config directory:
-- Linux: `~/.config/mcpls/mcpls.toml`
-- macOS: `~/Library/Application Support/mcpls/mcpls.toml`
-- Windows: `%APPDATA%\mcpls\mcpls.toml`
+**Configuration:** Zero-config for Python projects — pyright is a built-in, active with these defaults automatically. Write `mcpls.toml` only to override a field, e.g. `args` or `timeout_seconds`:
 
 ```toml
 [[lsp_servers]]
 language_id = "python"
-command = "pyright-langserver"
-args = ["--stdio"]
-file_patterns = ["**/*.py"]
+timeout_seconds = 60
 ```
 
 ### TypeScript/JavaScript - typescript-language-server
@@ -193,13 +182,11 @@ npm install -g typescript typescript-language-server
 typescript-language-server --version
 ```
 
-**Configuration:**
+**Configuration:** Zero-config — the TypeScript language server is a built-in. Write `mcpls.toml` only to override a field, e.g. to add JSX/JS file patterns beyond the built-in's `.ts`/`.tsx`:
 
 ```toml
 [[lsp_servers]]
 language_id = "typescript"
-command = "typescript-language-server"
-args = ["--stdio"]
 file_patterns = ["**/*.ts", "**/*.tsx", "**/*.js", "**/*.jsx"]
 ```
 
@@ -215,14 +202,12 @@ go install golang.org/x/tools/gopls@latest
 gopls version
 ```
 
-**Configuration:**
+**Configuration:** Zero-config for Go projects — gopls is a built-in. Write `mcpls.toml` only to override a field, e.g. `timeout_seconds`:
 
 ```toml
 [[lsp_servers]]
 language_id = "go"
-command = "gopls"
-args = []
-file_patterns = ["**/*.go"]
+timeout_seconds = 60
 ```
 
 ### C/C++ - clangd
@@ -243,14 +228,12 @@ brew install llvm
 clangd --version
 ```
 
-**Configuration:**
+**Configuration:** Zero-config for C/C++ projects — clangd is a built-in. Write `mcpls.toml` only to override a field, e.g. to pass extra flags:
 
 ```toml
 [[lsp_servers]]
 language_id = "cpp"
-command = "clangd"
-args = []
-file_patterns = ["**/*.c", "**/*.cpp", "**/*.h", "**/*.hpp"]
+args = ["--background-index", "--clang-tidy"]
 ```
 
 ### Java - jdtls (Eclipse JDT Language Server)
@@ -315,7 +298,7 @@ roots = []  # Auto-detect from current directory
 
 ### Multi-Language Configuration
 
-Example configuration for a polyglot project:
+Rust, Python, TypeScript, and Go are already active as built-ins with no configuration at all. A polyglot project typically only needs to scope each server's `file_patterns` to its own package:
 
 ```toml
 [workspace]
@@ -323,33 +306,21 @@ roots = [
     "/home/user/projects/myapp"
 ]
 
-# Rust
 [[lsp_servers]]
 language_id = "rust"
-command = "rust-analyzer"
-args = []
-file_patterns = ["**/*.rs"]
+file_patterns = ["**/backend/**/*.rs"]
 
-# Python
 [[lsp_servers]]
 language_id = "python"
-command = "pyright-langserver"
-args = ["--stdio"]
-file_patterns = ["**/*.py"]
+file_patterns = ["**/scripts/**/*.py"]
 
-# TypeScript/JavaScript
 [[lsp_servers]]
 language_id = "typescript"
-command = "typescript-language-server"
-args = ["--stdio"]
-file_patterns = ["**/*.ts", "**/*.tsx", "**/*.js"]
+file_patterns = ["**/frontend/**/*.ts", "**/frontend/**/*.tsx"]
 
-# Go
 [[lsp_servers]]
 language_id = "go"
-command = "gopls"
-args = []
-file_patterns = ["**/*.go"]
+file_patterns = ["**/cli/**/*.go"]
 ```
 
 ## PATH Configuration

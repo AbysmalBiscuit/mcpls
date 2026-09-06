@@ -280,7 +280,7 @@ mcpls ships six built-in servers — rust-analyzer, pyright, the TypeScript lang
 
 Overriding `command` drops the built-in's `args`, `env`, and `initialization_options`, since those belong to the binary being replaced (pyright's `--stdio` means nothing to a different program) — `file_patterns` survive, since they describe the language rather than the binary.
 
-Two entries may name the same identity: the first merges onto the built-in (or founds a new server, if there is no matching built-in), and every subsequent one appends another server. This is how two servers for one language, distinguished by `heuristics` or `handles`, both end up loaded — see `name` and `handles` below.
+Two entries may name the same identity: the first merges onto the built-in (or founds a new server, if there is no matching built-in), and every subsequent one appends another server. `ToolRouter::from_configs` rejects two servers sharing one identity if both are applicable in the same workspace, so this only works when their `heuristics.project_markers` are mutually exclusive. To run two servers for one language that are applicable at the same time, give each a distinct `name` and split the tools between them with `handles` instead — see `name` and `handles` below.
 
 ### `language_id`
 
@@ -468,11 +468,13 @@ directory, prefer an absolute path in `command` over overriding `PATH`.
 **Type**: String
 **Default**: the server's `language_id`
 
-Explicit routing identity for this server. Two servers may share one
-`language_id` (e.g. two Python servers), but each must have a distinct
-identity — set `name` on at least one of them so they don't collide.
+Explicit routing identity for this server. Two servers may share one `language_id` (e.g. two Python servers), but each must have a distinct identity — set `name` on at least one of them so they don't collide. Naming an entry `python` no longer matches the built-in `python` catch-all, so disable that built-in first or it survives alongside these two, and two catch-alls for one language fail at startup.
 
 ```toml
+[[lsp_servers]]
+language_id = "python"
+enabled = false
+
 [[lsp_servers]]
 name = "pyright"
 language_id = "python"
@@ -550,6 +552,8 @@ Set to `false` to remove every server sharing this entry's identity, most common
 language_id = "go"
 enabled = false
 ```
+
+**Order matters.** Entries are folded top to bottom, and `enabled = false` removes whatever already carries that identity at the point it runs — including an entry of your own written earlier in the file. Put a disable entry before any entry it isn't meant to remove.
 
 ## Apply Section
 

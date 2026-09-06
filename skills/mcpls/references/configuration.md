@@ -31,7 +31,7 @@ mcpls ships six built-in servers — rust-analyzer, pyright, the TypeScript lang
 | `initialization_options` | table | no | `{}`, or inherited | Server-specific options passed in the LSP `initialize` request, e.g. `cargo.features = "all"` for rust-analyzer. |
 | `env` | table | no | `{}`, or inherited | See [Environment passthrough](#environment-passthrough-env) below. |
 | `heuristics.project_markers` | array of strings | no | unset, or inherited | Marker files/directories that make this server applicable. mcpls searches for them recursively through the workspace tree up to `heuristics_max_depth` levels, skipping `node_modules`, `target`, and `.git`, e.g. `["pyproject.toml"]`. |
-| `enabled` | boolean | no | unset = stays enabled | Set to `false` to remove every server sharing this entry's identity, most commonly a built-in you don't want spawned. |
+| `enabled` | boolean | no | unset = stays enabled | Set to `false` to remove every server sharing this entry's identity, most commonly a built-in you don't want spawned. Order-sensitive: entries fold top to bottom, so it removes whatever already has that identity at that point, including an entry of your own written earlier — put it before any entry it isn't meant to remove. |
 
 ## Tool routing (`handles`)
 
