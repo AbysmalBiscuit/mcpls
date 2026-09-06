@@ -9,6 +9,7 @@ mod transport;
 pub(crate) mod types;
 pub mod watched_files;
 
+pub(crate) use client::CONTENT_MODIFIED_RETRY_METHODS;
 pub use client::{ApplySink, LspClient};
 #[cfg(test)]
 pub(crate) use lifecycle::fake_lsp_server;
