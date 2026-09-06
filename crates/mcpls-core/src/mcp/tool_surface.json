@@ -452,9 +452,9 @@
     },
     "annotations": {
       "title": "New Diagnostics",
-      "readOnlyHint": true,
+      "readOnlyHint": false,
       "destructiveHint": false,
-      "idempotentHint": true
+      "idempotentHint": false
     }
   },
   {

@@ -283,8 +283,9 @@ impl McplsServer {
     ///
     /// Most mcpls tools are read-only LSP queries, so applying that once
     /// here replaces an identical `annotations(...)` block on each `#[tool]`
-    /// attribute. A tool that can write to disk declares its own
-    /// annotations and keeps them;
+    /// attribute. A tool that mutates anything -- files on disk, or
+    /// server-side state such as a session's delivery record -- declares its
+    /// own annotations and keeps them;
     /// `test_tool_annotation_classifications_match_intent` forces any such
     /// tool to write down an explicit classification rather than inherit
     /// this default silently.
@@ -714,9 +715,20 @@ impl McplsServer {
     }
 
     /// Drain diagnostics that changed since the last call.
+    ///
+    /// The annotations are spelled out rather than inherited: draining
+    /// advances the session's delivery record, so a host that dedupes or
+    /// retries a call it believes to be read-only and idempotent would
+    /// discard a response whose contents are already gone.
     #[tool(
         description = "Diagnostics that changed since you last asked, across every file the language servers report on. Returns nothing when nothing changed.",
-        title = "New Diagnostics"
+        title = "New Diagnostics",
+        annotations(
+            title = "New Diagnostics",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
     )]
     async fn get_new_diagnostics(&self) -> Result<String, McpError> {
         let baselined = {
@@ -2210,7 +2222,7 @@ mod tests {
             ("go_to_implementation", true, false, true),
             ("go_to_type_definition", true, false, true),
             ("get_inlay_hints", true, false, true),
-            ("get_new_diagnostics", true, false, true),
+            ("get_new_diagnostics", false, false, false),
         ];
 
         assert_eq!(
