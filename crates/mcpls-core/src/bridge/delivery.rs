@@ -52,7 +52,11 @@ pub struct ChangedFile {
     pub key: String,
     /// Diagnostics at or above the floor, capped.
     pub diagnostics: Vec<lsp_types::Diagnostic>,
-    /// How many this file's own cap dropped. Those are not offered again:
+    /// How many admitted diagnostics did not make it into `diagnostics`.
+    /// Ordinarily this is exactly what `max_per_file` dropped; the
+    /// exception is the one flush whose total budget is too small to fit
+    /// even this single file, where the budget's own shortfall is folded
+    /// in too rather than held back for a later flush. Not offered again:
     /// the count is what tells the agent to look at the file itself.
     pub omitted: usize,
 }
@@ -64,8 +68,9 @@ pub struct FlushReport {
     pub changed: Vec<ChangedFile>,
     /// Cache keys of files that had visible diagnostics and now have none.
     pub cleared: Vec<String>,
-    /// Files the total cap held back entirely. They are not recorded as
-    /// delivered, so the next flush offers them again.
+    /// Whole files the total budget could not fit this flush. Their
+    /// session record is left untouched, so the next flush offers them
+    /// again in full.
     pub omitted: usize,
 }
 
@@ -142,17 +147,17 @@ impl DiagnosticsDelivery {
 
     /// Report what changed for `session` since its last flush.
     ///
-    /// The two caps behave differently on purpose. A file truncated by
-    /// `max_per_file` is recorded as delivered and carries its own `omitted`
-    /// count, because the agent has the file and can look. A file the
-    /// `max_total` budget could not fit at all keeps its old record, so the
-    /// next flush offers it again rather than losing it silently.
+    /// Running low on the flush's total budget defers a whole file to the
+    /// next flush rather than truncating it further: a partially delivered
+    /// file reads as the complete picture, which is worse than waiting. The
+    /// one exception is a file that does not fit even a fresh, untouched
+    /// budget — no later flush would do better either, so that file is
+    /// delivered truncated to the budget instead of withheld forever.
     pub fn flush(&mut self, session: &SessionId, entries: &[FileEntry<'_>]) -> FlushReport {
-        let baseline = self.baseline.clone().unwrap_or_default();
         let record = self
             .sessions
             .entry(session.clone())
-            .or_insert_with(|| baseline);
+            .or_insert_with(|| self.baseline.clone().unwrap_or_default());
 
         let mut report = FlushReport::default();
         let mut budget = self.config.max_total;
@@ -169,25 +174,38 @@ impl DiagnosticsDelivery {
                 (None, None) => {}
                 (Some(current), Some(before)) if current == before => {}
                 (Some(current), _) => {
-                    if budget == 0 {
-                        report.omitted += 1;
-                        continue;
-                    }
                     let mut visible: Vec<_> = entry
                         .diagnostics
                         .iter()
                         .filter(|d| entry.floor.admits(d.severity))
                         .cloned()
                         .collect();
-                    let per_file = self.config.max_per_file.min(budget);
-                    let omitted = visible.len().saturating_sub(per_file);
-                    visible.truncate(per_file);
+                    let per_file_omitted = visible.len().saturating_sub(self.config.max_per_file);
+                    visible.truncate(self.config.max_per_file);
+
+                    if visible.len() > budget {
+                        if budget != self.config.max_total {
+                            report.omitted += 1;
+                            continue;
+                        }
+                        let shortfall = visible.len() - budget;
+                        visible.truncate(budget);
+                        record.insert(entry.key.to_string(), current);
+                        report.changed.push(ChangedFile {
+                            key: entry.key.to_string(),
+                            diagnostics: visible,
+                            omitted: per_file_omitted + shortfall,
+                        });
+                        budget = 0;
+                        continue;
+                    }
+
                     budget -= visible.len();
                     record.insert(entry.key.to_string(), current);
                     report.changed.push(ChangedFile {
                         key: entry.key.to_string(),
                         diagnostics: visible,
-                        omitted,
+                        omitted: per_file_omitted,
                     });
                 }
             }
@@ -424,6 +442,128 @@ mod tests {
         assert!(
             report.changed.is_empty(),
             "the workspace already had this before the session started"
+        );
+    }
+
+    #[test]
+    fn test_max_per_file_and_max_total_both_bind_in_one_flush() {
+        let config = DiagnosticsConfig {
+            max_per_file: 2,
+            max_total: 3,
+            ..DiagnosticsConfig::default()
+        };
+        let mut delivery = DiagnosticsDelivery::new(config);
+        let session = SessionId::from("s".to_string());
+        let a: Vec<_> = (0..4)
+            .map(|i| diagnostic(i, DiagnosticSeverity::ERROR, "a"))
+            .collect();
+        let b: Vec<_> = (0..4)
+            .map(|i| diagnostic(i, DiagnosticSeverity::ERROR, "b"))
+            .collect();
+
+        let report = delivery.flush(
+            &session,
+            &[
+                entry("a.rs", &a, SeverityFloor::Warning),
+                entry("b.rs", &b, SeverityFloor::Warning),
+            ],
+        );
+
+        assert_eq!(report.changed.len(), 1, "only a.rs fit the total budget");
+        assert_eq!(report.changed[0].key, "a.rs");
+        assert_eq!(
+            report.changed[0].diagnostics.len(),
+            2,
+            "a.rs is still capped at max_per_file"
+        );
+        assert_eq!(
+            report.changed[0].omitted, 2,
+            "a.rs's own omitted count is max_per_file's drop, not the total cap's"
+        );
+        assert_eq!(report.omitted, 1, "b.rs was deferred whole, not truncated");
+    }
+
+    #[test]
+    fn test_a_file_deferred_by_the_total_cap_is_offered_whole_next_flush() {
+        let config = DiagnosticsConfig {
+            max_total: 3,
+            ..DiagnosticsConfig::default()
+        };
+        let mut delivery = DiagnosticsDelivery::new(config);
+        let session = SessionId::from("s".to_string());
+        let a: Vec<_> = (0..2)
+            .map(|i| diagnostic(i, DiagnosticSeverity::ERROR, "a"))
+            .collect();
+        let b: Vec<_> = (0..3)
+            .map(|i| diagnostic(i, DiagnosticSeverity::ERROR, "b"))
+            .collect();
+
+        let first = delivery.flush(
+            &session,
+            &[
+                entry("a.rs", &a, SeverityFloor::Warning),
+                entry("b.rs", &b, SeverityFloor::Warning),
+            ],
+        );
+        assert_eq!(first.changed.len(), 1);
+        assert_eq!(first.changed[0].key, "a.rs");
+        assert_eq!(first.omitted, 1, "b.rs did not fit alongside a.rs");
+
+        let second = delivery.flush(
+            &session,
+            &[
+                entry("a.rs", &a, SeverityFloor::Warning),
+                entry("b.rs", &b, SeverityFloor::Warning),
+            ],
+        );
+        assert_eq!(second.changed.len(), 1);
+        assert_eq!(second.changed[0].key, "b.rs");
+        assert_eq!(
+            second.changed[0].diagnostics.len(),
+            3,
+            "b.rs is offered whole once the budget is free again"
+        );
+        assert_eq!(second.changed[0].omitted, 0);
+    }
+
+    #[test]
+    fn test_a_file_larger_than_the_total_budget_is_delivered_truncated_once() {
+        let config = DiagnosticsConfig {
+            max_total: 2,
+            ..DiagnosticsConfig::default()
+        };
+        let mut delivery = DiagnosticsDelivery::new(config);
+        let session = SessionId::from("s".to_string());
+        let diags: Vec<_> = (0..5)
+            .map(|i| diagnostic(i, DiagnosticSeverity::ERROR, "boom"))
+            .collect();
+
+        let report = delivery.flush(&session, &[entry("c.rs", &diags, SeverityFloor::Warning)]);
+
+        assert_eq!(
+            report.changed.len(),
+            1,
+            "a file that can never fit the budget is delivered truncated, not deferred forever"
+        );
+        assert_eq!(report.changed[0].diagnostics.len(), 2);
+        assert_eq!(report.changed[0].omitted, 3);
+        assert_eq!(report.omitted, 0, "delivered, so not counted as deferred");
+    }
+
+    #[test]
+    fn test_diagnostics_entirely_below_the_floor_are_reported_as_cleared() {
+        let mut delivery = DiagnosticsDelivery::new(DiagnosticsConfig::default());
+        let session = SessionId::from("s".to_string());
+        let errors = vec![diagnostic(1, DiagnosticSeverity::ERROR, "boom")];
+        delivery.flush(&session, &[entry("a.rs", &errors, SeverityFloor::Warning)]);
+
+        let hints = vec![diagnostic(9, DiagnosticSeverity::HINT, "consider")];
+        let report = delivery.flush(&session, &[entry("a.rs", &hints, SeverityFloor::Warning)]);
+
+        assert_eq!(
+            report.cleared,
+            vec!["a.rs".to_string()],
+            "a non-empty publish with nothing above the floor is still a clear"
         );
     }
 }
