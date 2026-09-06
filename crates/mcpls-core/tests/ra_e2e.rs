@@ -35,6 +35,7 @@ mod ra_probe;
 
 use std::fs;
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use mcp_client::McpClient;
@@ -67,6 +68,15 @@ macro_rules! sub_case {
         }
     };
 }
+
+/// When the mcpls process was spawned, so [`sc_get_new_diagnostics`] can
+/// bound how long a real report took to arrive without threading a second
+/// argument through every `SubCaseFn`.
+///
+/// Set once, right before the process is spawned, which is at or before the
+/// `ServerSettle` deadline actually starts counting -- so time measured from
+/// here only ever overstates how far the deadline has run, never understates it.
+static SUITE_START: OnceLock<Instant> = OnceLock::new();
 
 // ---------------------------------------------------------------------------
 // Workspace staging
@@ -147,16 +157,31 @@ struct ApplyTable {
     rename: bool,
 }
 
-/// Overrides just the settle deadline; every other `[diagnostics]` field
-/// keeps its production default.
+/// How long the debounce must see no outstanding `$/progress` work before
+/// counting the workspace settled. Matches production's default: rust-analyzer's
+/// startup handoffs leave gaps far shorter than this (see `bridge::settle`).
+const SETTLE_QUIET_MS: u64 = 1_000;
+
+/// The settle deadline's backstop, in milliseconds.
 ///
-/// A real rust-analyzer session's `$/progress` traffic against the fixture
-/// workspace does not go quiet for a full `settle_quiet_ms` on its own, so
-/// the production default deadline (a full minute) would make
-/// `sc_get_new_diagnostics` wait that long for a baseline. A short deadline
-/// here forces one almost immediately, well before that sub-case runs.
+/// Set well above [`ra_index_timeout_secs`] rather than to a fixed constant:
+/// rust-analyzer keeps reporting `$/progress` for background indexing and
+/// flycheck for a while after hover-readiness, so quiet can legitimately
+/// take longer to land than hover does, and a slow CI runner needs both
+/// widened together or a debounce that fired correctly gets mistaken for
+/// the deadline instead. Still far below production's default deadline, so
+/// a real regression fails this suite instead of hanging it.
+fn settle_deadline_ms() -> u64 {
+    ra_index_timeout_secs()
+        .saturating_mul(1_000)
+        .saturating_add(30_000)
+}
+
+/// Overrides both settle knobs so the suite exercises the quiet debounce
+/// against a real rust-analyzer instead of routing around it.
 #[derive(Serialize, Deserialize)]
 struct DiagnosticsTable {
+    settle_quiet_ms: u64,
     settle_deadline_ms: u64,
 }
 
@@ -189,7 +214,8 @@ fn write_config(ra_binary: &Path, workspace_root: &Path, config_path: &Path) {
         // proving that a tool called without `apply` writes nothing.
         apply: ApplyTable { rename: true },
         diagnostics: DiagnosticsTable {
-            settle_deadline_ms: 2_000,
+            settle_quiet_ms: SETTLE_QUIET_MS,
+            settle_deadline_ms: settle_deadline_ms(),
         },
     };
     let content = toml::to_string(&cfg).expect("failed to serialize e2e config");
@@ -223,6 +249,18 @@ fn find_line(file: &Path, needle: &str) -> u32 {
 // Readiness gate
 // ---------------------------------------------------------------------------
 
+/// How long to wait for rust-analyzer to index, in seconds.
+///
+/// `MCPLS_RA_INDEX_TIMEOUT_SECS` overrides the platform default; Windows CI
+/// runners are significantly slower than Linux/macOS.
+fn ra_index_timeout_secs() -> u64 {
+    let default_timeout: u64 = if cfg!(windows) { 120 } else { 60 };
+    std::env::var("MCPLS_RA_INDEX_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(default_timeout, |t| t.max(5))
+}
+
 /// Poll `get_hover` on the `add` function until rust-analyzer returns content.
 ///
 /// Timeout controlled by `MCPLS_RA_INDEX_TIMEOUT_SECS` (default 60, minimum 5).
@@ -232,13 +270,7 @@ fn find_line(file: &Path, needle: &str) -> u32 {
 /// stored).  The readiness gate therefore uses hover-probe as the primary oracle.
 /// See M-r1 in the architect handoff for the follow-up to add `$/progress` capture.
 fn wait_until_ready(client: &mut McpClient, lib_rs: &Path) {
-    // Windows CI runners are significantly slower than Linux/macOS.
-    let default_timeout: u64 = if cfg!(windows) { 120 } else { 60 };
-    let timeout_secs: u64 = std::env::var("MCPLS_RA_INDEX_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map_or(default_timeout, |t| t.max(5));
-
+    let timeout_secs = ra_index_timeout_secs();
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     let lib_path = lib_rs.to_string_lossy().into_owned();
     let add_line = find_line(lib_rs, "pub fn add(");
@@ -1407,28 +1439,49 @@ fn sc_get_server_messages(client: &mut McpClient, _workspace: &Path) -> Result<(
 /// after the baseline depends on rust-analyzer's startup timing. The
 /// baseline semantics are pinned by unit tests instead.
 fn sc_get_new_diagnostics(client: &mut McpClient, _workspace: &Path) -> Result<(), String> {
-    let first = client
-        .call_tool("get_new_diagnostics", &json!({}))
-        .map_err(|e| format!("call failed: {e}"))?;
-    let text = assertions::assert_tool_ok(&first);
-    let inner: Value = serde_json::from_str(&text).map_err(|e| format!("bad JSON: {e}"))?;
+    // Whether the debounce has already fired by the time this sub-case runs
+    // depends on how long the sub-cases ahead of it took, not just on
+    // rust-analyzer's own timing, so poll instead of asserting on one call.
+    // A `note` response is side-effect-free (see `NewDiagnosticsResult::starting_up`),
+    // so polling it can't corrupt the baseline the real report below depends on.
+    let poll_deadline =
+        Instant::now() + Duration::from_millis(settle_deadline_ms()) + Duration::from_secs(5);
+    let mut inner: Value;
+    loop {
+        let resp = client
+            .call_tool("get_new_diagnostics", &json!({}))
+            .map_err(|e| format!("call failed: {e}"))?;
+        let text = assertions::assert_tool_ok(&resp);
+        inner = serde_json::from_str(&text).map_err(|e| format!("bad JSON: {e}"))?;
+        if inner.get("note").is_none() {
+            break;
+        }
+        if Instant::now() >= poll_deadline {
+            return Err(format!(
+                "no real report even {poll_deadline:?} past spawn, well beyond the \
+                 configured settle deadline; got {inner}"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
     inner["changed"]
         .as_array()
         .ok_or_else(|| format!("expected a changed array, got {inner}"))?;
-    // The e2e config sets a short `settle_deadline_ms` (see `write_config`)
-    // specifically so the baseline is guaranteed to have landed by the time
-    // this sub-case runs -- rust-analyzer's `$/progress` traffic in this
-    // fixture does not go quiet for a full `settle_quiet_ms` on its own, so
-    // without that override this assertion would depend on the deadline
-    // fallback instead, which defaults to a full minute. A `note` here
-    // means the baseline genuinely never landed, not a timing fluke.
-    // Without this check, an unsettled baseline would make the second
-    // call's "empty" trivially true (the starting-up shape is always
-    // empty) instead of actually proving the drain deduplicates.
-    if inner.get("note").is_some() {
-        return Err(format!(
-            "expected a real report by now (baseline should have settled), got {inner}"
-        ));
+    // A real report alone doesn't say which mechanism produced it -- the
+    // deadline backstop would look identical. Elapsed time since the
+    // process was spawned (at or before the deadline itself started
+    // counting) rules the deadline out when it is still short of the
+    // configured settle deadline, so only the quiet debounce could have
+    // landed this report.
+    if let Some(start) = SUITE_START.get() {
+        let elapsed = start.elapsed();
+        let deadline = Duration::from_millis(settle_deadline_ms());
+        if elapsed >= deadline {
+            return Err(format!(
+                "{elapsed:?} since spawn already reached the {deadline:?} settle deadline; \
+                 this report would be indistinguishable from the deadline mechanism"
+            ));
+        }
     }
 
     let second = client
@@ -1545,6 +1598,7 @@ fn ra_e2e_suite() {
     write_config(&ra_path, &workspace, &config_path);
 
     // Spawn mcpls.
+    SUITE_START.get_or_init(Instant::now);
     let config_str = config_path.to_string_lossy().into_owned();
     let mut client =
         McpClient::spawn_with_args(&["--config", &config_str]).expect("failed to spawn mcpls");
