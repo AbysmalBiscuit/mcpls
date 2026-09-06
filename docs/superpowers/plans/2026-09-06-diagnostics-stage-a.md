@@ -740,7 +740,7 @@ const fn default_settle_quiet_ms() -> u64 {
 }
 
 const fn default_settle_deadline_ms() -> u64 {
-    60_000
+    300_000
 }
 
 impl Default for DiagnosticsConfig {
@@ -1428,7 +1428,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 **Interfaces:**
 - Consumes: `DiagnosticsDelivery`, `FloorTable` from task 3; `PumpShared` from task 4.
 - Produces:
-  - `pub struct ServerSettle` with `new(quiet_for: Duration, deadline_after: Duration)`, `begin`, `end`, `should_settle_at(&self, now: Instant) -> bool`, `should_settle(&self) -> bool`
+  - `pub struct ServerSettle` with `new(quiet_for: Duration, deadline_after: Duration)`, `restart_deadline`, `begin`, `end`, `should_settle_at(&self, now: Instant) -> bool`, `should_settle(&self) -> bool`
   - `NotificationCache::diagnostics_snapshot(&self) -> Vec<(String, DiagnosticInfo, ServerId)>`
   - `PumpShared` gains `settle`, `delivery` and `floors`, which task 6 shares into `BridgeContext`
 
@@ -1568,28 +1568,53 @@ use crate::config::ServerId;
 pub struct ServerSettle {
     state: Mutex<SettleState>,
     quiet_for: Duration,
-    deadline: Instant,
+    deadline_after: Duration,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct SettleState {
     outstanding: HashSet<(ServerId, String)>,
     /// When the outstanding set last became empty. `None` until the first
     /// operation ends, so a process that has not yet heard from a server is
     /// not mistaken for one whose servers have finished.
     quiet_since: Option<Instant>,
+    /// When the backstop fires regardless of what the servers have said.
+    deadline: Instant,
 }
 
 impl ServerSettle {
     /// Track settling with a `quiet_for` debounce, giving up after
     /// `deadline_after`.
+    ///
+    /// The deadline runs from construction; [`Self::restart_deadline`] moves
+    /// it to cover the work it is meant to bound.
     #[must_use]
     pub fn new(quiet_for: Duration, deadline_after: Duration) -> Self {
         Self {
-            state: Mutex::new(SettleState::default()),
+            state: Mutex::new(SettleState {
+                outstanding: HashSet::new(),
+                quiet_since: None,
+                deadline: Instant::now() + deadline_after,
+            }),
             quiet_for,
-            deadline: Instant::now() + deadline_after,
+            deadline_after,
         }
+    }
+
+    /// Measure the deadline from now instead of from construction.
+    ///
+    /// The backstop exists to bound indexing, but a `ServerSettle` is built
+    /// before any server is spawned, so config load and every server's
+    /// `initialize` handshake would otherwise be spent out of the same
+    /// budget. Callers restart the clock once the servers exist, and must do
+    /// so unconditionally rather than on the arrival of server traffic: a
+    /// server that never reports progress produces no event to hang this on,
+    /// and the backstop is precisely what covers that case.
+    pub fn restart_deadline(&self) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        state.deadline = Instant::now() + self.deadline_after;
     }
 
     /// Record that `server` started a long-running operation.
@@ -1597,7 +1622,9 @@ impl ServerSettle {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
-        state.outstanding.insert((server.clone(), token.to_string()));
+        state
+            .outstanding
+            .insert((server.clone(), token.to_string()));
         state.quiet_since = None;
     }
 
@@ -1606,7 +1633,10 @@ impl ServerSettle {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
-        if !state.outstanding.remove(&(server.clone(), token.to_string())) {
+        if !state
+            .outstanding
+            .remove(&(server.clone(), token.to_string()))
+        {
             return;
         }
         if state.outstanding.is_empty() {
@@ -1617,12 +1647,12 @@ impl ServerSettle {
     /// Whether the workspace counts as analyzed as of `now`.
     #[must_use]
     pub fn should_settle_at(&self, now: Instant) -> bool {
-        if now >= self.deadline {
-            return true;
-        }
         let Ok(state) = self.state.lock() else {
             return false;
         };
+        if now >= state.deadline {
+            return true;
+        }
         state.outstanding.is_empty()
             && state
                 .quiet_since
@@ -1637,7 +1667,7 @@ impl ServerSettle {
 }
 ```
 
-A poisoned lock is treated as "no information" rather than propagated: a diagnostics baseline is not worth taking a process down for. Note that this differs from `bridge::lock_std`, which recovers the guard; here the answer "not settled yet" is both safe and simpler than recovering.
+A poisoned lock is treated as "no information" rather than propagated: a diagnostics baseline is not worth taking a process down for. This differs from `bridge::lock_std`, which recovers the guard. The cost is that the deadline lives in the guarded state, so a poisoned lock withholds the backstop as well as the debounce and the baseline never lands. That trade is taken knowingly: both critical sections are a `HashSet` operation and an `Instant` comparison, neither of which can panic, so there is nothing here to poison the lock.
 
 - [ ] **Step 4: Feed it from the pump**
 
