@@ -124,9 +124,7 @@ Stage C adds `[diagnostics.hooks]` under the same table.
 
 Not goal 1. The flush tool is `get_cached_diagnostics` with deduplication, and it fires only when the agent calls it. Stage A is worth landing for A1, which is useful on its own and unblocks every per-server key the config already has, and for the core plus the version fix, which everything after it needs. The spec says so rather than implying more.
 
-The one place stage A could deliver something automatic is rust-analyzer, which is the only configured server that watches the filesystem for itself. Whether an external write to a `.rs` file produces diagnostics through the flush tool depends on a fact nobody has measured: **does rust-analyzer run flycheck for a change it learned from its own watcher rather than from `didSave`?** If it does, stage A already covers external writes to Rust. If it does not, nothing covers them until stage C.
-
-This is cheap to settle once the core exists: warm a server, append to a `.rs` file with a shell redirect, and watch `get_server_logs` for a flycheck progress token. Do that before planning stage B, because the answer sizes stage B's payoff.
+The one place stage A could have delivered something automatic is rust-analyzer, the only configured server that watches the filesystem for itself. It does not. This was measured rather than assumed, and the result is in "What rust-analyzer does with an external write" below: its analysis stays current, but no compiler diagnostic is ever published. So stage A covers external writes to no language at all.
 
 ### Testing
 
@@ -238,7 +236,15 @@ A path passing neither is dropped without touching the tracker. This is what kee
 
 ### What a change does
 
-A tracked path takes B1's resync. An untracked path is reported through `workspace/didChangeWatchedFiles` to the servers that asked for it, which is the mechanism those servers wanted, and it costs no tracker slot. Paths arriving from tool inputs are different: they are bounded by what the agent actually edited, and they are opened if routable, so a first-touch file still produces diagnostics.
+Changes arrive in bursts, so they are collected rather than acted on one at a time. A path enters a pending set and the sweep runs once the set has been quiet briefly. This is not an optimisation: every `didSave` restarts rust-analyzer's flycheck and cancels the check in flight, so a `cargo fmt` forwarded one path at a time produces a run of cancelled checks and no diagnostics at all.
+
+The sweep then treats a path by what its server needs:
+
+- **A tracked path** takes B1's resync, whose content comparison drops the paths that did not really change.
+- **An untracked path routed to a server whose diagnostics come from a build** must be opened and saved, because naming it is not enough. rust-analyzer already knows what the file says and still will not check it without a `didSave`. This costs a tracker slot, which is what the filters above exist to protect.
+- **An untracked path routed to a server that wanted the notification** is reported through `workspace/didChangeWatchedFiles` and costs no slot.
+
+Paths arriving from tool inputs are bounded by what the agent actually edited, so they are opened if routable and a first-touch file still produces diagnostics.
 
 `add` maps to a watched-file create event, `unlink` to a delete event plus `didClose` if the path was tracked.
 
@@ -306,9 +312,23 @@ If the worktree-per-session habit holds, the passive path is rarely exercised, a
 
 Apply is the exception, inherited from the shipped part 1 rather than introduced here. The global apply mutex is per process, so two mcpls processes applying edits to the same file simultaneously can both pass phase one and the second wins. Two agents editing one file at the same moment is already unrecoverable regardless of mcpls, so this is documented rather than solved.
 
+## What rust-analyzer does with an external write
+
+Measured against rust-analyzer 1.98.1 with a minimal LSP client advertising the same capabilities mcpls does today, driving a two-file scratch crate. The method is a script, not a tool call: spawn the server, let it settle, write the file with a plain shell redirect, send nothing, and watch.
+
+**Its watcher sees the change.** A function appended to a file with no notification of any kind was returned by `workspace/symbol` 35 seconds later, having been absent before the write. rust-analyzer's virtual file system is current without help.
+
+**It does not check the change.** Sixty seconds after an external write introducing an `E0308`, there were zero `publishDiagnostics` and `rust-analyzer/flycheck/0` never began. The control run proves the setup: `didOpen` for the same erroneous text published an empty list, and the following `didSave` began flycheck and delivered the three `E0308` diagnostics 90 milliseconds later.
+
+Two consequences the design has to carry:
+
+- **A watched-files notification would not help, even if rust-analyzer accepted one.** It already knows. What it wants is a `didSave`. So for Rust, and for any server whose diagnostics come from a build rather than from resident analysis, an externally changed file needs mcpls to open it and save it, not merely to name it. That costs a tracker slot per file, which is why stage C's filters matter.
+- **A burst of external writes must be debounced into one save.** Every `didSave` restarts flycheck and cancels the `cargo check` in flight, so forwarding a `cargo fmt` across fifty files as fifty saves produces fifty cancelled checks and no diagnostics. One save after the burst settles, per changed file, with a short quiet period before the sweep.
+
+The same measurement should be repeated for any server later added to the routing table whose diagnostics come from a build step rather than from resident analysis.
+
 ## Open questions
 
-- **Does rust-analyzer run flycheck for a change it learned from its own watcher?** Sized in "What stage A actually delivers". Settle it before planning stage B.
 - **Does a range in the hash make edits above a diagnostic re-report it?** Hashing `(range, severity, message)` re-reports a file whenever an edit shifts an unrelated diagnostic's line. Hashing `(severity, code, message, line text)` would suppress that at the cost of conflating two identical messages on different lines. Native injection appears to have the same property, so start with the range and measure.
 - **HTTP transport.** `transport-http` exists behind a default-off feature. One process per client holds for stdio only; the record would need rmcp's session id there.
 
@@ -317,6 +337,7 @@ Apply is the exception, inherited from the shipped part 1 rather than introduced
 - Advertising `didChangeWatchedFiles.dynamic_registration` changes what gopls and tsgo do at init. Both abandon their current behaviour on the strength of the advertisement. Land the advertisement and the notification together, in one commit.
 - Replacing forget-on-apply with a resync changes what servers see after every apply, which is the shipped feature's most-used path. The content comparison is what keeps it from cancelling flycheck repeatedly, and it needs the e2e test to prove it.
 - Claude Code's `FileChanged` watcher spawns a hook process per event and passes no ignore list. The `watchPaths` computation is the only thing bounding it, so it needs measuring on a repository mid-build rather than at rest.
+- Opening externally changed files to get build diagnostics consumes tracker slots against `workspace.max_documents`, and a wide external change can consume many at once. The filters and the debounce bound it; a sweep that would exceed the ceiling should report that rather than fail the next unrelated tool call with `DocumentLimitExceeded`.
 - A1 changes what servers spawn for any config that already lists `[[lsp_servers]]`. That is intended, and it is the one change here that can surprise an existing config rather than only adding to it.
 - Two rust-analyzer processes still exist if the host separately spawns one through a plugin `.lsp.json`. Setting `diagnostics: false` on such a server suppresses duplicate injection but not the duplicate process; removing the `.lsp.json` is the actual fix.
 
