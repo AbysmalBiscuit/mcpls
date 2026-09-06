@@ -1164,20 +1164,26 @@ impl DiagnosticsDelivery {
 
     /// Report what changed for `session` since its last flush.
     ///
-    /// The two caps behave differently on purpose. A file truncated by
-    /// `max_per_file` is recorded as delivered and carries its own `omitted`
-    /// count, because the agent has the file and can look. A file the
-    /// `max_total` budget could not fit at all keeps its old record, so the
-    /// next flush offers it again rather than losing it silently.
+    /// A zero `max_per_file` or `max_total` means that cap is unlimited,
+    /// matching `workspace.max_documents`/`max_file_size`'s convention:
+    /// there is no other way to write "no limit", and a literal zero cap
+    /// has no sensible reading (`severity = "off"` already covers "deliver
+    /// nothing"). Running low on a finite total budget defers a whole file
+    /// to the next flush rather than truncating it further: a partially
+    /// delivered file reads as the complete picture, which is worse than
+    /// waiting. The one exception is a file that does not fit even a
+    /// fresh, untouched budget — no later flush would do better either, so
+    /// that file is delivered truncated to the budget instead of withheld
+    /// forever.
     pub fn flush(&mut self, session: &SessionId, entries: &[FileEntry<'_>]) -> FlushReport {
-        let baseline = self.baseline.clone().unwrap_or_default();
         let record = self
             .sessions
             .entry(session.clone())
-            .or_insert_with(|| baseline);
+            .or_insert_with(|| self.baseline.clone().unwrap_or_default());
 
         let mut report = FlushReport::default();
-        let mut budget = self.config.max_total;
+        let mut budget = (self.config.max_total > 0).then_some(self.config.max_total);
+        let mut delivered_any = false;
 
         for entry in entries {
             let hash = Self::visible_hash(entry.diagnostics, entry.floor);
@@ -1191,25 +1197,46 @@ impl DiagnosticsDelivery {
                 (None, None) => {}
                 (Some(current), Some(before)) if current == before => {}
                 (Some(current), _) => {
-                    if budget == 0 {
-                        report.omitted += 1;
-                        continue;
-                    }
                     let mut visible: Vec<_> = entry
                         .diagnostics
                         .iter()
                         .filter(|d| entry.floor.admits(d.severity))
                         .cloned()
                         .collect();
-                    let per_file = self.config.max_per_file.min(budget);
-                    let omitted = visible.len().saturating_sub(per_file);
-                    visible.truncate(per_file);
-                    budget -= visible.len();
+                    let per_file_omitted = if self.config.max_per_file == 0 {
+                        0
+                    } else {
+                        let dropped = visible.len().saturating_sub(self.config.max_per_file);
+                        visible.truncate(self.config.max_per_file);
+                        dropped
+                    };
+
+                    let budget_omitted = match budget {
+                        None => Some(0),
+                        Some(remaining) if visible.len() <= remaining => {
+                            budget = Some(remaining - visible.len());
+                            Some(0)
+                        }
+                        Some(remaining) if !delivered_any => {
+                            let shortfall = visible.len() - remaining;
+                            visible.truncate(remaining);
+                            budget = Some(0);
+                            Some(shortfall)
+                        }
+                        Some(_) => None,
+                    };
+
+                    let Some(budget_omitted) = budget_omitted else {
+                        report.omitted += 1;
+                        continue;
+                    };
+
+                    delivered_any = true;
                     record.insert(entry.key.to_string(), current);
                     report.changed.push(ChangedFile {
                         key: entry.key.to_string(),
                         diagnostics: visible,
-                        omitted,
+                        omitted: per_file_omitted + budget_omitted,
                     });
                 }
             }
