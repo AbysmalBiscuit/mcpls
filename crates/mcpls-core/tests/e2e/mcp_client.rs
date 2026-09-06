@@ -16,6 +16,12 @@ use serde_json::{Value, json};
 /// response before giving up.
 const CONTENT_MODIFIED_RETRY_BUDGET: Duration = Duration::from_secs(20);
 
+/// How many total attempts `call_tool` makes against a persistent `-32801`.
+/// Bounded separately from `CONTENT_MODIFIED_RETRY_BUDGET` so a systematic
+/// regression that always answers -32801 fails in a few seconds instead of
+/// being absorbed for the whole time budget before finally being reported.
+const CONTENT_MODIFIED_RETRY_ATTEMPTS: u32 = 3;
+
 /// Simulates an MCP client (like Claude Code) for E2E testing.
 ///
 /// This client spawns the mcpls binary as a child process and communicates
@@ -265,6 +271,7 @@ impl McpClient {
     /// - The parameters are invalid
     pub fn call_tool(&mut self, name: &str, arguments: &Value) -> Result<Value> {
         let retry_deadline = Instant::now() + CONTENT_MODIFIED_RETRY_BUDGET;
+        let mut attempt = 1u32;
         loop {
             let request = json!({
                 "jsonrpc": "2.0",
@@ -278,11 +285,24 @@ impl McpClient {
 
             match self.send_request(&request) {
                 Ok(response) => return Ok(response),
-                // rust-analyzer (and other servers) answer -32801 when a
-                // concurrent re-analysis invalidated the snapshot a request
-                // was made against; the LSP spec's documented response is to
-                // retry, not to treat it as a real failure.
-                Err(e) if e.to_string().contains("-32801") && Instant::now() < retry_deadline => {
+                // A concurrent re-analysis invalidated the document snapshot
+                // the request was made against. The call is idempotent and
+                // the test needs a result, so re-issue it against the
+                // server's now-current state rather than cancelling as the
+                // LSP spec's baseline advice for this code would have a
+                // capability-aware client do. `CONTENT_MODIFIED_RETRY_ATTEMPTS`
+                // bounds this separately from the time budget so a
+                // persistent failure (not a one-off race) still fails fast.
+                Err(e)
+                    if attempt < CONTENT_MODIFIED_RETRY_ATTEMPTS
+                        && Instant::now() < retry_deadline
+                        && e.to_string().contains("-32801 - content modified") =>
+                {
+                    eprintln!(
+                        "call_tool({name}): retrying after LSP -32801 content-modified \
+                         (attempt {attempt} of {CONTENT_MODIFIED_RETRY_ATTEMPTS})"
+                    );
+                    attempt += 1;
                     std::thread::sleep(Duration::from_millis(500));
                 }
                 Err(e) => return Err(e),
