@@ -102,12 +102,12 @@ impl Eq for DiskSync {}
 /// establishes the initial state: `version` starts at 1, `disk` provenance
 /// starts `None`, and no server is recorded as synced. From there, every
 /// mutation goes through a dedicated method (`apply_local_edit`,
-/// `commit_reload`, `set_disk`, `mark_synced`, `forget_server`) rather than a
-/// partial field write, so within a single tracked lifetime `version` (see
-/// [`Self::version`]) only increases. This does not cover re-opening: calling
-/// `DocumentTracker::open` again for an already-tracked path unconditionally
-/// replaces the entry, resetting `version` to 1 and clearing `synced` -- see
-/// that method's docs.
+/// `commit_reload`, `set_disk`, `mark_synced`, `mark_saved`, `forget_server`)
+/// rather than a partial field write, so within a single tracked lifetime
+/// `version` (see [`Self::version`]) only increases. This does not cover
+/// re-opening: calling `DocumentTracker::open` again for an already-tracked
+/// path unconditionally replaces the entry, resetting `version` to 1 and
+/// clearing `synced` -- see that method's docs.
 ///
 /// The `disk` provenance invariant: `None` means the content's on-disk
 /// provenance is unknown (it came from an in-memory `open`/`update` call, not
@@ -127,6 +127,13 @@ pub struct DocumentState {
     content: String,
     disk: Option<DiskSync>,
     synced: HashMap<ServerId, i32>,
+    /// Last document version for which `server` was sent a `didSave`.
+    ///
+    /// Separate from `synced` because a `didChange` and a `didSave` are two
+    /// notifications with an interruption point between them, and a server
+    /// whose diagnostics come from a build runs nothing on the change
+    /// alone. A resync is finished for a server only once both have landed.
+    saved: HashMap<ServerId, i32>,
 }
 
 impl DocumentState {
@@ -140,6 +147,7 @@ impl DocumentState {
             content,
             disk: None,
             synced: HashMap::new(),
+            saved: HashMap::new(),
         }
     }
 
@@ -237,9 +245,54 @@ impl DocumentState {
         self.synced.insert(server, version);
     }
 
-    /// Forgets `server`'s sync history for this document.
+    /// Last document version for which `server` was sent a `didSave`, or
+    /// `None` if it has never been sent one.
+    #[must_use]
+    pub fn saved_version(&self, server: &ServerId) -> Option<i32> {
+        self.saved.get(server).copied()
+    }
+
+    /// Records that `server` was sent a `didSave` at `version`.
+    ///
+    /// The resync entry point that decides, per server, whether a save is
+    /// still owed calls this once a `didSave` for it goes out.
+    #[allow(dead_code)]
+    fn mark_saved(&mut self, server: ServerId, version: i32) {
+        self.saved.insert(server, version);
+    }
+
+    /// Servers holding this document that have not yet been told about
+    /// `version`.
+    #[must_use]
+    pub fn servers_needing_change(&self, version: i32) -> Vec<ServerId> {
+        let mut servers: Vec<ServerId> = self
+            .synced
+            .iter()
+            .filter(|(_, synced)| **synced < version)
+            .map(|(server, _)| server.clone())
+            .collect();
+        servers.sort_unstable();
+        servers
+    }
+
+    /// Servers holding this document that have not been sent a `didSave` at
+    /// `version`.
+    #[must_use]
+    pub fn servers_needing_save(&self, version: i32) -> Vec<ServerId> {
+        let mut servers: Vec<ServerId> = self
+            .synced
+            .keys()
+            .filter(|server| self.saved.get(*server).is_none_or(|saved| *saved < version))
+            .cloned()
+            .collect();
+        servers.sort_unstable();
+        servers
+    }
+
+    /// Forgets `server`'s sync and save history for this document.
     fn forget_server(&mut self, server: &ServerId) {
         self.synced.remove(server);
+        self.saved.remove(server);
     }
 }
 
@@ -1029,7 +1082,7 @@ pub fn detect_language(path: &Path, extension_map: &HashMap<String, String>) -> 
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -1123,6 +1176,78 @@ mod tests {
         let state = tracker.get(&path).unwrap();
         assert!(state.synced_version(&respawned).is_none());
         assert!(state.synced_version(&untouched).is_some());
+    }
+
+    fn test_uri() -> Uri {
+        #[cfg(windows)]
+        let uri = "file:///C:/tmp/mcpls-test/a.rs";
+        #[cfg(not(windows))]
+        let uri = "file:///tmp/mcpls-test/a.rs";
+        uri.parse().expect("a valid test uri")
+    }
+
+    #[test]
+    fn test_a_server_that_was_synced_but_not_saved_still_needs_a_save() {
+        let mut state = DocumentState::new(test_uri(), "rust".to_string(), "fn a() {}".to_string());
+        let rust = ServerId::from("rust");
+        state.mark_synced(rust.clone(), 2);
+
+        assert_eq!(state.servers_needing_change(2), Vec::<ServerId>::new());
+        assert_eq!(
+            state.servers_needing_save(2),
+            vec![rust],
+            "a didChange that landed says nothing about whether a didSave did, \
+             and rust-analyzer runs no check without the save"
+        );
+    }
+
+    #[test]
+    fn test_a_saved_server_needs_neither_at_that_version() {
+        let mut state = DocumentState::new(test_uri(), "rust".to_string(), "fn a() {}".to_string());
+        let rust = ServerId::from("rust");
+        state.mark_synced(rust.clone(), 2);
+        state.mark_saved(rust, 2);
+
+        assert!(state.servers_needing_change(2).is_empty());
+        assert!(state.servers_needing_save(2).is_empty());
+    }
+
+    #[test]
+    fn test_a_later_version_makes_a_saved_server_need_both_again() {
+        let mut state = DocumentState::new(test_uri(), "rust".to_string(), "fn a() {}".to_string());
+        let rust = ServerId::from("rust");
+        state.mark_synced(rust.clone(), 2);
+        state.mark_saved(rust.clone(), 2);
+
+        assert_eq!(state.servers_needing_change(3), vec![rust.clone()]);
+        assert_eq!(state.servers_needing_save(3), vec![rust]);
+    }
+
+    #[test]
+    fn test_a_server_never_synced_is_not_reported_as_needing_anything() {
+        let state = DocumentState::new(test_uri(), "rust".to_string(), "fn a() {}".to_string());
+        assert!(
+            state.servers_needing_change(2).is_empty(),
+            "a resync tells servers that already hold the document; opening it \
+             for a new server is ensure_open's job, not the resync's"
+        );
+        assert!(state.servers_needing_save(2).is_empty());
+    }
+
+    #[test]
+    fn test_forgetting_a_server_clears_its_saved_version_too() {
+        let mut state = DocumentState::new(test_uri(), "rust".to_string(), "fn a() {}".to_string());
+        let rust = ServerId::from("rust");
+        state.mark_synced(rust.clone(), 2);
+        state.mark_saved(rust.clone(), 2);
+        state.forget_server(&rust);
+
+        assert_eq!(
+            state.saved_version(&rust),
+            None,
+            "a respawned process has saved nothing, so a stale saved version \
+             would suppress the didSave the fresh process needs"
+        );
     }
 
     /// #249 S1 regression: a `sync_phase` call that captured `server`'s
@@ -1292,6 +1417,7 @@ mod tests {
             content: "fn main() {}".to_string(),
             disk: None,
             synced: HashMap::new(),
+            saved: HashMap::new(),
         };
 
         #[allow(clippy::redundant_clone)]
