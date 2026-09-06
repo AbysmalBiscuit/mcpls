@@ -147,12 +147,17 @@ impl DiagnosticsDelivery {
 
     /// Report what changed for `session` since its last flush.
     ///
-    /// Running low on the flush's total budget defers a whole file to the
-    /// next flush rather than truncating it further: a partially delivered
-    /// file reads as the complete picture, which is worse than waiting. The
-    /// one exception is a file that does not fit even a fresh, untouched
-    /// budget — no later flush would do better either, so that file is
-    /// delivered truncated to the budget instead of withheld forever.
+    /// A zero `max_per_file` or `max_total` means that cap is unlimited,
+    /// matching `workspace.max_documents`/`max_file_size`'s convention:
+    /// there is no other way to write "no limit", and a literal zero cap
+    /// has no sensible reading (`severity = "off"` already covers "deliver
+    /// nothing"). Running low on a finite total budget defers a whole file
+    /// to the next flush rather than truncating it further: a partially
+    /// delivered file reads as the complete picture, which is worse than
+    /// waiting. The one exception is a file that does not fit even a
+    /// fresh, untouched budget — no later flush would do better either, so
+    /// that file is delivered truncated to the budget instead of withheld
+    /// forever.
     pub fn flush(&mut self, session: &SessionId, entries: &[FileEntry<'_>]) -> FlushReport {
         let record = self
             .sessions
@@ -160,7 +165,8 @@ impl DiagnosticsDelivery {
             .or_insert_with(|| self.baseline.clone().unwrap_or_default());
 
         let mut report = FlushReport::default();
-        let mut budget = self.config.max_total;
+        let mut budget = (self.config.max_total > 0).then_some(self.config.max_total);
+        let mut delivered_any = false;
 
         for entry in entries {
             let hash = Self::visible_hash(entry.diagnostics, entry.floor);
@@ -180,32 +186,40 @@ impl DiagnosticsDelivery {
                         .filter(|d| entry.floor.admits(d.severity))
                         .cloned()
                         .collect();
-                    let per_file_omitted = visible.len().saturating_sub(self.config.max_per_file);
-                    visible.truncate(self.config.max_per_file);
+                    let per_file_omitted = if self.config.max_per_file == 0 {
+                        0
+                    } else {
+                        let dropped = visible.len().saturating_sub(self.config.max_per_file);
+                        visible.truncate(self.config.max_per_file);
+                        dropped
+                    };
 
-                    if visible.len() > budget {
-                        if budget != self.config.max_total {
-                            report.omitted += 1;
-                            continue;
+                    let budget_omitted = match budget {
+                        None => Some(0),
+                        Some(remaining) if visible.len() <= remaining => {
+                            budget = Some(remaining - visible.len());
+                            Some(0)
                         }
-                        let shortfall = visible.len() - budget;
-                        visible.truncate(budget);
-                        record.insert(entry.key.to_string(), current);
-                        report.changed.push(ChangedFile {
-                            key: entry.key.to_string(),
-                            diagnostics: visible,
-                            omitted: per_file_omitted + shortfall,
-                        });
-                        budget = 0;
-                        continue;
-                    }
+                        Some(remaining) if !delivered_any => {
+                            let shortfall = visible.len() - remaining;
+                            visible.truncate(remaining);
+                            budget = Some(0);
+                            Some(shortfall)
+                        }
+                        Some(_) => None,
+                    };
 
-                    budget -= visible.len();
+                    let Some(budget_omitted) = budget_omitted else {
+                        report.omitted += 1;
+                        continue;
+                    };
+
+                    delivered_any = true;
                     record.insert(entry.key.to_string(), current);
                     report.changed.push(ChangedFile {
                         key: entry.key.to_string(),
                         diagnostics: visible,
-                        omitted: per_file_omitted,
+                        omitted: per_file_omitted + budget_omitted,
                     });
                 }
             }
@@ -564,6 +578,119 @@ mod tests {
             report.cleared,
             vec!["a.rs".to_string()],
             "a non-empty publish with nothing above the floor is still a clear"
+        );
+    }
+
+    #[test]
+    fn test_a_zero_total_cap_means_unlimited_not_zero() {
+        let config = DiagnosticsConfig {
+            max_total: 0,
+            ..DiagnosticsConfig::default()
+        };
+        let mut delivery = DiagnosticsDelivery::new(config);
+        let session = SessionId::from("s".to_string());
+        let files: Vec<Vec<Diagnostic>> = (0..6)
+            .map(|f| {
+                (0..8)
+                    .map(|i| diagnostic(i, DiagnosticSeverity::ERROR, "boom"))
+                    .map(|mut d| {
+                        d.message = format!("f{f}-{}", d.message);
+                        d
+                    })
+                    .collect()
+            })
+            .collect();
+        let keys: Vec<String> = (0..6).map(|f| format!("f{f}.rs")).collect();
+        let entries: Vec<FileEntry<'_>> = keys
+            .iter()
+            .zip(files.iter())
+            .map(|(key, diags)| entry(key, diags, SeverityFloor::Warning))
+            .collect();
+
+        let report = delivery.flush(&session, &entries);
+
+        assert_eq!(report.changed.len(), 6, "every file was delivered");
+        for changed in &report.changed {
+            assert_eq!(changed.diagnostics.len(), 8, "delivered whole");
+            assert_eq!(changed.omitted, 0);
+        }
+        assert_eq!(
+            report.omitted, 0,
+            "nothing deferred under an unlimited budget"
+        );
+    }
+
+    #[test]
+    fn test_a_zero_per_file_cap_means_unlimited_not_zero() {
+        let mut delivery = DiagnosticsDelivery::new(DiagnosticsConfig {
+            max_per_file: 0,
+            ..DiagnosticsConfig::default()
+        });
+        let session = SessionId::from("s".to_string());
+        let diags: Vec<_> = (0..15)
+            .map(|i| diagnostic(i, DiagnosticSeverity::ERROR, "boom"))
+            .collect();
+
+        let report = delivery.flush(&session, &[entry("a.rs", &diags, SeverityFloor::Warning)]);
+
+        assert_eq!(report.changed[0].diagnostics.len(), 15, "delivered whole");
+        assert_eq!(report.changed[0].omitted, 0);
+    }
+
+    #[test]
+    fn test_both_caps_zero_together_deliver_everything() {
+        let config = DiagnosticsConfig {
+            max_per_file: 0,
+            max_total: 0,
+            ..DiagnosticsConfig::default()
+        };
+        let mut delivery = DiagnosticsDelivery::new(config);
+        let session = SessionId::from("s".to_string());
+        let a: Vec<_> = (0..30)
+            .map(|i| diagnostic(i, DiagnosticSeverity::ERROR, "a"))
+            .collect();
+        let b: Vec<_> = (0..30)
+            .map(|i| diagnostic(i, DiagnosticSeverity::ERROR, "b"))
+            .collect();
+
+        let report = delivery.flush(
+            &session,
+            &[
+                entry("a.rs", &a, SeverityFloor::Warning),
+                entry("b.rs", &b, SeverityFloor::Warning),
+            ],
+        );
+
+        assert_eq!(report.changed.len(), 2);
+        assert_eq!(report.changed[0].diagnostics.len(), 30);
+        assert_eq!(report.changed[0].omitted, 0);
+        assert_eq!(report.changed[1].diagnostics.len(), 30);
+        assert_eq!(report.changed[1].omitted, 0);
+        assert_eq!(report.omitted, 0);
+    }
+
+    #[test]
+    fn test_a_zero_total_cap_still_deduplicates_across_flushes() {
+        let config = DiagnosticsConfig {
+            max_total: 0,
+            ..DiagnosticsConfig::default()
+        };
+        let mut delivery = DiagnosticsDelivery::new(config);
+        let session = SessionId::from("s".to_string());
+        let diags = vec![diagnostic(1, DiagnosticSeverity::ERROR, "boom")];
+
+        let first = delivery.flush(&session, &[entry("a.rs", &diags, SeverityFloor::Warning)]);
+        assert_eq!(
+            first.changed[0].diagnostics.len(),
+            1,
+            "an unlimited budget delivers the diagnostic, not an empty list"
+        );
+
+        let second = delivery.flush(&session, &[entry("a.rs", &diags, SeverityFloor::Warning)]);
+        assert!(
+            second.changed.is_empty(),
+            "the second flush is unchanged because the first one actually delivered \
+             the diagnostic, not because it was silently swallowed"
         );
     }
 }

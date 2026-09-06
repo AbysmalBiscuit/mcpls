@@ -106,8 +106,8 @@ Sets the default severity floor and the volume caps applied when diagnostics are
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `severity` | `"off"` \| `"error"` \| `"warning"` \| `"information"` \| `"hint"` | `"warning"` | The least severe diagnostic worth delivering, for any server without its own `diagnostics_severity`. A diagnostic with no severity at all clears every floor but `"off"`. |
-| `max_per_file` | integer | `10` | Most diagnostics delivered for one file in one flush. |
-| `max_total` | integer | `50` | Most diagnostics delivered in one flush across every file — a context budget, so it is not per server. |
+| `max_per_file` | integer | `10` | Most diagnostics delivered for one file in one flush. `0` disables the limit. |
+| `max_total` | integer | `50` | Most diagnostics delivered in one flush across every file — a context budget, so it is not per server. `0` disables the limit. |
 | `settle_quiet_ms` | integer (ms) | `1000` | How long the language servers must report no work before their view of the workspace counts as complete. |
 | `settle_deadline_ms` | integer (ms) | `60000` | How long to wait for that quiet before baselining anyway, bounding a server that never finishes. |
 

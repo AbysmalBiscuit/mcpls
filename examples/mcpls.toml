@@ -127,8 +127,8 @@ timeout_seconds = 30
 # delivered. Uncomment to change the defaults shown here.
 # [diagnostics]
 # severity = "warning"
-# max_per_file = 10
-# max_total = 50
+# max_per_file = 10  # 0 = unlimited
+# max_total = 50     # 0 = unlimited
 # settle_quiet_ms = 1000
 # settle_deadline_ms = 60000
 

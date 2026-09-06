@@ -644,14 +644,14 @@ The least severe diagnostic worth delivering, for any server that does not set i
 **Type**: Integer
 **Default**: `10`
 
-Most diagnostics delivered for one file in one flush.
+Most diagnostics delivered for one file in one flush. Set to `0` to disable the limit.
 
 ### `diagnostics.max_total`
 
 **Type**: Integer
 **Default**: `50`
 
-Most diagnostics delivered in one flush across every file. This is a context budget, which is why it applies globally rather than per server.
+Most diagnostics delivered in one flush across every file. This is a context budget, which is why it applies globally rather than per server. Set to `0` to disable the limit.
 
 ### `diagnostics.settle_quiet_ms`
 

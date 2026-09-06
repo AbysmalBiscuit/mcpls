@@ -136,11 +136,13 @@ pub struct DiagnosticsConfig {
     /// does not set its own.
     #[serde(default = "default_severity_floor")]
     pub severity: SeverityFloor,
-    /// Most diagnostics delivered for one file in one flush.
+    /// Most diagnostics delivered for one file in one flush. `0` means
+    /// unlimited.
     #[serde(default = "default_max_per_file")]
     pub max_per_file: usize,
     /// Most diagnostics delivered in one flush across every file. This is a
-    /// context budget, which is why it is not per server.
+    /// context budget, which is why it is not per server. `0` means
+    /// unlimited.
     #[serde(default = "default_max_total")]
     pub max_total: usize,
     /// How long the language servers must report no work before their view
