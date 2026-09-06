@@ -24,6 +24,18 @@ fn document_key(uri: &Uri) -> String {
     )
 }
 
+/// Whether an operation carrying these options replaces whatever sits at
+/// its destination.
+///
+/// A create or rename asking to be ignored when the destination exists is
+/// skipped there, and a document an earlier entry of the same edit already
+/// changed exists by definition, so such an operation leaves that document
+/// exactly as the earlier entry left it. `overwrite` wins over
+/// `ignoreIfExists` per the LSP specification.
+const fn replaces_destination(overwrite: Option<bool>, ignore_if_exists: Option<bool>) -> bool {
+    matches!(overwrite, Some(true)) || !matches!(ignore_if_exists, Some(true))
+}
+
 /// One step of an edit, in the order it must be performed.
 #[derive(Debug)]
 pub enum Operation {
@@ -156,12 +168,31 @@ impl EditPlan {
     /// Only the paths this operation actually touches: an unrelated create
     /// or delete elsewhere in the edit says nothing about the document a
     /// previous entry edited, and clearing everything would let
-    /// `edit a.rs; create b.rs; edit a.rs` through.
+    /// `edit a.rs; create b.rs; edit a.rs` through. An operation that will
+    /// be skipped touches nothing at all.
     fn release_documents(already_edited: &mut Vec<String>, resource: &lsp_types::ResourceOp) {
         let replaced: Vec<String> = match resource {
-            lsp_types::ResourceOp::Create(create) => vec![document_key(&create.uri)],
+            lsp_types::ResourceOp::Create(create) => {
+                let options = create.options.as_ref();
+                if replaces_destination(
+                    options.and_then(|o| o.overwrite),
+                    options.and_then(|o| o.ignore_if_exists),
+                ) {
+                    vec![document_key(&create.uri)]
+                } else {
+                    Vec::new()
+                }
+            }
             lsp_types::ResourceOp::Rename(rename) => {
-                vec![document_key(&rename.old_uri), document_key(&rename.new_uri)]
+                let options = rename.options.as_ref();
+                if replaces_destination(
+                    options.and_then(|o| o.overwrite),
+                    options.and_then(|o| o.ignore_if_exists),
+                ) {
+                    vec![document_key(&rename.old_uri), document_key(&rename.new_uri)]
+                } else {
+                    Vec::new()
+                }
             }
             lsp_types::ResourceOp::Delete(delete) => vec![document_key(&delete.uri)],
         };
@@ -574,6 +605,117 @@ mod tests {
                 DocumentChangeOperation::Op(ResourceOp::Create(CreateFile {
                     uri: uri("/w/a.rs"),
                     options: None,
+                    annotation_id: None,
+                })),
+                entry("/w/a.rs"),
+            ])),
+            ..WorkspaceEdit::default()
+        })
+        .expect("plan builds");
+        assert_eq!(plan.operations().len(), 3);
+    }
+
+    /// A create carrying `ignoreIfExists` is skipped when the destination is
+    /// already there, and a document an earlier entry edited is by
+    /// definition already there, so it replaces nothing and the second entry
+    /// would still splice stale ranges into edited text.
+    #[test]
+    fn test_a_skipped_create_does_not_license_a_second_entry() {
+        let entry = |path: &str| {
+            DocumentChangeOperation::Edit(TextDocumentEdit {
+                text_document: OptionalVersionedTextDocumentIdentifier {
+                    uri: uri(path),
+                    version: None,
+                },
+                edits: vec![OneOf::Left(edit(0, 0, "x"))],
+            })
+        };
+
+        let error = EditPlan::from_workspace_edit(WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Operations(vec![
+                entry("/w/a.rs"),
+                DocumentChangeOperation::Op(ResourceOp::Create(CreateFile {
+                    uri: uri("/w/a.rs"),
+                    options: Some(lsp_types::CreateFileOptions {
+                        overwrite: None,
+                        ignore_if_exists: Some(true),
+                    }),
+                    annotation_id: None,
+                })),
+                entry("/w/a.rs"),
+            ])),
+            ..WorkspaceEdit::default()
+        })
+        .expect_err("the create leaves the edited document alone");
+
+        assert!(
+            error.to_string().contains("two entries"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The same for a rename onto a document an earlier entry edited: with
+    /// `ignoreIfExists` and no `overwrite` the whole rename is skipped, so
+    /// neither end of it is replaced.
+    #[test]
+    fn test_a_skipped_rename_does_not_license_a_second_entry() {
+        let entry = |path: &str| {
+            DocumentChangeOperation::Edit(TextDocumentEdit {
+                text_document: OptionalVersionedTextDocumentIdentifier {
+                    uri: uri(path),
+                    version: None,
+                },
+                edits: vec![OneOf::Left(edit(0, 0, "x"))],
+            })
+        };
+
+        let error = EditPlan::from_workspace_edit(WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Operations(vec![
+                entry("/w/a.rs"),
+                DocumentChangeOperation::Op(ResourceOp::Rename(lsp_types::RenameFile {
+                    old_uri: uri("/w/b.rs"),
+                    new_uri: uri("/w/a.rs"),
+                    options: Some(lsp_types::RenameFileOptions {
+                        overwrite: None,
+                        ignore_if_exists: Some(true),
+                    }),
+                    annotation_id: None,
+                })),
+                entry("/w/a.rs"),
+            ])),
+            ..WorkspaceEdit::default()
+        })
+        .expect_err("the rename leaves the edited document alone");
+
+        assert!(
+            error.to_string().contains("two entries"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// An overwriting create does replace the document, which is what makes
+    /// a second entry for that path legitimate.
+    #[test]
+    fn test_an_overwriting_create_licenses_a_second_entry() {
+        let entry = |path: &str| {
+            DocumentChangeOperation::Edit(TextDocumentEdit {
+                text_document: OptionalVersionedTextDocumentIdentifier {
+                    uri: uri(path),
+                    version: None,
+                },
+                edits: vec![OneOf::Left(edit(0, 0, "x"))],
+            })
+        };
+
+        let plan = EditPlan::from_workspace_edit(WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Operations(vec![
+                entry("/w/a.rs"),
+                DocumentChangeOperation::Op(ResourceOp::Create(CreateFile {
+                    uri: uri("/w/a.rs"),
+                    options: Some(lsp_types::CreateFileOptions {
+                        overwrite: Some(true),
+                        ignore_if_exists: Some(true),
+                    }),
                     annotation_id: None,
                 })),
                 entry("/w/a.rs"),
