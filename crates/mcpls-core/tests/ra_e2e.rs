@@ -1442,8 +1442,13 @@ fn sc_get_new_diagnostics(client: &mut McpClient, _workspace: &Path) -> Result<(
     // Whether the debounce has already fired by the time this sub-case runs
     // depends on how long the sub-cases ahead of it took, not just on
     // rust-analyzer's own timing, so poll instead of asserting on one call.
-    // A `note` response is side-effect-free (see `NewDiagnosticsResult::starting_up`),
-    // so polling it can't corrupt the baseline the real report below depends on.
+    //
+    // `note` alone doesn't tell "still starting up" apart from "a real
+    // report that also held files back": `NewDiagnosticsResult::starting_up`
+    // sets `note` before `flush` ever runs (side-effect-free, `omitted == 0`),
+    // but `new_diagnostics_payload` also sets `note` when `omitted > 0` on a
+    // report a `flush` already consumed. Only the first shape is safe to
+    // poll past -- discriminate on `omitted`, not on `note`'s presence.
     let poll_deadline =
         Instant::now() + Duration::from_millis(settle_deadline_ms()) + Duration::from_secs(5);
     let mut inner: Value;
@@ -1453,16 +1458,27 @@ fn sc_get_new_diagnostics(client: &mut McpClient, _workspace: &Path) -> Result<(
             .map_err(|e| format!("call failed: {e}"))?;
         let text = assertions::assert_tool_ok(&resp);
         inner = serde_json::from_str(&text).map_err(|e| format!("bad JSON: {e}"))?;
-        if inner.get("note").is_none() {
+        let omitted = inner["omitted"].as_u64().unwrap_or(0);
+        let starting_up = inner.get("note").is_some() && omitted == 0;
+        if !starting_up {
             break;
         }
         if Instant::now() >= poll_deadline {
+            let elapsed = SUITE_START.get().map_or(Duration::ZERO, Instant::elapsed);
             return Err(format!(
-                "no real report even {poll_deadline:?} past spawn, well beyond the \
-                 configured settle deadline; got {inner}"
+                "no real report {elapsed:?} since spawn, well beyond the configured \
+                 settle deadline; got {inner}"
             ));
         }
         std::thread::sleep(Duration::from_millis(200));
+    }
+    let omitted = inner["omitted"].as_u64().unwrap_or(0);
+    if omitted > 0 {
+        return Err(format!(
+            "get_new_diagnostics held {omitted} file(s) back on its first real report; \
+             the fixture has outgrown the configured diagnostics caps, so this sub-case's \
+             drain-once property can't be checked as written, got {inner}"
+        ));
     }
     inner["changed"]
         .as_array()
@@ -1479,7 +1495,10 @@ fn sc_get_new_diagnostics(client: &mut McpClient, _workspace: &Path) -> Result<(
         if elapsed >= deadline {
             return Err(format!(
                 "{elapsed:?} since spawn already reached the {deadline:?} settle deadline; \
-                 this report would be indistinguishable from the deadline mechanism"
+                 this report would be indistinguishable from the deadline mechanism. Either \
+                 the debounce regressed, or this runner is slow enough to have pushed a \
+                 working debounce past the margin -- MCPLS_RA_INDEX_TIMEOUT_SECS widens \
+                 both the readiness gate and this deadline together"
             ));
         }
     }
