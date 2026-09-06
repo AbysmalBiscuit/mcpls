@@ -474,6 +474,7 @@ sleep __SLEEP__
                     heuristics: None,
                     name: Some(id.to_string()),
                     handles: None,
+                    diagnostics_severity: None,
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
@@ -868,6 +869,7 @@ fi
                     heuristics: None,
                     name: Some("hover-only".to_string()),
                     handles: Some(vec![ToolKind::Hover]),
+                    diagnostics_severity: None,
                 },
                 LspServerConfig {
                     language_id: "rust".to_string(),
@@ -881,6 +883,7 @@ fi
                     heuristics: None,
                     name: Some("diag-catchall".to_string()),
                     handles: None,
+                    diagnostics_severity: None,
                 },
             ];
             let router = ToolRouter::from_configs(configs.iter()).unwrap();

@@ -89,6 +89,110 @@ impl ApplyConfig {
     }
 }
 
+/// The least severe diagnostic worth delivering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SeverityFloor {
+    /// Deliver nothing from this server.
+    Off,
+    /// Errors only.
+    Error,
+    /// Errors and warnings.
+    Warning,
+    /// Everything but hints.
+    Information,
+    /// Everything.
+    Hint,
+}
+
+impl SeverityFloor {
+    /// Whether a diagnostic of this severity clears the floor.
+    ///
+    /// A diagnostic with no severity clears every floor but [`Self::Off`]:
+    /// the LSP field is optional, and a server omitting it is not saying the
+    /// diagnostic does not matter.
+    #[must_use]
+    pub fn admits(self, severity: Option<lsp_types::DiagnosticSeverity>) -> bool {
+        use lsp_types::DiagnosticSeverity;
+
+        // DiagnosticSeverity orders ERROR = 1 through HINT = 4 and derives
+        // Ord, so "at least as severe as the floor" is `<=`.
+        let deepest = match self {
+            Self::Off => return false,
+            Self::Error => DiagnosticSeverity::ERROR,
+            Self::Warning => DiagnosticSeverity::WARNING,
+            Self::Information => DiagnosticSeverity::INFORMATION,
+            Self::Hint => DiagnosticSeverity::HINT,
+        };
+        severity.is_none_or(|severity| severity <= deepest)
+    }
+}
+
+/// How much of what the language servers report reaches the agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiagnosticsConfig {
+    /// The least severe diagnostic worth delivering, for any server that
+    /// does not set its own.
+    #[serde(default = "default_severity_floor")]
+    pub severity: SeverityFloor,
+    /// Most diagnostics delivered for one file in one flush.
+    #[serde(default = "default_max_per_file")]
+    pub max_per_file: usize,
+    /// Most diagnostics delivered in one flush across every file. This is a
+    /// context budget, which is why it is not per server.
+    #[serde(default = "default_max_total")]
+    pub max_total: usize,
+    /// How long the language servers must report no work before their view
+    /// of the workspace counts as complete.
+    ///
+    /// Raise it on a workspace whose servers pause mid-analysis for longer
+    /// than this; the cost of raising it is a later baseline, and the cost
+    /// of setting it too low is a baseline taken mid-index.
+    #[serde(default = "default_settle_quiet_ms")]
+    pub settle_quiet_ms: u64,
+    /// How long to wait for that quiet before giving up and baselining
+    /// anyway. Bounds the damage from a server that never finishes, or from
+    /// a progress notification dropped before its pump existed.
+    #[serde(default = "default_settle_deadline_ms")]
+    pub settle_deadline_ms: u64,
+}
+
+const fn default_severity_floor() -> SeverityFloor {
+    SeverityFloor::Warning
+}
+
+const fn default_max_per_file() -> usize {
+    10
+}
+
+const fn default_max_total() -> usize {
+    50
+}
+
+/// rust-analyzer's startup phases leave gaps of roughly 70 to 100
+/// milliseconds between them. A second is an order of magnitude clear of
+/// that and still well inside a session's first tool call.
+const fn default_settle_quiet_ms() -> u64 {
+    1_000
+}
+
+const fn default_settle_deadline_ms() -> u64 {
+    60_000
+}
+
+impl Default for DiagnosticsConfig {
+    fn default() -> Self {
+        Self {
+            severity: default_severity_floor(),
+            max_per_file: default_max_per_file(),
+            max_total: default_max_total(),
+            settle_quiet_ms: default_settle_quiet_ms(),
+            settle_deadline_ms: default_settle_deadline_ms(),
+        }
+    }
+}
+
 /// Main configuration for the MCPLS server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -107,6 +211,10 @@ pub struct ServerConfig {
     /// Which tools may write their edits to the working tree.
     #[serde(default)]
     pub apply: ApplyConfig,
+
+    /// How much of what the language servers report reaches the agent.
+    #[serde(default)]
+    pub diagnostics: DiagnosticsConfig,
 
     /// Whether a CWD-discovered `./mcpls.toml` was ignored as untrusted
     /// during this load (see [`ProjectConfigTrust`]).
@@ -942,6 +1050,7 @@ impl Default for ServerConfig {
             workspace: WorkspaceConfig::default(),
             lsp_servers: LspServerConfig::builtins(),
             apply: ApplyConfig::default(),
+            diagnostics: DiagnosticsConfig::default(),
             project_config_ignored: false,
         }
     }
@@ -971,6 +1080,49 @@ mod tests {
         assert_eq!(config.lsp_servers[4].language_id, "cpp");
         assert_eq!(config.lsp_servers[5].language_id, "zig");
         assert_eq!(config.workspace.position_encodings, vec!["utf-8", "utf-16"]);
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_diagnostics_defaults_to_a_warning_floor() {
+        let config: ServerConfig = toml::from_str("").expect("empty config parses");
+        assert_eq!(config.diagnostics.severity, SeverityFloor::Warning);
+        assert_eq!(config.diagnostics.max_per_file, 10);
+        assert_eq!(config.diagnostics.max_total, 50);
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_a_server_can_raise_its_own_floor() {
+        let config: ServerConfig = toml::from_str(
+            "[diagnostics]\nseverity = \"hint\"\n\n[[lsp_servers]]\nlanguage_id = \"rust\"\ndiagnostics_severity = \"error\"\n",
+        )
+        .expect("config parses");
+
+        let rust = config
+            .lsp_servers
+            .iter()
+            .find(|s| s.language_id == "rust")
+            .expect("rust server survives");
+        assert_eq!(rust.diagnostics_severity, Some(SeverityFloor::Error));
+        assert_eq!(config.diagnostics.severity, SeverityFloor::Hint);
+    }
+
+    #[test]
+    fn test_off_admits_nothing_and_hint_admits_everything() {
+        use lsp_types::DiagnosticSeverity;
+        assert!(!SeverityFloor::Off.admits(Some(DiagnosticSeverity::ERROR)));
+        assert!(SeverityFloor::Hint.admits(Some(DiagnosticSeverity::HINT)));
+        assert!(SeverityFloor::Error.admits(Some(DiagnosticSeverity::ERROR)));
+        assert!(!SeverityFloor::Error.admits(Some(DiagnosticSeverity::WARNING)));
+        assert!(SeverityFloor::Warning.admits(Some(DiagnosticSeverity::ERROR)));
+        assert!(!SeverityFloor::Warning.admits(Some(DiagnosticSeverity::INFORMATION)));
+    }
+
+    #[test]
+    fn test_a_diagnostic_without_a_severity_is_admitted_unless_muted() {
+        assert!(SeverityFloor::Error.admits(None));
+        assert!(!SeverityFloor::Off.admits(None));
     }
 
     #[test]
@@ -1756,8 +1908,10 @@ mod tests {
                 heuristics: None,
                 name: None,
                 handles: None,
+                diagnostics_severity: None,
             }],
             apply: ApplyConfig::default(),
+            diagnostics: DiagnosticsConfig::default(),
             project_config_ignored: false,
         };
 
@@ -1782,8 +1936,10 @@ mod tests {
                 heuristics: None,
                 name: None,
                 handles: None,
+                diagnostics_severity: None,
             }],
             apply: ApplyConfig::default(),
+            diagnostics: DiagnosticsConfig::default(),
             project_config_ignored: false,
         };
 
@@ -1808,8 +1964,10 @@ mod tests {
                 heuristics: None,
                 name: None,
                 handles: None,
+                diagnostics_severity: None,
             }],
             apply: ApplyConfig::default(),
+            diagnostics: DiagnosticsConfig::default(),
             project_config_ignored: false,
         };
 
@@ -1834,8 +1992,10 @@ mod tests {
                 heuristics: None,
                 name: None,
                 handles: None,
+                diagnostics_severity: None,
             }],
             apply: ApplyConfig::default(),
+            diagnostics: DiagnosticsConfig::default(),
             project_config_ignored: false,
         };
 

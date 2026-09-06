@@ -508,6 +508,7 @@ mod tests {
             heuristics: None,
             name: name.map(str::to_string),
             handles,
+            diagnostics_severity: None,
         }
     }
 
@@ -598,6 +599,7 @@ mod tests {
                 heuristics: None,
                 name: None,
                 handles: None,
+                diagnostics_severity: None,
             },
             LspServerConfig {
                 language_id: "rust".to_string(),
@@ -611,6 +613,7 @@ mod tests {
                 heuristics: None,
                 name: None,
                 handles: None,
+                diagnostics_severity: None,
             },
         ];
         let err = ToolRouter::from_configs(&configs).unwrap_err();

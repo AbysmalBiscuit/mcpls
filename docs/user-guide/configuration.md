@@ -555,6 +555,19 @@ enabled = false
 
 **Order matters.** Entries are folded top to bottom, and `enabled = false` removes whatever already carries that identity at the point it runs — including an entry of your own written earlier in the file. Put a disable entry before any entry it isn't meant to remove.
 
+### `diagnostics_severity`
+
+**Type**: String (`"off"`, `"error"`, `"warning"`, `"information"`, or `"hint"`)
+**Default**: unset (falls back to `diagnostics.severity`)
+
+Overrides `diagnostics.severity` for this one server. `"off"` mutes the server entirely, which is how a language is excluded from diagnostics delivery without disabling the server itself (`hover`, `definition`, and the rest keep working).
+
+```toml
+[[lsp_servers]]
+language_id = "rust"
+diagnostics_severity = "error"
+```
+
 ## Apply Section
 
 The `[apply]` table is the only thing that lets mcpls write to your source tree. Leave it out and mcpls is read-only: every tool returns an edit for you to read, and nothing on disk changes.
@@ -605,6 +618,54 @@ This is the widest of the three. A code action can carry a `WorkspaceEdit` that 
 Permits an operation that destroys a file's content: an explicit delete, a create that overwrites an existing file, or a rename onto an existing destination. It gates all three for every tool above rather than any one of them, because losing a file is not the same kind of mistake as a bad edit. With it `false`, an edit containing any of them is refused as a whole and nothing is written.
 
 Deletion is performed by moving the file to a hidden sibling for the duration of the apply, so a later step failing can put it back. Once the apply succeeds, that sibling is removed and the file is gone.
+
+## Diagnostics Section
+
+The `[diagnostics]` table sets the default severity floor and the volume caps applied when diagnostics are delivered.
+
+```toml
+[diagnostics]
+severity = "warning"
+max_per_file = 10
+max_total = 50
+settle_quiet_ms = 1000
+settle_deadline_ms = 60000
+```
+
+### `diagnostics.severity`
+
+**Type**: String (`"off"`, `"error"`, `"warning"`, `"information"`, or `"hint"`)
+**Default**: `"warning"`
+
+The least severe diagnostic worth delivering, for any server that does not set its own `diagnostics_severity` (see [`diagnostics_severity`](#diagnostics_severity)). A diagnostic with no severity at all clears every floor but `"off"`, since LSP makes severity optional and a server that omits it is not thereby saying the diagnostic does not matter.
+
+### `diagnostics.max_per_file`
+
+**Type**: Integer
+**Default**: `10`
+
+Most diagnostics delivered for one file in one flush.
+
+### `diagnostics.max_total`
+
+**Type**: Integer
+**Default**: `50`
+
+Most diagnostics delivered in one flush across every file. This is a context budget, which is why it applies globally rather than per server.
+
+### `diagnostics.settle_quiet_ms`
+
+**Type**: Integer (milliseconds)
+**Default**: `1000`
+
+How long the language servers must report no work before their view of the workspace counts as complete. Raise it on a workspace whose servers pause mid-analysis for longer than this; the cost of raising it is a later baseline, and the cost of setting it too low is a baseline taken mid-index.
+
+### `diagnostics.settle_deadline_ms`
+
+**Type**: Integer (milliseconds)
+**Default**: `60000`
+
+How long to wait for that quiet before giving up and baselining anyway. Bounds the damage from a server that never finishes, or from a progress notification dropped before its pump existed.
 
 ## Environment Variables
 

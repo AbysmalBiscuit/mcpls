@@ -32,6 +32,7 @@ mcpls ships six built-in servers — rust-analyzer, pyright, the TypeScript lang
 | `env` | table | no | `{}`, or inherited | See [Environment passthrough](#environment-passthrough-env) below. |
 | `heuristics.project_markers` | array of strings | no | unset, or inherited | Marker files/directories that make this server applicable. mcpls searches for them recursively through the workspace tree up to `heuristics_max_depth` levels, skipping `node_modules`, `target`, and `.git`, e.g. `["pyproject.toml"]`. |
 | `enabled` | boolean | no | unset = stays enabled | Set to `false` to remove every server sharing this entry's identity, most commonly a built-in you don't want spawned. Order-sensitive: entries fold top to bottom, so it removes whatever already has that identity at that point, including an entry of your own written earlier — put it before any entry it isn't meant to remove. |
+| `diagnostics_severity` | `"off"` \| `"error"` \| `"warning"` \| `"information"` \| `"hint"` | no | unset = falls back to `diagnostics.severity` | The least severe diagnostic worth delivering from this server. `"off"` mutes diagnostics for this server without disabling it. |
 
 ## Tool routing (`handles`)
 
@@ -97,6 +98,18 @@ Turning a key on hands the write to the language server: it decides which files 
 There is no undo beyond the run itself. A step failing partway through one apply reverses the completed steps and the error names any file it could not restore; once an apply returns successfully the change is on disk and mcpls holds no record of what was there before.
 
 An edit is refused outright when there are no `workspace.roots`, when a path resolves outside them, when it would change or destroy a file the filesystem marks read-only (all such files are named in one refusal, rather than one per attempt), when a file it edits holds no readable text, when two entries address one document, when it creates a file in a directory that does not exist, or when it edits a file under a directory the same edit moves.
+
+## `[diagnostics]` fields
+
+Sets the default severity floor and the volume caps applied when diagnostics are delivered. A per-server `diagnostics_severity` (see `[[lsp_servers]]` fields above) overrides `severity` for that one server.
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `severity` | `"off"` \| `"error"` \| `"warning"` \| `"information"` \| `"hint"` | `"warning"` | The least severe diagnostic worth delivering, for any server without its own `diagnostics_severity`. A diagnostic with no severity at all clears every floor but `"off"`. |
+| `max_per_file` | integer | `10` | Most diagnostics delivered for one file in one flush. |
+| `max_total` | integer | `50` | Most diagnostics delivered in one flush across every file — a context budget, so it is not per server. |
+| `settle_quiet_ms` | integer (ms) | `1000` | How long the language servers must report no work before their view of the workspace counts as complete. |
+| `settle_deadline_ms` | integer (ms) | `60000` | How long to wait for that quiet before baselining anyway, bounding a server that never finishes. |
 
 ## Environment passthrough (`env`)
 

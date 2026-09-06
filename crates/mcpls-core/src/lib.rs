@@ -1825,8 +1825,10 @@ mod tests {
                     heuristics: None,
                     name: None,
                     handles: None,
+                    diagnostics_severity: None,
                 }],
                 apply: crate::config::ApplyConfig::default(),
+                diagnostics: crate::config::DiagnosticsConfig::default(),
                 project_config_ignored: false,
             };
 
@@ -1869,6 +1871,7 @@ mod tests {
                 },
                 lsp_servers: vec![],
                 apply: crate::config::ApplyConfig::default(),
+                diagnostics: crate::config::DiagnosticsConfig::default(),
                 project_config_ignored: false,
             };
 
@@ -1926,6 +1929,7 @@ mod tests {
                 },
                 lsp_servers: vec![],
                 apply: crate::config::ApplyConfig::default(),
+                diagnostics: crate::config::DiagnosticsConfig::default(),
                 project_config_ignored: false,
             };
 
@@ -1987,8 +1991,10 @@ mod tests {
                     heuristics: None,
                     name: None,
                     handles: None,
+                    diagnostics_severity: None,
                 }],
                 apply: crate::config::ApplyConfig::default(),
+                diagnostics: crate::config::DiagnosticsConfig::default(),
                 project_config_ignored: false,
             };
 

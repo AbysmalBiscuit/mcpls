@@ -122,3 +122,18 @@ timeout_seconds = 30
 # command = "pylsp"
 # file_patterns = ["**/*.py"]
 # handles = ["diagnostics"]
+
+# Diagnostics: severity floor and volume caps applied when diagnostics are
+# delivered. Uncomment to change the defaults shown here.
+# [diagnostics]
+# severity = "warning"
+# max_per_file = 10
+# max_total = 50
+# settle_quiet_ms = 1000
+# settle_deadline_ms = 60000
+
+# Raise a single server's own floor above the global default -- "off" mutes
+# diagnostics for that server without disabling the server itself.
+# [[lsp_servers]]
+# language_id = "rust"
+# diagnostics_severity = "error"

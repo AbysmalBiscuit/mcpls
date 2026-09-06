@@ -6,6 +6,7 @@ use std::path::Path;
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 
+use super::SeverityFloor;
 use super::routing::{ServerId, ToolKind};
 use crate::error::{Error, Result};
 
@@ -213,6 +214,12 @@ pub struct LspServerConfig {
     /// `Some(list)` restricts the server to exactly those tools.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handles: Option<Vec<ToolKind>>,
+
+    /// The least severe diagnostic worth delivering from this server.
+    ///
+    /// `None` defers to [`crate::config::DiagnosticsConfig::severity`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics_severity: Option<SeverityFloor>,
 }
 
 const fn default_timeout() -> u64 {
@@ -294,6 +301,7 @@ impl LspServerConfig {
             heuristics: Some(ServerHeuristics::with_markers(markers)),
             name: None,
             handles: None,
+            diagnostics_severity: None,
         }
     }
 
@@ -438,6 +446,9 @@ pub struct PartialLspServerConfig {
     /// Set to `false` to drop the server this entry names.
     #[serde(default)]
     pub enabled: Option<bool>,
+    /// The least severe diagnostic worth delivering from this server.
+    #[serde(default)]
+    pub diagnostics_severity: Option<SeverityFloor>,
 }
 
 impl PartialLspServerConfig {
@@ -528,6 +539,7 @@ impl LspServerConfig {
             name,
             handles,
             enabled: _,
+            diagnostics_severity,
         } = partial;
 
         // A new binary does not want the old one's invocation.
@@ -567,6 +579,9 @@ impl LspServerConfig {
         if let Some(handles) = handles {
             self.handles = Some(handles);
         }
+        if let Some(diagnostics_severity) = diagnostics_severity {
+            self.diagnostics_severity = Some(diagnostics_severity);
+        }
     }
 
     /// Build a server from an entry that matched no built-in.
@@ -592,6 +607,7 @@ impl LspServerConfig {
             heuristics: partial.heuristics,
             name: partial.name,
             handles: partial.handles,
+            diagnostics_severity: partial.diagnostics_severity,
         })
     }
 }
@@ -664,6 +680,7 @@ mod tests {
             heuristics: None,
             name: None,
             handles: None,
+            diagnostics_severity: None,
         };
 
         assert_eq!(config.language_id, "custom");
@@ -782,6 +799,7 @@ mod tests {
             heuristics: None,
             name: None,
             handles: None,
+            diagnostics_severity: None,
         };
 
         let tmp = TempDir::new().unwrap();
