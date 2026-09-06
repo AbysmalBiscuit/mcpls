@@ -215,6 +215,29 @@ impl NewDiagnosticsResult {
     }
 }
 
+/// Build the `FileEntry` list a `get_new_diagnostics` flush should see from
+/// a diagnostics snapshot.
+///
+/// Excludes any entry whose URI `uri_to_path` can't map to a filesystem
+/// path *before* `flush` ever runs, rather than dropping it from the
+/// payload afterward: `flush` records a hash for every entry it is given,
+/// so a post-hoc drop would still mark the file delivered -- permanently
+/// hiding diagnostics that were in fact never shown to anyone.
+fn routable_entries<'a>(
+    snapshot: &'a [(String, DiagnosticInfo, ServerId)],
+    floors: &FloorTable,
+) -> Vec<FileEntry<'a>> {
+    snapshot
+        .iter()
+        .filter(|(_, info, _)| uri_to_path(&info.uri).is_some())
+        .map(|(key, info, owner)| FileEntry {
+            key,
+            diagnostics: &info.diagnostics,
+            floor: floors.for_server(owner),
+        })
+        .collect()
+}
+
 #[tool_router(router = declared_tool_router)]
 impl McplsServer {
     /// Create a new MCP server with the given translator, notification
@@ -706,14 +729,7 @@ impl McplsServer {
             cache.diagnostics_snapshot()
         };
 
-        let entries: Vec<FileEntry<'_>> = snapshot
-            .iter()
-            .map(|(key, info, owner)| FileEntry {
-                key,
-                diagnostics: &info.diagnostics,
-                floor: self.context.floors.for_server(owner),
-            })
-            .collect();
+        let entries = routable_entries(&snapshot, &self.context.floors);
 
         let report = {
             let mut delivery = self.context.delivery.lock().await;
@@ -1683,6 +1699,47 @@ mod tests {
             tags: None,
             data: None,
         }
+    }
+
+    /// A file whose URI does not resolve to a filesystem path (e.g. a
+    /// virtual document under some other scheme) must never reach `flush`
+    /// at all -- reaching it and being dropped from the payload afterward
+    /// would still record it delivered, permanently hiding diagnostics
+    /// that were in fact never shown.
+    #[test]
+    fn test_routable_entries_excludes_unmappable_uri() {
+        let ok_uri: lsp_types::Uri = "file:///workspace/a.rs".parse().unwrap();
+        let bad_uri: lsp_types::Uri = "http://example.com/not-a-file.rs".parse().unwrap();
+        let snapshot = vec![
+            (
+                "a".to_string(),
+                DiagnosticInfo {
+                    uri: ok_uri,
+                    version: Some(1),
+                    diagnostics: vec![diagnostic_at("ok")],
+                },
+                crate::config::ServerId::from("rust"),
+            ),
+            (
+                "b".to_string(),
+                DiagnosticInfo {
+                    uri: bad_uri,
+                    version: Some(1),
+                    diagnostics: vec![diagnostic_at("unreachable")],
+                },
+                crate::config::ServerId::from("rust"),
+            ),
+        ];
+        let floors = FloorTable::new(&crate::config::DiagnosticsConfig::default(), &[]);
+
+        let entries = routable_entries(&snapshot, &floors);
+
+        assert_eq!(
+            entries.len(),
+            1,
+            "the unmappable-URI file must be excluded before flush ever sees it"
+        );
+        assert_eq!(entries[0].key, "a");
     }
 
     /// Before a baseline exists, `get_new_diagnostics` must not call
