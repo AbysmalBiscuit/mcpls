@@ -340,6 +340,41 @@ fn test_e2e_multiple_requests() -> Result<()> {
     Ok(())
 }
 
+/// `get_new_diagnostics` in protocol-only mode (every built-in LSP server
+/// disabled, per the default e2e config) must answer normally instead of
+/// advising a retry.
+///
+/// With no server ever spawned, nothing ever settles, so nothing would
+/// otherwise adopt a diagnostics baseline -- `has_baseline()` would stay
+/// false for the process's whole life. There is genuinely nothing starting
+/// up and nothing to report, so the response must carry no `note` and empty
+/// `changed`/`cleared`, not the "still starting up" shape repeated forever.
+#[test]
+#[ignore = "Requires mcpls binary built"]
+fn test_e2e_new_diagnostics_in_protocol_only_mode() -> Result<()> {
+    let mut client = McpClient::spawn()?;
+    client.initialize()?;
+
+    let response = client.call_tool("get_new_diagnostics", &json!({}))?;
+    let is_error = response["result"]["isError"].as_bool().unwrap_or(false);
+    assert!(!is_error, "call should succeed, got {response}");
+
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected text content, got {response}"));
+    let payload: serde_json::Value = serde_json::from_str(text)?;
+
+    assert!(
+        payload.get("note").is_none(),
+        "protocol-only mode has nothing starting up and nothing to report, so there is no \
+         retry to advise; got {payload}"
+    );
+    assert_eq!(payload["changed"].as_array().map(Vec::len), Some(0));
+    assert_eq!(payload["cleared"].as_array().map(Vec::len), Some(0));
+
+    Ok(())
+}
+
 /// Test that mcpls exits promptly on `SIGTERM` while the client's stdin
 /// write end is still open (regression test for #308).
 ///

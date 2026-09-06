@@ -730,6 +730,12 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
 
     let lsp_init_handle = if applicable_configs.is_empty() {
         warn!("No applicable LSP servers configured — starting in protocol-only mode");
+        // No server will ever be spawned, so `baseline_task` never runs and
+        // `has_baseline()` would stay false for the process's whole life.
+        // Adopt an empty baseline now: there is nothing starting up and
+        // nothing to report, so `get_new_diagnostics` should say exactly
+        // that instead of advising a retry that could never succeed.
+        delivery.lock().await.set_baseline(HashMap::new());
         None
     } else {
         info!(
