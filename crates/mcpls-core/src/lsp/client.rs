@@ -771,7 +771,8 @@ impl LspClient {
             | "workspace/semanticTokens/refresh"
             | "workspace/inlayHint/refresh"
             | "workspace/codeLens/refresh"
-            | "window/showMessageRequest" => Ok(Value::Null),
+            | "window/showMessageRequest"
+            | "window/workDoneProgress/create" => Ok(Value::Null),
             "workspace/configuration" => Ok(Self::workspace_configuration_result(params)),
             _ => Err(JsonRpcError {
                 code: -32601,
@@ -905,6 +906,22 @@ mod tests {
         let response = LspClient::server_request_response(request, None).await;
 
         assert_eq!(response.id, RequestId::String("ts1".to_string()));
+        assert_eq!(response.result, Some(Value::Null));
+        assert!(response.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_work_done_progress_create_request_is_acknowledged() {
+        let request = JsonRpcRequest {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id: RequestId::String("wdp1".to_string()),
+            method: "window/workDoneProgress/create".to_string(),
+            params: Some(serde_json::json!({ "token": "1" })),
+        };
+
+        let response = LspClient::server_request_response(request, None).await;
+
+        assert_eq!(response.id, RequestId::String("wdp1".to_string()));
         assert_eq!(response.result, Some(Value::Null));
         assert!(response.error.is_none());
     }

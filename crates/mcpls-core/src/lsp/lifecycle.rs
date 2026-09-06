@@ -13,7 +13,8 @@ use std::process::Stdio;
 
 use lsp_types::{
     ClientCapabilities, ClientInfo, GeneralClientCapabilities, InitializeParams, InitializeResult,
-    InitializedParams, PositionEncodingKind, ServerCapabilities, WorkspaceFolder,
+    InitializedParams, PositionEncodingKind, ServerCapabilities, WindowClientCapabilities,
+    WorkspaceFolder,
 };
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -727,6 +728,13 @@ fn build_client_capabilities(
             }),
             ..Default::default()
         }),
+        // Without this, servers must not send `$/progress` at all, which is
+        // how a server that never reports work leaves `ServerSettle` waiting
+        // on its deadline instead of a quiet debounce.
+        window: Some(WindowClientCapabilities {
+            work_done_progress: Some(true),
+            ..Default::default()
+        }),
         ..Default::default()
     }
 }
@@ -941,6 +949,17 @@ mod tests {
             Some(true),
             "advertising this without sending the notification blinds gopls and tsgo"
         );
+    }
+
+    /// A server gates server-initiated `$/progress` on this capability, so
+    /// omitting it is why `ServerSettle`'s debounce could never fire and
+    /// only its deadline ever landed a baseline.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_client_capabilities_claim_work_done_progress() {
+        let caps = build_client_capabilities(vec![], true);
+        let window = caps.window.expect("window capabilities are declared");
+        assert_eq!(window.work_done_progress, Some(true));
     }
 
     #[test]
