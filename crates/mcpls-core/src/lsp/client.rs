@@ -58,8 +58,10 @@ pub const CONTENT_MODIFIED_RETRY_METHODS: &[&str] = &[
 
 /// Byte-length threshold for truncating an LSP error message before logging it.
 ///
-/// Kept short since this feeds a single `tracing::error!` log line, not the
-/// MCP caller -- see `MAX_ERROR_MESSAGE_CALLER_BYTES` for that budget.
+/// Kept short since this feeds a single log line in [`LspClient::request`]
+/// -- `warn!` while a transient error is being retried, `error!` once it is
+/// actually surfaced to the caller -- not the MCP caller itself; see
+/// `MAX_ERROR_MESSAGE_CALLER_BYTES` for that budget.
 const MAX_ERROR_MESSAGE_LOG_BYTES: usize = 200;
 
 /// Byte-length threshold for the LSP error message forwarded to the MCP
@@ -383,6 +385,9 @@ impl LspClient {
     /// starting at 500 ms. Both codes share the same attempt budget: a
     /// request that hits -32801 then -32802 does not get 8 attempts, only 4.
     ///
+    /// Log retries at warning level and final failures at error level. The
+    /// message loop cannot decide severity before the retry policy runs.
+    ///
     /// # Type Parameters
     ///
     /// * `P` - The type of the request parameters (must be serializable)
@@ -457,25 +462,53 @@ impl LspClient {
                 }
                 Err(Error::LspServerError {
                     code,
-                    ref message,
-                    ref data,
+                    message,
+                    data,
                 }) if (code == SERVER_CANCELLED_CODE
                     || (code == CONTENT_MODIFIED_CODE
                         && CONTENT_MODIFIED_RETRY_METHODS.contains(&method)))
                     && Self::should_retrigger(data.as_ref()) =>
                 {
                     if attempt == SERVER_CANCELLED_MAX_RETRIES {
+                        error!(
+                            "LSP error response: {} (code {}) on '{}' (id={:?}), retries exhausted",
+                            Self::truncate_error_message_for_log(&message),
+                            code,
+                            method,
+                            id
+                        );
                         return Err(Error::LspServerError {
                             code,
-                            message: message.clone(),
-                            data: data.clone(),
+                            message,
+                            data,
                         });
                     }
                     warn!(
-                        "LSP error ({}) on '{}', will retry: {}",
-                        code, method, message
+                        "LSP error response: {} (code {}) on '{}' (id={:?}), will retry",
+                        Self::truncate_error_message_for_log(&message),
+                        code,
+                        method,
+                        id
                     );
                     // continue loop for next attempt
+                }
+                Err(Error::LspServerError {
+                    code,
+                    message,
+                    data,
+                }) => {
+                    error!(
+                        "LSP error response: {} (code {}) on '{}' (id={:?})",
+                        Self::truncate_error_message_for_log(&message),
+                        code,
+                        method,
+                        id
+                    );
+                    return Err(Error::LspServerError {
+                        code,
+                        message,
+                        data,
+                    });
                 }
                 Err(e) => return Err(e),
             }
@@ -672,8 +705,11 @@ impl LspClient {
 
                             if let Some(sender) = sender {
                                 if let Some(error) = response.error {
-                                    let log_message = Self::truncate_error_message_for_log(&error.message);
-                                    error!("LSP error response: {} (code {})", log_message, error.code);
+                                    trace!(
+                                        "LSP error response: {} (code {})",
+                                        Self::truncate_error_message_for_log(&error.message),
+                                        error.code
+                                    );
                                     // Truncated separately from the log line, to the larger
                                     // MAX_ERROR_MESSAGE_CALLER_BYTES -- the raw message is
                                     // unbounded and attacker-influenceable (#313), but a
@@ -1783,7 +1819,7 @@ mod tests {
             )
         }
 
-        use crate::test_support::{assert_no_frame_within, read_framed_message};
+        use crate::test_support::{CapturedLogs, assert_no_frame_within, read_framed_message};
 
         /// Writes a framed JSON-RPC retryable error response — either
         /// `ServerCancelled` (-32802) or `ContentModified` (-32801) — with a
@@ -1849,7 +1885,12 @@ mod tests {
         // virtual time does not reliably auto-advance across both.
         #[tokio::test]
         async fn test_retry_exhaustion_returns_original_server_cancelled_error() {
+            use tracing_subscriber::layer::SubscriberExt as _;
+
             let (client, mut server) = fake_lsp_client();
+            let captured = CapturedLogs::default();
+            let subscriber = tracing_subscriber::registry().with(captured.clone());
+            let guard = tracing::subscriber::set_default(subscriber);
 
             let request_task = tokio::spawn(async move {
                 client
@@ -1895,6 +1936,33 @@ mod tests {
                 }
                 other => panic!("expected exhausted ServerCancelled error, got {other:?}"),
             }
+
+            drop(guard);
+            let logs = captured.entries();
+            assert_eq!(
+                logs.iter()
+                    .filter(|(level, _)| *level == tracing::Level::ERROR)
+                    .count(),
+                1,
+                "exactly the final exhausted attempt must log at ERROR, got: {logs:?}"
+            );
+            assert!(
+                logs.iter()
+                    .any(|(level, msg)| *level == tracing::Level::ERROR
+                        && msg.contains("LSP error response")
+                        && msg.contains("retries exhausted")),
+                "expected an ERROR log sharing the 'LSP error response' prefix and naming \
+                 retry exhaustion, got: {logs:?}"
+            );
+            assert_eq!(
+                logs.iter()
+                    .filter(
+                        |(level, msg)| *level == tracing::Level::WARN && msg.contains("will retry")
+                    )
+                    .count(),
+                usize::try_from(SERVER_CANCELLED_MAX_RETRIES).unwrap(),
+                "every attempt before the last must log a WARN 'will retry' line, got: {logs:?}"
+            );
         }
 
         #[tokio::test]
@@ -2192,6 +2260,110 @@ mod tests {
                 "no retry should have been sent for a non-allowlisted method",
             )
             .await;
+        }
+
+        #[tokio::test]
+        async fn test_retried_error_that_recovers_does_not_log_error_level() {
+            use tracing_subscriber::layer::SubscriberExt as _;
+
+            let (client, mut server) = fake_lsp_client();
+            let captured = CapturedLogs::default();
+            let subscriber = tracing_subscriber::registry().with(captured.clone());
+            let guard = tracing::subscriber::set_default(subscriber);
+
+            let request_task = tokio::spawn(async move {
+                client
+                    .request::<_, Value>(
+                        "textDocument/hover",
+                        serde_json::json!({}),
+                        Duration::from_secs(30),
+                    )
+                    .await
+            });
+
+            let mut reader = BufReader::new(&mut server.write_stdout);
+
+            let first = read_framed_message(&mut reader).await;
+            write_retryable_error_response(
+                &mut server.read_half_stdin,
+                &first["id"].clone(),
+                SERVER_CANCELLED_CODE,
+                "server cancelled the request",
+                true,
+            )
+            .await;
+
+            let second = read_framed_message(&mut reader).await;
+            write_success_response(
+                &mut server.read_half_stdin,
+                &second["id"].clone(),
+                serde_json::json!({ "contents": "resolved on retry" }),
+            )
+            .await;
+
+            let result = request_task.await.unwrap();
+            assert!(result.is_ok(), "expected retry to recover, got {result:?}");
+
+            drop(guard);
+            let logs = captured.entries();
+            assert!(
+                !logs
+                    .iter()
+                    .any(|(level, _)| *level == tracing::Level::ERROR),
+                "a retried-and-recovered error must not log at ERROR, got: {logs:?}"
+            );
+            assert!(
+                logs.iter().any(
+                    |(level, msg)| *level == tracing::Level::WARN && msg.contains("will retry")
+                ),
+                "expected a WARN 'will retry' log line, got: {logs:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_non_retryable_error_logs_error_level() {
+            use tracing_subscriber::layer::SubscriberExt as _;
+
+            let (client, mut server) = fake_lsp_client();
+            let captured = CapturedLogs::default();
+            let subscriber = tracing_subscriber::registry().with(captured.clone());
+            let guard = tracing::subscriber::set_default(subscriber);
+
+            let request_task = tokio::spawn(async move {
+                client
+                    .request::<_, Value>(
+                        "textDocument/rename",
+                        serde_json::json!({}),
+                        Duration::from_secs(30),
+                    )
+                    .await
+            });
+
+            let mut reader = BufReader::new(&mut server.write_stdout);
+            let request = read_framed_message(&mut reader).await;
+            let id = request["id"].clone();
+            write_retryable_error_response(
+                &mut server.read_half_stdin,
+                &id,
+                CONTENT_MODIFIED_CODE,
+                "content modified",
+                true,
+            )
+            .await;
+
+            let result = request_task.await.unwrap();
+            assert!(result.is_err(), "expected a non-retryable error");
+
+            drop(guard);
+            let logs = captured.entries();
+            assert!(
+                logs.iter()
+                    .any(|(level, msg)| *level == tracing::Level::ERROR
+                        && msg.contains("LSP error response")
+                        && msg.contains("content modified")),
+                "a non-retryable error must still surface an ERROR log sharing the \
+                 'LSP error response' prefix, got: {logs:?}"
+            );
         }
 
         /// #313: an oversized, server-controlled error message must be
