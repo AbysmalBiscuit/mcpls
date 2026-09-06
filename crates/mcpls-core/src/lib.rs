@@ -200,13 +200,12 @@ pub(crate) async fn diagnostics_pump(
                         }
                         if let Some(version) = p.version
                             && let Some(path) = bridge::uri_to_path(&p.uri)
-                            && let Some(state) = document_tracker.get(&path)
-                            && state.version() > version
+                            && let Some(tracked_version) = document_tracker.version_of(&path)
+                            && tracked_version > version
                         {
                             debug!(
-                                "dropping diagnostics for {} at version {version}, tracker holds {}",
-                                p.uri.as_str(),
-                                state.version()
+                                "dropping diagnostics for {} at version {version}, tracker holds {tracked_version}",
+                                p.uri.as_str()
                             );
                             continue;
                         }

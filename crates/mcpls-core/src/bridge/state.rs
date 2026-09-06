@@ -322,6 +322,19 @@ impl DocumentTracker {
         lock_std(&self.documents).get(path).cloned()
     }
 
+    /// Current tracked version of `path`, or `None` if it is not open.
+    ///
+    /// A caller that only needs the version (e.g. a per-notification
+    /// staleness check on a hot path) should use this instead of
+    /// [`Self::get`], which clones the document's full in-memory text along
+    /// with everything else in [`DocumentState`].
+    #[must_use]
+    pub fn version_of(&self, path: &Path) -> Option<i32> {
+        lock_std(&self.documents)
+            .get(path)
+            .map(DocumentState::version)
+    }
+
     /// Text of the 0-based `line`'th line of `path`'s currently tracked
     /// content, or `None` if the document is not open or has no such line.
     ///
@@ -1059,6 +1072,24 @@ mod tests {
         tracker.close(&path);
         assert!(!tracker.is_open(&path));
         assert!(tracker.is_empty());
+    }
+
+    #[test]
+    fn test_version_of_agrees_with_get_and_is_none_when_untracked() {
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let path = PathBuf::from("/test/file.rs");
+
+        assert_eq!(tracker.version_of(&path), None);
+
+        tracker
+            .open(path.clone(), "fn main() {}".to_string())
+            .unwrap();
+        tracker.update(&path, "fn main() { edited() }".to_string());
+
+        assert_eq!(
+            tracker.version_of(&path),
+            Some(tracker.get(&path).unwrap().version())
+        );
     }
 
     /// #249: after a respawn, `forget_server` must clear only the respawned
