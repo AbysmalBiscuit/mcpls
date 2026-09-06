@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Return structured output and advertise output schemas for definitions, references, diagnostics, and document symbols while retaining JSON text responses. ([bug-ops/mcpls#397](https://github.com/bug-ops/mcpls/pull/397))
+
 - Advertise hierarchical document symbols and supported symbol kinds so Pyrefly returns document symbols. ([bug-ops/mcpls#78](https://github.com/bug-ops/mcpls/pull/78))
 
 - **`[diagnostics]` config table and per-server `diagnostics_severity`** — new `severity` (default `warning`), `max_per_file` (default `10`), `max_total` (default `50`), `settle_quiet_ms` (default `1000`), and `settle_deadline_ms` (default `300000`) fields set the severity floor and volume caps applied when diagnostics are delivered. Any `[[lsp_servers]]` entry can set its own `diagnostics_severity` to override `diagnostics.severity` for that one server; `"off"` mutes diagnostics for a server without disabling it. New `SeverityFloor` enum and its `admits(Option<lsp_types::DiagnosticSeverity>)` method decide whether a diagnostic clears a floor — a diagnostic with no severity clears every floor but `off`, since the LSP field is optional and a server omitting it is not thereby saying the diagnostic does not matter. Nothing reads this configuration yet. See `docs/user-guide/configuration.md#diagnostics-section`.

@@ -1,10 +1,11 @@
 //! Public MCP-facing result/data-transfer types returned by the tool-call
 //! handlers in the sibling domain modules.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Position in a document (1-based for MCP).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Position2D {
     /// Line number (1-based).
     pub line: u32,
@@ -13,7 +14,7 @@ pub struct Position2D {
 }
 
 /// Range in a document (1-based for MCP).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Range {
     /// Start position.
     pub start: Position2D,
@@ -22,7 +23,7 @@ pub struct Range {
 }
 
 /// Location in a document.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Location {
     /// URI of the document.
     pub uri: String,
@@ -40,21 +41,21 @@ pub struct HoverResult {
 }
 
 /// Result of a definition request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DefinitionResult {
     /// Locations of the definition.
     pub locations: Vec<Location>,
 }
 
 /// Result of a references request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ReferencesResult {
     /// Locations of all references.
     pub locations: Vec<Location>,
 }
 
 /// Diagnostic severity.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum DiagnosticSeverity {
     /// Error diagnostic.
@@ -68,7 +69,7 @@ pub enum DiagnosticSeverity {
 }
 
 /// A single diagnostic.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Diagnostic {
     /// Range where the diagnostic applies.
     pub range: Range,
@@ -86,7 +87,7 @@ pub struct Diagnostic {
 }
 
 /// Result of a diagnostics request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DiagnosticsResult {
     /// List of diagnostics for the document.
     pub diagnostics: Vec<Diagnostic>,
@@ -148,7 +149,7 @@ pub struct CompletionsResult {
 }
 
 /// A document symbol.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Symbol {
     /// Name of the symbol.
     pub name: String,
@@ -164,7 +165,7 @@ pub struct Symbol {
 }
 
 /// Result of a document symbols request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DocumentSymbolsResult {
     /// List of symbols in the document.
     pub symbols: Vec<Symbol>,
