@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use lsp_types::Uri;
 use rmcp::handler::server::router::tool::ToolRouter;
-use rmcp::handler::server::wrapper::Parameters;
+use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{
     Implementation, ListResourcesResult, ListToolsResult, ReadResourceRequestParams,
     ReadResourceResponse, ReadResourceResult, Resource, ResourceContents,
@@ -19,6 +19,8 @@ use rmcp::model::{
     ToolAnnotations, UnsubscribeRequestParams,
 };
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
+use schemars::JsonSchema;
+use serde::Serialize;
 use tokio::sync::Mutex;
 
 use super::handlers::BridgeContext;
@@ -30,8 +32,9 @@ use super::tools::{
 };
 use crate::bridge::resources::{make_uri, parse_uri};
 use crate::bridge::{
-    Diagnostic, DiagnosticInfo, DiagnosticSeverity, DiagnosticsDelivery, FileEntry, FloorTable,
-    FlushReport, NotificationCache, PositionEncoding, ResourceSubscriptions, ServerSettle,
+    DefinitionResult, Diagnostic, DiagnosticInfo, DiagnosticSeverity, DiagnosticsDelivery,
+    DiagnosticsResult, DocumentSymbolsResult, FileEntry, FloorTable, FlushReport,
+    NotificationCache, PositionEncoding, ReferencesResult, ResourceSubscriptions, ServerSettle,
     SessionId, Translator, uri_to_path, validate_path_against_roots,
 };
 use crate::config::{DiagnosticsConfig, ServerId, ToolKind};
@@ -82,6 +85,15 @@ fn to_tool_result<T: serde::Serialize>(
     match result {
         Ok(value) => serde_json::to_string(&value)
             .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
+        Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+    }
+}
+
+fn to_structured_tool_result<T: Serialize + JsonSchema>(
+    result: crate::error::Result<T>,
+) -> Result<Json<T>, McpError> {
+    match result {
+        Ok(value) => Ok(Json(value)),
         Err(e) => Err(McpError::internal_error(e.to_string(), None)),
     }
 }
@@ -644,8 +656,8 @@ impl McplsServer {
             line,
             character,
         }): Parameters<PositionParams>,
-    ) -> Result<String, McpError> {
-        to_tool_result(
+    ) -> Result<Json<DefinitionResult>, McpError> {
+        to_structured_tool_result(
             self.context
                 .translator
                 .handle_definition(file_path, line, character)
@@ -669,8 +681,8 @@ impl McplsServer {
                 },
             include_declaration,
         }): Parameters<ReferencesParams>,
-    ) -> Result<String, McpError> {
-        to_tool_result(
+    ) -> Result<Json<ReferencesResult>, McpError> {
+        to_structured_tool_result(
             self.context
                 .translator
                 .handle_references(file_path, line, character, include_declaration)
@@ -686,11 +698,11 @@ impl McplsServer {
     async fn get_diagnostics(
         &self,
         Parameters(DiagnosticsParams { file_path }): Parameters<DiagnosticsParams>,
-    ) -> Result<String, McpError> {
+    ) -> Result<Json<DiagnosticsResult>, McpError> {
         // Merging push-model (flycheck/clippy) diagnostics into the pull
         // result, including the pull-error-but-cache-has-data fallback, is
         // handled inside handle_diagnostics itself -- see its doc comment.
-        to_tool_result(
+        to_structured_tool_result(
             self.context
                 .translator
                 .handle_diagnostics(file_path, &self.context.notification_cache)
@@ -774,8 +786,8 @@ impl McplsServer {
     async fn get_document_symbols(
         &self,
         Parameters(DocumentSymbolsParams { file_path }): Parameters<DocumentSymbolsParams>,
-    ) -> Result<String, McpError> {
-        to_tool_result(
+    ) -> Result<Json<DocumentSymbolsResult>, McpError> {
+        to_structured_tool_result(
             self.context
                 .translator
                 .handle_document_symbols(file_path)
@@ -2912,6 +2924,141 @@ mod tests {
         assert!(result.is_err());
     }
 
+    async fn mcp_test_request(
+        wire: &mut tokio::io::BufStream<tokio::io::DuplexStream>,
+        request: serde_json::Value,
+    ) -> serde_json::Value {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+
+        let id = request["id"].clone();
+        wire.write_all(format!("{request}\n").as_bytes())
+            .await
+            .unwrap();
+        wire.flush().await.unwrap();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert_ne!(wire.read_line(&mut line).await.unwrap(), 0);
+            let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if response["id"] == id {
+                return response;
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn test_diagnostics_structured_output_preserves_source() {
+        use rmcp::ServiceExt as _;
+        use tokio::io::{AsyncWriteExt as _, BufReader, BufStream};
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("main.rs");
+            std::fs::write(&path, "fn main() {}\n").unwrap();
+            let (translator, mut lsp) = translator_with_capabilities(
+                &dir,
+                &ServerId::from("rust"),
+                lsp_types::ServerCapabilities::default(),
+            );
+            let (delivery, floors) = default_delivery_and_floors();
+            let server = McplsServer::new(
+                Arc::new(translator),
+                Arc::new(Mutex::new(NotificationCache::new())),
+                Arc::from(vec![dir.path().to_path_buf()]),
+                Arc::new(ResourceSubscriptions::new()),
+                false,
+                delivery,
+                floors,
+                DiagnosticsConfig::default(),
+                test_settle(),
+            );
+            let (server_io, client_io) = tokio::io::duplex(65_536);
+            let started = tokio::spawn(async move { server.serve(server_io).await.unwrap() });
+            let mut wire = BufStream::new(client_io);
+            let initialized = mcp_test_request(
+                &mut wire,
+                json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25", "capabilities": {},
+                        "clientInfo": {"name": "structured-output-test", "version": "1"}
+                    }
+                }),
+            )
+            .await;
+            assert!(initialized["result"].is_object(), "{initialized}");
+            wire.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+                .await
+                .unwrap();
+            wire.flush().await.unwrap();
+            let running = started.await.unwrap();
+
+            let call = mcp_test_request(
+                &mut wire,
+                json!({
+                    "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": {"name": "get_diagnostics", "arguments": {"file_path": path}}
+                }),
+            );
+            let respond = async {
+                let request = read_framed_reply(&mut BufReader::new(&mut lsp.write_stdout)).await;
+                assert_eq!(request["method"], "textDocument/diagnostic");
+                write_response(
+                    &mut lsp.read_half_stdin,
+                    &request["id"],
+                    json!({
+                        "kind": "full",
+                        "items": [{
+                            "range": {
+                                "start": {"line": 0, "character": 0},
+                                "end": {"line": 0, "character": 1}
+                            },
+                            "severity": 1, "code": "E0428", "source": "rustc",
+                            "message": "duplicate definition"
+                        }]
+                    }),
+                )
+                .await;
+            };
+            let (response, ()) = tokio::join!(call, respond);
+            assert!(response["error"].is_null(), "{response}");
+            assert_eq!(response["result"]["isError"], false, "{response}");
+            let text: serde_json::Value =
+                serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                    .unwrap();
+            let expected = json!({"diagnostics": [{
+                "range": {
+                    "start": {"line": 1, "character": 1},
+                    "end": {"line": 1, "character": 2}
+                },
+                "severity": "error", "code": "E0428", "source": "rustc",
+                "message": "duplicate definition"
+            }]});
+            assert_eq!(text, expected);
+            assert_eq!(response["result"]["structuredContent"], text);
+
+            let listed = mcp_test_request(
+                &mut wire,
+                json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}),
+            )
+            .await;
+            let diagnostics = listed["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == "get_diagnostics")
+                .unwrap();
+            assert_eq!(
+                diagnostics["outputSchema"]["$defs"]["Diagnostic"]["properties"]["source"]["type"],
+                json!(["string", "null"])
+            );
+            running.cancel().await.unwrap();
+        })
+        .await
+        .expect("MCP diagnostic call should finish within five seconds");
+    }
+
     #[tokio::test]
     async fn test_rename_tool_with_params() {
         let server = create_test_server();
@@ -4313,5 +4460,26 @@ mod tests {
             "client-visible tool surface changed -- update tool_surface.json only if the \
              change is intentional"
         );
+    }
+    #[test]
+    fn test_output_schema_present_only_for_structured_tools() {
+        const STRUCTURED_TOOLS: &[&str] = &[
+            "get_diagnostics",
+            "get_definition",
+            "get_references",
+            "get_document_symbols",
+        ];
+
+        let tools = McplsServer::tool_router().list_all();
+        assert!(!tools.is_empty(), "no tools registered");
+        for tool in &tools {
+            let expects_schema = STRUCTURED_TOOLS.contains(&tool.name.as_ref());
+            assert_eq!(
+                tool.output_schema.is_some(),
+                expects_schema,
+                "tool `{}`: expected output_schema.is_some() == {expects_schema}",
+                tool.name
+            );
+        }
     }
 }
