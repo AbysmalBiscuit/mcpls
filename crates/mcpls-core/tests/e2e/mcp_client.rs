@@ -7,10 +7,14 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
+
+/// How long `call_tool` retries an LSP `-32801` ("content modified")
+/// response before giving up.
+const CONTENT_MODIFIED_RETRY_BUDGET: Duration = Duration::from_secs(20);
 
 /// Simulates an MCP client (like Claude Code) for E2E testing.
 ///
@@ -260,17 +264,30 @@ impl McpClient {
     /// - The tool does not exist
     /// - The parameters are invalid
     pub fn call_tool(&mut self, name: &str, arguments: &Value) -> Result<Value> {
-        let request = json!({
-            "jsonrpc": "2.0",
-            "id": self.next_id(),
-            "method": "tools/call",
-            "params": {
-                "name": name,
-                "arguments": arguments
-            }
-        });
+        let retry_deadline = Instant::now() + CONTENT_MODIFIED_RETRY_BUDGET;
+        loop {
+            let request = json!({
+                "jsonrpc": "2.0",
+                "id": self.next_id(),
+                "method": "tools/call",
+                "params": {
+                    "name": name,
+                    "arguments": arguments
+                }
+            });
 
-        self.send_request(&request)
+            match self.send_request(&request) {
+                Ok(response) => return Ok(response),
+                // rust-analyzer (and other servers) answer -32801 when a
+                // concurrent re-analysis invalidated the snapshot a request
+                // was made against; the LSP spec's documented response is to
+                // retry, not to treat it as a real failure.
+                Err(e) if e.to_string().contains("-32801") && Instant::now() < retry_deadline => {
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// List MCP resources (`resources/list`).
