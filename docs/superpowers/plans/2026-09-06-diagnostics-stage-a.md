@@ -4,7 +4,7 @@
 
 **Goal:** Make configuration entries merge onto the built-in servers, then build the per-session diagnostics deduplication core and the tool that drains it.
 
-**Architecture:** Config entries become partial records folded onto the built-in server list by routing identity, which is what makes a per-server severity floor reachable. A new `bridge::delivery` module holds one record per session mapping each file to a hash of its diagnostics, so a flush returns only what changed. The diagnostics pump gains a document-tracker handle to drop publishes describing text that is already gone, and a settle signal so the baseline is taken when servers go quiet rather than on first sight.
+**Architecture:** Config entries become partial records folded onto the built-in server list by routing identity, which is what makes a per-server severity floor reachable. A new `bridge::delivery` module holds one record per session mapping each file to a hash of its diagnostics, so a flush returns only what changed. The diagnostics pump gains a document-tracker handle to drop publishes describing text that is already gone, and a background task takes the baseline once the language servers have been quiet long enough to mean it.
 
 **Tech Stack:** Rust 2024 edition, MSRV 1.88, tokio, rmcp 3.1.4, serde/toml, clippy pedantic + nursery.
 
@@ -13,9 +13,9 @@
 ## Global Constraints
 
 - Rust edition 2024, MSRV 1.88. `cargo fmt` clean and `cargo clippy --workspace --all-targets -- -D warnings` clean before every commit.
-- `unwrap_used` and `expect_used` are warn-level in this crate. Production code uses neither. Test code that needs one carries `#[allow(clippy::unwrap_used)]` or `#[allow(clippy::expect_used)]` on the test module or the individual test, matching the surrounding file.
+- `unwrap_used` and `expect_used` are warn-level in this crate. Production code uses neither. Test code that needs one carries `#[allow(clippy::unwrap_used)]` or `#[allow(clippy::expect_used)]` on the test module or the individual test, matching the surrounding file. Note that these are two separate lints: a module allowing `unwrap_used` still fails on `expect` and `expect_err`.
 - `missing_docs` is warn-level. Every public item gets a doc comment. Every public function returning `Result` gets an `# Errors` section.
-- `too_many_lines` triggers at 100. Split rather than allow.
+- `too_many_lines` triggers at 100 and `too_many_arguments` at 7. Split rather than allow. `spawn_lsp_servers_background` already sits at exactly 7 parameters, so any task adding one to it must collapse instead: task 4 does this.
 - Comments explain a non-obvious *why*, never restate the *what*. No comment mentions this plan, a task number, a PR, or a TDD phase.
 - This is the `AbysmalBiscuit/mcpls` fork. Breaking configuration changes are acceptable and intended. Do not add backward-compatibility shims.
 - Work in the worktree `/home/lev/Git/lev/mcpls-diagnostics` on branch `feat/diagnostics-injection`. Never switch the branch checked out in `/home/lev/Git/lev/mcpls`.
@@ -29,18 +29,19 @@
 |---|---|
 | `crates/mcpls-core/src/config/server.rs` | `LspServerConfig`, the new `PartialLspServerConfig`, the built-in list, and the fold of one onto the other. |
 | `crates/mcpls-core/src/config/mod.rs` | `ServerConfig`, the new `DiagnosticsConfig` and `SeverityFloor`, and the serde wiring that resolves partial entries at load time. |
-| `crates/mcpls-core/src/bridge/delivery.rs` | New. The per-session record, the diagnostic-set hash, the severity floor and volume caps, and the flush. Pure: no locks, no IO, no LSP types beyond what a diagnostic is. |
-| `crates/mcpls-core/src/bridge/settle.rs` | New. Counts outstanding `$/progress` operations per server so the delivery core knows when a workspace has gone quiet. |
-| `crates/mcpls-core/src/lib.rs` | `PumpShared` gains the tracker and settle handles; the pump drops stale publishes and feeds the settle counter. |
-| `crates/mcpls-core/src/mcp/handlers.rs` | `BridgeContext` gains the delivery core. |
+| `crates/mcpls-core/src/bridge/delivery.rs` | New. The per-session record, the diagnostic-set hash, the severity floor and volume caps, and the flush. Pure: no locks, no IO, and no notion of a URI, a path or an encoding. |
+| `crates/mcpls-core/src/bridge/settle.rs` | New. Tracks outstanding `$/progress` operations so the baseline is taken when the servers have gone quiet and stayed quiet. |
+| `crates/mcpls-core/src/bridge/notifications.rs` | `NotificationCache` gains an owner-aware snapshot accessor. |
+| `crates/mcpls-core/src/lib.rs` | `PumpShared` carries everything the background tasks need; the pump drops stale publishes and feeds the settle tracker; a new task takes the baseline. |
+| `crates/mcpls-core/src/mcp/handlers.rs` | `BridgeContext` gains the delivery core and the floor table. |
 | `crates/mcpls-core/src/mcp/server.rs` | The `get_new_diagnostics` tool. |
-| `crates/mcpls-core/src/mcp/tools.rs` | Its parameter struct. |
-| `crates/mcpls-core/tests/ra_e2e.rs` | End-to-end proof against a real rust-analyzer. |
+| `crates/mcpls-core/tests/ra_e2e.rs` | A sub-case proving the tool is wired and deduplicates against a real rust-analyzer. |
 
 ## Deliberate deviations from the spec
 
 - The spec's `[diagnostics]` block shows a `footer` key. This plan does not add it. Nothing in stage A reads it, and an inert configuration key is worse than an absent one. Stage B adds it in the commit that makes it do something.
 - Task 1 also changes what a config file with no `[[lsp_servers]]` block produces. Today that is zero servers (`config/mod.rs:1600-1610`), so a file setting only `[workspace]` spawns nothing at all. After the merge it produces the built-ins. This is a strict improvement and falls out of the same change, so it is not called out separately in the spec.
+- The spec describes the baseline as taken "when the servers go quiet". Measurement against rust-analyzer 1.98.1 shows that the first moment of quiet is not that moment: its startup phases run in sequence with gaps of about 70 to 100 milliseconds between them, and a latch on the first zero-crossing fires around 3.2 seconds in, before indexing and before the first `cargo check`. Quiet therefore has to be sustained, not instantaneous. Task 5 implements it as a debounce with a deadline. The evidence is in the spec's measurement section.
 
 ---
 
@@ -49,7 +50,10 @@
 **Files:**
 - Modify: `crates/mcpls-core/src/config/server.rs`
 - Modify: `crates/mcpls-core/src/config/mod.rs`
-- Test: `crates/mcpls-core/src/config/server.rs` (inline `mod tests`), `crates/mcpls-core/src/config/mod.rs` (inline `mod tests`)
+- Modify: `crates/mcpls-core/tests/integration/basic_tests.rs`
+- Modify: `crates/mcpls-core/tests/fixtures/empty_config.toml`, `crates/mcpls-core/tests/fixtures/configs/two_server_routing.toml`, `crates/mcpls-core/tests/fixtures/configs/mutually_exclusive_heuristics.toml`
+- Modify: `docs/user-guide/configuration.md`, `skills/mcpls/references/configuration.md`, `examples/mcpls.toml`
+- Test: `crates/mcpls-core/src/config/mod.rs` (inline `mod tests`)
 
 **Interfaces:**
 - Consumes: nothing from earlier tasks.
@@ -59,7 +63,11 @@
   - `PartialLspServerConfig::id(&self) -> Option<ServerId>`
   - `pub fn resolve_lsp_servers(partials: Vec<PartialLspServerConfig>) -> Result<Vec<LspServerConfig>>`
 
-Background the implementer needs: `LspServerConfig::id()` (`config/server.rs:269`) returns `name` when set and `language_id` otherwise. It is already the routing key across `Translator`'s maps, and `ToolRouter::from_configs` rejects duplicates. That is the merge key; do not invent another.
+Background the implementer needs:
+
+- `LspServerConfig::id()` (`config/server.rs:269`) returns `name` when set and `language_id` otherwise. It is already the routing key across `Translator`'s maps, and `ToolRouter::from_configs` rejects duplicates that are applicable in the same workspace. That is the merge key; do not invent another.
+- The six built-ins and their ids: `rust`, `python`, `typescript`, `go`, `cpp`, `zig` (`config/server.rs:301-377`).
+- Two entries naming the same id is a **supported configuration**, not a mistake: `tests/fixtures/configs/mutually_exclusive_heuristics.toml` is the #174 §5 regression case, two servers for one language whose `heuristics.project_markers` never both match. So the fold must not collapse them and must not reject them. The rule below is that only the *first* entry claiming an id merges; a later one appends a second server.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -81,8 +89,10 @@ fn test_a_partial_entry_keeps_the_builtin_fields_it_omits() {
         .expect("rust server survives the merge");
     assert_eq!(rust.request_timeout_seconds, 60);
     assert_eq!(rust.command, "rust-analyzer");
-    assert!(
-        config.lsp_servers.len() > 1,
+    assert_eq!(rust.file_patterns, vec!["**/*.rs".to_string()]);
+    assert_eq!(
+        config.lsp_servers.len(),
+        LspServerConfig::builtins().len(),
         "the other built-ins are still there"
     );
 }
@@ -112,7 +122,8 @@ fn test_disabling_a_builtin_removes_it() {
 #[allow(clippy::expect_used)]
 fn test_overriding_the_command_drops_the_builtin_arguments() {
     // pyright's built-in carries `--stdio`, which means nothing to a
-    // different binary.
+    // different binary. The file patterns are not the binary's, so they
+    // survive: that is what distinguishes a merge from a replace here.
     let config: ServerConfig = toml::from_str(
         "[[lsp_servers]]\nlanguage_id = \"python\"\ncommand = \"ty\"\n",
     )
@@ -128,6 +139,11 @@ fn test_overriding_the_command_drops_the_builtin_arguments() {
         python.args.is_empty(),
         "arguments belonged to the replaced binary, got {:?}",
         python.args
+    );
+    assert_eq!(
+        python.file_patterns,
+        vec!["**/*.py".to_string()],
+        "file patterns are the language's, not the binary's, so they are inherited"
     );
 }
 
@@ -149,10 +165,34 @@ fn test_an_explicit_empty_argument_list_is_not_unspecified() {
 }
 
 #[test]
+#[allow(clippy::expect_used)]
+fn test_a_second_entry_for_one_id_adds_a_server_instead_of_overwriting() {
+    // Two servers for one language, distinguished by heuristics, is a
+    // supported configuration. Folding the second onto the first would
+    // silently delete one of them.
+    let config: ServerConfig = toml::from_str(
+        "[[lsp_servers]]\nlanguage_id = \"python\"\ncommand = \"pyright-langserver\"\n\n\
+         [[lsp_servers]]\nlanguage_id = \"python\"\ncommand = \"pylsp\"\n",
+    )
+    .expect("config parses");
+
+    let commands: Vec<&str> = config
+        .lsp_servers
+        .iter()
+        .filter(|s| s.language_id == "python")
+        .map(|s| s.command.as_str())
+        .collect();
+    assert_eq!(commands, vec!["pyright-langserver", "pylsp"]);
+}
+
+#[test]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 fn test_an_entry_matching_no_builtin_needs_a_command() {
     let result: std::result::Result<ServerConfig, _> =
         toml::from_str("[[lsp_servers]]\nlanguage_id = \"elixir\"\n");
-    let message = result.expect_err("an unmatched entry without a command is rejected").to_string();
+    let message = result
+        .expect_err("an unmatched entry without a command is rejected")
+        .to_string();
     assert!(
         message.contains("elixir"),
         "the error names the id it could not find, got: {message}"
@@ -164,7 +204,9 @@ fn test_an_entry_matching_no_builtin_needs_a_command() {
 
 Run: `cargo test --manifest-path /home/lev/Git/lev/mcpls-diagnostics/Cargo.toml -p mcpls-core --lib config::tests 2>&1 | tail -30`
 
-Expected: compile errors on `LspServerConfig::builtins`, plus assertion failures showing one server where the test wants several. If instead a test passes, stop: the behaviour is not what this task assumes.
+Expected: compile errors on `LspServerConfig::builtins`, plus assertion failures showing one server where the test wants several.
+
+`test_overriding_the_command_drops_the_builtin_arguments` and `test_a_second_entry_for_one_id_adds_a_server_instead_of_overwriting` will fail only on their inheritance assertions (`file_patterns`, and the second server's presence), because today's replace semantics already give an entry the command it wrote and an empty `args`. That is the correct RED for them: they fail on the merge, not on the parse.
 
 - [ ] **Step 3: Add the built-in list and the partial record**
 
@@ -194,46 +236,46 @@ Then the partial record, in the same file:
 ///
 /// Every field is optional because an entry modifies a built-in rather than
 /// replacing it: what it omits, it inherits. See [`resolve_lsp_servers`].
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PartialLspServerConfig {
     /// Language identifier. Required unless `name` identifies the entry.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub language_id: Option<String>,
     /// Command to start the LSP server.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub command: Option<String>,
     /// Arguments to pass to the command. An empty list is empty arguments,
     /// not an absent key.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub args: Option<Vec<String>>,
     /// Environment variables for the server process.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub env: Option<HashMap<String, String>>,
     /// File patterns this server handles.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub file_patterns: Option<Vec<String>>,
     /// Server-specific initialization options. Replaces the built-in's
     /// value rather than merging into it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub initialization_options: Option<serde_json::Value>,
     /// Handshake timeout in seconds.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub timeout_seconds: Option<u64>,
     /// Per-request timeout in seconds.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub request_timeout_seconds: Option<u64>,
     /// Spawn heuristics.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub heuristics: Option<ServerHeuristics>,
     /// Routing identity, defaulting to `language_id`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub name: Option<String>,
     /// Tools this server handles.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub handles: Option<Vec<ToolKind>>,
-    /// Set to `false` to drop the built-in this entry names.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Set to `false` to drop the server this entry names.
+    #[serde(default)]
     pub enabled: Option<bool>,
 }
 
@@ -250,9 +292,13 @@ impl PartialLspServerConfig {
 }
 ```
 
+`deny_unknown_fields` means this struct must list every field of `LspServerConfig` or a valid config stops parsing. `from_partial` below is an exhaustive struct literal with no `..`, so the compiler catches a missing one; if it errors on a field not listed here, add it in both places.
+
+Deriving `Deserialize` only, not `Serialize`: nothing serializes a partial entry, and `skip_serializing_if` on a field that is never serialized is noise.
+
 - [ ] **Step 4: Write the fold**
 
-Still in `crates/mcpls-core/src/config/server.rs`:
+Still in `crates/mcpls-core/src/config/server.rs`. Its imports today are `HashMap`, `Path`, `WalkBuilder`, serde and `super::routing::{ServerId, ToolKind}`, so this step also adds `std::collections::HashSet` and `crate::error::{Error, Result}`:
 
 ```rust
 /// Fold configuration entries onto the built-in servers.
@@ -260,12 +306,19 @@ Still in `crates/mcpls-core/src/config/server.rs`:
 /// An entry modifies the built-in sharing its [`LspServerConfig::id`]: what
 /// the entry omits, it inherits. An entry naming no built-in defines a new
 /// server, where nothing can be inherited and `command` is required. An
-/// entry with `enabled = false` removes the server it names.
+/// entry with `enabled = false` removes every server it names.
+///
+/// Only the first entry claiming an id merges. A second entry with the same
+/// id appends another server, because two servers for one language,
+/// separated by their spawn heuristics, is a configuration mcpls supports
+/// (see `ToolRouter::from_configs`, which adjudicates the pair against the
+/// workspace). Folding the second onto the first would delete one of them.
 ///
 /// Overriding `command` drops the built-in's `args`, `env`, and
 /// `initialization_options`, because those belong to the binary being
 /// replaced: pyright's `--stdio` means nothing to a different program, and
-/// inheriting it fails at spawn time rather than at load time.
+/// inheriting it fails at spawn time rather than at load time. The file
+/// patterns describe the language rather than the binary, so they survive.
 ///
 /// # Errors
 ///
@@ -275,6 +328,7 @@ pub fn resolve_lsp_servers(
     partials: Vec<PartialLspServerConfig>,
 ) -> Result<Vec<LspServerConfig>> {
     let mut resolved = LspServerConfig::builtins();
+    let mut claimed: HashSet<ServerId> = HashSet::new();
 
     for partial in partials {
         let id = partial.id().ok_or_else(|| {
@@ -283,14 +337,17 @@ pub fn resolve_lsp_servers(
             )
         })?;
 
-        let existing = resolved.iter().position(|server| server.id() == id);
-
         if partial.enabled == Some(false) {
-            if let Some(index) = existing {
-                resolved.remove(index);
-            }
+            resolved.retain(|server| server.id() != id);
             continue;
         }
+
+        let existing = if claimed.contains(&id) {
+            None
+        } else {
+            resolved.iter().position(|server| server.id() == id)
+        };
+        claimed.insert(id.clone());
 
         match existing {
             Some(index) => resolved[index].merge(partial),
@@ -347,7 +404,7 @@ impl LspServerConfig {
     fn from_partial(id: &ServerId, partial: PartialLspServerConfig) -> Result<Self> {
         let command = partial.command.ok_or_else(|| {
             Error::InvalidConfig(format!(
-                "[[lsp_servers]] entry '{id}' matches no built-in server, so it needs a command"
+                "[[lsp_servers]] entry '{id}' inherits from no built-in server, so it needs a command"
             ))
         })?;
         let language_id = partial.language_id.unwrap_or_else(|| id.to_string());
@@ -383,11 +440,15 @@ In `crates/mcpls-core/src/config/mod.rs`, change the `lsp_servers` field of `Ser
     pub lsp_servers: Vec<LspServerConfig>,
 ```
 
-and add, at module level in the same file:
+`default` and `deserialize_with` coexist on one field: `default` supplies the value when the key is absent, `deserialize_with` runs when it is present.
+
+Add, at module level in the same file:
 
 ```rust
 /// Deserialize `[[lsp_servers]]` entries and fold them onto the built-ins.
-fn deserialize_lsp_servers<'de, D>(deserializer: D) -> std::result::Result<Vec<LspServerConfig>, D::Error>
+fn deserialize_lsp_servers<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<LspServerConfig>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -400,13 +461,76 @@ Export `PartialLspServerConfig` and `resolve_lsp_servers` from `config/mod.rs`'s
 
 Leave `ServerConfig::default()`'s explicit list in place but have it call `LspServerConfig::builtins()` so the two cannot drift.
 
-- [ ] **Step 6: Fix the tests this breaks**
+- [ ] **Step 6: Fix the tests and fixtures this breaks**
 
-`test_load_from_valid_toml` (`config/mod.rs:975`) asserts `config.lsp_servers.len() == 1` and `test_empty_config_file` asserts the list is empty. Both pinned the replace semantics this task removes. Rewrite them to assert the merged shape: the first now expects the rust entry's `timeout_seconds` to be 30 with every other built-in still present, the second expects `LspServerConfig::builtins().len()`.
+This is the widest step in the plan. Work through it in order and run the suite at the end rather than after each file.
+
+**Unit tests in `crates/mcpls-core/src/config/mod.rs`:**
+
+- `test_load_from_valid_toml` (around `:975`) asserts `lsp_servers.len() == 1`. Rewrite: find the rust server by `language_id` and assert its `timeout_seconds`, then assert the total is `LspServerConfig::builtins().len()`.
+- `test_load_multiple_servers` (around `:1577`) asserts len 2 and indexes positionally. Rewrite to look each server up by `language_id`, then assert the total.
+- `test_empty_config_file` (around `:1600`) asserts the list is empty. It now expects `LspServerConfig::builtins().len()`.
+- `test_load_with_trust_loads_trusted_project_local_config` (around `:2015`) asserts len 1. Same rewrite as the first.
+
+**Integration tests in `crates/mcpls-core/tests/integration/basic_tests.rs`:**
+
+- `:26` asserts len 1 for `minimal.toml`. Rewrite to find the rust server and assert the total is `LspServerConfig::builtins().len()`.
+- `:39` asserts len 3 for `multi_language.toml` and indexes `[0] [1] [2]`. Rewrite to look up `rust`, `python` and `typescript` by `language_id` and assert the total.
+- `:87` and `:114` are fixture-driven and stay as they are; the fixtures change instead, below.
+
+**Fixtures.** Three fixtures exist to pin an exact, closed set of servers, and a merge that adds five more breaks what each one is for. Each gets `enabled = false` entries for the built-ins it does not want. Place a disable entry before any `[[lsp_servers]]` that carries an `[lsp_servers.heuristics]` sub-table, since TOML attaches such a table to the most recent array element.
+
+`crates/mcpls-core/tests/fixtures/empty_config.toml` is the one that matters most: `tests/e2e/mcp_client.rs:132` spawns the binary against it precisely so no language server starts. After the merge it would start all six, and since the e2e working directory has a `Cargo.toml` and rust-analyzer is on PATH, every protocol test would begin indexing this repository. Rewrite it as:
+
+```toml
+# Protocol-only configuration for E2E testing.
+#
+# Every built-in server is disabled: these tests exercise the MCP layer, and
+# spawning a language server here would make each of them wait on an index.
+
+[workspace]
+roots = []
+
+[[lsp_servers]]
+language_id = "rust"
+enabled = false
+
+[[lsp_servers]]
+language_id = "python"
+enabled = false
+
+[[lsp_servers]]
+language_id = "typescript"
+enabled = false
+
+[[lsp_servers]]
+language_id = "go"
+enabled = false
+
+[[lsp_servers]]
+language_id = "cpp"
+enabled = false
+
+[[lsp_servers]]
+language_id = "zig"
+enabled = false
+```
+
+`crates/mcpls-core/tests/fixtures/configs/two_server_routing.toml`: its two entries carry explicit `name`s (`pyright`, `pylsp`), so neither matches the built-in whose id is `python`, and that built-in would survive as a third python server and a second catch-all, which `ToolRouter::from_configs` rejects. Add the same six disable entries before the existing two.
+
+`crates/mcpls-core/tests/fixtures/configs/mutually_exclusive_heuristics.toml`: its two entries both have id `python`, so under the fold the first merges onto the built-in and the second appends, leaving seven servers where the test wants two, and the built-in's own `pyrightconfig.json` marker would make it applicable alongside them. Add the six disable entries at the top, before the first `[[lsp_servers]]` with a heuristics sub-table.
+
+`minimal.toml` and `multi_language.toml` need no change: their tests are what change.
+
+**Documentation that describes replace semantics:**
+
+- `docs/user-guide/configuration.md:237` ("# Only Rust and Python") and the surrounding server section.
+- `skills/mcpls/references/configuration.md:17-30`, which marks `command` as required.
+- `examples/mcpls.toml:67-110`, whose "uncomment as needed" guidance only makes sense under replace.
 
 Run: `cargo test --manifest-path /home/lev/Git/lev/mcpls-diagnostics/Cargo.toml -p mcpls-core --lib config 2>&1 | tail -20`
 
-Expected: every config test passes, including the six added in step 1.
+Expected: every config test passes, including the seven added in step 1.
 
 - [ ] **Step 7: Check the whole workspace and the lints**
 
@@ -414,26 +538,32 @@ Run:
 ```bash
 cargo fmt --manifest-path /home/lev/Git/lev/mcpls-diagnostics/Cargo.toml --all
 cargo clippy --manifest-path /home/lev/Git/lev/mcpls-diagnostics/Cargo.toml --workspace --all-targets -- -D warnings
+cargo build --manifest-path /home/lev/Git/lev/mcpls-diagnostics/Cargo.toml --workspace
 cargo test --manifest-path /home/lev/Git/lev/mcpls-diagnostics/Cargo.toml --workspace
+cargo test --manifest-path /home/lev/Git/lev/mcpls-diagnostics/Cargo.toml -p mcpls-core --test integration_tests e2e:: -- --include-ignored
 ```
 
-Expected: all clean. Integration tests that build a `ServerConfig` literal need the field unchanged, since `lsp_servers` keeps its type.
+The e2e set is the reason for the last line: every test in `tests/e2e/protocol_tests.rs` is `#[ignore]`, so a plain `cargo test` runs none of them and the `empty_config.toml` regression would pass unnoticed. The staleness guard added in `92b7f4c` refuses a binary older than its sources, hence the build first.
 
-- [ ] **Step 8: Document and commit**
+Expected: all clean.
 
-Update `docs/user-guide/configuration.md`'s server section to describe entries as modifying built-ins, with `enabled = false` to remove one and the `command` rule spelled out. Add a `## [Unreleased]` entry to `CHANGELOG.md` under `### Changed` naming the breaking change.
+- [ ] **Step 8: Commit**
 
 ```bash
-git -C /home/lev/Git/lev/mcpls-diagnostics add crates/mcpls-core/src/config/ docs/user-guide/configuration.md CHANGELOG.md
+git -C /home/lev/Git/lev/mcpls-diagnostics add crates/mcpls-core/src/config/ crates/mcpls-core/tests/ docs/user-guide/configuration.md skills/mcpls/references/configuration.md examples/mcpls.toml CHANGELOG.md
 git -C /home/lev/Git/lev/mcpls-diagnostics commit -m "feat(config)!: merge server entries onto the built-ins" -m "Writing any [[lsp_servers]] block replaced the built-in list wholesale,
 so reaching one per-server key cost every default server, and a config
 file with no server table spawned nothing at all.
 
 Entries are now partial records folded onto the built-ins by routing
 identity: what an entry omits, it inherits. enabled = false removes a
-built-in, replacing the disable-by-omission that replace semantics gave
+server, replacing the disable-by-omission that replace semantics gave
 for free. Overriding command drops the built-in's args, env and
 initialization options, which belong to the binary being replaced.
+
+Only the first entry claiming an id merges; a second one appends,
+so two servers for one language separated by their spawn heuristics
+still load as two servers.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
@@ -451,9 +581,13 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Consumes: `PartialLspServerConfig` from task 1.
 - Produces:
   - `pub enum SeverityFloor { Off, Error, Warning, Information, Hint }` with `pub fn admits(self, severity: Option<lsp_types::DiagnosticSeverity>) -> bool`
-  - `pub struct DiagnosticsConfig { pub severity: SeverityFloor, pub max_per_file: usize, pub max_total: usize }`
+  - `pub struct DiagnosticsConfig` with `severity`, `max_per_file`, `max_total`, `settle_quiet_ms`, `settle_deadline_ms`
   - `ServerConfig::diagnostics: DiagnosticsConfig`
   - `LspServerConfig::diagnostics_severity: Option<SeverityFloor>`
+
+Background: in the pinned `lsp-types` 0.97, `DiagnosticSeverity` is `pub struct DiagnosticSeverity(i32)` with a private field and associated constants (`lsp-types-0.97.0/src/lib.rs:445-459`). It is not a C-like enum, so `severity as i32` is a `non-primitive cast` error. It derives `Ord`, and its constants run `ERROR = 1` through `HINT = 4`, so comparison alone gives the ordering.
+
+Adding a field to `LspServerConfig` breaks every struct literal that builds one, and none of them use a `..` spread. There are 38 across the crate, concentrated in `lsp/lifecycle.rs` (13), with the rest spread over `config/routing.rs`, `config/mod.rs`, `config/server.rs`, `bridge/translator/{routing,respawn,symbols}.rs`, `lib.rs`, `tests/ra_e2e.rs` and `tests/integration/rust_analyzer_tests.rs`. Find them with `rg -n 'LspServerConfig \{' /home/lev/Git/lev/mcpls-diagnostics/crates/mcpls-core` and expect the compiler to name each one.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -493,6 +627,8 @@ fn test_off_admits_nothing_and_hint_admits_everything() {
     assert!(SeverityFloor::Hint.admits(Some(DiagnosticSeverity::HINT)));
     assert!(SeverityFloor::Error.admits(Some(DiagnosticSeverity::ERROR)));
     assert!(!SeverityFloor::Error.admits(Some(DiagnosticSeverity::WARNING)));
+    assert!(SeverityFloor::Warning.admits(Some(DiagnosticSeverity::ERROR)));
+    assert!(!SeverityFloor::Warning.admits(Some(DiagnosticSeverity::INFORMATION)));
 }
 
 #[test]
@@ -539,20 +675,18 @@ impl SeverityFloor {
     /// diagnostic does not matter.
     #[must_use]
     pub fn admits(self, severity: Option<lsp_types::DiagnosticSeverity>) -> bool {
-        let Some(severity) = severity else {
-            return self != Self::Off;
+        use lsp_types::DiagnosticSeverity;
+
+        // DiagnosticSeverity orders ERROR = 1 through HINT = 4 and derives
+        // Ord, so "at least as severe as the floor" is `<=`.
+        let deepest = match self {
+            Self::Off => return false,
+            Self::Error => DiagnosticSeverity::ERROR,
+            Self::Warning => DiagnosticSeverity::WARNING,
+            Self::Information => DiagnosticSeverity::INFORMATION,
+            Self::Hint => DiagnosticSeverity::HINT,
         };
-        let rank = |floor: Self| match floor {
-            Self::Off => 0_u8,
-            Self::Error => 1,
-            Self::Warning => 2,
-            Self::Information => 3,
-            Self::Hint => 4,
-        };
-        // lsp_types orders ERROR = 1 through HINT = 4, matching the ranks
-        // above, so a diagnostic clears the floor when its own rank is no
-        // deeper than the floor's.
-        self != Self::Off && u8::try_from(severity as i32).is_ok_and(|s| s <= rank(self))
+        severity.is_none_or(|severity| severity <= deepest)
     }
 }
 
@@ -571,6 +705,19 @@ pub struct DiagnosticsConfig {
     /// context budget, which is why it is not per server.
     #[serde(default = "default_max_total")]
     pub max_total: usize,
+    /// How long the language servers must report no work before their view
+    /// of the workspace counts as complete.
+    ///
+    /// Raise it on a workspace whose servers pause mid-analysis for longer
+    /// than this; the cost of raising it is a later baseline, and the cost
+    /// of setting it too low is a baseline taken mid-index.
+    #[serde(default = "default_settle_quiet_ms")]
+    pub settle_quiet_ms: u64,
+    /// How long to wait for that quiet before giving up and baselining
+    /// anyway. Bounds the damage from a server that never finishes, or from
+    /// a progress notification dropped before its pump existed.
+    #[serde(default = "default_settle_deadline_ms")]
+    pub settle_deadline_ms: u64,
 }
 
 const fn default_severity_floor() -> SeverityFloor {
@@ -585,12 +732,25 @@ const fn default_max_total() -> usize {
     50
 }
 
+/// rust-analyzer's startup phases leave gaps of roughly 70 to 100
+/// milliseconds between them. A second is an order of magnitude clear of
+/// that and still well inside a session's first tool call.
+const fn default_settle_quiet_ms() -> u64 {
+    1_000
+}
+
+const fn default_settle_deadline_ms() -> u64 {
+    60_000
+}
+
 impl Default for DiagnosticsConfig {
     fn default() -> Self {
         Self {
             severity: default_severity_floor(),
             max_per_file: default_max_per_file(),
             max_total: default_max_total(),
+            settle_quiet_ms: default_settle_quiet_ms(),
+            settle_deadline_ms: default_settle_deadline_ms(),
         }
     }
 }
@@ -604,7 +764,9 @@ Add the field to `ServerConfig` next to `apply`:
     pub diagnostics: DiagnosticsConfig,
 ```
 
-and to `ServerConfig::default()`. Add `diagnostics_severity: Option<SeverityFloor>` to both `LspServerConfig` (as `#[serde(default, skip_serializing_if = "Option::is_none")]`) and `PartialLspServerConfig`, extend `LspServerConfig::merge` and `from_partial` to carry it, and set it to `None` in `LspServerConfig::builtin`.
+and to `ServerConfig::default()`.
+
+Add `diagnostics_severity: Option<SeverityFloor>` to `LspServerConfig` (as `#[serde(default, skip_serializing_if = "Option::is_none")]`) and to `PartialLspServerConfig` (as `#[serde(default)]`), extend `LspServerConfig::merge` and `from_partial` to carry it, and set it to `None` in `LspServerConfig::builtin`. Then work through the 38 struct literals the compiler names.
 
 - [ ] **Step 4: Run the tests**
 
@@ -614,14 +776,18 @@ Expected: PASS. `test_apply_defaults_to_read_only` and the round-trip tests stil
 
 - [ ] **Step 5: Verify and commit**
 
-Run fmt, clippy and the workspace suite as in task 1 step 7. Document the `[diagnostics]` table in `docs/user-guide/configuration.md` with a section per key, and add a `### Added` entry to the changelog.
+Run fmt, clippy and the full command set from task 1 step 7. Document the `[diagnostics]` table in `docs/user-guide/configuration.md` with a section per key, and add a `### Added` entry to the changelog.
 
 ```bash
-git -C /home/lev/Git/lev/mcpls-diagnostics add crates/mcpls-core/src/config/ docs/user-guide/configuration.md CHANGELOG.md
+git -C /home/lev/Git/lev/mcpls-diagnostics add crates/mcpls-core/src/ crates/mcpls-core/tests/ docs/user-guide/configuration.md CHANGELOG.md
 git -C /home/lev/Git/lev/mcpls-diagnostics commit -m "feat(config): add the diagnostics table" -m "One severity floor per server, with a global default, plus two volume
 caps that stay global because they bound one shared context budget
 rather than one server's output. off mutes a server, which is how a
 language is excluded.
+
+The two settle durations decide when a workspace counts as analyzed.
+They are configurable because the right quiet period depends on how
+long the slowest server pauses mid-analysis.
 
 Nothing reads these yet.
 
@@ -641,18 +807,17 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Consumes: `DiagnosticsConfig`, `SeverityFloor` from task 2.
 - Produces:
   - `pub struct SessionId(String)` with `impl From<String>` and `pub fn process_default() -> Self`
-  - `pub struct DiagnosticsDelivery` with `pub fn new(config: DiagnosticsConfig) -> Self`
-  - `pub fn flush(&mut self, session: &SessionId, entries: &[FileEntry]) -> FlushReport`
-  - `pub struct FileEntry<'a> { pub key: &'a str, pub path: String, pub diagnostics: &'a [lsp_types::Diagnostic], pub floor: SeverityFloor }`
+  - `pub struct DiagnosticsDelivery` with `pub fn new(config: DiagnosticsConfig) -> Self`, `flush`, `set_baseline`, `has_baseline`, `visible_hash`
+  - `pub struct FileEntry<'a> { pub key: &'a str, pub diagnostics: &'a [lsp_types::Diagnostic], pub floor: SeverityFloor }`
   - `pub struct FlushReport { pub changed: Vec<ChangedFile>, pub cleared: Vec<String>, pub omitted: usize }`
-  - `pub struct ChangedFile { pub path: String, pub diagnostics: Vec<lsp_types::Diagnostic>, pub omitted: usize }`
+  - `pub struct ChangedFile { pub key: String, pub diagnostics: Vec<lsp_types::Diagnostic>, pub omitted: usize }`
   - `pub struct FloorTable` with `pub fn new(config: &DiagnosticsConfig, servers: &[LspServerConfig]) -> Self` and `pub fn for_server(&self, server: &ServerId) -> SeverityFloor`
 
-The caller assembles `FileEntry` values from `NotificationCache` and the config; this module never touches a lock, a file, or a server. That is what makes it testable without a language server.
+This module knows nothing about URIs, paths, position encodings or locks. It speaks in opaque cache keys, and the caller maps those back to something an agent can read. That is what makes it testable without a language server, and it is why `ChangedFile` carries a key rather than a path.
 
-- [ ] **Step 1: Write the failing tests**
+- [ ] **Step 1: Create the module and write the failing tests**
 
-Create `crates/mcpls-core/src/bridge/delivery.rs` with only the test module and the imports it needs, so the tests fail to compile against types that do not exist yet:
+Create `crates/mcpls-core/src/bridge/delivery.rs` containing only the test module below, and in the same step add `mod delivery;` to `crates/mcpls-core/src/bridge/mod.rs`. Without the module declaration the file is never compiled and step 2 passes for the wrong reason.
 
 ```rust
 #[cfg(test)]
@@ -675,10 +840,13 @@ mod tests {
         }
     }
 
-    fn entry<'a>(key: &'a str, diagnostics: &'a [Diagnostic], floor: SeverityFloor) -> FileEntry<'a> {
+    fn entry<'a>(
+        key: &'a str,
+        diagnostics: &'a [Diagnostic],
+        floor: SeverityFloor,
+    ) -> FileEntry<'a> {
         FileEntry {
             key,
-            path: format!("/w/{key}"),
             diagnostics,
             floor,
         }
@@ -705,7 +873,7 @@ mod tests {
         delivery.flush(&session, &[entry("a.rs", &diags, SeverityFloor::Warning)]);
 
         let fixed = delivery.flush(&session, &[entry("a.rs", &[], SeverityFloor::Warning)]);
-        assert_eq!(fixed.cleared, vec!["/w/a.rs".to_string()]);
+        assert_eq!(fixed.cleared, vec!["a.rs".to_string()]);
 
         let again = delivery.flush(&session, &[entry("a.rs", &[], SeverityFloor::Warning)]);
         assert!(again.cleared.is_empty(), "cleared is not re-reported");
@@ -734,7 +902,10 @@ mod tests {
         let a = diagnostic(1, DiagnosticSeverity::ERROR, "one");
         let b = diagnostic(2, DiagnosticSeverity::WARNING, "two");
 
-        delivery.flush(&session, &[entry("a.rs", &[a.clone(), b.clone()], SeverityFloor::Warning)]);
+        delivery.flush(
+            &session,
+            &[entry("a.rs", &[a.clone(), b.clone()], SeverityFloor::Warning)],
+        );
         let reordered = delivery.flush(&session, &[entry("a.rs", &[b, a], SeverityFloor::Warning)]);
         assert!(reordered.changed.is_empty(), "order is not content");
     }
@@ -813,6 +984,27 @@ mod tests {
         let other = delivery.flush(&two, &[entry("a.rs", &diags, SeverityFloor::Warning)]);
         assert_eq!(other.changed.len(), 1, "a second session has its own record");
     }
+
+    #[test]
+    fn test_a_session_starting_after_the_baseline_ignores_what_it_recorded() {
+        let mut delivery = DiagnosticsDelivery::new(DiagnosticsConfig::default());
+        let diags = vec![diagnostic(1, DiagnosticSeverity::ERROR, "pre-existing")];
+
+        let baseline = std::collections::HashMap::from([(
+            "a.rs".to_string(),
+            DiagnosticsDelivery::visible_hash(&diags, SeverityFloor::Warning).unwrap(),
+        )]);
+        delivery.set_baseline(baseline);
+
+        let report = delivery.flush(
+            &SessionId::from("s".to_string()),
+            &[entry("a.rs", &diags, SeverityFloor::Warning)],
+        );
+        assert!(
+            report.changed.is_empty(),
+            "the workspace already had this before the session started"
+        );
+    }
 }
 ```
 
@@ -837,7 +1029,7 @@ Above the test module in `crates/mcpls-core/src/bridge/delivery.rs`:
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
-use crate::config::{DiagnosticsConfig, SeverityFloor};
+use crate::config::{DiagnosticsConfig, LspServerConfig, ServerId, SeverityFloor};
 
 /// Identity of one client session.
 ///
@@ -869,8 +1061,6 @@ impl SessionId {
 pub struct FileEntry<'a> {
     /// Cache key identifying the file, stable across publishes.
     pub key: &'a str,
-    /// Path to show the agent.
-    pub path: String,
     /// Everything the owning server currently reports for this file.
     pub diagnostics: &'a [lsp_types::Diagnostic],
     /// The floor this file's server answers to.
@@ -880,11 +1070,12 @@ pub struct FileEntry<'a> {
 /// One file that changed since the last flush.
 #[derive(Debug, Clone)]
 pub struct ChangedFile {
-    /// Path to show the agent.
-    pub path: String,
+    /// Cache key, matching the [`FileEntry`] this came from.
+    pub key: String,
     /// Diagnostics at or above the floor, capped.
     pub diagnostics: Vec<lsp_types::Diagnostic>,
-    /// How many this file's cap dropped.
+    /// How many this file's own cap dropped. Those are not offered again:
+    /// the count is what tells the agent to look at the file itself.
     pub omitted: usize,
 }
 
@@ -893,10 +1084,10 @@ pub struct ChangedFile {
 pub struct FlushReport {
     /// Files whose visible diagnostics differ from the last flush.
     pub changed: Vec<ChangedFile>,
-    /// Files that had visible diagnostics and now have none.
+    /// Cache keys of files that had visible diagnostics and now have none.
     pub cleared: Vec<String>,
-    /// Files the total cap held back. They are not recorded as delivered,
-    /// so the next flush offers them again.
+    /// Files the total cap held back entirely. They are not recorded as
+    /// delivered, so the next flush offers them again.
     pub omitted: usize,
 }
 
@@ -921,7 +1112,7 @@ impl DiagnosticsDelivery {
 
     /// Adopt `baseline` as what every future session starts out believing.
     ///
-    /// Taken when the workspace's servers first go quiet. Without it the
+    /// Taken once the workspace's servers have gone quiet. Without it the
     /// first flush of a session reports every warning the workspace already
     /// had, which is never what the agent asked for.
     pub fn set_baseline(&mut self, baseline: HashMap<String, u64>) {
@@ -940,8 +1131,13 @@ impl DiagnosticsDelivery {
     /// survivors by severity when it truncates and a resort is not a change.
     /// Computed over the set that clears the floor, so raising a hint on a
     /// file whose floor is `error` reports nothing.
+    ///
+    /// `None` means the file has nothing visible at all.
     #[must_use]
-    pub fn visible_hash(diagnostics: &[lsp_types::Diagnostic], floor: SeverityFloor) -> Option<u64> {
+    pub fn visible_hash(
+        diagnostics: &[lsp_types::Diagnostic],
+        floor: SeverityFloor,
+    ) -> Option<u64> {
         let mut parts: Vec<String> = diagnostics
             .iter()
             .filter(|d| floor.admits(d.severity))
@@ -967,6 +1163,12 @@ impl DiagnosticsDelivery {
     }
 
     /// Report what changed for `session` since its last flush.
+    ///
+    /// The two caps behave differently on purpose. A file truncated by
+    /// `max_per_file` is recorded as delivered and carries its own `omitted`
+    /// count, because the agent has the file and can look. A file the
+    /// `max_total` budget could not fit at all keeps its old record, so the
+    /// next flush offers it again rather than losing it silently.
     pub fn flush(&mut self, session: &SessionId, entries: &[FileEntry<'_>]) -> FlushReport {
         let baseline = self.baseline.clone().unwrap_or_default();
         let record = self
@@ -984,30 +1186,28 @@ impl DiagnosticsDelivery {
             match (hash, previous) {
                 (None, Some(_)) => {
                     record.remove(entry.key);
-                    report.cleared.push(entry.path.clone());
+                    report.cleared.push(entry.key.to_string());
                 }
                 (None, None) => {}
                 (Some(current), Some(before)) if current == before => {}
                 (Some(current), _) => {
+                    if budget == 0 {
+                        report.omitted += 1;
+                        continue;
+                    }
                     let mut visible: Vec<_> = entry
                         .diagnostics
                         .iter()
                         .filter(|d| entry.floor.admits(d.severity))
                         .cloned()
                         .collect();
-                    if budget == 0 {
-                        // Held back rather than delivered: leaving the record
-                        // untouched is what makes the next flush offer it again.
-                        report.omitted += 1;
-                        continue;
-                    }
                     let per_file = self.config.max_per_file.min(budget);
                     let omitted = visible.len().saturating_sub(per_file);
                     visible.truncate(per_file);
                     budget -= visible.len();
                     record.insert(entry.key.to_string(), current);
                     report.changed.push(ChangedFile {
-                        path: entry.path.clone(),
+                        key: entry.key.to_string(),
                         diagnostics: visible,
                         omitted,
                     });
@@ -1027,7 +1227,7 @@ Then the floor lookup, in the same file, because a floor is part of deciding wha
 ///
 /// Resolved once at startup, because a server's floor comes from
 /// configuration and configuration does not change while the process runs.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct FloorTable {
     default: SeverityFloor,
     by_server: HashMap<ServerId, SeverityFloor>,
@@ -1054,15 +1254,13 @@ impl FloorTable {
 }
 ```
 
-`SeverityFloor` needs a `Default` implementation returning `Warning` for `FloorTable`'s derive; add it in `config/mod.rs` beside the enum.
-
-Declare the module in `crates/mcpls-core/src/bridge/mod.rs` (`mod delivery;` plus a `pub use delivery::{...};` matching how neighbouring modules are re-exported).
+Add a `pub use delivery::{...};` to `crates/mcpls-core/src/bridge/mod.rs` matching how neighbouring modules are re-exported.
 
 - [ ] **Step 4: Run the tests**
 
 Run: `cargo test --manifest-path /home/lev/Git/lev/mcpls-diagnostics/Cargo.toml -p mcpls-core --lib bridge::delivery 2>&1 | tail -20`
 
-Expected: all eight pass.
+Expected: all nine pass.
 
 - [ ] **Step 5: Verify and commit**
 
@@ -1075,8 +1273,9 @@ that clear its floor, so a flush returns what changed rather than
 everything known. The hash is order-insensitive because truncation
 re-sorts survivors by severity, and a resort is not a change.
 
-A file the total cap holds back keeps its old record, so the next
-flush offers it again instead of swallowing it.
+A file the total budget cannot fit keeps its old record, so the next
+flush offers it again instead of swallowing it. A file truncated by its
+own cap is recorded and reports the count it dropped.
 
 Nothing calls this yet.
 
@@ -1088,14 +1287,17 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ### Task 4: The pump drops publishes describing text that is gone
 
 **Files:**
-- Modify: `crates/mcpls-core/src/lib.rs:120-127` (`PumpShared`), `crates/mcpls-core/src/lib.rs:154` (`diagnostics_pump`), and the `serve_with` call site that builds `PumpShared`
+- Modify: `crates/mcpls-core/src/lib.rs` (`PumpShared` at `:120`, `diagnostics_pump` at `:154`, `spawn_lsp_servers_background` at `:911`, `serve_with` at `:557`)
 - Test: the existing `diagnostics_pump` test module in `crates/mcpls-core/src/lib.rs:2194`
 
 **Interfaces:**
 - Consumes: nothing from earlier tasks.
-- Produces: `PumpShared::document_tracker: Arc<DocumentTracker>`, consumed by task 5.
+- Produces: `PumpShared::document_tracker: Arc<DocumentTracker>`, and a `PumpShared` built in `serve_with` and passed into `spawn_lsp_servers_background`, which task 5 extends.
 
-Background: `DocumentTracker::get(&Path) -> Option<DocumentState>` (`bridge/state.rs:321`) and `DocumentState::version() -> i32`. The tracker's map is a `StdMutex` held only for short synchronous sections (`bridge/state.rs:280-286`), so a lookup from the pump cannot stall it. `Translator::document_tracker()` already exposes the handle; `serve_with` has the translator in scope where it builds `PumpShared`.
+Background:
+
+- `DocumentTracker::get(&Path) -> Option<DocumentState>` (`bridge/state.rs:321`) and `DocumentState::version() -> i32` (`:162`) are both public and re-exported from `bridge`. `Translator::document_tracker()` is `pub(crate)` and reachable from `lib.rs`. The tracker's map is a `StdMutex` held only for short synchronous sections (`bridge/state.rs:280-286`), so a lookup from the pump cannot stall it. `DocumentTracker::open` touches no disk, so a test can open a path that does not exist.
+- `PumpShared` is built at `lib.rs:980`, inside `spawn_lsp_servers_background`, not in `serve_with`. That function already takes exactly 7 parameters, which is where `too_many_arguments` fires, so task 5 cannot add its three handles to it. This task therefore also collapses the signature: build `PumpShared` in `serve_with` and pass it in, replacing `notification_cache`, `subscriptions`, `peer_cell` and `workspace_roots`. That leaves four parameters and gives task 5 somewhere to put its fields. Inside the function, reach the cache through `shared.notification_cache` for the `set_diagnostics_route_count` call.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1128,7 +1330,7 @@ Fill each body following the pattern of the existing pump tests: build a `PumpSh
 
 Run: `cargo test --manifest-path /home/lev/Git/lev/mcpls-diagnostics/Cargo.toml -p mcpls-core --lib diagnostics_pump 2>&1 | tail -20`
 
-Expected: the first test fails because the stale publish is stored. The other two should pass before the change and must still pass after it; that is the point of writing them now.
+Expected: the first test fails because the stale publish is stored. The other two pass before the change and must still pass after it; that is why they are written now.
 
 - [ ] **Step 3: Add the tracker handle and the check**
 
@@ -1156,19 +1358,19 @@ destructure it alongside the other fields, and in the `PublishDiagnostics` arm, 
                         }
 ```
 
-Let-chains are stable in edition 2024; if clippy objects to the shape, use nested `if let` rather than restructuring the condition.
+Let-chains are stable in edition 2024 and this crate already uses one (`config/server.rs:121`); if clippy objects to the shape, use nested `if let` rather than restructuring the condition.
 
-Update the `PumpShared` construction in `serve_with` to pass `translator.document_tracker()`, and every test that builds a `PumpShared`.
+- [ ] **Step 4: Collapse the background spawn's parameters**
 
-- [ ] **Step 4: Run the tests**
+Change `spawn_lsp_servers_background` to take `(applicable_configs, translator, cancel_rx, shared: PumpShared)` and delete its construction of `PumpShared`. Build the value in `serve_with` instead, where `translator.document_tracker()` is in scope, and clone it into the call. Update the five test call sites that build a `PumpShared` (`lib.rs:2242, 2314, 2387, 2417, 2467`).
+
+- [ ] **Step 5: Run the tests**
 
 Run: `cargo test --manifest-path /home/lev/Git/lev/mcpls-diagnostics/Cargo.toml -p mcpls-core --lib diagnostics_pump 2>&1 | tail -20`
 
-Expected: all three pass, and no existing pump test regresses.
+Expected: all three pass, and no existing pump test regresses. Then run fmt, clippy and the full command set from task 1 step 7.
 
-- [ ] **Step 5: Verify and commit**
-
-Run fmt, clippy and the workspace suite.
+- [ ] **Step 6: Commit**
 
 ```bash
 git -C /home/lev/Git/lev/mcpls-diagnostics add crates/mcpls-core/src/lib.rs
@@ -1181,81 +1383,125 @@ publish with no version, or for a path with no tracked entry, is kept:
 those are the files a server reports without being asked, and they are
 the ones worth delivering.
 
+The background spawn takes the shared pump state as one value rather
+than four parameters, which is what leaves room to add to it.
+
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
 
 ---
 
-### Task 5: The baseline is taken when the servers go quiet
+### Task 5: The baseline is taken once the servers have stayed quiet
 
 **Files:**
 - Create: `crates/mcpls-core/src/bridge/settle.rs`
-- Modify: `crates/mcpls-core/src/bridge/mod.rs`, `crates/mcpls-core/src/lib.rs`
+- Modify: `crates/mcpls-core/src/bridge/mod.rs`, `crates/mcpls-core/src/bridge/notifications.rs`, `crates/mcpls-core/src/lib.rs`
 - Test: inline `mod tests` in `settle.rs`, plus one pump test in `lib.rs`
 
 **Interfaces:**
-- Consumes: `DiagnosticsDelivery::set_baseline` and `visible_hash` from task 3; `PumpShared` from task 4.
-- Produces: `pub struct ServerSettle` with `pub fn begin(&self, server: &ServerId, token: &serde_json::Value)`, `pub fn end(&self, server: &ServerId, token: &serde_json::Value)`, `pub fn has_settled(&self) -> bool`.
+- Consumes: `DiagnosticsDelivery`, `FloorTable` from task 3; `PumpShared` from task 4.
+- Produces:
+  - `pub struct ServerSettle` with `new(quiet_for: Duration, deadline_after: Duration)`, `begin`, `end`, `should_settle_at(&self, now: Instant) -> bool`, `should_settle(&self) -> bool`
+  - `NotificationCache::diagnostics_snapshot(&self) -> Vec<(String, DiagnosticInfo, ServerId)>`
+  - `PumpShared` gains `settle`, `delivery` and `floors`, which task 6 shares into `BridgeContext`
 
-Why this exists: language servers spawn in the background (`lib.rs:652-690`) and rust-analyzer publishes for the whole workspace once its initial analysis finishes, well after the first session op. A baseline taken on first sight is therefore empty, and every publish after it looks new, which is exactly the workspace dump the baseline exists to prevent.
+Why this exists, and why the obvious version is wrong. Language servers spawn in the background and rust-analyzer publishes for the whole workspace once its initial analysis finishes, well after the first session op. A baseline taken on first sight is therefore empty, and every publish after it looks new. But a baseline taken the first time the outstanding `$/progress` count reaches zero is just as wrong, and this is measured, not guessed: against rust-analyzer 1.98.1 the count crosses zero at roughly 3.21s, 3.34s, 3.40s and 4.11s while `Fetching`, `Building CrateGraph`, `Roots Scanned` and `Loading proc-macros` hand off to each other. Indexing does not finish until 6.52s and the first `cargo check` not until 6.73s. A first-crossing latch fires before a single diagnostic exists.
 
-- [ ] **Step 1: Write the failing tests**
+So quiet has to be sustained. The gaps between phases run about 70 to 100 milliseconds; a one-second debounce clears them by an order of magnitude. Two further hazards, both bounded by the deadline rather than solved: notification channels hold 64 items and drop on `try_send` (`lsp/lifecycle.rs:337`, `lsp/client.rs:673`), and the pumps do not exist until every server has registered, so a `begin` or an `end` from early startup can be lost; and a server that reports no progress at all never becomes quiet because it was never busy.
 
-Create `crates/mcpls-core/src/bridge/settle.rs` with only its test module:
+- [ ] **Step 1: Create the module and write the failing tests**
+
+Create `crates/mcpls-core/src/bridge/settle.rs` with the test module below, and add `mod settle;` to `crates/mcpls-core/src/bridge/mod.rs` in the same step.
+
+The tests take `now` as an argument rather than sleeping. That keeps them deterministic and keeps a one-second debounce from costing a second of test time.
 
 ```rust
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use serde_json::json;
 
     use super::*;
 
-    #[test]
-    fn test_a_server_that_never_started_work_has_not_settled() {
-        let settle = ServerSettle::default();
-        assert!(!settle.has_settled(), "nothing has happened yet");
+    fn settle() -> ServerSettle {
+        ServerSettle::new(Duration::from_secs(1), Duration::from_secs(600))
     }
 
     #[test]
-    fn test_a_server_settles_when_its_last_operation_ends() {
-        let settle = ServerSettle::default();
-        let server = "rust".into();
-        settle.begin(&server, &json!("rustAnalyzer/cachePriming"));
-        assert!(!settle.has_settled());
-        settle.end(&server, &json!("rustAnalyzer/cachePriming"));
-        assert!(settle.has_settled());
+    fn test_a_server_with_work_outstanding_is_not_quiet() {
+        let settle = settle();
+        let rust = ServerId::from("rust");
+        settle.begin(&rust, &json!("rustAnalyzer/cachePriming"));
+        assert!(!settle.should_settle_at(Instant::now() + Duration::from_secs(5)));
     }
 
     #[test]
-    fn test_nested_operations_settle_only_when_all_end() {
-        let settle = ServerSettle::default();
-        let server = "rust".into();
-        settle.begin(&server, &json!("rustAnalyzer/Indexing"));
-        settle.begin(&server, &json!("rust-analyzer/flycheck/0"));
-        settle.end(&server, &json!("rustAnalyzer/Indexing"));
-        assert!(!settle.has_settled(), "flycheck is still running");
-        settle.end(&server, &json!("rust-analyzer/flycheck/0"));
-        assert!(settle.has_settled());
-    }
+    fn test_quiet_must_outlast_the_gap_between_two_startup_phases() {
+        let settle = settle();
+        let rust = ServerId::from("rust");
+        settle.begin(&rust, &json!("rustAnalyzer/Fetching"));
+        settle.end(&rust, &json!("rustAnalyzer/Fetching"));
+        let quiet_began = Instant::now();
 
-    #[test]
-    fn test_settling_once_is_remembered_through_later_work() {
-        let settle = ServerSettle::default();
-        let server = "rust".into();
-        settle.begin(&server, &json!("a"));
-        settle.end(&server, &json!("a"));
-        settle.begin(&server, &json!("b"));
         assert!(
-            settle.has_settled(),
-            "the baseline moment already happened; later work does not undo it"
+            !settle.should_settle_at(quiet_began + Duration::from_millis(100)),
+            "rust-analyzer hands off between startup phases in about this long, \
+             and indexing has not started yet"
+        );
+        assert!(settle.should_settle_at(quiet_began + Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn test_work_resuming_restarts_the_quiet_period() {
+        let settle = settle();
+        let rust = ServerId::from("rust");
+        settle.begin(&rust, &json!("rustAnalyzer/Indexing"));
+        settle.end(&rust, &json!("rustAnalyzer/Indexing"));
+        settle.begin(&rust, &json!("rust-analyzer/flycheck/0"));
+        assert!(!settle.should_settle_at(Instant::now() + Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn test_every_server_must_be_quiet_at_once() {
+        let settle = settle();
+        let rust = ServerId::from("rust");
+        let python = ServerId::from("python");
+        settle.begin(&rust, &json!("indexing"));
+        settle.begin(&python, &json!("analyzing"));
+        settle.end(&rust, &json!("indexing"));
+
+        assert!(!settle.should_settle_at(Instant::now() + Duration::from_secs(5)));
+        settle.end(&python, &json!("analyzing"));
+        assert!(settle.should_settle_at(Instant::now() + Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn test_an_end_without_a_begin_does_not_start_a_quiet_period() {
+        let settle = settle();
+        settle.end(&ServerId::from("rust"), &json!("orphan"));
+        assert!(
+            !settle.should_settle_at(Instant::now() + Duration::from_secs(5)),
+            "an unmatched end proves nothing about what is still running"
         );
     }
 
     #[test]
-    fn test_an_end_without_a_begin_is_ignored() {
-        let settle = ServerSettle::default();
-        settle.end(&"rust".into(), &json!("orphan"));
-        assert!(!settle.has_settled(), "an unmatched end proves nothing");
+    fn test_a_server_that_never_reports_progress_settles_on_the_deadline() {
+        let settle = ServerSettle::new(Duration::from_secs(1), Duration::from_secs(60));
+        assert!(!settle.should_settle_at(Instant::now() + Duration::from_secs(30)));
+        assert!(
+            settle.should_settle_at(Instant::now() + Duration::from_secs(61)),
+            "a baseline taken late beats never reporting anything as new"
+        );
+    }
+
+    #[test]
+    fn test_the_deadline_fires_even_with_work_still_outstanding() {
+        let settle = ServerSettle::new(Duration::from_secs(1), Duration::from_secs(60));
+        settle.begin(&ServerId::from("rust"), &json!("stuck"));
+        assert!(settle.should_settle_at(Instant::now() + Duration::from_secs(61)));
     }
 }
 ```
@@ -1273,71 +1519,113 @@ Above the tests in `settle.rs`:
 ```rust
 //! Tracks whether the language servers have finished their startup work.
 //!
-//! Every server reports long-running work through `$/progress`. When a
-//! server's outstanding operations reach zero, its view of the workspace is
-//! as complete as it is going to get without new input, which is the moment
-//! worth calling a baseline.
+//! Every server reports long-running work through `$/progress`. Quiet is not
+//! the first moment the outstanding count reaches zero: rust-analyzer's
+//! startup phases hand off to each other through gaps of about 70 to 100
+//! milliseconds, and the first of those gaps arrives before indexing has
+//! begun. Quiet is a count of zero that has held for `quiet_for`.
+//!
+//! A deadline bounds two failure modes neither the count nor the debounce
+//! can see: a notification dropped from a full channel before its pump
+//! existed, and a server that reports no progress at all and so never stops
+//! being busy for the first time.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
-use crate::lsp::ServerId;
+use crate::config::ServerId;
 
-/// Outstanding `$/progress` operations, per server.
-#[derive(Debug, Default)]
+/// Outstanding `$/progress` operations across every server.
+#[derive(Debug)]
 pub struct ServerSettle {
     state: Mutex<SettleState>,
+    quiet_for: Duration,
+    deadline: Instant,
 }
 
 #[derive(Debug, Default)]
 struct SettleState {
-    outstanding: HashMap<ServerId, HashSet<String>>,
-    settled: bool,
+    outstanding: HashSet<(ServerId, String)>,
+    /// When the outstanding set last became empty. `None` until the first
+    /// operation ends, so a process that has not yet heard from a server is
+    /// not mistaken for one whose servers have finished.
+    quiet_since: Option<Instant>,
 }
 
 impl ServerSettle {
+    /// Track settling with a `quiet_for` debounce, giving up after
+    /// `deadline_after`.
+    #[must_use]
+    pub fn new(quiet_for: Duration, deadline_after: Duration) -> Self {
+        Self {
+            state: Mutex::new(SettleState::default()),
+            quiet_for,
+            deadline: Instant::now() + deadline_after,
+        }
+    }
+
     /// Record that `server` started a long-running operation.
     pub fn begin(&self, server: &ServerId, token: &serde_json::Value) {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
-        state
-            .outstanding
-            .entry(server.clone())
-            .or_default()
-            .insert(token.to_string());
+        state.outstanding.insert((server.clone(), token.to_string()));
+        state.quiet_since = None;
     }
 
-    /// Record that `server` finished one, and note the settle if that was
-    /// the last outstanding operation anywhere.
+    /// Record that `server` finished one.
     pub fn end(&self, server: &ServerId, token: &serde_json::Value) {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
-        let Some(tokens) = state.outstanding.get_mut(server) else {
-            return;
-        };
-        if !tokens.remove(&token.to_string()) {
+        if !state.outstanding.remove(&(server.clone(), token.to_string())) {
             return;
         }
-        if state.outstanding.values().all(HashSet::is_empty) {
-            state.settled = true;
+        if state.outstanding.is_empty() {
+            state.quiet_since = Some(Instant::now());
         }
     }
 
-    /// Whether the servers have gone quiet at least once.
+    /// Whether the workspace counts as analyzed as of `now`.
     #[must_use]
-    pub fn has_settled(&self) -> bool {
-        self.state.lock().is_ok_and(|state| state.settled)
+    pub fn should_settle_at(&self, now: Instant) -> bool {
+        if now >= self.deadline {
+            return true;
+        }
+        let Ok(state) = self.state.lock() else {
+            return false;
+        };
+        state.outstanding.is_empty()
+            && state
+                .quiet_since
+                .is_some_and(|since| now.duration_since(since) >= self.quiet_for)
+    }
+
+    /// [`Self::should_settle_at`] as of now.
+    #[must_use]
+    pub fn should_settle(&self) -> bool {
+        self.should_settle_at(Instant::now())
     }
 }
 ```
 
-A poisoned lock is treated as "no information" rather than propagated: a diagnostics baseline is not worth taking a process down for.
+A poisoned lock is treated as "no information" rather than propagated: a diagnostics baseline is not worth taking a process down for. Note that this differs from `bridge::lock_std`, which recovers the guard; here the answer "not settled yet" is both safe and simpler than recovering.
 
 - [ ] **Step 4: Feed it from the pump**
 
-In `crates/mcpls-core/src/lib.rs`, add `pub(crate) settle: Arc<ServerSettle>` to `PumpShared`, and replace the discarding arm:
+In `crates/mcpls-core/src/lib.rs`, add three fields to `PumpShared`:
+
+```rust
+    /// Outstanding server work, so the baseline waits for a quiet workspace.
+    pub(crate) settle: Arc<ServerSettle>,
+    /// Per-session record of what has already been delivered.
+    pub(crate) delivery: Arc<Mutex<DiagnosticsDelivery>>,
+    /// The severity floor each server answers to.
+    pub(crate) floors: Arc<FloorTable>,
+```
+
+and replace the discarding match arm in `diagnostics_pump`:
 
 ```rust
                     LspNotification::Progress { token, value } => {
@@ -1350,52 +1638,117 @@ In `crates/mcpls-core/src/lib.rs`, add `pub(crate) settle: Arc<ServerSettle>` to
                     LspNotification::Other { .. } => {}
 ```
 
-Add one pump test asserting that a begin followed by an end marks the settle, matching the setup of the tests added in task 4.
-
-- [ ] **Step 5: Take the baseline**
-
-The delivery core is behind a lock in `BridgeContext` (task 6 puts it there). For this task, add the plumbing on the pump side only: after processing a publish, if `settle.has_settled()` and the delivery core has no baseline yet, snapshot the cache into it.
-
-Put that in a small helper next to the pump rather than inline, so `diagnostics_pump` stays under the 100-line limit:
+Construct all three in `serve_with` where task 4 put the `PumpShared` literal:
 
 ```rust
-/// Adopt the current cache as the baseline the first time the servers go
+    let settle = Arc::new(ServerSettle::new(
+        Duration::from_millis(config.diagnostics.settle_quiet_ms),
+        Duration::from_millis(config.diagnostics.settle_deadline_ms),
+    ));
+    let delivery = Arc::new(Mutex::new(DiagnosticsDelivery::new(config.diagnostics)));
+    let floors = Arc::new(FloorTable::new(&config.diagnostics, &config.lsp_servers));
+```
+
+Place these before `applicable_configs` is moved into `spawn_lsp_servers_background`; `config` is still owned at that point.
+
+Add one pump test asserting that a `$/progress` begin followed by its end leaves the settle tracker quiet, matching the setup of the tests added in task 4.
+
+- [ ] **Step 5: Give the cache an owner-aware snapshot**
+
+`NotificationCache::diagnostics` and `diagnostics_owners` are private (`bridge/notifications.rs:432-435`) and nothing iterates them. Add next to `get_diagnostics` (`:719`):
+
+```rust
+    /// Every cached entry with the key it is stored under and the server
+    /// that published it.
+    ///
+    /// Returns owned values so a caller can release the cache lock before
+    /// doing anything with them: the diagnostics pump needs the same lock.
+    #[must_use]
+    pub fn diagnostics_snapshot(&self) -> Vec<(String, DiagnosticInfo, ServerId)> {
+        self.diagnostics
+            .iter()
+            .filter_map(|(key, info)| {
+                let owner = self.diagnostics_owners.get(key)?;
+                Some((key.clone(), info.clone(), owner.clone()))
+            })
+            .collect()
+    }
+```
+
+- [ ] **Step 6: Take the baseline from its own task**
+
+`diagnostics_pump` is already near the 100-line limit and there is one pump per server, so a poll inside it would run N times over. Give the baseline its own task, spawned beside the pumps in `spawn_lsp_servers_background`:
+
+```rust
+/// How often to ask whether the servers have gone quiet. The task stops
+/// once the baseline is taken, so this cost is bounded by the settle
+/// deadline rather than by the process lifetime.
+const BASELINE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Adopt the current cache as the baseline once the servers have stayed
 /// quiet, so a session's first flush reports what happened since startup
 /// rather than everything the workspace already knew.
-async fn take_baseline_once(
-    settle: &ServerSettle,
-    cache: &Mutex<NotificationCache>,
-    delivery: &Mutex<DiagnosticsDelivery>,
-    floors: &FloorTable,
+async fn baseline_task(
+    settle: Arc<ServerSettle>,
+    cache: Arc<Mutex<NotificationCache>>,
+    delivery: Arc<Mutex<DiagnosticsDelivery>>,
+    floors: Arc<FloorTable>,
+    mut cancel_rx: tokio::sync::watch::Receiver<bool>,
 ) {
-    if !settle.has_settled() {
-        return;
+    loop {
+        tokio::select! {
+            result = cancel_rx.changed() => {
+                if result.is_err() || *cancel_rx.borrow() {
+                    return;
+                }
+            }
+            () = tokio::time::sleep(BASELINE_POLL_INTERVAL) => {
+                if !settle.should_settle() {
+                    continue;
+                }
+                let snapshot = {
+                    let cache = cache.lock().await;
+                    cache.diagnostics_snapshot()
+                };
+                let baseline = snapshot
+                    .iter()
+                    .filter_map(|(key, info, owner)| {
+                        DiagnosticsDelivery::visible_hash(
+                            &info.diagnostics,
+                            floors.for_server(owner),
+                        )
+                        .map(|hash| (key.clone(), hash))
+                    })
+                    .collect();
+                delivery.lock().await.set_baseline(baseline);
+                debug!("diagnostics baseline taken over {} file(s)", snapshot.len());
+                return;
+            }
+        }
     }
-    let mut delivery = delivery.lock().await;
-    if delivery.has_baseline() {
-        return;
-    }
-    let cache = cache.lock().await;
-    delivery.set_baseline(baseline_from_cache(&cache, floors));
 }
 ```
 
-`FloorTable` comes from task 3. `baseline_from_cache` iterates the cache's diagnostics entries and records `DiagnosticsDelivery::visible_hash` for each.
+Spawn it into the same `JoinSet` as the pumps, from the fields task 4 put on `PumpShared`.
 
-- [ ] **Step 6: Run the tests and commit**
+- [ ] **Step 7: Run the tests and commit**
 
-Run: `cargo test --manifest-path /home/lev/Git/lev/mcpls-diagnostics/Cargo.toml -p mcpls-core --lib 2>&1 | tail -20`, then fmt, clippy and the workspace suite.
+Run: `cargo test --manifest-path /home/lev/Git/lev/mcpls-diagnostics/Cargo.toml -p mcpls-core --lib 2>&1 | tail -20`, then fmt, clippy and the full command set from task 1 step 7.
 
 ```bash
 git -C /home/lev/Git/lev/mcpls-diagnostics add crates/mcpls-core/src/bridge/ crates/mcpls-core/src/lib.rs
-git -C /home/lev/Git/lev/mcpls-diagnostics commit -m "feat(bridge): baseline diagnostics when servers go quiet" -m "Servers spawn in the background and rust-analyzer publishes for the
+git -C /home/lev/Git/lev/mcpls-diagnostics commit -m "feat(bridge): baseline diagnostics once servers stay quiet" -m "Servers spawn in the background and rust-analyzer publishes for the
 whole workspace once its initial analysis finishes, so a baseline taken
 the first time a session appears is empty and every later publish looks
 new. That is the workspace dump the baseline exists to prevent.
 
-The pump now counts outstanding $/progress operations per server, which
-it previously discarded, and the baseline is taken the first time they
-all reach zero.
+Waiting for the first moment of quiet is no better: measured against
+rust-analyzer 1.98.1, the outstanding progress count reaches zero four
+times while startup phases hand off, the first of them seconds before
+indexing finishes. The baseline now waits for quiet that has held for
+settle_quiet_ms, and takes it anyway after settle_deadline_ms so a
+dropped notification or a server that never reports progress cannot
+wedge it.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
@@ -1405,38 +1758,72 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ### Task 6: The `get_new_diagnostics` tool
 
 **Files:**
-- Modify: `crates/mcpls-core/src/mcp/handlers.rs` (`BridgeContext`), `crates/mcpls-core/src/mcp/server.rs`, `crates/mcpls-core/src/mcp/tools.rs`, `crates/mcpls-core/src/lib.rs` (construct the delivery core and the floor table)
+- Modify: `crates/mcpls-core/src/mcp/handlers.rs` (`BridgeContext`), `crates/mcpls-core/src/mcp/server.rs`, `crates/mcpls-core/src/lib.rs`
 - Test: `crates/mcpls-core/tests/e2e/protocol_tests.rs`, `crates/mcpls-core/tests/ra_e2e.rs`
 
 **Interfaces:**
 - Consumes: everything from tasks 2 through 5.
 - Produces: the `get_new_diagnostics` MCP tool. No parameters: the agent asks what is new, and narrowing it by path is what `get_cached_diagnostics` already does.
 
+Background:
+
+- Declare the tool with no `Parameters` argument at all rather than an empty parameter struct. `rmcp-macros/src/tool.rs:200-215` falls back to `schema_for_empty_input()` when it finds no `Parameters` argument, which emits `{"type":"object","properties":{}}`. An empty `#[derive(JsonSchema)]` struct emits `{"type":"object"}` with no `properties` key, and `tests/e2e/protocol_tests.rs:151` asserts every tool's schema has one.
+- `BridgeContext::new` is a positional `const fn` with five parameters (`mcp/handlers.rs:54-60`). Adding two keeps it under the limit but breaks its call sites in `mcp/server.rs` and the handlers tests.
+- The tool must return the same coordinates `get_cached_diagnostics` does. That one resolves the owner's negotiated encoding and runs the entry through `Translator::diagnostics_from_cache_entry` (`mcp/server.rs:601-627`). Two diagnostics tools disagreeing about columns is a trap for the agent, so this one does the same.
+
 - [ ] **Step 1: Write the failing tests**
 
 In `crates/mcpls-core/tests/e2e/protocol_tests.rs`, extend the `expected_names` array in `test_e2e_list_tools` with `"get_new_diagnostics"`. That test derives its count from the array, so no number needs changing.
 
-In `crates/mcpls-core/tests/ra_e2e.rs`, following the existing fixture-driven tests:
+In `crates/mcpls-core/tests/ra_e2e.rs`, add a sub-case. That file is one `#[test] fn ra_e2e_suite()` driving `SubCase` values sequentially against a single rust-analyzer, so the new test is a `fn(&mut McpClient, &Path) -> Result<(), String>` registered in the sub-case list, not a `#[tokio::test]`.
 
 ```rust
-#[tokio::test]
-#[ignore = "requires rust-analyzer"]
-async fn test_new_diagnostics_reports_a_break_once() {
-    // Warm the workspace, break a caller by changing the callee's return
-    // type, then assert the caller's file appears in a flush and does not
-    // appear in the flush after it.
+/// Tool 17: `get_new_diagnostics` — drains once and stays drained.
+///
+/// Scoped to the deduplication property rather than to a diagnostic
+/// appearing, because whether the workspace's known errors land before or
+/// after the baseline depends on rust-analyzer's startup timing. The
+/// baseline semantics are pinned by unit tests instead.
+fn sc_get_new_diagnostics(client: &mut McpClient, _workspace: &Path) -> Result<(), String> {
+    let first = client
+        .call_tool("get_new_diagnostics", &json!({}))
+        .map_err(|e| format!("call failed: {e}"))?;
+    let text = assertions::assert_tool_ok(&first);
+    let inner: Value = serde_json::from_str(&text).map_err(|e| format!("bad JSON: {e}"))?;
+    inner["changed"]
+        .as_array()
+        .ok_or_else(|| format!("expected a changed array, got {inner}"))?;
+
+    let second = client
+        .call_tool("get_new_diagnostics", &json!({}))
+        .map_err(|e| format!("second call failed: {e}"))?;
+    let text = assertions::assert_tool_ok(&second);
+    let inner: Value = serde_json::from_str(&text).map_err(|e| format!("bad JSON: {e}"))?;
+
+    let changed = inner["changed"].as_array().map_or(0, Vec::len);
+    let cleared = inner["cleared"].as_array().map_or(0, Vec::len);
+    if changed != 0 || cleared != 0 {
+        return Err(format!(
+            "a second drain with no edits between should be empty, got {inner}"
+        ));
+    }
+    Ok(())
 }
 ```
 
-Fill the body following the existing rust-analyzer e2e tests: they already drive a real server against `tests/fixtures/rust_workspace` and wait for diagnostics. Reuse their wait helper rather than writing a new sleep.
+Register it in the sub-case list, and update the module doc comment's tool count at the top of the file.
 
 - [ ] **Step 2: Run them and watch them fail**
 
 Run:
 ```bash
-cargo test --manifest-path /home/lev/Git/lev/mcpls-diagnostics/Cargo.toml -p mcpls-core --test integration_tests e2e::protocol_tests::test_e2e_list_tools 2>&1 | tail -20
+cargo build --manifest-path /home/lev/Git/lev/mcpls-diagnostics/Cargo.toml --workspace
+cargo test --manifest-path /home/lev/Git/lev/mcpls-diagnostics/Cargo.toml -p mcpls-core --test integration_tests e2e::protocol_tests::test_e2e_list_tools -- --include-ignored 2>&1 | tail -20
 ```
-Expected: the tool count is one short, naming `get_new_diagnostics` as missing.
+
+Every test in `protocol_tests.rs` is `#[ignore = "Requires mcpls binary built"]`, so without `--include-ignored` this command runs nothing and reports success. The build comes first because the staleness guard from `92b7f4c` refuses a binary older than its sources.
+
+Expected: the tool list is one short, naming `get_new_diagnostics` as missing.
 
 - [ ] **Step 3: Wire the delivery core into the context**
 
@@ -1446,24 +1833,15 @@ Add to `BridgeContext` in `crates/mcpls-core/src/mcp/handlers.rs`:
     /// Per-session record of which diagnostics have already been delivered.
     ///
     /// Locked independently of `notification_cache`; a flush takes the cache
-    /// lock only long enough to copy what it needs.
+    /// lock only long enough to copy the snapshot it works from.
     pub delivery: Arc<Mutex<DiagnosticsDelivery>>,
     /// The severity floor each server answers to, resolved once at startup.
     pub floors: Arc<FloorTable>,
 ```
 
-`FloorTable` was defined in task 3. Construct it and the delivery core in `serve_with` where `BridgeContext` is built, and pass the same `Arc`s into `PumpShared` so task 5's `take_baseline_once` reaches them.
+Extend `BridgeContext::new` and `McplsServer::new` to take them, and pass the same `Arc`s task 5 built in `serve_with`, so the baseline the background task adopts is the one this tool reads. Update the handlers tests that construct a `BridgeContext`.
 
 - [ ] **Step 4: Add the tool**
-
-In `crates/mcpls-core/src/mcp/tools.rs`:
-
-```rust
-/// Parameters for the `get_new_diagnostics` tool.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
-#[schemars(description = "Parameters for draining diagnostics not yet delivered.")]
-pub struct NewDiagnosticsParams {}
-```
 
 In `crates/mcpls-core/src/mcp/server.rs`, beside `get_cached_diagnostics`:
 
@@ -1473,25 +1851,19 @@ In `crates/mcpls-core/src/mcp/server.rs`, beside `get_cached_diagnostics`:
         description = "Diagnostics that changed since you last asked, across every file the language servers report on. Returns nothing when nothing changed.",
         title = "New Diagnostics"
     )]
-    async fn get_new_diagnostics(
-        &self,
-        Parameters(NewDiagnosticsParams {}): Parameters<NewDiagnosticsParams>,
-    ) -> Result<String, McpError> {
+    async fn get_new_diagnostics(&self) -> Result<String, McpError> {
         let session = SessionId::process_default();
         let snapshot = {
             let cache = self.context.notification_cache.lock().await;
             cache.diagnostics_snapshot()
         };
+
         let entries: Vec<FileEntry<'_>> = snapshot
             .iter()
-            .filter_map(|(key, info, owner)| {
-                let path = bridge::uri_to_path(&info.uri)?;
-                Some(FileEntry {
-                    key,
-                    path: path.display().to_string(),
-                    diagnostics: &info.diagnostics,
-                    floor: self.context.floors.for_server(owner),
-                })
+            .map(|(key, info, owner)| FileEntry {
+                key,
+                diagnostics: &info.diagnostics,
+                floor: self.context.floors.for_server(owner),
             })
             .collect();
 
@@ -1499,26 +1871,28 @@ In `crates/mcpls-core/src/mcp/server.rs`, beside `get_cached_diagnostics`:
             let mut delivery = self.context.delivery.lock().await;
             delivery.flush(&session, &entries)
         };
-        to_tool_result(Ok(report_to_payload(&report)))
+
+        to_tool_result(Ok(self.new_diagnostics_payload(&report, &snapshot).await))
     }
 ```
 
-`NotificationCache` needs a `diagnostics_snapshot()` returning owned `(String, DiagnosticInfo, ServerId)` triples, so the cache lock is released before the flush. Add it next to `get_diagnostics` (`bridge/notifications.rs:719`).
+`new_diagnostics_payload` is a private async helper on the same impl, kept separate so the tool body stays short. For each `ChangedFile` it finds the matching `(uri, owner)` in the snapshot by key, builds a `DiagnosticInfo` carrying the file's *filtered* diagnostics, resolves the owner's encoding with `self.context.translator.position_encoding_for(&owner)`, and runs it through `Translator::diagnostics_from_cache_entry(.., encoding, self.context.translator.document_tracker())`. That is the same conversion `get_cached_diagnostics` performs, so both tools report the same columns.
 
-`report_to_payload` converts a `FlushReport` into the serializable shape the tool returns: changed files with their diagnostics and per-file omitted count, cleared paths, and the total omitted count with a sentence saying the caps held them back and the next call will offer them again.
+The serialized shape: `changed` as an array of `{ file_path, diagnostics, omitted }`, `cleared` as an array of file paths, and a top-level `omitted` count with a sentence saying the caps held those files back and the next call will offer them again. Derive `file_path` from the URI with `bridge::uri_to_path`; drop an entry whose URI does not map to a path rather than showing the agent a URI it cannot open.
 
 - [ ] **Step 5: Run the tests**
 
 Run:
 ```bash
+cargo fmt --manifest-path /home/lev/Git/lev/mcpls-diagnostics/Cargo.toml --all
+cargo clippy --manifest-path /home/lev/Git/lev/mcpls-diagnostics/Cargo.toml --workspace --all-targets -- -D warnings
 cargo build --manifest-path /home/lev/Git/lev/mcpls-diagnostics/Cargo.toml --workspace
 cargo test --manifest-path /home/lev/Git/lev/mcpls-diagnostics/Cargo.toml --workspace
 cargo test --manifest-path /home/lev/Git/lev/mcpls-diagnostics/Cargo.toml -p mcpls-core --test integration_tests e2e:: -- --include-ignored
+cargo test --manifest-path /home/lev/Git/lev/mcpls-diagnostics/Cargo.toml -p mcpls-core --test ra_e2e -- --include-ignored
 ```
 
-The e2e binary staleness guard added in `92b7f4c` will refuse a binary older than the sources, so build before running the e2e set.
-
-Expected: PASS throughout, including the new rust-analyzer test.
+Expected: PASS throughout. If rust-analyzer is not on PATH, `MCPLS_SKIP_RA=1` skips the last command; say so in the report rather than treating a skip as a pass.
 
 - [ ] **Step 6: Document and commit**
 
@@ -1531,8 +1905,9 @@ asked, deduplicated per session and filtered by each server's severity
 floor. Returns nothing when nothing changed, which is the common case
 and the reason it is cheap to call often.
 
-The cache lock is taken only to copy the snapshot, so a flush never
-holds it across the deduplication work.
+Positions run through the same encoding conversion get_cached_diagnostics
+uses, so the two tools cannot disagree about a column. The cache lock is
+taken only to copy the snapshot, never across the deduplication work.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
@@ -1545,12 +1920,16 @@ Stated so a reviewer does not look for them:
 
 - **The footer on the tools that write.** Stage B. Before the resync exists, an apply ends by telling every server to forget the files it wrote, so a footer would report nothing.
 - **Automatic delivery.** Nothing here injects anything. The agent must call `get_new_diagnostics`. Stage C is where a hook drains it without being asked.
-- **Coverage of external writes.** Measured and recorded in the spec: rust-analyzer sees an external write and will not check it, so no language is covered until stage C opens and saves changed files.
+- **Coverage of external writes.** Measured and recorded in the spec: rust-analyzer sees an external write and will not check it, so no language is covered until stage B opens and saves changed files.
+- **A way to start from no built-in servers at all.** A config wanting only its own servers must disable each built-in by name. The obvious key for this cannot be read by `deserialize_lsp_servers`, which is a field-level `deserialize_with` and cannot see a sibling field; supporting it means giving `ServerConfig` a shadow struct for deserialization, where every future field has to be added twice. That is worth its own change, not a rider on this one.
+- **An end-to-end proof that a newly broken file shows up as new.** The e2e sub-case in task 6 asserts the drain deduplicates, not that a specific diagnostic is new, because whether the workspace's known errors land before or after the baseline depends on rust-analyzer's startup timing, which the test cannot control. The baseline semantics are pinned by unit tests instead.
 
 ## Self-review
 
-**Spec coverage.** A1 is task 1. The `[diagnostics]` table and per-server floor are task 2. A2's record, hash, floor and caps are task 3; its stale-publish rule is task 4; its baseline rule is task 5. A3's flush tool and session keying are tasks 3 and 6. Stage A's testing section maps onto the tests in tasks 1, 3 and 6. The one spec element deliberately not implemented is the `footer` key, recorded above under deliberate deviations.
+**Spec coverage.** A1 is task 1. The `[diagnostics]` table and per-server floor are task 2. A2's record, hash, floor and caps are task 3; its stale-publish rule is task 4; its baseline rule is task 5. A3's flush tool and session keying are tasks 3 and 6. The one spec element deliberately not implemented is the `footer` key, recorded under deliberate deviations, and the one reinterpreted is the baseline trigger, also recorded there with its measurement.
 
-**Placeholders.** Two test bodies are described rather than written: the pump tests in task 4 step 1 and the rust-analyzer test in task 6 step 1. Both are cases where the surrounding file already has a setup idiom that a fresh implementer should copy rather than reinvent, and both name the file and the helper to copy from. Every other step carries the code it needs.
+**Placeholders.** Two test bodies are described rather than written: the pump tests in task 4 step 1 and the settle pump test in task 5 step 4. Both are cases where the surrounding file already has a setup idiom that a fresh implementer should copy rather than reinvent, and both name the file and the helper to copy from. `new_diagnostics_payload` in task 6 is specified by its inputs, its conversion and its output shape rather than written out, because its body is assembly against three signatures the task quotes. Every other step carries the code it needs.
 
-**Type consistency.** `SessionId`, `FileEntry`, `FlushReport`, `ChangedFile`, `DiagnosticsDelivery`, `ServerSettle`, `FloorTable`, `SeverityFloor` and `DiagnosticsConfig` keep the same names and shapes from the task that defines them through every later use. `visible_hash` is used by both task 3's flush and task 5's baseline. `FloorTable` is defined in task 3 beside the delivery core, used by task 5's baseline and constructed by task 6, so no task references a type a later task defines.
+**Type consistency.** `SessionId`, `FileEntry`, `FlushReport`, `ChangedFile`, `DiagnosticsDelivery`, `ServerSettle`, `FloorTable`, `SeverityFloor` and `DiagnosticsConfig` keep the same names and shapes from the task that defines them through every later use. `visible_hash` is used by both task 3's flush and task 5's baseline. `FloorTable` is defined in task 3, constructed in task 5 and read in task 6. `diagnostics_snapshot` is added in task 5, where the baseline first needs it, and reused in task 6. `PumpShared` grows in task 4 and again in task 5; no task references a type a later task defines.
+
+**Ordering.** Task 4 collapses `spawn_lsp_servers_background`'s parameter list because task 5 cannot add to it otherwise. Task 5 constructs the delivery core and floor table because its baseline task needs them; task 6 shares the same `Arc`s rather than building new ones, which is what makes the baseline the tool reads the one the background task adopted.
