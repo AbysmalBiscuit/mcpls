@@ -29,38 +29,38 @@
 
 **Stage B, created:**
 
-- `crates/mcpls-core/src/lsp/watched_files.rs` — the `WatchRegistry`: which servers registered which globs under which registration ids, and which of them match a given path and change kind. Pure; no I/O, no LSP client.
-- `crates/mcpls-core/tests/fixtures/python_workspace/` — a pyrefly fixture, created only if Task 1's measurement says pyrefly publishes for unopened files.
+- `crates/mcpls-core/src/lsp/watched_files.rs`: the `WatchRegistry`: which servers registered which globs under which registration ids, and which of them match a given path and change kind. Pure; no I/O, no LSP client.
+- `crates/mcpls-core/tests/fixtures/python_workspace/`: a pyrefly fixture, created only if Task 1's measurement says pyrefly publishes for unopened files.
 
 **Stage B, modified:**
 
-- `crates/mcpls-core/src/bridge/state.rs` — `DocumentState` gains `saved`; `DocumentTracker` gains the resync entry point and the two per-server marking calls.
-- `crates/mcpls-core/src/bridge/translator/mod.rs` — `forget_changed_documents` becomes `resync_changed_documents`; the drain drives notifications and marking.
-- `crates/mcpls-core/src/bridge/delivery.rs` — the cleared budget and the `Off`-floor arm.
-- `crates/mcpls-core/src/bridge/settle.rs` — the footer's own quiet judgment, and an injectable clock.
-- `crates/mcpls-core/src/config/mod.rs` — the three footer keys.
-- `crates/mcpls-core/src/lsp/client.rs` — the registry reaches `server_request_result`.
-- `crates/mcpls-core/src/lsp/lifecycle.rs` — the capability flip, the tripwire test, `ServerInitConfig` carries the registry.
-- `crates/mcpls-core/src/mcp/server.rs` — the lock-order fix, the payload signature, the footer wrapper and its three call sites.
-- `crates/mcpls-core/tests/ra_e2e.rs`, `crates/mcpls-core/tests/fixtures/rust_workspace/src/` — the collision fixture and the B1 e2e.
+- `crates/mcpls-core/src/bridge/state.rs`: `DocumentState` gains `saved`; `DocumentTracker` gains the resync entry point and the two per-server marking calls.
+- `crates/mcpls-core/src/bridge/translator/mod.rs`: `forget_changed_documents` becomes `resync_changed_documents`; the drain drives notifications and marking.
+- `crates/mcpls-core/src/bridge/delivery.rs`: the cleared budget and the `Off`-floor arm.
+- `crates/mcpls-core/src/bridge/settle.rs`: the footer's own quiet judgment, and an injectable clock.
+- `crates/mcpls-core/src/config/mod.rs`: the three footer keys.
+- `crates/mcpls-core/src/lsp/client.rs`: the registry reaches `server_request_result`.
+- `crates/mcpls-core/src/lsp/lifecycle.rs`: the capability flip, the tripwire test, `ServerInitConfig` carries the registry.
+- `crates/mcpls-core/src/mcp/server.rs`: the lock-order fix, the payload signature, the footer wrapper and its three call sites.
+- `crates/mcpls-core/tests/ra_e2e.rs`, `crates/mcpls-core/tests/fixtures/rust_workspace/src/`: the collision fixture and the B1 e2e.
 
 **Stage C, created:**
 
-- `crates/mcpls-core/src/hooks/mod.rs` — module root and the public surface the rest of the crate uses.
-- `crates/mcpls-core/src/hooks/identity.rs` — canonicalization, the directory hash, the platform socket path, the lock path.
-- `crates/mcpls-core/src/hooks/protocol.rs` — the newline-delimited JSON request and response types.
-- `crates/mcpls-core/src/hooks/listener.rs` — the transport trait, the Unix and Windows implementations, and lock-based ownership.
-- `crates/mcpls-core/src/hooks/filters.rs` — the two path filters and the `watchPaths` walk.
-- `crates/mcpls-core/src/hooks/sweep.rs` — the debounced pending set and the sweep.
-- `crates/mcpls-cli/src/hook.rs` — the `mcpls hook` and `mcpls hook doctor` subcommands.
-- `crates/mcpls-core/tests/hooks_socket.rs` — socket integration tests.
-- `plugin/` — the Claude Code plugin.
+- `crates/mcpls-core/src/hooks/mod.rs`: module root and the public surface the rest of the crate uses.
+- `crates/mcpls-core/src/hooks/identity.rs`: canonicalization, the directory hash, the platform socket path, the lock path.
+- `crates/mcpls-core/src/hooks/protocol.rs`: the newline-delimited JSON request and response types.
+- `crates/mcpls-core/src/hooks/listener.rs`: the transport trait, the Unix and Windows implementations, and lock-based ownership.
+- `crates/mcpls-core/src/hooks/filters.rs`: the two path filters and the `watchPaths` walk.
+- `crates/mcpls-core/src/hooks/sweep.rs`: the debounced pending set and the sweep.
+- `crates/mcpls-cli/src/hook.rs`: the `mcpls hook` and `mcpls hook doctor` subcommands.
+- `crates/mcpls-core/tests/hooks_socket.rs`: socket integration tests.
+- `plugin/`: the Claude Code plugin.
 
 **Stage C, modified:**
 
-- `crates/mcpls-core/src/config/mod.rs` — `[diagnostics.hooks]`.
-- `crates/mcpls-core/src/lib.rs` — build the registry and the hook listener; restart nothing else.
-- `crates/mcpls-cli/src/args.rs`, `crates/mcpls-cli/src/main.rs` — the subcommand.
+- `crates/mcpls-core/src/config/mod.rs`: `[diagnostics.hooks]`.
+- `crates/mcpls-core/src/lib.rs`: build the registry and the hook listener; restart nothing else.
+- `crates/mcpls-cli/src/args.rs`, `crates/mcpls-cli/src/main.rs`: the subcommand.
 
 ---
 
@@ -132,8 +132,8 @@ git -C /home/lev/Git/lev/mcpls-diag-bc commit -m "docs(diagnostics): measure wha
 - Produces:
   - `DocumentState::saved_version(&self, server: &ServerId) -> Option<i32>`
   - `DocumentState::mark_saved(&mut self, server: ServerId, version: i32)` (private to the module, like `mark_synced`)
-  - `DocumentState::servers_needing_change(&self, version: i32) -> Vec<ServerId>` — every server in `synced` whose recorded version is below `version`
-  - `DocumentState::servers_needing_save(&self, version: i32) -> Vec<ServerId>` — every server in `synced` whose `saved` entry is absent or below `version`
+  - `DocumentState::servers_needing_change(&self, version: i32) -> Vec<ServerId>`: every server in `synced` whose recorded version is below `version`
+  - `DocumentState::servers_needing_save(&self, version: i32) -> Vec<ServerId>`: every server in `synced` whose `saved` entry is absent or below `version`
   - `DocumentState::forget_server` also clears that server's `saved` entry.
 
 - [ ] **Step 1: write the failing tests**
@@ -2042,7 +2042,7 @@ git -C /home/lev/Git/lev/mcpls-diag-bc commit -m "docs(spec): narrow what watchi
 **Interfaces:**
 - Produces:
   - `new_diagnostics_payload(&self, report: &FlushReport, sources: &HashMap<String, (Uri, ServerId)>) -> NewDiagnosticsResult`
-  - `McplsServer::flush_now(&self, session: &SessionId) -> NewDiagnosticsResult` — the flush and its payload, without the tool wrapper and without the baseline guard, so the tool, the footer (Task 13) and the socket op (Task 19) all run the same code against the same record
+  - `McplsServer::flush_now(&self, session: &SessionId) -> NewDiagnosticsResult`: the flush and its payload, without the tool wrapper and without the baseline guard, so the tool, the footer (Task 13) and the socket op (Task 19) all run the same code against the same record
   - `NotificationCache::diagnostics_entries(&self) -> Vec<(&str, &DiagnosticInfo, &ServerId)>`
 
 - [ ] **Step 1: write the failing test**
