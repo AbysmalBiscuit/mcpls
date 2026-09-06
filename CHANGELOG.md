@@ -28,6 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Retry ContentModified responses for safe read methods and advertise the same retry allowlist during LSP initialization. ([bug-ops/mcpls#390](https://github.com/bug-ops/mcpls/pull/390))
+
 - Let repeat shutdown signals end HTTP connection draining, reuse normalized flat-symbol ranges, and test pull diagnostics with a native rust-analyzer error. ([bug-ops/mcpls#365](https://github.com/bug-ops/mcpls/pull/365))
 
 - **Repeat `SIGTERM`/`SIGINT` during shutdown cleanup can now force-quit a stuck cleanup** — previously, a signal arriving while `shutdown()` was mid `shutdown_servers`/LSP-init cleanup had no listener to catch it and was silently discarded, making that window uninterruptible short of `SIGKILL`. `shutdown()` now re-registers its own signal handler for the duration of cleanup, so a repeat signal there triggers an immediate exit. (#350)

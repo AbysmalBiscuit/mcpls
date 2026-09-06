@@ -14,8 +14,8 @@ use std::sync::Arc;
 
 use lsp_types::{
     ClientCapabilities, ClientInfo, GeneralClientCapabilities, InitializeParams, InitializeResult,
-    InitializedParams, PositionEncodingKind, ServerCapabilities, SymbolKind,
-    WindowClientCapabilities, WorkspaceFolder,
+    InitializedParams, PositionEncodingKind, ServerCapabilities,
+    StaleRequestSupportClientCapabilities, SymbolKind, WindowClientCapabilities, WorkspaceFolder,
 };
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -25,6 +25,7 @@ use tracing::{debug, info, warn};
 use crate::bridge::try_path_to_uri;
 use crate::config::{LspServerConfig, ServerId};
 use crate::error::{Error, Result, ServerSpawnFailure};
+use crate::lsp::CONTENT_MODIFIED_RETRY_METHODS;
 use crate::lsp::client::LspClient;
 use crate::lsp::transport::LspTransport;
 use crate::lsp::types::LspNotification;
@@ -717,6 +718,13 @@ fn build_client_capabilities(
     ClientCapabilities {
         general: Some(GeneralClientCapabilities {
             position_encodings: Some(position_encodings),
+            stale_request_support: Some(StaleRequestSupportClientCapabilities {
+                cancel: false,
+                retry_on_content_modified: CONTENT_MODIFIED_RETRY_METHODS
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            }),
             ..Default::default()
         }),
         text_document: Some(lsp_types::TextDocumentClientCapabilities {
@@ -2019,6 +2027,59 @@ mod tests {
             .await;
 
             // The response written above must let `initialize` complete successfully.
+            init_task.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn test_initialize_advertises_stale_request_support() {
+            let (client, mut server) = fake_lsp_client();
+
+            let config = ServerInitConfig {
+                applies_edits: false,
+                server_config: LspServerConfig::rust_analyzer(),
+                workspace_roots: vec![],
+                initialization_options: None,
+                position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+                notification_tx: None,
+                watch_registry: None,
+            };
+
+            let init_task =
+                tokio::spawn(async move { LspServer::initialize(&client, &config).await });
+
+            let mut reader = BufReader::new(&mut server.write_stdout);
+            let request = read_framed_message(&mut reader).await;
+            let params: InitializeParams =
+                serde_json::from_value(request["params"].clone()).unwrap();
+            let stale_request_support = params
+                .capabilities
+                .general
+                .unwrap()
+                .stale_request_support
+                .unwrap();
+
+            assert_eq!(request["method"], "initialize");
+            assert!(
+                !stale_request_support.cancel,
+                "mcpls does not implement active in-flight request cancellation"
+            );
+            assert_eq!(
+                stale_request_support.retry_on_content_modified,
+                CONTENT_MODIFIED_RETRY_METHODS
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+                "the wire-advertised capability must match the methods LspClient::request \
+                 actually retries -32801 for, not drift from it"
+            );
+
+            write_success_response(
+                &mut server.read_half_stdin,
+                &request["id"].clone(),
+                serde_json::json!({ "capabilities": {} }),
+            )
+            .await;
+
             init_task.await.unwrap().unwrap();
         }
 
