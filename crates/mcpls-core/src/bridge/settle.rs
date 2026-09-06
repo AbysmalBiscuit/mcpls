@@ -96,7 +96,6 @@ impl ServerSettle {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use std::time::{Duration, Instant};
 
@@ -140,6 +139,59 @@ mod tests {
         settle.end(&rust, &json!("rustAnalyzer/Indexing"));
         settle.begin(&rust, &json!("rust-analyzer/flycheck/0"));
         assert!(!settle.should_settle_at(Instant::now() + Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn test_a_second_quiet_period_restarts_the_clock_from_its_own_end() {
+        // A small `quiet_for` so the real sleep below (needed because `end`
+        // stamps `quiet_since` from the wall clock, not from an injectable
+        // `now`) stays short.
+        let quiet_for = Duration::from_millis(50);
+        let settle = ServerSettle::new(quiet_for, Duration::from_secs(600));
+        let rust = ServerId::from("rust");
+
+        settle.begin(&rust, &json!("rustAnalyzer/Indexing"));
+        settle.end(&rust, &json!("rustAnalyzer/Indexing"));
+        let first_quiet_began = Instant::now();
+
+        std::thread::sleep(quiet_for * 3);
+
+        settle.begin(&rust, &json!("rust-analyzer/flycheck/0"));
+        settle.end(&rust, &json!("rust-analyzer/flycheck/0"));
+        let second_quiet_began = Instant::now();
+
+        // Sanity-check the test's own timing assumption before relying on
+        // it: the sleep above must actually have separated the two quiet
+        // periods by more than `quiet_for`, or the assertions below would
+        // hold vacuously regardless of which quiet period the clock is
+        // reading from.
+        assert!(second_quiet_began.duration_since(first_quiet_began) > quiet_for);
+
+        // More than `quiet_for` past the first quiet period, but not yet
+        // `quiet_for` past the second. An implementation that stamps
+        // `quiet_since` once and accumulates from there, instead of
+        // re-stamping it on every later empty transition, would already
+        // call this settled here (or would never settle again at all, if
+        // it instead forgets to re-stamp altogether).
+        assert!(
+            !settle.should_settle_at(second_quiet_began),
+            "the clock must restart from the second quiet period, not the first"
+        );
+        assert!(settle.should_settle_at(second_quiet_began + quiet_for * 2));
+    }
+
+    #[test]
+    fn test_two_servers_sharing_a_token_string_are_tracked_independently() {
+        let settle = settle();
+        let rust = ServerId::from("rust");
+        let python = ServerId::from("python");
+        settle.begin(&rust, &json!("indexing"));
+        settle.begin(&python, &json!("indexing"));
+        settle.end(&rust, &json!("indexing"));
+        assert!(
+            !settle.should_settle_at(Instant::now() + Duration::from_secs(5)),
+            "python's identically-named token is still outstanding"
+        );
     }
 
     #[test]

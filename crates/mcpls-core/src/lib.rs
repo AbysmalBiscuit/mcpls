@@ -1090,7 +1090,7 @@ async fn baseline_task(
                     let cache = cache.lock().await;
                     cache.diagnostics_snapshot()
                 };
-                let baseline = snapshot
+                let baseline: HashMap<String, u64> = snapshot
                     .iter()
                     .filter_map(|(key, info, owner)| {
                         bridge::DiagnosticsDelivery::visible_hash(
@@ -1100,8 +1100,9 @@ async fn baseline_task(
                         .map(|hash| (key.clone(), hash))
                     })
                     .collect();
+                let baseline_len = baseline.len();
                 delivery.lock().await.set_baseline(baseline);
-                debug!("diagnostics baseline taken over {} file(s)", snapshot.len());
+                debug!("diagnostics baseline taken over {baseline_len} file(s)");
                 return;
             }
         }
