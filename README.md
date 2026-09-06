@@ -298,8 +298,8 @@ max_documents = 100    # 0 = unlimited
 max_file_size = 10485760  # bytes, 0 = unlimited
 
 # rust-analyzer is a built-in, active without any [[lsp_servers]] entry --
-# this one overrides its heuristics and initialization_options below,
-# restating the rest of the built-in's own values for illustration.
+# this one overrides initialization_options below, restating the rest of
+# the built-in's own values for illustration.
 [[lsp_servers]]
 language_id = "rust"
 command = "rust-analyzer"

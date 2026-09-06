@@ -2473,7 +2473,7 @@ mod tests {
             .expect_err("an entry with no language_id and no name is rejected")
             .to_string();
         assert!(
-            message.contains('1'),
+            message.contains("entry #1"),
             "the error names the offending entry's position, got: {message}"
         );
     }
