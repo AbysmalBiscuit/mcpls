@@ -201,9 +201,13 @@ fn normalize(path: &Path) -> PathBuf {
 ///
 /// A path that cannot be stat'd is not read-only for this purpose: it is
 /// either absent, which is fine, or unreadable, which the operation itself
-/// will report.
+/// will report. Neither is a directory: Windows sets the read-only
+/// attribute on directories as a folder-customization marker rather than a
+/// protection, and on Unix the bit governs the entries inside rather than
+/// the directory itself. Moving a directory aside needs its parent's
+/// permission, which the filesystem enforces without help.
 fn is_read_only(path: &Path) -> bool {
-    fs::metadata(path).is_ok_and(|meta| meta.permissions().readonly())
+    fs::metadata(path).is_ok_and(|meta| !meta.is_dir() && meta.permissions().readonly())
 }
 
 /// What a path holds at some point during planning.
@@ -409,6 +413,29 @@ impl<'a> Planner<'a> {
         }
     }
 
+    /// Whether `path` holds nothing by the time its delete runs, which is
+    /// what a non-recursive delete of a directory turns on.
+    ///
+    /// Entries an earlier operation moves out are gone by then and entries
+    /// one puts in are there, so neither the disk nor the overlay answers
+    /// this alone. gopls renames a package by moving its files out one at a
+    /// time and then deleting the directory they came from.
+    fn directory_is_empty(&self, path: &Path) -> Result<bool> {
+        let io_error = |e: std::io::Error| Error::FileIo {
+            path: path.to_path_buf(),
+            source: e,
+        };
+        for entry in fs::read_dir(path).map_err(io_error)? {
+            let child = normalize(&entry.map_err(io_error)?.path());
+            if !matches!(self.overlay.get(&child), Some(Presence::Absent)) {
+                return Ok(false);
+            }
+        }
+        Ok(!self.overlay.iter().any(|(key, presence)| {
+            key.parent() == Some(path) && !matches!(presence, Presence::Absent)
+        }))
+    }
+
     /// Note that `path`'s on-disk content no longer matches anything cached
     /// against it, so a caller tracking open documents must drop its entry.
     fn invalidate(&mut self, path: &Path) {
@@ -599,16 +626,7 @@ impl<'a> Planner<'a> {
             )));
         }
 
-        if !recursive
-            && path.is_dir()
-            && fs::read_dir(&path)
-                .map_err(|e| Error::FileIo {
-                    path: path.clone(),
-                    source: e,
-                })?
-                .next()
-                .is_some()
-        {
+        if !recursive && path.is_dir() && !self.directory_is_empty(&path)? {
             return Err(Error::ApplyRefused(format!(
                 "{} is a non-empty directory and the edit did not ask for a recursive delete",
                 path.display()
@@ -867,6 +885,85 @@ mod tests {
             .expect("an ignored create is not a failure");
 
         assert_eq!(fs::read_to_string(&path).expect("read"), "keep me\n");
+    }
+
+    #[tokio::test]
+    async fn test_deletes_a_directory_the_same_edit_empties() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let old_pkg = dir.path().join("old");
+        let new_pkg = dir.path().join("new");
+        fs::create_dir(&old_pkg).expect("old package");
+        fs::create_dir(&new_pkg).expect("new package");
+        fs::write(old_pkg.join("a.rs"), "fn a() {}\n").expect("seed");
+
+        let plan = EditPlan::from_workspace_edit(WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Operations(vec![
+                DocumentChangeOperation::Op(ResourceOp::Rename(RenameFile {
+                    old_uri: uri_for(&old_pkg.join("a.rs")),
+                    new_uri: uri_for(&new_pkg.join("a.rs")),
+                    options: None,
+                    annotation_id: None,
+                })),
+                DocumentChangeOperation::Op(ResourceOp::Delete(DeleteFile {
+                    uri: uri_for(&old_pkg),
+                    options: None,
+                })),
+            ])),
+            ..WorkspaceEdit::default()
+        })
+        .expect("plan builds");
+
+        let applier = Applier::new(vec![dir.path().to_path_buf()], permissive());
+        applier
+            .apply(plan, PositionEncoding::Utf16, &InvalidationQueue::default())
+            .await
+            .expect("the directory is empty by the time the delete runs");
+
+        assert!(!old_pkg.exists());
+        assert_eq!(
+            fs::read_to_string(new_pkg.join("a.rs")).expect("read"),
+            "fn a() {}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refuses_a_directory_the_edit_does_not_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let old_pkg = dir.path().join("old");
+        let new_pkg = dir.path().join("new");
+        fs::create_dir(&old_pkg).expect("old package");
+        fs::create_dir(&new_pkg).expect("new package");
+        fs::write(old_pkg.join("a.rs"), "fn a() {}\n").expect("seed");
+        fs::write(old_pkg.join("stays.rs"), "fn stays() {}\n").expect("seed");
+
+        let plan = EditPlan::from_workspace_edit(WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Operations(vec![
+                DocumentChangeOperation::Op(ResourceOp::Rename(RenameFile {
+                    old_uri: uri_for(&old_pkg.join("a.rs")),
+                    new_uri: uri_for(&new_pkg.join("a.rs")),
+                    options: None,
+                    annotation_id: None,
+                })),
+                DocumentChangeOperation::Op(ResourceOp::Delete(DeleteFile {
+                    uri: uri_for(&old_pkg),
+                    options: None,
+                })),
+            ])),
+            ..WorkspaceEdit::default()
+        })
+        .expect("plan builds");
+
+        let applier = Applier::new(vec![dir.path().to_path_buf()], permissive());
+        let error = applier
+            .apply(plan, PositionEncoding::Utf16, &InvalidationQueue::default())
+            .await
+            .expect_err("stays.rs is still there when the delete runs");
+
+        assert!(
+            error.to_string().contains("non-empty directory"),
+            "unexpected refusal: {error}"
+        );
+        assert!(old_pkg.join("a.rs").exists(), "the rename rolled back");
     }
 
     #[tokio::test]
@@ -1214,6 +1311,38 @@ mod tests {
         );
         assert!(path.exists(), "the file survives");
         set_read_only(&path, false);
+    }
+
+    /// A directory's read-only bit says nothing about whether removing the
+    /// directory is against the user's wishes: Windows sets the attribute on
+    /// directories as a folder-customization marker, and on Unix it governs
+    /// the entries inside rather than the directory itself. Moving the
+    /// directory aside needs the parent's permission, which the filesystem
+    /// enforces on its own.
+    #[tokio::test]
+    async fn test_deletes_a_read_only_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let victim = dir.path().join("protected");
+        fs::create_dir(&victim).expect("directory");
+        set_read_only(&victim, true);
+
+        let applier = Applier::new(vec![dir.path().to_path_buf()], permissive());
+        let plan = EditPlan::from_workspace_edit(WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Operations(vec![
+                DocumentChangeOperation::Op(ResourceOp::Delete(DeleteFile {
+                    uri: uri_for(&victim),
+                    options: None,
+                })),
+            ])),
+            ..WorkspaceEdit::default()
+        })
+        .expect("plan builds");
+
+        applier
+            .apply(plan, PositionEncoding::Utf16, &InvalidationQueue::default())
+            .await
+            .expect("the directory's own read-only bit does not protect it");
+        assert!(!victim.exists());
     }
 
     /// rust-analyzer's "create module" quick fix asks for a file in a
