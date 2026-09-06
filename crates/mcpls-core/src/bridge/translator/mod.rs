@@ -240,6 +240,11 @@ impl Translator {
         self
     }
 
+    /// Which tools this deployment lets write.
+    pub(crate) fn apply_config(&self) -> &ApplyConfig {
+        self.applier.config()
+    }
+
     /// The applier, if `tool` is permitted to write.
     ///
     /// Called before any LSP request, so a refused call costs nothing and

@@ -9,10 +9,10 @@ use std::sync::Arc;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    Implementation, ListResourcesResult, ReadResourceRequestParams, ReadResourceResponse,
-    ReadResourceResult, Resource, ResourceContents, ResourceUpdatedNotificationParam,
-    ServerCapabilities, ServerInfo, SubscribeRequestParams, ToolAnnotations,
-    UnsubscribeRequestParams,
+    Implementation, ListResourcesResult, ListToolsResult, ReadResourceRequestParams,
+    ReadResourceResponse, ReadResourceResult, Resource, ResourceContents,
+    ResourceUpdatedNotificationParam, ServerCapabilities, ServerInfo, SubscribeRequestParams, Tool,
+    ToolAnnotations, UnsubscribeRequestParams,
 };
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use tokio::sync::Mutex;
@@ -29,11 +29,24 @@ use crate::bridge::{
     DiagnosticInfo, NotificationCache, PositionEncoding, ResourceSubscriptions, Translator,
     validate_path_against_roots,
 };
+use crate::config::ToolKind;
 
 /// MCP server that exposes LSP capabilities as tools.
 #[derive(Clone)]
 pub struct McplsServer {
     context: Arc<BridgeContext>,
+}
+
+/// The apply toggle a tool's writes answer to, for the tools that write.
+///
+/// Every other tool reads, so its annotations never depend on the config.
+fn write_toggle(tool_name: &str) -> Option<ToolKind> {
+    match tool_name {
+        "rename_symbol" => Some(ToolKind::Rename),
+        "format_document" => Some(ToolKind::FormatDocument),
+        "apply_code_action" => Some(ToolKind::CodeActions),
+        _ => None,
+    }
 }
 
 /// Map a bridge-layer result to the MCP tool response shape shared by every `#[tool]` handler.
@@ -198,6 +211,37 @@ impl McplsServer {
             });
         }
         router
+    }
+
+    /// `tools` with every writing tool this deployment forbids re-advertised
+    /// as read-only.
+    ///
+    /// A `#[tool]` attribute describes what its tool does with its apply key
+    /// on. With the key off the tool refuses the write and returns the same
+    /// edits a query would, so a client that puts destructive tools behind a
+    /// prompt has nothing here to prompt about.
+    fn annotate_for_config(&self, mut tools: Vec<Tool>) -> Vec<Tool> {
+        let config = self.context.translator.apply_config();
+        for tool in &mut tools {
+            let Some(kind) = write_toggle(&tool.name) else {
+                continue;
+            };
+            if config.permits(kind) {
+                continue;
+            }
+            let title = tool
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.title.clone());
+            tool.annotations = Some(ToolAnnotations::from_raw(
+                title,
+                Some(true),
+                Some(false),
+                Some(true),
+                None,
+            ));
+        }
+        tools
     }
 
     /// Get hover information at a position in a file.
@@ -715,6 +759,33 @@ impl McplsServer {
 #[allow(clippy::unused_async_trait_impl)]
 #[tool_handler]
 impl ServerHandler for McplsServer {
+    /// What `#[tool_handler]` would generate, plus the pass that fits each
+    /// tool's annotations to this deployment. Defining it here is what stops
+    /// the macro generating its own.
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        context: rmcp::service::RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        let supports_cache_hints = context
+            .protocol_version()
+            .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28);
+        Ok(ListToolsResult {
+            result_type: Some(rmcp::model::ResultType::COMPLETE),
+            tools: self.annotate_for_config(Self::tool_router().list_all()),
+            meta: None,
+            next_cursor: None,
+            ttl_ms: supports_cache_hints.then_some(0),
+            cache_scope: supports_cache_hints.then_some(rmcp::model::CacheScope::Public),
+        })
+    }
+
+    /// Same, for the single-tool lookup.
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        let tool = Self::tool_router().get(name).cloned()?;
+        self.annotate_for_config(vec![tool]).pop()
+    }
+
     async fn list_resources(
         &self,
         request: Option<rmcp::model::PaginatedRequestParams>,
@@ -1736,6 +1807,73 @@ mod tests {
                 Some(*idempotent),
                 "tool `{name}` idempotent_hint mismatch"
             );
+        }
+    }
+
+    fn server_permitting_writes() -> McplsServer {
+        use crate::bridge::apply::Applier;
+        use crate::config::ApplyConfig;
+
+        let applier = Arc::new(Applier::new(
+            Vec::new(),
+            ApplyConfig {
+                rename: true,
+                format_document: true,
+                code_actions: true,
+                allow_file_deletion: false,
+            },
+        ));
+        McplsServer::new(
+            Arc::new(Translator::new().with_applier(applier)),
+            Arc::new(Mutex::new(NotificationCache::new())),
+            Arc::from(Vec::new()),
+            Arc::new(ResourceSubscriptions::new()),
+            false,
+        )
+    }
+
+    /// The writing tools describe themselves by what they can actually do
+    /// here: with every apply key off they only ever return edits, and a
+    /// client that gates destructive tools should not be gating them.
+    #[test]
+    fn test_writing_tools_are_read_only_when_the_config_forbids_writing() {
+        let server = create_test_server();
+        for name in ["rename_symbol", "format_document", "apply_code_action"] {
+            let annotations = server
+                .get_tool(name)
+                .unwrap_or_else(|| panic!("tool `{name}` is registered"))
+                .annotations
+                .unwrap_or_else(|| panic!("tool `{name}` carries annotations"));
+            assert_eq!(annotations.read_only_hint, Some(true), "{name}");
+            assert_eq!(annotations.destructive_hint, Some(false), "{name}");
+        }
+    }
+
+    #[test]
+    fn test_writing_tools_keep_their_warning_when_the_config_permits_writing() {
+        let server = server_permitting_writes();
+        for name in ["rename_symbol", "format_document", "apply_code_action"] {
+            let annotations = server
+                .get_tool(name)
+                .unwrap_or_else(|| panic!("tool `{name}` is registered"))
+                .annotations
+                .unwrap_or_else(|| panic!("tool `{name}` carries annotations"));
+            assert_eq!(annotations.read_only_hint, Some(false), "{name}");
+            assert_eq!(annotations.destructive_hint, Some(true), "{name}");
+        }
+    }
+
+    /// A reading tool's classification is the same either way.
+    #[test]
+    fn test_reading_tools_are_untouched_by_the_apply_config() {
+        for server in [create_test_server(), server_permitting_writes()] {
+            let annotations = server
+                .get_tool("get_hover")
+                .unwrap_or_else(|| panic!("get_hover is registered"))
+                .annotations
+                .unwrap_or_else(|| panic!("get_hover carries annotations"));
+            assert_eq!(annotations.read_only_hint, Some(true));
+            assert_eq!(annotations.destructive_hint, Some(false));
         }
     }
 
