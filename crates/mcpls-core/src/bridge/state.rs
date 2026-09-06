@@ -253,10 +253,6 @@ impl DocumentState {
     }
 
     /// Records that `server` was sent a `didSave` at `version`.
-    ///
-    /// The resync entry point that decides, per server, whether a save is
-    /// still owed calls this once a `didSave` for it goes out.
-    #[allow(dead_code)]
     fn mark_saved(&mut self, server: ServerId, version: i32) {
         self.saved.insert(server, version);
     }
@@ -293,6 +289,29 @@ impl DocumentState {
     fn forget_server(&mut self, server: &ServerId) {
         self.synced.remove(server);
         self.saved.remove(server);
+    }
+}
+
+/// What a resync of one path found, and what still has to be sent for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resync {
+    /// URI to name in the notifications.
+    pub uri: Uri,
+    /// Version the document is now at.
+    pub version: i32,
+    /// Full text to send in the `didChange`.
+    pub text: String,
+    /// Servers that still need a `didChange` at `version`.
+    pub needs_change: Vec<ServerId>,
+    /// Servers that still need a `didSave` at `version`.
+    pub needs_save: Vec<ServerId>,
+}
+
+impl Resync {
+    /// Whether every server this document is open for is caught up.
+    #[must_use]
+    pub const fn is_settled(&self) -> bool {
+        self.needs_change.is_empty() && self.needs_save.is_empty()
     }
 }
 
@@ -506,6 +525,17 @@ impl DocumentTracker {
         lock_std(&self.documents).keys().cloned().collect()
     }
 
+    /// A clone of the tracked state for `path`, or `None` when the tracker
+    /// does not hold it.
+    ///
+    /// A clone rather than a borrow: `documents` is a `StdMutex` and
+    /// handing out a guard would let a caller hold it across an `.await`.
+    /// For tests and for diagnostics, not for the hot path.
+    #[must_use]
+    pub fn snapshot(&self, path: &Path) -> Option<DocumentState> {
+        lock_std(&self.documents).get(path).cloned()
+    }
+
     /// Forget `server`'s last-synced version for every currently open
     /// document, so the next `ensure_open` call sends `didOpen` again
     /// instead of `didChange`.
@@ -539,6 +569,100 @@ impl DocumentTracker {
             .get(server)
             .copied()
             .unwrap_or(0)
+    }
+
+    /// Sync generation for `server`, captured before notifying and handed
+    /// back to [`Self::mark_change_sent`] and [`Self::mark_save_sent`].
+    #[must_use]
+    pub fn generation_for(&self, server: &ServerId) -> u64 {
+        self.generation(server)
+    }
+
+    /// Re-read `path` from disk, commit any change, and report which servers
+    /// holding it open still need a `didChange` or a `didSave` at the
+    /// resulting version.
+    ///
+    /// Always reads. The apply queue this drives is itself proof the file
+    /// was written, and `disk_phase`'s stat fast paths would skip a
+    /// same-length rewrite landing inside the debounce window.
+    ///
+    /// Returns `Ok(None)` for a path the tracker does not hold: naming an
+    /// untracked path to the servers that asked to watch it is the watched
+    /// files registry's job, and opening it is the sweep's.
+    ///
+    /// The caller must hold `path`'s lock from [`Self::lock_path`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read or exceeds the
+    /// configured size limit.
+    pub async fn resync_from_disk(&self, path: &Path) -> Result<Option<Resync>> {
+        let read_at = SystemTime::now();
+        if !lock_std(&self.documents).contains_key(path) {
+            return Ok(None);
+        }
+        let meta = fs::metadata(path).await.map_err(|e| Error::FileIo {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        let (fresh, ..) = self.read_to_string_checked(path).await?;
+        let snap = DiskSync {
+            mtime: meta.modified().ok(),
+            size: meta.len(),
+            mtime_settled: mtime_settled(meta.modified().ok(), read_at),
+            content_checked_at: Instant::now(),
+        };
+
+        let mut documents = lock_std(&self.documents);
+        let Some(state) = documents.get_mut(path) else {
+            return Ok(None);
+        };
+        let version = if fresh == state.content {
+            state.set_disk(snap);
+            state.version()
+        } else {
+            let next = state.version().saturating_add(1);
+            state.commit_reload(next, fresh, Some(snap));
+            next
+        };
+        let resync = Resync {
+            uri: state.uri().clone(),
+            version,
+            text: state.content().to_string(),
+            needs_change: state.servers_needing_change(version),
+            needs_save: state.servers_needing_save(version),
+        };
+        drop(documents);
+        Ok(Some(resync))
+    }
+
+    /// Record that `server` received the `didChange` for `version`.
+    ///
+    /// Dropped when `generation` no longer matches: the process that would
+    /// have received it has been respawned, and the fresh one has seen
+    /// nothing.
+    pub fn mark_change_sent(&self, path: &Path, server: &ServerId, version: i32, generation: u64) {
+        let mut documents = lock_std(&self.documents);
+        if self.generation(server) != generation {
+            return;
+        }
+        if let Some(state) = documents.get_mut(path) {
+            state.mark_synced(server.clone(), version);
+        }
+    }
+
+    /// Record that `server` received the `didSave` for `version`.
+    ///
+    /// Dropped when `generation` no longer matches, for the same reason as
+    /// [`Self::mark_change_sent`].
+    pub fn mark_save_sent(&self, path: &Path, server: &ServerId, version: i32, generation: u64) {
+        let mut documents = lock_std(&self.documents);
+        if self.generation(server) != generation {
+            return;
+        }
+        if let Some(state) = documents.get_mut(path) {
+            state.mark_saved(server.clone(), version);
+        }
     }
 
     /// Acquire the per-path lock used by [`Self::ensure_open`], creating its
@@ -2080,6 +2204,21 @@ mod tests {
         )
     }
 
+    /// An `LspClient` whose notifications succeed, discarding the
+    /// `FakeServer` guard the tracker tests do not read back from.
+    ///
+    /// The guard owns two `cat` children with `kill_on_drop`, so it is
+    /// returned alongside the client and the caller must hold it for as
+    /// long as it uses the client.
+    fn fake_client() -> (LspClient, FakeServer) {
+        fake_lsp_client()
+    }
+
+    /// The extension map the tracker needs to route `.rs` to `rust`.
+    fn extension_map() -> HashMap<String, String> {
+        HashMap::from([("rs".to_string(), "rust".to_string())])
+    }
+
     /// Backdates or forwards a file's mtime for deterministic disk-sync tests.
     ///
     /// Opened with `write(true)` rather than [`std::fs::File::open`]: on
@@ -2789,6 +2928,169 @@ mod tests {
             "path_locks must be fully evicted once every ensure_open call \
              for every path has completed, otherwise the map grows \
              unbounded for the lifetime of the process"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // resync_from_disk
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_a_resync_reports_both_lists_for_a_changed_file() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "fn a() {}").expect("write");
+
+        let tracker = DocumentTracker::new(ResourceLimits::default(), extension_map());
+        let (client, _fake) = fake_client();
+        let rust = ServerId::from("rust");
+        tracker
+            .ensure_open(&path, &rust, &client)
+            .await
+            .expect("open");
+
+        std::fs::write(&path, "fn a() -> i32 { }").expect("rewrite");
+
+        let _guard = tracker.lock_path(&path).await;
+        let resync = tracker
+            .resync_from_disk(&path)
+            .await
+            .expect("resync")
+            .expect("the path is tracked");
+
+        assert_eq!(resync.needs_change, vec![rust.clone()]);
+        assert_eq!(resync.needs_save, vec![rust]);
+        assert!(!resync.is_settled());
+        assert_eq!(resync.text, "fn a() -> i32 { }");
+    }
+
+    #[tokio::test]
+    async fn test_a_resync_over_identical_content_still_reports_an_unsaved_server() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "fn a() {}").expect("write");
+
+        let tracker = DocumentTracker::new(ResourceLimits::default(), extension_map());
+        let (client, _fake) = fake_client();
+        let rust = ServerId::from("rust");
+        tracker
+            .ensure_open(&path, &rust, &client)
+            .await
+            .expect("open");
+
+        let _guard = tracker.lock_path(&path).await;
+        let resync = tracker
+            .resync_from_disk(&path)
+            .await
+            .expect("resync")
+            .expect("the path is tracked");
+
+        assert!(
+            resync.needs_change.is_empty(),
+            "nothing changed, so no server is behind on content"
+        );
+        assert_eq!(
+            resync.needs_save,
+            vec![rust],
+            "ensure_open sends didOpen and never didSave, so the server has \
+             never been told to check this file; a re-drain after a cancelled \
+             resync lands here and must not conclude there is nothing to do"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_marking_a_change_sent_does_not_settle_the_save() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "fn a() {}").expect("write");
+
+        let tracker = DocumentTracker::new(ResourceLimits::default(), extension_map());
+        let (client, _fake) = fake_client();
+        let rust = ServerId::from("rust");
+        tracker
+            .ensure_open(&path, &rust, &client)
+            .await
+            .expect("open");
+        std::fs::write(&path, "fn a() -> i32 { }").expect("rewrite");
+
+        let generation = tracker.generation_for(&rust);
+        let version = {
+            let _guard = tracker.lock_path(&path).await;
+            let resync = tracker
+                .resync_from_disk(&path)
+                .await
+                .expect("resync")
+                .expect("tracked");
+            tracker.mark_change_sent(&path, &rust, resync.version, generation);
+            resync.version
+        };
+
+        let _guard = tracker.lock_path(&path).await;
+        let again = tracker
+            .resync_from_disk(&path)
+            .await
+            .expect("resync")
+            .expect("tracked");
+        assert!(again.needs_change.is_empty());
+        assert_eq!(again.needs_save, vec![rust]);
+        assert_eq!(
+            again.version, version,
+            "a second read of unchanged content does not bump"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_resync_of_an_untracked_path_reports_nothing() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "fn a() {}").expect("write");
+
+        let tracker = DocumentTracker::new(ResourceLimits::default(), extension_map());
+        let _guard = tracker.lock_path(&path).await;
+        assert!(
+            tracker
+                .resync_from_disk(&path)
+                .await
+                .expect("resync")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_stale_generation_does_not_mark_a_respawned_server_caught_up() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "fn a() {}").expect("write");
+
+        let tracker = DocumentTracker::new(ResourceLimits::default(), extension_map());
+        let (client, _fake) = fake_client();
+        let rust = ServerId::from("rust");
+        tracker
+            .ensure_open(&path, &rust, &client)
+            .await
+            .expect("open");
+        std::fs::write(&path, "fn a() -> i32 { }").expect("rewrite");
+
+        let stale = tracker.generation_for(&rust);
+        let version = {
+            let _guard = tracker.lock_path(&path).await;
+            tracker
+                .resync_from_disk(&path)
+                .await
+                .expect("resync")
+                .expect("tracked")
+                .version
+        };
+        tracker.forget_server(&rust);
+        tracker.mark_save_sent(&path, &rust, version, stale);
+
+        let doc_state = tracker
+            .snapshot(&path)
+            .expect("the document is still tracked");
+        assert_eq!(
+            doc_state.saved_version(&rust),
+            None,
+            "the process that received that didSave is gone"
         );
     }
 }
