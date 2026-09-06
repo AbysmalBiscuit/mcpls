@@ -62,6 +62,7 @@ async fn setup_rust_analyzer() -> Arc<Mutex<Translator>> {
     };
 
     let server_init_config = ServerInitConfig {
+        applies_edits: false,
         server_config: lsp_config,
         workspace_roots: vec![workspace_path.clone()],
         initialization_options: None,

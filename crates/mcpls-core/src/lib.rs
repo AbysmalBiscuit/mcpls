@@ -461,6 +461,41 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
     serve_with(config, Transport::Stdio).await
 }
 
+/// The servers to spawn for `workspace_roots`, skipping any whose project
+/// markers are absent.
+fn applicable_server_configs(
+    config: &ServerConfig,
+    workspace_roots: &[PathBuf],
+    max_depth: Option<usize>,
+) -> Vec<ServerInitConfig> {
+    config
+        .lsp_servers
+        .iter()
+        .filter_map(|lsp_config| {
+            let should_spawn = workspace_roots
+                .iter()
+                .any(|root| lsp_config.should_spawn(root, max_depth));
+
+            if !should_spawn {
+                info!(
+                    "Skipping LSP server '{}' ({}): no project markers found",
+                    lsp_config.language_id, lsp_config.command
+                );
+                return None;
+            }
+
+            Some(ServerInitConfig {
+                applies_edits: config.apply.permits_any(),
+                server_config: lsp_config.clone(),
+                workspace_roots: workspace_roots.to_vec(),
+                initialization_options: lsp_config.initialization_options.clone(),
+                position_encodings: config.workspace.position_encodings.clone(),
+                notification_tx: None,
+            })
+        })
+        .collect()
+}
+
 /// Start the MCPLS server with an explicit transport.
 ///
 /// Performs all shared setup (workspace discovery, LSP spawning, translator
@@ -572,31 +607,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     let extension_map = config.build_effective_extension_map();
     let max_depth = Some(config.workspace.heuristics_max_depth);
 
-    let applicable_configs: Vec<ServerInitConfig> = config
-        .lsp_servers
-        .iter()
-        .filter_map(|lsp_config| {
-            let should_spawn = workspace_roots
-                .iter()
-                .any(|root| lsp_config.should_spawn(root, max_depth));
-
-            if !should_spawn {
-                info!(
-                    "Skipping LSP server '{}' ({}): no project markers found",
-                    lsp_config.language_id, lsp_config.command
-                );
-                return None;
-            }
-
-            Some(ServerInitConfig {
-                server_config: lsp_config.clone(),
-                workspace_roots: workspace_roots.clone(),
-                initialization_options: lsp_config.initialization_options.clone(),
-                position_encodings: config.workspace.position_encodings.clone(),
-                notification_tx: None,
-            })
-        })
-        .collect();
+    let applicable_configs = applicable_server_configs(&config, &workspace_roots, max_depth);
 
     info!(
         "Attempting to spawn {} applicable LSP server(s)...",

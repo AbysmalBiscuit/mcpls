@@ -64,6 +64,16 @@ pub struct ApplyConfig {
 }
 
 impl ApplyConfig {
+    /// Whether any tool may write.
+    ///
+    /// What mcpls tells a language server about `workspace/applyEdit`: a
+    /// deployment that can write nothing should not have servers routing
+    /// assists through an edit it would refuse.
+    #[must_use]
+    pub const fn permits_any(&self) -> bool {
+        self.rename || self.format_document || self.code_actions
+    }
+
     /// Whether `tool` may write. Tools with nothing to write are always
     /// `false`, so a caller need not know which of the fifteen `ToolKind`
     /// variants can mutate anything.

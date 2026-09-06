@@ -119,6 +119,13 @@ pub struct ServerInitConfig {
     /// this can't assume the value was already checked. If nothing parses,
     /// falls back to `config::default_position_encodings()`'s default.
     pub position_encodings: Vec<String>,
+    /// Whether any tool in this deployment may write to disk.
+    ///
+    /// Sent as `capabilities.workspace.applyEdit`. Claiming it while every
+    /// apply key is off invites a server to deliver an assist as a command
+    /// that calls `workspace/applyEdit`, which mcpls then refuses, instead
+    /// of as the plain edit a read-only caller can still read.
+    pub applies_edits: bool,
     /// Optional channel for forwarding LSP notifications to the notification cache.
     ///
     /// When `Some`, the spawned LSP client sends every notification it receives
@@ -406,9 +413,10 @@ impl LspServer {
             #[allow(deprecated)]
             root_uri: None,
             initialization_options: config.initialization_options.clone(),
-            capabilities: build_client_capabilities(resolve_position_encodings(
-                &config.position_encodings,
-            )),
+            capabilities: build_client_capabilities(
+                resolve_position_encodings(&config.position_encodings),
+                config.applies_edits,
+            ),
             client_info: Some(ClientInfo {
                 name: "mcpls".to_string(),
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),
@@ -579,6 +587,7 @@ impl LspServer {
     ///         initialization_options: None,
     ///         position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
     ///         notification_tx: None,
+    ///         applies_edits: false,
     ///     },
     ///     ServerInitConfig {
     ///         server_config: LspServerConfig::pyright(),
@@ -586,6 +595,7 @@ impl LspServer {
     ///         initialization_options: None,
     ///         position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
     ///         notification_tx: None,
+    ///         applies_edits: false,
     ///     },
     /// ];
     ///
@@ -645,6 +655,7 @@ impl LspServer {
 /// should.
 fn build_client_capabilities(
     position_encodings: Vec<lsp_types::PositionEncodingKind>,
+    applies_edits: bool,
 ) -> ClientCapabilities {
     ClientCapabilities {
         general: Some(GeneralClientCapabilities {
@@ -703,7 +714,7 @@ fn build_client_capabilities(
         }),
         workspace: Some(lsp_types::WorkspaceClientCapabilities {
             workspace_folders: Some(true),
-            apply_edit: Some(true),
+            apply_edit: Some(applies_edits),
             workspace_edit: Some(lsp_types::WorkspaceEditClientCapabilities {
                 document_changes: Some(true),
                 resource_operations: Some(vec![
@@ -882,7 +893,7 @@ mod tests {
     #[test]
     #[allow(clippy::expect_used)]
     fn test_client_capabilities_declare_edit_application() {
-        let caps = build_client_capabilities(vec![]);
+        let caps = build_client_capabilities(vec![], true);
         let workspace = caps.workspace.expect("workspace capabilities are declared");
 
         assert_eq!(workspace.apply_edit, Some(true));
@@ -906,9 +917,21 @@ mod tests {
         assert_eq!(sync.did_save, Some(true));
     }
 
+    /// A deployment that writes nothing says so, so a server delivers an
+    /// assist as an edit the caller can read rather than as a command that
+    /// calls back into an `applyEdit` mcpls would refuse.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_client_capabilities_withhold_edit_application_when_nothing_may_write() {
+        let caps = build_client_capabilities(vec![], false);
+        let workspace = caps.workspace.expect("workspace capabilities are declared");
+
+        assert_eq!(workspace.apply_edit, Some(false));
+    }
+
     #[test]
     fn test_client_capabilities_do_not_claim_dynamic_file_watching() {
-        let caps = build_client_capabilities(vec![]);
+        let caps = build_client_capabilities(vec![], true);
         let declared = caps
             .workspace
             .and_then(|w| w.did_change_watched_files)
@@ -923,7 +946,7 @@ mod tests {
     #[test]
     #[allow(clippy::expect_used)]
     fn test_client_capabilities_pass_through_position_encodings() {
-        let caps = build_client_capabilities(vec![lsp_types::PositionEncodingKind::UTF8]);
+        let caps = build_client_capabilities(vec![lsp_types::PositionEncodingKind::UTF8], true);
         let general = caps.general.expect("general capabilities are declared");
         let encodings = general
             .position_encodings
@@ -1064,6 +1087,7 @@ mod tests {
     #[test]
     fn test_server_init_config_clone() {
         let config = ServerInitConfig {
+            applies_edits: false,
             server_config: LspServerConfig::rust_analyzer(),
             workspace_roots: vec![PathBuf::from("/tmp/workspace")],
             initialization_options: Some(serde_json::json!({"key": "value"})),
@@ -1080,6 +1104,7 @@ mod tests {
     #[test]
     fn test_server_init_config_debug() {
         let config = ServerInitConfig {
+            applies_edits: false,
             server_config: LspServerConfig::pyright(),
             workspace_roots: vec![],
             initialization_options: None,
@@ -1110,6 +1135,7 @@ mod tests {
         env.insert("PYTHONPATH".to_string(), "/usr/lib".to_string());
 
         let config = ServerInitConfig {
+            applies_edits: false,
             server_config: LspServerConfig {
                 language_id: "python".to_string(),
                 command: "pyright-langserver".to_string(),
@@ -1136,6 +1162,7 @@ mod tests {
     #[test]
     fn test_server_init_config_empty_workspace() {
         let config = ServerInitConfig {
+            applies_edits: false,
             server_config: LspServerConfig::typescript(),
             workspace_roots: vec![],
             initialization_options: None,
@@ -1149,6 +1176,7 @@ mod tests {
     #[test]
     fn test_server_init_config_multiple_workspaces() {
         let config = ServerInitConfig {
+            applies_edits: false,
             server_config: LspServerConfig::rust_analyzer(),
             workspace_roots: vec![
                 PathBuf::from("/workspace1"),
@@ -1596,6 +1624,7 @@ mod tests {
     #[tokio::test]
     async fn test_spawn_batch_single_invalid_config() {
         let configs = vec![ServerInitConfig {
+            applies_edits: false,
             server_config: LspServerConfig {
                 language_id: "rust".to_string(),
                 command: "nonexistent-command-12345".to_string(),
@@ -1633,6 +1662,7 @@ mod tests {
     async fn test_spawn_batch_all_invalid_configs() {
         let configs = vec![
             ServerInitConfig {
+                applies_edits: false,
                 server_config: LspServerConfig {
                     language_id: "rust".to_string(),
                     command: "nonexistent-rust-analyzer".to_string(),
@@ -1652,6 +1682,7 @@ mod tests {
                 notification_tx: None,
             },
             ServerInitConfig {
+                applies_edits: false,
                 server_config: LspServerConfig {
                     language_id: "python".to_string(),
                     command: "nonexistent-pyright".to_string(),
@@ -1671,6 +1702,7 @@ mod tests {
                 notification_tx: None,
             },
             ServerInitConfig {
+                applies_edits: false,
                 server_config: LspServerConfig {
                     language_id: "typescript".to_string(),
                     command: "nonexistent-tsserver".to_string(),
@@ -1713,6 +1745,7 @@ mod tests {
     async fn test_spawn_batch_multiple_invalid_configs_ordering() {
         let configs = vec![
             ServerInitConfig {
+                applies_edits: false,
                 server_config: LspServerConfig {
                     language_id: "lang1".to_string(),
                     command: "cmd1-nonexistent".to_string(),
@@ -1732,6 +1765,7 @@ mod tests {
                 notification_tx: None,
             },
             ServerInitConfig {
+                applies_edits: false,
                 server_config: LspServerConfig {
                     language_id: "lang2".to_string(),
                     command: "cmd2-nonexistent".to_string(),
@@ -1842,6 +1876,7 @@ mod tests {
             let (client, mut server) = fake_lsp_client();
 
             let config = ServerInitConfig {
+                applies_edits: false,
                 server_config: LspServerConfig::rust_analyzer(),
                 workspace_roots: vec![],
                 initialization_options: None,
@@ -1884,6 +1919,7 @@ mod tests {
 
             let (client, mut server) = fake_lsp_client();
             let config = ServerInitConfig {
+                applies_edits: false,
                 server_config: LspServerConfig::rust_analyzer(),
                 workspace_roots,
                 initialization_options: None,
@@ -1917,6 +1953,7 @@ mod tests {
     async fn test_spawn_batch_logs_each_failure() {
         let configs = vec![
             ServerInitConfig {
+                applies_edits: false,
                 server_config: LspServerConfig {
                     language_id: "test1".to_string(),
                     command: "nonexistent-test1".to_string(),
@@ -1936,6 +1973,7 @@ mod tests {
                 notification_tx: None,
             },
             ServerInitConfig {
+                applies_edits: false,
                 server_config: LspServerConfig {
                     language_id: "test2".to_string(),
                     command: "nonexistent-test2".to_string(),

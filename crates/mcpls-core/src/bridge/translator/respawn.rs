@@ -461,6 +461,7 @@ sleep __SLEEP__
 
         fn stub_server_config(id: &str, script: &Path) -> ServerInitConfig {
             ServerInitConfig {
+                applies_edits: false,
                 server_config: LspServerConfig {
                     language_id: id.to_string(),
                     command: "sh".to_string(),
