@@ -33,7 +33,7 @@ This section is the collision map. Every file a task creates or modifies is name
 **Stage B, created:**
 
 - `crates/mcpls-core/src/lsp/watched_files.rs`: the `WatchRegistry`: which servers registered which globs under which registration ids, and which of them match a given path and change kind. Pure; no I/O, no LSP client. Task 6.
-- `crates/mcpls-core/tests/fixtures/python_workspace/`: the pyrefly fixture, `a.py`, `b.py` and `pyrefly.toml`. Task 9.
+- `crates/mcpls-core/tests/fixtures/python_workspace/`: the pyrefly fixture, `a.py`, `b.py`, `c.py` and `pyrefly.toml`. Task 9.
 - `crates/mcpls-core/tests/pyrefly_e2e.rs`: the B2 end-to-end suite. Task 9.
 - `docs/superpowers/notes/2026-09-07-stage-b-measurements.md`: the three measurements stage B rests on. Task 1, already committed.
 
@@ -54,20 +54,23 @@ This section is the collision map. Every file a task creates or modifies is name
 - `crates/mcpls-core/src/mcp/handlers.rs`: `BridgeContext` gains the diagnostics config, the settle tracker and the owner flag. Tasks 13 and 19.
 - `crates/mcpls-core/src/mcp/server.rs`: the lock-order fix, the payload signature, the footer wrapper and its three call sites. Tasks 10, 13 and 19.
 - `crates/mcpls-core/src/lib.rs`: the registry, the settle share, the hooks module, the listener. Tasks 7, 10, 13, 14 and 19.
+- `crates/mcpls-core/src/transport.rs`: the three `McplsServer::new` calls in its test module gain the two new arguments. Task 13.
 - `Cargo.toml` and `crates/mcpls-core/Cargo.toml`: `globset`, then `fs4`. Tasks 6 and 16.
 - `crates/mcpls-core/tests/ra_e2e.rs`, `crates/mcpls-core/tests/fixtures/rust_workspace/src/`: the collision fixture and the B1 e2e. Task 5.
+- `crates/mcpls-core/tests/integration/rust_analyzer_tests.rs`: its `ServerInitConfig` literal gains `watch_registry`. Task 7.
 - `docs/superpowers/specs/2026-09-06-diagnostics-injection-design.md`: the B2 pyrefly entry, then the status line. Tasks 9 and 22.
 
 **Stage C, created:**
 
-- `crates/mcpls-core/src/hooks/mod.rs`: module root and the public surface the rest of the crate uses.
-- `crates/mcpls-core/src/hooks/identity.rs`: canonicalization, the directory hash, the platform socket path, the lock path.
-- `crates/mcpls-core/src/hooks/protocol.rs`: the newline-delimited JSON request and response types.
-- `crates/mcpls-core/src/hooks/listener.rs`: the transport trait, the Unix and Windows implementations, and lock-based ownership.
-- `crates/mcpls-core/src/hooks/filters.rs`: the two path filters and the `watchPaths` walk.
-- `crates/mcpls-core/src/hooks/sweep.rs`: the debounced pending set and the sweep.
+- `crates/mcpls-core/src/hooks/mod.rs`: module root and the public surface the rest of the crate uses. Created by Task 14; each later hooks module is declared and re-exported here. Tasks 14, 15, 16, 17, 18 and 19.
+- `crates/mcpls-core/src/hooks/identity.rs`: canonicalization, the directory hash, the platform socket path, the lock path. Task 14.
+- `crates/mcpls-core/src/hooks/protocol.rs`: the newline-delimited JSON request and response types. Created by Task 15, extended by Task 21.
+- `crates/mcpls-core/src/hooks/listener.rs`: the transport trait, the Unix and Windows implementations, and lock-based ownership. Task 16.
+- `crates/mcpls-core/src/hooks/filters.rs`: the two path filters and the `watchPaths` walk. Task 17.
+- `crates/mcpls-core/src/hooks/sweep.rs`: the debounced pending set and the sweep. Created by Task 18; Task 19 adds two more `#[cfg(test)] pub(crate)` accessors beside Task 18's four. Tasks 18 and 19.
+- `crates/mcpls-core/src/hooks/service.rs`: `HookRole`, the socket handler, the takeover retry, and their tests. Created by Task 19; Task 21 fills the new `Response::Status` field in its `Status` arm. Tasks 19 and 21.
 - `crates/mcpls-cli/src/hook.rs`: the `mcpls hook` and `mcpls hook doctor` subcommands. Tasks 20 and 21.
-- `crates/mcpls-core/tests/hooks_socket.rs`: socket integration tests. Tasks 16 and 19.
+- `crates/mcpls-core/tests/hooks_socket.rs`: socket integration tests. Task 16. Task 19's tests deliberately live in `hooks/service.rs` instead, because they need `#[cfg(test)] pub(crate)` items no integration-test crate can see.
 - `plugin/`: the Claude Code plugin. Task 22.
 
 **Stage C, modified:**
@@ -1683,7 +1686,7 @@ The spec requires the advertisement and the notification in one commit, twice: B
 
 **Files:**
 - Modify: `crates/mcpls-core/src/lsp/client.rs` (`server_request_result` at `:762`, `server_request_response` at `:711`, `spawn_server_request_responder` at `:690`, `message_loop` at `:520` and `message_loop_inner` at `:557`, `from_transport` at `:177` and `from_transport_with_notifications` at `:209`)
-- Modify: `crates/mcpls-core/src/lsp/lifecycle.rs` (`ServerInitConfig` at `:116`, `LspServer::spawn` at `:305`, `build_client_capabilities` at `:671`, the tripwire test at `:954`)
+- Modify: `crates/mcpls-core/src/lsp/lifecycle.rs` (`ServerInitConfig` at `:116`, `LspServer::spawn` at `:305`, the `spawn_batch` doctest at `:592-627`, `build_client_capabilities` at `:671`, the tripwire test at `:954`)
 - Modify: `crates/mcpls-core/src/bridge/translator/mod.rs` (`resync_one_document` from Task 4, the struct at `:60`, the `with_*` builders near `:228`)
 - Modify: `crates/mcpls-core/src/bridge/translator/testing.rs` (extend `TranslatorHarness` from Task 4)
 - Modify: `crates/mcpls-core/src/bridge/translator/respawn.rs:281`
@@ -1990,13 +1993,18 @@ Add to `ServerInitConfig` (`lifecycle.rs:116`):
 
 and in `LspServer::spawn` (`:305`), where the client is actually constructed at `:353`, pass `config.watch_registry.clone()` and `config.server_config.id()` into `from_transport_with_notifications`. `spawn_batch` (`:628`) constructs nothing itself; it clones each config and calls `spawn`, so it needs no change.
 
-`ServerInitConfig` has no `Default` impl and every construction site is a full struct literal, so all eighteen need the new field. Seventeen get `watch_registry: None`:
+`ServerInitConfig` has no `Default` impl and every construction site is a full struct literal, so all twenty need the new field. Nineteen get `watch_registry: None`:
 
 - `crates/mcpls-core/src/lsp/lifecycle.rs` at `:1122, :1139, :1170, :1198, :1212, :1660, :1699, :1720, :1741, :1785, :1806, :1918, :1961, :1995, :2016`
+- `crates/mcpls-core/src/lsp/lifecycle.rs` at `:599` and `:607`, the two literals inside the `spawn_batch` doctest, which are Rust that has to compile like any other
 - `crates/mcpls-core/src/bridge/translator/respawn.rs:463`, in `stub_server_config`
 - `crates/mcpls-core/tests/integration/rust_analyzer_tests.rs:65`
 
-The eighteenth is the production one, in Step 5. The last of the seventeen is in an integration-test crate rather than in the library, so run `cargo nextest run -p mcpls-core` rather than `cargo test --lib` to see it fail; `-p mcpls-core` compiles that target too.
+The twentieth is the production one, in Step 5.
+
+Two of the nineteen are not compiled by the commands the later steps run. `cargo nextest run` skips doctests entirely and `cargo clippy --all-targets` does not build them either, so the two `spawn_batch` doctest literals can be forgotten with every local check green, and CI's `cargo test --doc --workspace --all-features` then fails on a struct literal missing a field. Step 10 exists to catch exactly that. Verify the enumeration against the source rather than trusting these line numbers, with `rg -n 'ServerInitConfig \{' crates/` from the repository root: the struct definition and `stub_server_config`'s return type match that pattern too, so the literal count is the match count minus those two.
+
+`rust_analyzer_tests.rs` is in an integration-test crate rather than in the library, so run `cargo nextest run -p mcpls-core` rather than `cargo test --lib` to see it fail; `-p mcpls-core` compiles that target too.
 
 Change the signature and the two arms in `client.rs`:
 
@@ -2243,7 +2251,14 @@ Expected: PASS.
 Run: `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings`
 Expected: both clean.
 
-- [ ] **Step 10: commit, both halves together**
+- [ ] **Step 10: compile the doctests**
+
+Run: `cargo test --doc -p mcpls-core`
+Expected: PASS.
+
+This is not redundant with Steps 8 and 9 and must not be deleted as such. Neither `cargo nextest run` nor `cargo clippy --all-targets` builds doctests, so the two `ServerInitConfig` literals in the `spawn_batch` doctest are invisible to both, and CI runs `cargo test --doc --workspace --all-features`. Without this step the task can look finished locally and break CI on a missing struct field.
+
+- [ ] **Step 11: commit, both halves together**
 
 One commit, staging the advertisement, the registry plumbing and the notification. Do not split it: the spec forbids an intermediate state in which mcpls advertises `dynamicRegistration` without sending the notification, because gopls and tsgo abandon their fallback watchers on the advertisement alone.
 
@@ -3234,7 +3249,7 @@ EOF
 
 **Files:**
 - Modify: `crates/mcpls-core/src/mcp/handlers.rs` (`BridgeContext` at `:27-58` and `BridgeContext::new` at `:60-82`)
-- Modify: `crates/mcpls-core/src/mcp/server.rs` (`McplsServer::new` at `:262`, `rename_symbol` at `:437`, `format_document` at `:514`, `apply_code_action` at `:604`, the test module at `:1183`)
+- Modify: `crates/mcpls-core/src/mcp/server.rs` (`McplsServer::new` at `:262`, `rename_symbol` at `:437`, `format_document` at `:514`, `apply_code_action` at `:604`, and the three `McplsServer::new` calls in the test module at `:1208`, `:1694` and `:2273`)
 - Modify: `crates/mcpls-core/src/lib.rs` (`serve_with`'s `settle` at `:708` and its `McplsServer::new` call at `:754`)
 - Modify: `crates/mcpls-core/src/transport.rs` (the `McplsServer::new` calls at `:839`, `:1022`, `:1051`)
 
@@ -3261,7 +3276,7 @@ struct WithDiagnostics<T> {
 - `pub diagnostics: DiagnosticsConfig`, by value rather than behind an `Arc`. `DiagnosticsConfig` is `Copy` and fixed for the process lifetime, and the footer reads four scalars off it. Carrying the whole `ServerConfig` would drag `lsp_servers` and `apply` into a struct that has no use for them.
 - `pub settle: Arc<ServerSettle>`, the same `Arc` the pump holds, so the footer sees the `begin` and `end` the pump records.
 
-`BridgeContext::new` is a `pub const fn` with seven positional parameters and exactly two callers, the test at `handlers.rs:100` and `McplsServer::new` at `mcp/server.rs:272`. `McplsServer::new` has five callers: `lib.rs:754`, `transport.rs:839`, `transport.rs:1022`, `transport.rs:1051`, and the test helpers at `mcp/server.rs:1208` and `:2273`. Both constructors gain the two parameters at the end, in that order, and every caller passes `DiagnosticsConfig::default()` and a freshly built `Arc<ServerSettle>` unless it has real ones. In `serve_with`, change line `:726` from `settle,` to `settle: Arc::clone(&settle),` so the local binding survives the `PumpShared` construction, then pass `config.diagnostics` and `settle` to `McplsServer::new`.
+`BridgeContext::new` is a `pub const fn` with seven positional parameters and exactly two callers, the test at `handlers.rs:100` and `McplsServer::new` at `mcp/server.rs:272`. `McplsServer::new` has seven callers: `lib.rs:754`, `transport.rs:839`, `transport.rs:1022`, `transport.rs:1051`, and the three test helpers at `mcp/server.rs:1208` (`create_test_server`), `:1694` (`new_diagnostics_test_server`) and `:2273` (`server_permitting_writes`). Both constructors gain the two parameters at the end, in that order, and every caller passes `DiagnosticsConfig::default()` and a freshly built `Arc<ServerSettle>` unless it has real ones. In `serve_with`, change line `:726` from `settle,` to `settle: Arc::clone(&settle),` so the local binding survives the `PumpShared` construction, then pass `config.diagnostics` and `settle` to `McplsServer::new`.
 
 `BridgeContext::new` stays `const`: `Arc` moves and a `Copy` struct are both const-compatible.
 
@@ -5052,6 +5067,7 @@ EOF
 **Files:**
 - Create: `crates/mcpls-core/src/hooks/service.rs` (the role, the handler, the takeover retry, and this task's tests)
 - Modify: `crates/mcpls-core/src/hooks/mod.rs`
+- Modify: `crates/mcpls-core/src/hooks/sweep.rs` (`set_shortfall_for_test` and `pending_len`, two more `#[cfg(test)] pub(crate)` accessors beside Task 18's four)
 - Modify: `crates/mcpls-core/src/mcp/handlers.rs` (`BridgeContext`)
 - Modify: `crates/mcpls-core/src/mcp/server.rs` (the session key, the flush's rendering, the passive branches)
 - Modify: `crates/mcpls-core/src/bridge/delivery.rs` (`SessionId::from_env_or_process`, `DiagnosticsDelivery::end_session`)
@@ -5060,7 +5076,8 @@ EOF
 **Interfaces:**
 - Consumes: everything from Tasks 14 through 18.
 - Produces:
-  - `hooks::HookRole` and `hooks::Role`, the process's relationship to the socket, and `hooks::build_handler`, which turns an `Arc<McplsServer>` and an `Arc<Sweeper>` into the handler `HookListener::serve` takes.
+  - `hooks::HookRole` and `hooks::Role`, the process's relationship to the socket, and `hooks::build_handler`, which turns an `Arc<McplsServer>`, an `Arc<Sweeper>` and the `SocketIdentity` being served into the handler `HookListener::serve` takes.
+  - `McplsServer::from_context(context: Arc<BridgeContext>) -> Self`, `pub(crate)`, so `serve_with` can decide the hook role on the context before the server is built.
   - `BridgeContext` gains `pub hooks: Arc<HookRole>`.
   - `McplsServer::flush_for_hook(&self, session: &SessionId) -> Option<String>`, `pub(crate)`.
   - `McplsServer::forward_apply_targets(&self, files_written: &[String])`, `pub(crate)`.
@@ -5101,12 +5118,23 @@ impl HookRole {
     /// A cloned snapshot, so no `std::sync::Mutex` guard is held across an
     /// `.await`.
     #[must_use] pub fn get(&self) -> Role;
-    /// Called by the takeover task once it wins the lock.
+    /// Move this process from `Passive` to `Owner`, called by the takeover
+    /// task once it wins the lock. The only runtime transition there is.
     pub fn promote_to_owner(&self);
 }
 ```
 
-`BridgeContext` gains `pub hooks: Arc<HookRole>`, and `BridgeContext::new` sets `Arc::new(HookRole::disabled())`, which is what every caller except `serve_with` wants and means no constructor gains another parameter. `serve_with` overwrites the field on the struct before wrapping it in an `Arc`, which the `pub` fields already allow, then hands the server that context through a new `pub(crate) fn McplsServer::from_context(context: Arc<BridgeContext>) -> Self`. `McplsServer::new` stays as it is and becomes a wrapper that builds the context and calls `from_context`, so no other call site changes.
+`promote_to_owner` is the whole mutable surface. There is deliberately no way to reach `Passive` after construction, because `serve_with` tries the ownership lock before it builds the context (Step 8) and therefore knows which of the three variants this process starts in. A process that loses the lock is constructed `HookRole::passive(identity)`; a demotion mutator would have no caller.
+
+**The concurrency discipline for `hooks`, which both the takeover task and the MCP handler read.** The field is an `Arc<HookRole>` shared by the takeover task, the socket handler and every tool call, so state it once here rather than leaving each reader to guess:
+
+- The inner lock is a `std::sync::Mutex`, not a `tokio::sync::Mutex`. Every critical section is a clone or a single assignment with no `.await` inside it, which is what makes a blocking mutex correct on an async runtime.
+- `get` clones the `Role` and drops the guard before returning, so no guard ever crosses an await point. Read the role by binding `hooks.get()` to a value; never hold a guard while sending on the socket.
+- Take the lock with `crate::bridge::lock_std`, the crate's poison-tolerant helper, for the same reason every other `std::sync::Mutex` in the crate does: a panic in an unrelated task must not turn every later role read into a panic.
+- The transition is one way and happens at most once. `Disabled` and `Owner` are terminal, `Passive` moves only to `Owner`, and only `hook_takeover_task` calls `promote_to_owner`, immediately before it returns. So no reader needs the role and the lock to be consistent under a compare-and-swap.
+- The one race that reaching monotonicity leaves is benign. A tool call can read `Passive` in the window between the takeover task winning the lock and calling `promote_to_owner`, and will then forward to the socket this process is about to serve. It is answered by this process's own handler against the same record, which is the same answer it would have got from the local branch. The reverse, a reader sending to a socket nobody owns, cannot happen, because the role is never widened back to `Passive`.
+
+`BridgeContext` gains `pub hooks: Arc<HookRole>`, and `BridgeContext::new` sets `Arc::new(HookRole::disabled())`, which is what every caller except `serve_with` wants and means no constructor gains another parameter. `serve_with` decides the role first, overwrites the field on the struct before wrapping it in an `Arc`, which the `pub` fields already allow, then hands the server that context through a new `pub(crate) fn McplsServer::from_context(context: Arc<BridgeContext>) -> Self`. `McplsServer::new` stays as it is and becomes a wrapper that builds the context and calls `from_context`, so no other call site changes.
 
 **A passive instance forwards its apply targets from the MCP layer, not from the translator.** The spec says "an apply made through it sends its targets to the owner as a `changed`". The obvious reading is to put that in `resync_changed_documents`, but `Translator` has no socket, no `SocketIdentity` and no session id, and the spec's CLI section says plainly that "nothing host-specific reaches the bridge or the LSP layer". The apply's targets are already on the tool result as `files_written`, at the MCP layer, beside the footer guard and the role. So the forward lives there, in `McplsServer::forward_apply_targets`, called from the same three write tools that call `footer_if_written`. `Translator` is not changed by this task.
 
@@ -5180,9 +5208,27 @@ The harness, in full:
                 .expect("the flush tool answers")
         }
     }
+
+    /// A `SocketIdentity` whose socket and lock live inside a fresh
+    /// `TempDir`, built field by field rather than through `identity_for`,
+    /// which would put the socket in the real runtime directory.
+    ///
+    /// Task 16's integration tests have a function of the same name, but it
+    /// is in `tests/hooks_socket.rs` and no library test can call it, so
+    /// this module carries its own copy.
+    fn temp_identity() -> (TempDir, SocketIdentity);
+
+    /// The `Arc<McplsServer>` and `Arc<Sweeper>` a takeover would start
+    /// serving with: the same pieces `owner()` builds, over `dir`, with
+    /// `role` already installed on the server's context, and no listener
+    /// acquired.
+    fn takeover_candidate(
+        dir: &TempDir,
+        role: Arc<HookRole>,
+    ) -> (Arc<McplsServer>, Arc<Sweeper>);
 ```
 
-`owner()` builds its own `TempDir`, a `SocketIdentity` whose socket and lock live inside it, an `McplsServer` over a fresh translator, cache, delivery and floors with `HookRole::owner()`, a `Sweeper` over a `PathFilter` rooted at the temp directory, then acquires the listener and spawns `serve(build_handler(server, sweeper), Duration::from_millis(1500), cancel_rx)`.
+`owner()` builds its own `TempDir`, a `SocketIdentity` whose socket and lock live inside it, an `McplsServer` over a fresh translator, cache, delivery and floors with `HookRole::owner()`, a `Sweeper` over a `PathFilter` rooted at the temp directory, then acquires the listener and spawns `serve(build_handler(Arc::clone(&server), Arc::clone(&sweeper), identity.clone()), Duration::from_millis(1500), cancel_rx)`. All three arguments are required: `build_handler` takes the identity so the `Status` arm can answer with the socket it is serving.
 
 ```rust
 #[tokio::test]
@@ -5317,11 +5363,14 @@ async fn test_a_passive_instance_takes_over_when_the_owner_exits() {
     let owner = HookListener::acquire(&identity).await.expect("acquire").expect("owner");
     let role = Arc::new(HookRole::passive(identity.clone()));
     let (_tx, cancel) = tokio::sync::watch::channel(false);
+    let (server, sweeper) = takeover_candidate(&dir, Arc::clone(&role));
     tokio::spawn(hook_takeover_task(
         identity.clone(),
         Arc::clone(&role),
+        server,
+        sweeper,
+        Duration::from_millis(1500),
         cancel,
-        /* the handler factory and op deadline */
     ));
 
     tokio::time::advance(Duration::from_secs(6)).await;
@@ -5576,7 +5625,9 @@ At each of the three write tools, beside the footer call Task 13 added:
 
 - [ ] **Step 8: wire it in `serve_with`**
 
-After the `McplsServer` is built and before the transport runs:
+The order matters and is fixed, because the role has to be known before the context it lives on is frozen into an `Arc`, while the handler cannot be built until the server exists. Three phases, in this order.
+
+**First, before the `BridgeContext` is built**, which is before the `McplsServer::new` call at `lib.rs:754` that Task 13 already edits, and after `cancel_rx` exists:
 
 ```rust
     let identity = hooks::identity_for(&std::env::current_dir()?)?;
@@ -5585,18 +5636,25 @@ After the `McplsServer` is built and before the transport runs:
     } else {
         None
     };
+    let role = match (config.diagnostics.hooks.enabled, &ownership) {
+        (false, _) => HookRole::disabled(),
+        (true, Some(_)) => HookRole::owner(),
+        (true, None) => HookRole::passive(identity.clone()),
+    };
 ```
 
-Then, when `hooks.enabled`:
+Also when `hooks.enabled`, build the `PathFilter` from the workspace roots, the extension map and the watch registry Task 7 created, build the `Sweeper` from it, and spawn `Arc::clone(&sweeper).run(cancel_rx.clone())` whether this process owns the socket or not. A passive instance's sweeper is idle until it takes over, and building it unconditionally means the takeover has nothing left to construct.
 
-- Build the `PathFilter` from the workspace roots, the extension map and the watch registry Task 7 created, and the `Sweeper` from it. Spawn `Arc::clone(&sweeper).run(cancel_rx.clone())` either way: a passive instance's sweeper is idle until it takes over, and building it unconditionally means the takeover has nothing left to construct.
-- Set the context's role to `HookRole::owner()` when `ownership` is `Some`, and `HookRole::passive(identity.clone())` when it is `None`.
-- With `Some(listener)`, spawn `listener.serve(build_handler(...), Duration::from_millis(config.diagnostics.hooks.op_deadline_ms), cancel_rx.clone())`.
-- With `None`, spawn `hook_takeover_task(...)`.
+**Second, build the context and the server.** Construct the `BridgeContext` explicitly rather than through `McplsServer::new`, overwrite `hooks` with `Arc::new(role)` before wrapping the struct in an `Arc`, and build the server with `McplsServer::from_context(Arc::clone(&context))`. This is why the acquire comes first: the losing process is constructed `Passive`, so `HookRole` needs no demotion mutator and only one runtime transition exists, `Passive` to `Owner`, described above.
 
-With `hooks.enabled` false, the role stays `HookRole::disabled()`, nothing binds, and no task is spawned.
+**Third, once the server is in an `Arc`, spawn the socket side:**
 
-The `McplsServer` has to exist before the handler can close over it, and `run_stdio` takes it by value, so build it, wrap it in an `Arc`, hand `Arc::clone` to the handler, and pass `McplsServer::from_context(Arc::clone(&context))` to the transport. Both share one `Arc<BridgeContext>`, which is where all the state lives, so they are the same server in every sense that matters.
+- With `ownership` `Some(listener)`, spawn `listener.serve(build_handler(Arc::clone(&server), Arc::clone(&sweeper), identity.clone()), Duration::from_millis(config.diagnostics.hooks.op_deadline_ms), cancel_rx.clone())`.
+- With `ownership` `None` and `hooks.enabled`, spawn `hook_takeover_task(identity.clone(), Arc::clone(&context.hooks), Arc::clone(&server), Arc::clone(&sweeper), Duration::from_millis(config.diagnostics.hooks.op_deadline_ms), cancel_rx.clone())`. It shares the same `Arc<HookRole>` the context holds, which is how its `promote_to_owner` becomes visible to the tool calls.
+
+With `hooks.enabled` false, the role is `HookRole::disabled()`, no sweeper is built, nothing binds, and no task is spawned.
+
+`run_stdio` takes an `McplsServer` by value while the handler needs one it can keep, so build the server, wrap it in an `Arc` for the handler and the takeover task, and pass a second `McplsServer::from_context(Arc::clone(&context))` to the transport. Both share one `Arc<BridgeContext>`, which is where all the state lives, so they are the same server in every sense that matters.
 
 - [ ] **Step 9: run the tests and watch them pass**
 
