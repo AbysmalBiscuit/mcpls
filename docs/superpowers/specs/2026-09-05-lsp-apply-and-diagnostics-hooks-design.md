@@ -1,6 +1,8 @@
 # LSP edit application and diagnostics injection
 
-Status: approved design, not yet implemented
+Status: part 1 (applying edits) shipped in a63cc14..f7d8ffa. Parts 2 through 4 are
+superseded by `2026-09-06-diagnostics-injection-design.md` and are kept here only as
+the record they were designed from.
 
 Target: `AbysmalBiscuit/mcpls` fork, not upstream
 
