@@ -124,6 +124,8 @@ pub(crate) struct PumpShared {
     /// Used to reject diagnostics for out-of-workspace URIs; see
     /// `diagnostic_path_in_workspace`.
     pub(crate) workspace_roots: Arc<[PathBuf]>,
+    /// Used to drop publishes describing text an edit has already replaced.
+    pub(crate) document_tracker: Arc<bridge::DocumentTracker>,
 }
 
 /// Background task that drains LSP notifications, writes them to the cache,
@@ -163,6 +165,7 @@ pub(crate) async fn diagnostics_pump(
         subs,
         peer_cell,
         workspace_roots,
+        document_tracker,
     } = shared;
     loop {
         tokio::select! {
@@ -192,6 +195,18 @@ pub(crate) async fn diagnostics_pump(
                             debug!(
                                 "dropping diagnostics for out-of-workspace URI: {}",
                                 p.uri.as_str()
+                            );
+                            continue;
+                        }
+                        if let Some(version) = p.version
+                            && let Some(path) = bridge::uri_to_path(&p.uri)
+                            && let Some(state) = document_tracker.get(&path)
+                            && state.version() > version
+                        {
+                            debug!(
+                                "dropping diagnostics for {} at version {version}, tracker holds {}",
+                                p.uri.as_str(),
+                                state.version()
                             );
                             continue;
                         }
@@ -670,6 +685,14 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     // Cancellation for pump tasks: send `true` to request shutdown.
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
+    let pump_shared = PumpShared {
+        notification_cache: Arc::clone(&notification_cache),
+        subs: Arc::clone(&subscriptions),
+        peer_cell: Arc::clone(&peer_cell),
+        workspace_roots: Arc::clone(&workspace_roots_snapshot),
+        document_tracker: Arc::clone(translator.document_tracker()),
+    };
+
     let lsp_init_handle = if applicable_configs.is_empty() {
         warn!("No applicable LSP servers configured — starting in protocol-only mode");
         None
@@ -681,11 +704,8 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         Some(spawn_lsp_servers_background(
             applicable_configs,
             Arc::clone(&translator),
-            Arc::clone(&notification_cache),
-            Arc::clone(&subscriptions),
-            Arc::clone(&peer_cell),
             cancel_rx.clone(),
-            Arc::clone(&workspace_roots_snapshot),
+            pump_shared,
         ))
     };
 
@@ -911,11 +931,8 @@ async fn shutdown(
 fn spawn_lsp_servers_background(
     applicable_configs: Vec<ServerInitConfig>,
     translator: Arc<Translator>,
-    notification_cache: Arc<Mutex<NotificationCache>>,
-    subscriptions: Arc<ResourceSubscriptions>,
-    peer_cell: Arc<OnceCell<rmcp::Peer<rmcp::RoleServer>>>,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
-    workspace_roots: Arc<[PathBuf]>,
+    shared: PumpShared,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let configs_by_id: HashMap<ServerId, ServerInitConfig> = applicable_configs
@@ -971,18 +988,13 @@ fn spawn_lsp_servers_background(
             .values()
             .filter(|&&is_route| is_route)
             .count();
-        notification_cache
+        shared
+            .notification_cache
             .lock()
             .await
             .set_diagnostics_route_count(diagnostics_route_count);
 
         // Start diagnostics pump tasks now that servers are registered.
-        let pump_shared = PumpShared {
-            notification_cache,
-            subs: subscriptions,
-            peer_cell,
-            workspace_roots,
-        };
         let mut pumps: JoinSet<()> = JoinSet::new();
         for (id, rx) in registered.receivers {
             let caches_diagnostics = registered
@@ -995,7 +1007,7 @@ fn spawn_lsp_servers_background(
                 rx,
                 cancel_rx.clone(),
                 caches_diagnostics,
-                pump_shared.clone(),
+                shared.clone(),
             ));
         }
         while pumps.join_next().await.is_some() {}
@@ -2221,6 +2233,13 @@ mod tests {
             Arc::new(OnceCell::new())
         }
 
+        fn make_tracker() -> Arc<bridge::DocumentTracker> {
+            Arc::new(bridge::DocumentTracker::new(
+                bridge::ResourceLimits::default(),
+                HashMap::new(),
+            ))
+        }
+
         /// Empty workspace roots: `diagnostic_path_in_workspace` allows any
         /// URI in this mode, matching `validate_path_against_roots`, so these
         /// pump-mechanics tests don't need to construct real workspace paths.
@@ -2250,6 +2269,7 @@ mod tests {
                     subs: Arc::clone(&subs),
                     peer_cell: Arc::clone(&peer_cell),
                     workspace_roots: no_workspace_roots(),
+                    document_tracker: make_tracker(),
                 },
             ));
 
@@ -2322,6 +2342,7 @@ mod tests {
                     subs: Arc::clone(&subs),
                     peer_cell: Arc::clone(&peer_cell),
                     workspace_roots,
+                    document_tracker: make_tracker(),
                 },
             ));
 
@@ -2395,6 +2416,7 @@ mod tests {
                     subs,
                     peer_cell,
                     workspace_roots: no_workspace_roots(),
+                    document_tracker: make_tracker(),
                 },
             ));
 
@@ -2425,6 +2447,7 @@ mod tests {
                     subs,
                     peer_cell,
                     workspace_roots: no_workspace_roots(),
+                    document_tracker: make_tracker(),
                 },
             ));
 
@@ -2475,6 +2498,7 @@ mod tests {
                     subs,
                     peer_cell,
                     workspace_roots: no_workspace_roots(),
+                    document_tracker: make_tracker(),
                 },
             ));
 
@@ -2510,6 +2534,199 @@ mod tests {
 
             release_lock.notify_one();
             holder.await.unwrap();
+        }
+
+        /// A late publish describing pre-edit text must not overwrite the
+        /// current entry: the agent would be shown errors for text that no
+        /// longer exists, and the next publish would flip them back.
+        #[tokio::test]
+        async fn test_a_publish_below_the_tracked_version_is_dropped() {
+            let cache = make_cache();
+            let subs = make_subs();
+            let peer_cell = make_peer_cell();
+            let tracker = make_tracker();
+            let (tx, rx) = mpsc::channel(8);
+            let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+            #[cfg(windows)]
+            let (path, uri_str) = (PathBuf::from(r"C:\test\main.rs"), "file:///C:/test/main.rs");
+            #[cfg(not(windows))]
+            let (path, uri_str) = (PathBuf::from("/test/main.rs"), "file:///test/main.rs");
+            let uri: Uri = uri_str.parse().unwrap();
+
+            // Bumps the tracked version to 2 via one edit past the initial open.
+            tracker.open(path.clone(), "one".to_string()).unwrap();
+            tracker.update(&path, "two".to_string()).unwrap();
+
+            let handle = tokio::spawn(diagnostics_pump(
+                ServerId::from("rust"),
+                rx,
+                cancel_rx,
+                true,
+                PumpShared {
+                    notification_cache: Arc::clone(&cache),
+                    subs,
+                    peer_cell,
+                    workspace_roots: no_workspace_roots(),
+                    document_tracker: tracker,
+                },
+            ));
+
+            // The current publish, then a stale one describing the pre-edit text.
+            tx.send(LspNotification::PublishDiagnostics(
+                PublishDiagnosticsParams {
+                    uri: uri.clone(),
+                    diagnostics: vec![],
+                    version: Some(2),
+                },
+            ))
+            .await
+            .unwrap();
+            tx.send(LspNotification::PublishDiagnostics(
+                PublishDiagnosticsParams {
+                    uri: uri.clone(),
+                    diagnostics: vec![],
+                    version: Some(1),
+                },
+            ))
+            .await
+            .unwrap();
+            drop(tx);
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+                .await
+                .expect("pump did not exit within 5 s")
+                .unwrap();
+
+            let stored = cache
+                .lock()
+                .await
+                .get_diagnostics(uri.as_str())
+                .cloned()
+                .expect("cache should still hold the version-2 entry");
+            assert_eq!(
+                stored.version,
+                Some(2),
+                "a publish naming a version below the tracked one must not \
+                 overwrite the newer entry"
+            );
+        }
+
+        /// Servers publish for files they were never told to open, and those
+        /// fanout files are what this feature exists to deliver: a publish
+        /// naming no version at all must be kept even against a tracked
+        /// document.
+        #[tokio::test]
+        async fn test_a_publish_without_a_version_is_kept() {
+            let cache = make_cache();
+            let subs = make_subs();
+            let peer_cell = make_peer_cell();
+            let tracker = make_tracker();
+            let (tx, rx) = mpsc::channel(8);
+            let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+            #[cfg(windows)]
+            let (path, uri_str) = (PathBuf::from(r"C:\test\main.rs"), "file:///C:/test/main.rs");
+            #[cfg(not(windows))]
+            let (path, uri_str) = (PathBuf::from("/test/main.rs"), "file:///test/main.rs");
+            let uri: Uri = uri_str.parse().unwrap();
+
+            tracker.open(path.clone(), "one".to_string()).unwrap();
+            tracker.update(&path, "two".to_string()).unwrap();
+
+            let handle = tokio::spawn(diagnostics_pump(
+                ServerId::from("rust"),
+                rx,
+                cancel_rx,
+                true,
+                PumpShared {
+                    notification_cache: Arc::clone(&cache),
+                    subs,
+                    peer_cell,
+                    workspace_roots: no_workspace_roots(),
+                    document_tracker: tracker,
+                },
+            ));
+
+            tx.send(LspNotification::PublishDiagnostics(
+                PublishDiagnosticsParams {
+                    uri: uri.clone(),
+                    diagnostics: vec![],
+                    version: None,
+                },
+            ))
+            .await
+            .unwrap();
+            drop(tx);
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+                .await
+                .expect("pump did not exit within 5 s")
+                .unwrap();
+
+            let stored = cache
+                .lock()
+                .await
+                .get_diagnostics(uri.as_str())
+                .cloned()
+                .expect("a publish with no version must be kept even against a tracked document");
+            assert_eq!(stored.version, None);
+        }
+
+        /// Same reason as a versionless publish: no tracked entry means no
+        /// evidence of staleness, not evidence of it.
+        #[tokio::test]
+        async fn test_a_publish_for_an_untracked_path_is_kept() {
+            let cache = make_cache();
+            let subs = make_subs();
+            let peer_cell = make_peer_cell();
+            let tracker = make_tracker();
+            let (tx, rx) = mpsc::channel(8);
+            let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+            #[cfg(windows)]
+            let uri_str = "file:///C:/test/untracked.rs";
+            #[cfg(not(windows))]
+            let uri_str = "file:///test/untracked.rs";
+            let uri: Uri = uri_str.parse().unwrap();
+
+            let handle = tokio::spawn(diagnostics_pump(
+                ServerId::from("rust"),
+                rx,
+                cancel_rx,
+                true,
+                PumpShared {
+                    notification_cache: Arc::clone(&cache),
+                    subs,
+                    peer_cell,
+                    workspace_roots: no_workspace_roots(),
+                    document_tracker: tracker,
+                },
+            ));
+
+            tx.send(LspNotification::PublishDiagnostics(
+                PublishDiagnosticsParams {
+                    uri: uri.clone(),
+                    diagnostics: vec![],
+                    version: Some(7),
+                },
+            ))
+            .await
+            .unwrap();
+            drop(tx);
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+                .await
+                .expect("pump did not exit within 5 s")
+                .unwrap();
+
+            let stored = cache
+                .lock()
+                .await
+                .get_diagnostics(uri.as_str())
+                .cloned()
+                .expect("a publish for a path with no tracked entry must be kept");
+            assert_eq!(stored.version, Some(7));
         }
     }
 }
