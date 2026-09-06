@@ -6,12 +6,16 @@
 use std::sync::{Mutex as StdMutex, MutexGuard, PoisonError};
 
 pub mod apply;
+mod delivery;
 mod encoding;
 mod notifications;
 pub mod resources;
 mod state;
 mod translator;
 
+pub use delivery::{
+    ChangedFile, DiagnosticsDelivery, FileEntry, FloorTable, FlushReport, SessionId,
+};
 pub use encoding::{PositionEncoding, lsp_to_mcp_position, mcp_to_lsp_position};
 pub use notifications::{
     DiagnosticInfo, LogEntry, LogLevel, MessageType, NotificationCache, ServerMessage,
