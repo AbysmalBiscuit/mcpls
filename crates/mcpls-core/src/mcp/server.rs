@@ -174,8 +174,11 @@ struct NewDiagnosticsFile {
     file_path: String,
     /// Diagnostics at or above the file's severity floor, capped.
     diagnostics: Vec<Diagnostic>,
-    /// Admitted diagnostics the caps held back this call. Not delivered
-    /// yet, and not recorded as seen, so the next call offers them again.
+    /// Admitted diagnostics the caps held back this call. The file is
+    /// recorded as seen in full regardless, so these are not offered
+    /// again: the count is what tells the agent to look at the file
+    /// itself. The whole-flush `omitted` count on the response is the
+    /// other thing -- those files a later call does offer again.
     omitted: usize,
 }
 

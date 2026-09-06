@@ -968,7 +968,7 @@ While the language servers are still starting up (before mcpls has a stable base
 ### Notes
 
 - Deduplicated per client session: calling it twice in a row with no edits in between returns an empty `changed`/`cleared` the second time
-- `changed[].omitted` counts admitted diagnostics the per-file/total caps held back for that file this call; the top-level `omitted` counts whole files the total budget could not fit. Both are offered again on a later call rather than dropped; a non-zero top-level `omitted` also sets `note` to say so, since a bare count doesn't tell an agent that a retry gets the rest
+- `changed[].omitted` counts admitted diagnostics the per-file/total caps held back for that file this call; the top-level `omitted` counts whole files the total budget could not fit. The two behave differently: a file that was delivered is recorded as seen in full, so its `changed[].omitted` diagnostics are not offered again and the count is the cue to open the file itself, while a whole file the budget deferred is offered again on a later call. A non-zero top-level `omitted` also sets `note` to say so, since a bare count doesn't tell an agent that a retry gets the rest
 - `cleared` lists files that had diagnostics on a previous call and now report none
 - Filtered by the `[diagnostics]` config table's severity floor (and any per-server `diagnostics_severity` override), same as every other diagnostics tool
 - Positions use the same encoding conversion as `get_cached_diagnostics`, so the two tools never disagree about a column
