@@ -175,6 +175,7 @@ Claude: [get_references] Found 4 matches:
 |------|--------------|
 | `get_diagnostics` | Real compiler errors and warnings, not guesses |
 | `get_cached_diagnostics` | Fast access to push-based diagnostics from LSP server |
+| `get_new_diagnostics` | Diagnostics that changed since you last asked, deduplicated per session |
 | `get_code_actions` | Quick fixes, refactorings, and source actions at a position |
 
 </details>

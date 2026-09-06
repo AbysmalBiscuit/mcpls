@@ -27,6 +27,7 @@ Most tools only read. Three can write to your source tree, and only when the `[a
 |------|------------|-------------|
 | [get_diagnostics](#get_diagnostics) | `textDocument/diagnostic` + push notifications | Compiler errors, warnings, and hints (merged from pull and push) |
 | [get_cached_diagnostics](#get_cached_diagnostics) | Cached notifications | Diagnostics from server push notifications only |
+| [get_new_diagnostics](#get_new_diagnostics) | Cached notifications | Diagnostics that changed since you last asked, deduplicated per session |
 | [format_document](#format_document) | `textDocument/formatting` | Document formatting |
 
 ### Refactoring Tools
@@ -909,6 +910,58 @@ Get diagnostics from LSP server push notifications (cached), without making a ne
 - Filtered by the same routing rules as `get_diagnostics`, so both tools use the same server when routed explicitly
 - Returns empty array if the file hasn't been analyzed yet or no push notifications have been received
 - Useful when you want fast, cached-only results without waiting for a fresh pull request
+
+---
+
+## get_new_diagnostics
+
+Diagnostics that changed since you last called this tool, across every file the language servers report on. Takes no parameters: this tool answers "what's new", while narrowing the result to one file is what `get_cached_diagnostics` already does.
+
+### Parameters
+
+None.
+
+### Returns
+
+```json
+{
+  "changed": [
+    {
+      "file_path": "/path/to/file.rs",
+      "diagnostics": [
+        {
+          "message": "unused variable",
+          "severity": "warning",
+          "range": { "start": { "line": 10, "character": 5 }, "end": { "line": 10, "character": 10 } }
+        }
+      ],
+      "omitted": 0
+    }
+  ],
+  "cleared": ["/path/to/now-clean-file.rs"],
+  "omitted": 0
+}
+```
+
+While the language servers are still starting up (before mcpls has a stable baseline of the workspace's existing diagnostics), the response instead carries an explanatory `note` alongside empty `changed`/`cleared`:
+
+```json
+{
+  "changed": [],
+  "cleared": [],
+  "omitted": 0,
+  "note": "Language servers are still starting up; call again shortly."
+}
+```
+
+### Notes
+
+- Deduplicated per client session: calling it twice in a row with no edits in between returns an empty `changed`/`cleared` the second time
+- `changed[].omitted` counts admitted diagnostics the per-file/total caps held back for that file this call; the top-level `omitted` counts whole files the total budget could not fit. Both are offered again on a later call rather than dropped
+- `cleared` lists files that had diagnostics on a previous call and now report none
+- Filtered by the `[diagnostics]` config table's severity floor (and any per-server `diagnostics_severity` override), same as every other diagnostics tool
+- Positions use the same encoding conversion as `get_cached_diagnostics`, so the two tools never disagree about a column
+- Call it as often as you like: it costs nothing when nothing changed
 
 ---
 

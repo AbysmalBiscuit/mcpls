@@ -9,7 +9,9 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::bridge::{NotificationCache, ResourceSubscriptions, Translator};
+use crate::bridge::{
+    DiagnosticsDelivery, FloorTable, NotificationCache, ResourceSubscriptions, Translator,
+};
 
 /// Shared context for all tool handlers.
 ///
@@ -46,6 +48,13 @@ pub struct BridgeContext {
     /// (stderr's `tracing::warn!` at load time is typically invisible to an
     /// MCP client).
     pub project_config_ignored: bool,
+    /// Per-session record of which diagnostics have already been delivered.
+    ///
+    /// Locked independently of `notification_cache`; a flush takes the cache
+    /// lock only long enough to copy the snapshot it works from.
+    pub delivery: Arc<Mutex<DiagnosticsDelivery>>,
+    /// The severity floor each server answers to, resolved once at startup.
+    pub floors: Arc<FloorTable>,
 }
 
 impl BridgeContext {
@@ -57,6 +66,8 @@ impl BridgeContext {
         workspace_roots: Arc<[PathBuf]>,
         subscriptions: Arc<ResourceSubscriptions>,
         project_config_ignored: bool,
+        delivery: Arc<Mutex<DiagnosticsDelivery>>,
+        floors: Arc<FloorTable>,
     ) -> Self {
         Self {
             translator,
@@ -64,6 +75,8 @@ impl BridgeContext {
             workspace_roots,
             subscriptions,
             project_config_ignored,
+            delivery,
+            floors,
         }
     }
 }
@@ -72,6 +85,7 @@ impl BridgeContext {
 mod tests {
     use super::*;
     use crate::bridge::Translator;
+    use crate::config::DiagnosticsConfig;
 
     #[test]
     fn test_bridge_context_creation() {
@@ -79,12 +93,18 @@ mod tests {
         let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
         let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
         let subscriptions = Arc::new(ResourceSubscriptions::new());
+        let delivery = Arc::new(Mutex::new(DiagnosticsDelivery::new(
+            DiagnosticsConfig::default(),
+        )));
+        let floors = Arc::new(FloorTable::new(&DiagnosticsConfig::default(), &[]));
         let context = BridgeContext::new(
             translator,
             notification_cache,
             workspace_roots,
             subscriptions,
             false,
+            delivery,
+            floors,
         );
         assert_eq!(Arc::strong_count(&context.translator), 1);
     }

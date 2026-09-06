@@ -724,8 +724,8 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         workspace_roots: Arc::clone(&workspace_roots_snapshot),
         document_tracker: Arc::clone(translator.document_tracker()),
         settle,
-        delivery,
-        floors,
+        delivery: Arc::clone(&delivery),
+        floors: Arc::clone(&floors),
     };
 
     let lsp_init_handle = if applicable_configs.is_empty() {
@@ -751,6 +751,8 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         Arc::clone(&workspace_roots_snapshot),
         Arc::clone(&subscriptions),
         project_config_ignored,
+        delivery,
+        floors,
     );
     info!("MCPLS server initialized successfully");
 

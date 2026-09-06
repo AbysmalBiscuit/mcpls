@@ -60,9 +60,9 @@ impl From<&str> for ServerId {
 /// A routable MCP tool: every MCP tool that dispatches a request to a
 /// specific LSP server via [`ToolRouter`].
 ///
-/// Cache-only tools (`get_cached_diagnostics`, `get_server_logs`,
-/// `get_server_messages`) are deliberately excluded — they never reach a
-/// client directly, so they have nothing to route.
+/// Cache-only tools (`get_cached_diagnostics`, `get_new_diagnostics`,
+/// `get_server_logs`, `get_server_messages`) are deliberately excluded —
+/// they never reach a client directly, so they have nothing to route.
 ///
 /// `CallHierarchy` covers `prepare`, `incoming_calls`, and `outgoing_calls`
 /// as a single route: the opaque item returned by `prepare` is only

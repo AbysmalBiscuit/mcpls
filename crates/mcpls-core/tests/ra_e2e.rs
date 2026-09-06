@@ -1,4 +1,4 @@
-//! End-to-end test suite exercising all 16 MCP tools against a real rust-analyzer.
+//! End-to-end test suite exercising all 22 MCP tools against a real rust-analyzer.
 //!
 //! # Process model
 //!
@@ -1383,6 +1383,38 @@ fn sc_get_server_messages(client: &mut McpClient, _workspace: &Path) -> Result<(
     Ok(())
 }
 
+/// Tool 22: `get_new_diagnostics` — drains once and stays drained.
+///
+/// Scoped to the deduplication property rather than to a diagnostic
+/// appearing, because whether the workspace's known errors land before or
+/// after the baseline depends on rust-analyzer's startup timing. The
+/// baseline semantics are pinned by unit tests instead.
+fn sc_get_new_diagnostics(client: &mut McpClient, _workspace: &Path) -> Result<(), String> {
+    let first = client
+        .call_tool("get_new_diagnostics", &json!({}))
+        .map_err(|e| format!("call failed: {e}"))?;
+    let text = assertions::assert_tool_ok(&first);
+    let inner: Value = serde_json::from_str(&text).map_err(|e| format!("bad JSON: {e}"))?;
+    inner["changed"]
+        .as_array()
+        .ok_or_else(|| format!("expected a changed array, got {inner}"))?;
+
+    let second = client
+        .call_tool("get_new_diagnostics", &json!({}))
+        .map_err(|e| format!("second call failed: {e}"))?;
+    let text = assertions::assert_tool_ok(&second);
+    let inner: Value = serde_json::from_str(&text).map_err(|e| format!("bad JSON: {e}"))?;
+
+    let changed = inner["changed"].as_array().map_or(0, Vec::len);
+    let cleared = inner["cleared"].as_array().map_or(0, Vec::len);
+    if changed != 0 || cleared != 0 {
+        return Err(format!(
+            "a second drain with no edits between should be empty, got {inner}"
+        ));
+    }
+    Ok(())
+}
+
 /// Tool 25: `rename_symbol` with `apply` — rename `add` → `plus` and check
 /// that the files really changed on disk.
 ///
@@ -1517,6 +1549,7 @@ fn ra_e2e_suite() {
         sub_case!(sc_read_resource),
         sub_case!(sc_subscribe_unsubscribe_resource),
         sub_case!(sc_subscribe_no_replay_without_cached_diagnostics),
+        sub_case!(sc_get_new_diagnostics),
         // Last: this one writes to the staged workspace, and every anchor
         // above it looks for text this rename moves.
         sub_case!(sc_rename_symbol_apply),

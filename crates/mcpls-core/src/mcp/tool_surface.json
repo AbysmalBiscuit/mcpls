@@ -443,6 +443,21 @@
     }
   },
   {
+    "name": "get_new_diagnostics",
+    "title": "New Diagnostics",
+    "description": "Diagnostics that changed since you last asked, across every file the language servers report on. Returns nothing when nothing changed.",
+    "inputSchema": {
+      "properties": {},
+      "type": "object"
+    },
+    "annotations": {
+      "title": "New Diagnostics",
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
+    }
+  },
+  {
     "name": "get_outgoing_calls",
     "title": "Outgoing Calls",
     "description": "Functions called by the specified item. Takes call hierarchy item, returns all callees.",

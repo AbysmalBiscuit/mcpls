@@ -87,6 +87,7 @@ fn test_e2e_list_tools() -> Result<()> {
         "go_to_type_definition",
         "get_inlay_hints",
         "apply_code_action",
+        "get_new_diagnostics",
     ];
 
     for expected in &expected_names {

@@ -26,10 +26,11 @@ use super::tools::{
 };
 use crate::bridge::resources::{make_uri, parse_uri};
 use crate::bridge::{
-    DiagnosticInfo, NotificationCache, PositionEncoding, ResourceSubscriptions, Translator,
+    Diagnostic, DiagnosticInfo, DiagnosticsDelivery, FileEntry, FloorTable, FlushReport,
+    NotificationCache, PositionEncoding, ResourceSubscriptions, SessionId, Translator, uri_to_path,
     validate_path_against_roots,
 };
-use crate::config::ToolKind;
+use crate::config::{ServerId, ToolKind};
 
 /// MCP server that exposes LSP capabilities as tools.
 #[derive(Clone)]
@@ -165,15 +166,69 @@ fn build_resource_diagnostics_response(
     ResourceDiagnosticsResponse::new(document_open || entry.is_some(), entry)
 }
 
+/// One file whose visible diagnostics changed since the caller's last
+/// `get_new_diagnostics` call.
+#[derive(Debug, Clone, serde::Serialize)]
+struct NewDiagnosticsFile {
+    /// Path the caller can open, derived from the notification's URI.
+    file_path: String,
+    /// Diagnostics at or above the file's severity floor, capped.
+    diagnostics: Vec<Diagnostic>,
+    /// Admitted diagnostics the caps held back this call. Not delivered
+    /// yet, and not recorded as seen, so the next call offers them again.
+    omitted: usize,
+}
+
+/// Response shape for `get_new_diagnostics`.
+#[derive(Debug, Clone, serde::Serialize)]
+struct NewDiagnosticsResult {
+    /// Files whose visible diagnostics differ from the caller's last call.
+    changed: Vec<NewDiagnosticsFile>,
+    /// Paths that had diagnostics before and have none now.
+    cleared: Vec<String>,
+    /// Whole files the total budget could not fit this call. The caps held
+    /// them back; the next call offers them again in full.
+    omitted: usize,
+    /// Set instead of a real report while the language servers are still
+    /// settling, so a caller cannot mistake "too early to tell" for
+    /// "nothing changed".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+}
+
+impl NewDiagnosticsResult {
+    /// The response returned before a baseline exists.
+    ///
+    /// Calling `DiagnosticsDelivery::flush` this early would permanently
+    /// seed the caller's session record as empty, and every diagnostic the
+    /// workspace already had would then read as newly changed forever
+    /// after. Returning this instead, without touching the delivery
+    /// record at all, keeps that session's first real flush available for
+    /// once a baseline lands.
+    fn starting_up() -> Self {
+        Self {
+            changed: Vec::new(),
+            cleared: Vec::new(),
+            omitted: 0,
+            note: Some("Language servers are still starting up; call again shortly.".to_string()),
+        }
+    }
+}
+
 #[tool_router(router = declared_tool_router)]
 impl McplsServer {
-    /// Create a new MCP server with the given translator, notification cache,
-    /// workspace roots, and subscriptions.
+    /// Create a new MCP server with the given translator, notification
+    /// cache, workspace roots, subscriptions, and diagnostics delivery
+    /// state.
     ///
     /// `project_config_ignored` reports whether a CWD-discovered
     /// `./mcpls.toml` was skipped as untrusted when the active config was
     /// loaded (see [`ServerConfig::project_config_ignored`](crate::config::ServerConfig::project_config_ignored));
     /// `get_info` surfaces it in [`ServerInfo::instructions`].
+    ///
+    /// `delivery` and `floors` should be the same `Arc`s the caller's
+    /// diagnostics-baseline background task shares, so that `flush` and
+    /// `set_baseline` observe each other's writes.
     #[must_use]
     pub fn new(
         translator: Arc<Translator>,
@@ -181,6 +236,8 @@ impl McplsServer {
         workspace_roots: Arc<[PathBuf]>,
         subscriptions: Arc<ResourceSubscriptions>,
         project_config_ignored: bool,
+        delivery: Arc<Mutex<DiagnosticsDelivery>>,
+        floors: Arc<FloorTable>,
     ) -> Self {
         let context = Arc::new(BridgeContext::new(
             translator,
@@ -188,6 +245,8 @@ impl McplsServer {
             workspace_roots,
             subscriptions,
             project_config_ignored,
+            delivery,
+            floors,
         ));
         Self { context }
     }
@@ -627,6 +686,100 @@ impl McplsServer {
         to_tool_result(result)
     }
 
+    /// Drain diagnostics that changed since the last call.
+    #[tool(
+        description = "Diagnostics that changed since you last asked, across every file the language servers report on. Returns nothing when nothing changed.",
+        title = "New Diagnostics"
+    )]
+    async fn get_new_diagnostics(&self) -> Result<String, McpError> {
+        let baselined = {
+            let delivery = self.context.delivery.lock().await;
+            delivery.has_baseline()
+        };
+        if !baselined {
+            return to_tool_result(Ok(NewDiagnosticsResult::starting_up()));
+        }
+
+        let session = SessionId::process_default();
+        let snapshot = {
+            let cache = self.context.notification_cache.lock().await;
+            cache.diagnostics_snapshot()
+        };
+
+        let entries: Vec<FileEntry<'_>> = snapshot
+            .iter()
+            .map(|(key, info, owner)| FileEntry {
+                key,
+                diagnostics: &info.diagnostics,
+                floor: self.context.floors.for_server(owner),
+            })
+            .collect();
+
+        let report = {
+            let mut delivery = self.context.delivery.lock().await;
+            delivery.flush(&session, &entries)
+        };
+
+        to_tool_result(Ok(self.new_diagnostics_payload(&report, &snapshot).await))
+    }
+
+    /// Build `get_new_diagnostics`'s payload from one flush's report.
+    ///
+    /// Runs each changed file's diagnostics through the same conversion
+    /// `get_cached_diagnostics` uses -- resolving the owning server's
+    /// negotiated position encoding via `Translator::diagnostics_from_cache_entry`
+    /// -- so the two tools never disagree about a column.
+    async fn new_diagnostics_payload(
+        &self,
+        report: &FlushReport,
+        snapshot: &[(String, DiagnosticInfo, ServerId)],
+    ) -> NewDiagnosticsResult {
+        let mut changed = Vec::with_capacity(report.changed.len());
+        for file in &report.changed {
+            let Some((_, info, owner)) = snapshot.iter().find(|(key, _, _)| *key == file.key)
+            else {
+                continue;
+            };
+            // Drop an entry whose URI does not map to a path rather than
+            // showing the agent a URI it cannot open.
+            let Some(path) = uri_to_path(&info.uri) else {
+                continue;
+            };
+            let encoding = self.context.translator.position_encoding_for(owner);
+            let entry = DiagnosticInfo {
+                uri: info.uri.clone(),
+                version: info.version,
+                diagnostics: file.diagnostics.clone(),
+            };
+            let converted = Translator::diagnostics_from_cache_entry(
+                Some(&entry),
+                encoding,
+                self.context.translator.document_tracker(),
+            )
+            .await;
+            changed.push(NewDiagnosticsFile {
+                file_path: path.display().to_string(),
+                diagnostics: converted.diagnostics,
+                omitted: file.omitted,
+            });
+        }
+
+        let cleared = report
+            .cleared
+            .iter()
+            .filter_map(|key| snapshot.iter().find(|(k, _, _)| k == key))
+            .filter_map(|(_, info, _)| uri_to_path(&info.uri))
+            .map(|path| path.display().to_string())
+            .collect();
+
+        NewDiagnosticsResult {
+            changed,
+            cleared,
+            omitted: report.omitted,
+            note: None,
+        }
+    }
+
     /// Get recent LSP server log messages.
     #[tool(
         description = "Recent server log messages. Filter by level (error, warning, info, debug) for debugging.",
@@ -990,6 +1143,17 @@ impl ServerHandler for McplsServer {
 mod tests {
     use super::*;
 
+    /// A `DiagnosticsDelivery`/`FloorTable` pair for tests that don't care
+    /// about diagnostics config or per-server floors, just a working
+    /// `McplsServer::new` call.
+    fn default_delivery_and_floors() -> (Arc<Mutex<DiagnosticsDelivery>>, Arc<FloorTable>) {
+        let config = crate::config::DiagnosticsConfig::default();
+        (
+            Arc::new(Mutex::new(DiagnosticsDelivery::new(config))),
+            Arc::new(FloorTable::new(&config, &[])),
+        )
+    }
+
     fn create_test_server() -> McplsServer {
         create_test_server_with_ignored_flag(false)
     }
@@ -999,12 +1163,15 @@ mod tests {
         let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
         let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
         let subscriptions = Arc::new(ResourceSubscriptions::new());
+        let (delivery, floors) = default_delivery_and_floors();
         McplsServer::new(
             translator,
             notification_cache,
             workspace_roots,
             subscriptions,
             project_config_ignored,
+            delivery,
+            floors,
         )
     }
 
@@ -1470,6 +1637,142 @@ mod tests {
         );
     }
 
+    /// Build a server for `get_new_diagnostics` tests with direct access to
+    /// the cache and delivery `Arc`s it shares, so a test can seed the cache
+    /// and the baseline independently of the tool calls under test.
+    fn new_diagnostics_test_server() -> (
+        McplsServer,
+        Arc<Mutex<NotificationCache>>,
+        Arc<Mutex<DiagnosticsDelivery>>,
+    ) {
+        let translator = Arc::new(Translator::new());
+        let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
+        let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
+        let (delivery, floors) = default_delivery_and_floors();
+        let server = McplsServer::new(
+            translator,
+            Arc::clone(&notification_cache),
+            workspace_roots,
+            subscriptions,
+            false,
+            Arc::clone(&delivery),
+            floors,
+        );
+        (server, notification_cache, delivery)
+    }
+
+    fn diagnostic_at(message: &str) -> lsp_types::Diagnostic {
+        lsp_types::Diagnostic {
+            range: lsp_types::Range {
+                start: lsp_types::Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: lsp_types::Position {
+                    line: 0,
+                    character: 1,
+                },
+            },
+            severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+            code: None,
+            code_description: None,
+            source: None,
+            message: message.to_string(),
+            related_information: None,
+            tags: None,
+            data: None,
+        }
+    }
+
+    /// Before a baseline exists, `get_new_diagnostics` must not call
+    /// `DiagnosticsDelivery::flush` at all -- calling it and discarding the
+    /// result still seeds the session's record as empty, permanently, and
+    /// every diagnostic the workspace already had would then read as newly
+    /// changed forever after (see `DiagnosticsDelivery::flush`'s doc
+    /// comment on why the record is seeded from the baseline).
+    ///
+    /// Pinned end-to-end: call once with no baseline (must not touch the
+    /// delivery record), adopt a baseline that already accounts for a
+    /// pre-existing error, then call again with both that pre-existing
+    /// error and a genuinely new one in the cache. Only the new one may be
+    /// reported -- if the first call had seeded the session's record empty,
+    /// the pre-existing error would incorrectly show up too.
+    #[tokio::test]
+    async fn test_new_diagnostics_does_not_seed_session_before_baseline_exists() {
+        let (server, notification_cache, delivery) = new_diagnostics_test_server();
+        let owner = crate::config::ServerId::from("rust");
+
+        // No baseline yet: the tool must report "starting up", not a
+        // (falsely empty) drain.
+        let early = server.get_new_diagnostics().await.unwrap();
+        let early: serde_json::Value = serde_json::from_str(&early).unwrap();
+        assert!(
+            early["note"].is_string(),
+            "expected a starting-up note before any baseline exists, got {early}"
+        );
+        assert_eq!(early["changed"].as_array().unwrap().len(), 0);
+        assert_eq!(early["cleared"].as_array().unwrap().len(), 0);
+
+        // A pre-existing error, as if a language server had reported it
+        // before mcpls ever started -- the baseline task would have folded
+        // this into the baseline once the servers went quiet.
+        let pre_existing_uri: lsp_types::Uri = "file:///workspace/pre_existing.rs".parse().unwrap();
+        let pre_existing = diagnostic_at("pre-existing error");
+        {
+            let mut cache = notification_cache.lock().await;
+            cache.store_diagnostics(
+                &owner,
+                &pre_existing_uri,
+                Some(1),
+                vec![pre_existing.clone()],
+            );
+        }
+        let baseline_key = {
+            let cache = notification_cache.lock().await;
+            cache
+                .diagnostics_snapshot()
+                .into_iter()
+                .find(|(_, info, _)| info.uri == pre_existing_uri)
+                .map(|(key, _, _)| key)
+                .unwrap()
+        };
+        let baseline_hash = DiagnosticsDelivery::visible_hash(
+            &[pre_existing],
+            crate::config::SeverityFloor::Warning,
+        )
+        .unwrap();
+        {
+            let mut delivery = delivery.lock().await;
+            let mut baseline = std::collections::HashMap::new();
+            baseline.insert(baseline_key, baseline_hash);
+            delivery.set_baseline(baseline);
+        }
+
+        // A genuinely new error, arriving after the baseline was captured.
+        let new_uri: lsp_types::Uri = "file:///workspace/new_error.rs".parse().unwrap();
+        {
+            let mut cache = notification_cache.lock().await;
+            cache.store_diagnostics(&owner, &new_uri, Some(1), vec![diagnostic_at("new error")]);
+        }
+
+        let report = server.get_new_diagnostics().await.unwrap();
+        let report: serde_json::Value = serde_json::from_str(&report).unwrap();
+        assert!(
+            report["note"].is_null(),
+            "a real report must not carry the starting-up note, got {report}"
+        );
+        let changed = report["changed"].as_array().unwrap();
+        assert_eq!(
+            changed.len(),
+            1,
+            "the pre-existing error must be suppressed by the baseline, only the new one \
+             reported, got {report}"
+        );
+        assert_eq!(changed[0]["file_path"], "/workspace/new_error.rs");
+        assert_eq!(changed[0]["diagnostics"][0]["message"], "new error");
+    }
+
     #[tokio::test]
     async fn test_cached_diagnostics_tool_nonexistent_file() {
         let server = create_test_server();
@@ -1780,6 +2083,7 @@ mod tests {
             ("go_to_implementation", true, false, true),
             ("go_to_type_definition", true, false, true),
             ("get_inlay_hints", true, false, true),
+            ("get_new_diagnostics", true, false, true),
         ];
 
         assert_eq!(
@@ -1823,12 +2127,15 @@ mod tests {
                 allow_file_deletion: false,
             },
         ));
+        let (delivery, floors) = default_delivery_and_floors();
         McplsServer::new(
             Arc::new(Translator::new().with_applier(applier)),
             Arc::new(Mutex::new(NotificationCache::new())),
             Arc::from(Vec::new()),
             Arc::new(ResourceSubscriptions::new()),
             false,
+            delivery,
+            floors,
         )
     }
 

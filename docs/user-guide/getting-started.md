@@ -66,7 +66,7 @@ Ask Claude: "What tools are available?"
 
 You should see the mcpls tools, including:
 - get_hover, get_definition, get_references, get_completions
-- get_diagnostics, get_cached_diagnostics
+- get_diagnostics, get_cached_diagnostics, get_new_diagnostics
 - get_document_symbols, workspace_symbol_search
 - rename_symbol, format_document, get_code_actions, apply_code_action
 - get_signature_help, go_to_implementation, go_to_type_definition, get_inlay_hints
