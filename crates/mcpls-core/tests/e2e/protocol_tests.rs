@@ -49,9 +49,8 @@ fn test_e2e_initialize_handshake() -> Result<()> {
 
 /// Test listing all available MCP tools.
 ///
-/// Validates that:
-/// - tools/list returns an array of 16 tools
-/// - All expected tool names are present
+/// Validates that `tools/list` returns exactly the expected set: every name
+/// below is present, and nothing else is.
 #[test]
 #[ignore = "Requires mcpls binary built"]
 fn test_e2e_list_tools() -> Result<()> {
@@ -64,11 +63,9 @@ fn test_e2e_list_tools() -> Result<()> {
         .as_array()
         .unwrap_or_else(|| panic!("tools should be an array"));
 
-    assert_eq!(tools.len(), 20, "Should have exactly 20 tools");
-
     let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
-    for expected in &[
+    let expected_names = [
         "get_hover",
         "get_definition",
         "get_references",
@@ -89,9 +86,17 @@ fn test_e2e_list_tools() -> Result<()> {
         "go_to_implementation",
         "go_to_type_definition",
         "get_inlay_hints",
-    ] {
+        "apply_code_action",
+    ];
+
+    for expected in &expected_names {
         assert!(tool_names.contains(expected), "Should have {expected} tool");
     }
+    assert_eq!(
+        tools.len(),
+        expected_names.len(),
+        "tools/list returned something the expected set does not name: {tool_names:?}"
+    );
 
     Ok(())
 }
