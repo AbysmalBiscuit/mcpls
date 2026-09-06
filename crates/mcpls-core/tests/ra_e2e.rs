@@ -139,11 +139,25 @@ struct E2eConfig {
     workspace: WorkspaceConfig,
     lsp_servers: Vec<LspServerConfig>,
     apply: ApplyTable,
+    diagnostics: DiagnosticsTable,
 }
 
 #[derive(Serialize, Deserialize)]
 struct ApplyTable {
     rename: bool,
+}
+
+/// Overrides just the settle deadline; every other `[diagnostics]` field
+/// keeps its production default.
+///
+/// A real rust-analyzer session's `$/progress` traffic against the fixture
+/// workspace does not go quiet for a full `settle_quiet_ms` on its own, so
+/// the production default deadline (a full minute) would make
+/// `sc_get_new_diagnostics` wait that long for a baseline. A short deadline
+/// here forces one almost immediately, well before that sub-case runs.
+#[derive(Serialize, Deserialize)]
+struct DiagnosticsTable {
+    settle_deadline_ms: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -174,6 +188,9 @@ fn write_config(ra_binary: &Path, workspace_root: &Path, config_path: &Path) {
         // Only `rename` is on: the earlier read-only sub-cases must keep
         // proving that a tool called without `apply` writes nothing.
         apply: ApplyTable { rename: true },
+        diagnostics: DiagnosticsTable {
+            settle_deadline_ms: 2_000,
+        },
     };
     let content = toml::to_string(&cfg).expect("failed to serialize e2e config");
     fs::write(config_path, content).expect("failed to write e2e config");
@@ -1398,6 +1415,21 @@ fn sc_get_new_diagnostics(client: &mut McpClient, _workspace: &Path) -> Result<(
     inner["changed"]
         .as_array()
         .ok_or_else(|| format!("expected a changed array, got {inner}"))?;
+    // The e2e config sets a short `settle_deadline_ms` (see `write_config`)
+    // specifically so the baseline is guaranteed to have landed by the time
+    // this sub-case runs -- rust-analyzer's `$/progress` traffic in this
+    // fixture does not go quiet for a full `settle_quiet_ms` on its own, so
+    // without that override this assertion would depend on the deadline
+    // fallback instead, which defaults to a full minute. A `note` here
+    // means the baseline genuinely never landed, not a timing fluke.
+    // Without this check, an unsettled baseline would make the second
+    // call's "empty" trivially true (the starting-up shape is always
+    // empty) instead of actually proving the drain deduplicates.
+    if inner.get("note").is_some() {
+        return Err(format!(
+            "expected a real report by now (baseline should have settled), got {inner}"
+        ));
+    }
 
     let second = client
         .call_tool("get_new_diagnostics", &json!({}))
