@@ -734,7 +734,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         peer_cell: Arc::clone(&peer_cell),
         workspace_roots: Arc::clone(&workspace_roots_snapshot),
         document_tracker: Arc::clone(translator.document_tracker()),
-        settle,
+        settle: Arc::clone(&settle),
         delivery: Arc::clone(&delivery),
         floors: Arc::clone(&floors),
     };
@@ -770,6 +770,8 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         project_config_ignored,
         delivery,
         floors,
+        config.diagnostics,
+        settle,
     );
     info!("MCPLS server initialized successfully");
 
