@@ -446,18 +446,14 @@ where
     while let Ok(Some(line)) = lines.next_line().await {
         let response = match serde_json::from_str::<Request>(&line) {
             Ok(request) => {
+                let overrun = overrun_message(&request, op_deadline);
                 let work = tokio::spawn(handler(request));
                 match tokio::time::timeout(op_deadline, work).await {
                     Ok(Ok(response)) => response,
                     Ok(Err(_join_error)) => Response::Error {
                         message: "the handler panicked".to_string(),
                     },
-                    Err(_elapsed) => Response::Error {
-                        message: format!(
-                            "op exceeded {}ms; its work continues and reaches the next flush",
-                            op_deadline.as_millis()
-                        ),
-                    },
+                    Err(_elapsed) => Response::Error { message: overrun },
                 }
             }
             Err(e) => Response::Error {
@@ -472,6 +468,34 @@ where
         if write_line(&mut writer, &line).await.is_err() {
             return;
         }
+    }
+}
+
+/// What a client is told when its op outran the deadline: what the work
+/// it did not wait for does once it finishes, which differs per op.
+///
+/// A `flush` that outruns the deadline stages a report nobody
+/// acknowledges, so the record does not move and the next `flush` offers
+/// the same report; saying so is what lets a client treat the error as a
+/// deferral rather than a loss.
+fn overrun_message(request: &Request, op_deadline: Duration) -> String {
+    let ms = op_deadline.as_millis();
+    match request {
+        Request::Changed { .. } => format!(
+            "op exceeded {ms}ms; the paths are queued when the work finishes and their \
+             diagnostics reach a later flush"
+        ),
+        Request::Flush { .. } => format!(
+            "op exceeded {ms}ms; nothing confirmed this report was delivered, so the next \
+             flush offers it again"
+        ),
+        Request::Ack { .. } => {
+            format!("op exceeded {ms}ms; the record advances when the work finishes")
+        }
+        Request::EndSession { .. } => {
+            format!("op exceeded {ms}ms; the session's record is dropped when the work finishes")
+        }
+        Request::Status => format!("op exceeded {ms}ms"),
     }
 }
 
@@ -527,6 +551,86 @@ pub async fn send_many(
             timeout.as_millis()
         ))),
     }
+}
+
+/// Send `requests` down one connection and, when the last flush among
+/// them was answered with a token, acknowledge it on that connection
+/// before returning.
+///
+/// The answers are returned whether or not the acknowledgement lands. By
+/// the time it is sent the caller's report is in hand, and an owner that
+/// never hears it offers the same report again next time; withholding the
+/// report over a failed acknowledgement would be the one outcome the
+/// acknowledgement exists to rule out. The acknowledgement shares the
+/// caller's deadline but not its error path.
+///
+/// It is sent before the caller prints, not after. The host reads a
+/// hook's output at the hook's exit and discards it if the hook is
+/// killed first, so the interval in which a kill loses the report runs
+/// from the ack leaving this process to the process exiting under either
+/// order; sending after the print would trim that interval by the print
+/// alone and leave the round trip and the exit, which dominate it, where
+/// they are.
+///
+/// # Errors
+///
+/// Returns an error if no one owns the socket, the connection drops before
+/// every answer arrives, or `timeout` elapses before they do.
+pub async fn send_and_acknowledge(
+    identity: &SocketIdentity,
+    requests: &[Request],
+    timeout: Duration,
+) -> Result<Vec<Response>> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let exchanged = tokio::time::timeout_at(deadline, async {
+        let mut connection = Connection::open(identity).await?;
+        let responses = connection.exchange(requests).await?;
+        Ok::<_, Error>((connection, responses))
+    })
+    .await
+    .map_err(|_elapsed| {
+        Error::Transport(format!(
+            "the hook socket did not answer within {}ms",
+            timeout.as_millis()
+        ))
+    })?;
+    let (mut connection, responses) = exchanged?;
+
+    if let Some(ack) = acknowledgement_for(requests, &responses) {
+        match tokio::time::timeout_at(deadline, connection.exchange(&[ack])).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                tracing::debug!(%error, "the flush acknowledgement was not answered; the owner offers the report again");
+            }
+            Err(_elapsed) => {
+                tracing::debug!(
+                    "the flush acknowledgement outran the deadline; the owner offers the report again"
+                );
+            }
+        }
+    }
+    Ok(responses)
+}
+
+/// The acknowledgement `responses` call for: one for the last `Flush` in
+/// `requests` whose answer carries a token, or none.
+fn acknowledgement_for(requests: &[Request], responses: &[Response]) -> Option<Request> {
+    requests
+        .iter()
+        .zip(responses)
+        .rev()
+        .find_map(|(request, response)| match (request, response) {
+            (
+                Request::Flush { session },
+                Response::Flush {
+                    token: Some(token), ..
+                },
+            ) => Some(Request::Ack {
+                session: session.clone(),
+                token: *token,
+            }),
+            _ => None,
+        })
 }
 
 /// What probing a socket once found.
@@ -672,43 +776,65 @@ const fn classify_gave_up_connect(saw_pipe_busy: bool) -> ProbeOutcome {
     }
 }
 
+/// One open connection to whoever owns a socket, so a caller can run more
+/// than one exchange on it: a flush and, once its answer is in hand, the
+/// acknowledgement that lets the owner advance the record. One connection
+/// rather than two because a connect is the one step that can find a
+/// Windows pipe busy; an exchange on an open connection cannot.
+struct Connection {
+    lines: tokio::io::Lines<BufReader<tokio::io::ReadHalf<Box<dyn HookStream>>>>,
+    writer: tokio::io::WriteHalf<Box<dyn HookStream>>,
+}
+
+impl Connection {
+    async fn open(identity: &SocketIdentity) -> Result<Self> {
+        Ok(Self::over(connect(identity).await?))
+    }
+
+    fn over(stream: Box<dyn HookStream>) -> Self {
+        let (reader, writer) = tokio::io::split(stream);
+        Self {
+            lines: BufReader::new(reader).lines(),
+            writer,
+        }
+    }
+
+    /// Write every request in `requests`, in order, then read back one
+    /// response line for each.
+    ///
+    /// The one place that writes the request framing and reads the
+    /// response framing, for [`send_many_inner`], [`answer_one`] and
+    /// [`send_and_acknowledge`] alike: if any two disagreed on either,
+    /// `mcpls hook doctor` would misread a healthy owner's answer and
+    /// report [`ProbeOutcome::Busy`] for it, which is exactly the
+    /// misdiagnosis this module exists to prevent.
+    async fn exchange(&mut self, requests: &[Request]) -> Result<Vec<Response>> {
+        for request in requests {
+            let mut line = serde_json::to_string(request)?;
+            line.push('\n');
+            write_line(&mut self.writer, &line).await?;
+        }
+        let mut responses = Vec::with_capacity(requests.len());
+        for _ in requests {
+            let line = self.lines.next_line().await?.ok_or_else(|| {
+                Error::Transport("the hook socket closed before answering".to_string())
+            })?;
+            responses.push(serde_json::from_str(&line)?);
+        }
+        Ok(responses)
+    }
+}
+
 /// Write `request` on `stream` and read back one response line.
 async fn answer_one(stream: Box<dyn HookStream>, request: &Request) -> Result<Response> {
-    let mut responses = exchange(stream, std::slice::from_ref(request)).await?;
+    let mut responses = Connection::over(stream)
+        .exchange(std::slice::from_ref(request))
+        .await?;
     Ok(responses.remove(0))
 }
 
 async fn send_many_inner(identity: &SocketIdentity, requests: &[Request]) -> Result<Vec<Response>> {
-    let stream = connect(identity).await?;
-    exchange(stream, requests).await
-}
-
-/// Write every request in `requests` on `stream`, in order, then read
-/// back one response line for each.
-///
-/// The one place that writes the request framing and reads the response
-/// framing, for both [`send_many_inner`] and [`answer_one`]: if the two
-/// ever disagreed on either, `mcpls hook doctor` would misread a healthy
-/// owner's answer and report [`ProbeOutcome::Busy`] for it, which is
-/// exactly the misdiagnosis this module exists to prevent.
-async fn exchange(stream: Box<dyn HookStream>, requests: &[Request]) -> Result<Vec<Response>> {
-    let (reader, mut writer) = tokio::io::split(stream);
-
-    for request in requests {
-        let mut line = serde_json::to_string(request)?;
-        line.push('\n');
-        write_line(&mut writer, &line).await?;
-    }
-
-    let mut lines = BufReader::new(reader).lines();
-    let mut responses = Vec::with_capacity(requests.len());
-    for _ in requests {
-        let line = lines.next_line().await?.ok_or_else(|| {
-            Error::Transport("the hook socket closed before answering".to_string())
-        })?;
-        responses.push(serde_json::from_str(&line)?);
-    }
-    Ok(responses)
+    Connection::open(identity).await?.exchange(requests).await
 }
 
 #[cfg(not(windows))]
@@ -890,7 +1016,12 @@ mod tests {
             Duration::from_secs(1),
             listener.serve(
                 |_req: Request| -> BoxFuture<'static, Response> {
-                    Box::pin(async { Response::Flush { context: None } })
+                    Box::pin(async {
+                        Response::Flush {
+                            context: None,
+                            token: None,
+                        }
+                    })
                 },
                 Duration::from_millis(100),
                 cancel,
@@ -923,6 +1054,71 @@ mod classify_tests {
             classify_gave_up_connect(false),
             ProbeOutcome::NoOwner
         ));
+    }
+}
+
+/// Each overrun message is the only thing a client ever learns about work
+/// its deadline cut off, so what every one of them promises is pinned
+/// whole here rather than by substring: a message that named the wrong
+/// consequence would read as authoritative and send the reader looking
+/// for a report that is not coming, or stop them looking for one that is.
+#[cfg(test)]
+mod overrun_tests {
+    use super::*;
+    use crate::hooks::ChangeEvent;
+
+    fn message_for(request: &Request) -> String {
+        overrun_message(request, Duration::from_millis(1500))
+    }
+
+    #[test]
+    fn test_a_changed_overrun_says_its_paths_reach_a_later_flush() {
+        assert_eq!(
+            message_for(&Request::Changed {
+                session: "s1".to_string(),
+                paths: Vec::new(),
+                event: ChangeEvent::Change,
+            }),
+            "op exceeded 1500ms; the paths are queued when the work finishes and their \
+             diagnostics reach a later flush"
+        );
+    }
+
+    #[test]
+    fn test_a_flush_overrun_says_the_report_is_offered_again() {
+        assert_eq!(
+            message_for(&Request::Flush {
+                session: "s1".to_string(),
+            }),
+            "op exceeded 1500ms; nothing confirmed this report was delivered, so the next \
+             flush offers it again"
+        );
+    }
+
+    #[test]
+    fn test_an_ack_overrun_says_the_record_still_advances() {
+        assert_eq!(
+            message_for(&Request::Ack {
+                session: "s1".to_string(),
+                token: 7,
+            }),
+            "op exceeded 1500ms; the record advances when the work finishes"
+        );
+    }
+
+    #[test]
+    fn test_an_end_session_overrun_says_the_record_is_still_dropped() {
+        assert_eq!(
+            message_for(&Request::EndSession {
+                session: "s1".to_string(),
+            }),
+            "op exceeded 1500ms; the session's record is dropped when the work finishes"
+        );
+    }
+
+    #[test]
+    fn test_a_status_overrun_promises_nothing_beyond_the_deadline() {
+        assert_eq!(message_for(&Request::Status), "op exceeded 1500ms");
     }
 }
 

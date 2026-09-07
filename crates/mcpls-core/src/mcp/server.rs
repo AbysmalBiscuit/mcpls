@@ -289,6 +289,20 @@ impl NewDiagnosticsResult {
     }
 }
 
+/// When a flush's record changes take effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Advance {
+    /// In the flush itself. For a reader on this process's own transport,
+    /// whose answer either arrives or ends the session: the tool and the
+    /// footer.
+    Now,
+    /// When the reader acknowledges the report, or never. For the hook
+    /// socket, whose client gives up on a timer and may be gone before
+    /// the answer is written; a report it never acknowledges is offered
+    /// again.
+    OnAcknowledgement,
+}
+
 /// How long each phase of a footer's wait lasts.
 #[derive(Debug, Clone, Copy)]
 struct FooterTiming {
@@ -1043,67 +1057,98 @@ impl McplsServer {
         // per changed file, and holding the cache lock across those awaits
         // would block the diagnostics pump, which loses publishes rather than
         // waiting for them.
-        to_tool_result(Ok(self.flush_now(&session).await))
+        to_tool_result(Ok(self.flush_now(&session, Advance::Now).await.0))
     }
 
-    /// Flush `session`'s record and render it.
+    /// Flush `session`'s record and render it, advancing the record as
+    /// `advance` says.
     ///
     /// The caller checks `has_baseline()` first. Both the tool and the
-    /// footer must, because `flush` seeds a session's record from the
+    /// footer must, because `stage` seeds a session's record from the
     /// baseline and `set_baseline` never rewrites one that already exists.
+    ///
+    /// The token is `Some` only under `Advance::OnAcknowledgement`, and
+    /// only when the report implies a record change.
     // What enforces the delivery-before-cache order is where the two
     // acquires sit, not how long either guard lives afterward. Clippy's fix
     // for this lint moves the `delivery` acquire below the cache acquire,
     // which is the exact reversal that order forbids, so the acquires stay
     // where they are and the lint is silenced instead.
     #[allow(clippy::significant_drop_tightening)]
-    async fn flush_now(&self, session: &SessionId) -> NewDiagnosticsResult {
-        let (report, sources) = {
+    async fn flush_now(
+        &self,
+        session: &SessionId,
+        advance: Advance,
+    ) -> (NewDiagnosticsResult, Option<u64>) {
+        let (report, token, sources) = {
             let mut delivery = self.context.delivery.lock().await;
             let cache = self.context.notification_cache.lock().await;
             let entries = routable_entries_borrowed(&cache, &self.context.floors);
-            let report = delivery.flush(session, &entries);
+            let (report, token) = match advance {
+                Advance::Now => (delivery.flush(session, &entries), None),
+                Advance::OnAcknowledgement => delivery.stage(session, &entries),
+            };
             let sources = source_map(&cache, &report);
-            (report, sources)
+            (report, token, sources)
         };
-        self.new_diagnostics_payload(&report, &sources).await
+        (self.new_diagnostics_payload(&report, &sources).await, token)
     }
 
-    /// `session`'s flush, rendered as the text a hook prints, or `None`
-    /// when nothing changed.
+    /// `session`'s flush, rendered as the text a hook prints, with the
+    /// token the hook acknowledges once it has that text.
     ///
-    /// The same flush the tool runs, against the same record, so a hook and
-    /// an agent never see the same diagnostic twice. Silent before a
-    /// baseline exists for the same reason the footer is: `flush` seeds a
-    /// session's record from the baseline and `set_baseline` never rewrites
-    /// one that already exists, so flushing early would leave that session
+    /// The same report the tool would run, against the same record, so a
+    /// hook and an agent never see the same diagnostic twice once either
+    /// has confirmed it. The record moves only in `commit_for_hook`: the
+    /// hook gives up on a timer, and a report it gave up on is offered
+    /// again rather than marked delivered. Silent before a baseline exists
+    /// for the same reason the footer is: `stage` seeds a session's record
+    /// from the baseline and `set_baseline` never rewrites one that
+    /// already exists, so flushing early would leave that session
     /// permanently believing the workspace started clean.
-    pub(crate) async fn flush_for_hook(&self, session: &SessionId) -> Option<String> {
+    pub(crate) async fn flush_for_hook(
+        &self,
+        session: &SessionId,
+    ) -> (Option<String>, Option<u64>) {
         if !self.context.delivery.lock().await.has_baseline() {
-            return None;
+            return (None, None);
         }
-        render_for_hook(&self.flush_now(session).await)
+        let (report, token) = self.flush_now(session, Advance::OnAcknowledgement).await;
+        (render_for_hook(&report), token)
+    }
+
+    /// Mark the report staged under `token` delivered to `session`.
+    ///
+    /// Takes `delivery` alone. `false` when `token` no longer names the
+    /// session's staged report, in which case the record already reflects
+    /// something sent more recently, or nothing.
+    pub(crate) async fn commit_for_hook(&self, session: &SessionId, token: u64) -> bool {
+        self.context.delivery.lock().await.commit(session, token)
     }
 
     /// The owner's flush for this session, in the shape every other
-    /// instance answers with.
+    /// instance answers with, acknowledged once the answer is in hand.
     ///
-    /// Never falls back to this process's own record. The owner advances
-    /// the session's delivery record before it writes a byte back, so a
-    /// forward that fails has already consumed a report; answering from the
-    /// local record would hand the agent a different record's diff and
-    /// leave the two permanently disagreeing about what this session has
-    /// been shown. An answer that says the owner could not be reached is
-    /// the smaller failure, and it is the MCP tool rather than a hook, so
-    /// the rule that an edit must never fail on the socket does not apply.
+    /// Never falls back to this process's own record. The owner's record
+    /// is the session's record; a diff against this process's own would
+    /// be against a baseline the session never agreed to, and would leave
+    /// the two permanently disagreeing about what this session has been
+    /// shown. A forward that fails costs nothing on the owner's side: its
+    /// staged report is unacknowledged and the next flush offers it
+    /// again. Saying the owner could not be reached is the honest answer,
+    /// and it is the MCP tool rather than a hook, so the rule that an
+    /// edit must never fail on the socket does not apply.
     async fn flush_from_owner(&self, identity: &SocketIdentity) -> NewDiagnosticsResult {
         let request = hooks::Request::Flush {
             session: SessionId::from_env_or_process().to_string(),
         };
         let timeout =
             Duration::from_millis(self.context.diagnostics.hooks.op_deadline_ms) + HOOK_FLUSH_GRACE;
-        match hooks::send(identity, &request, timeout).await {
-            Ok(hooks::Response::Flush { context }) => NewDiagnosticsResult::from_owner(context),
+        let answer = hooks::send_and_acknowledge(identity, std::slice::from_ref(&request), timeout)
+            .await
+            .map(|mut responses| responses.remove(0));
+        match answer {
+            Ok(hooks::Response::Flush { context, .. }) => NewDiagnosticsResult::from_owner(context),
             Ok(hooks::Response::Error { message }) => {
                 tracing::warn!(%message, "the hook socket's owner refused this session's flush");
                 NewDiagnosticsResult::owner_unreachable()
@@ -1265,7 +1310,7 @@ impl McplsServer {
         .await;
 
         let session = SessionId::from_env_or_process();
-        let mut report = self.flush_now(&session).await;
+        let (mut report, _) = self.flush_now(&session, Advance::Now).await;
         report.note = Some(report.note.take().map_or_else(
             || {
                 "This footer is best effort; anything slower than the wait arrives in the \
@@ -1796,6 +1841,44 @@ mod tests {
              /work/b.rs: no diagnostics\n\
              2 file(s) were held back."
         );
+    }
+
+    /// The tool door advances the record in the same lock block that
+    /// computes its report, so a hook report staged for the same session
+    /// is superseded rather than committed on top of it.
+    #[tokio::test]
+    async fn test_an_immediate_flush_supersedes_a_staged_hook_report() {
+        let parts = test_server_with_footer_and_one_error().await;
+        let session = SessionId::from("s1".to_string());
+
+        let (staged, token) = parts
+            .server
+            .flush_now(&session, Advance::OnAcknowledgement)
+            .await;
+        assert_eq!(staged.changed.len(), 1);
+        let token = token.expect("a staged report with content carries a token");
+
+        let (now, none) = parts.server.flush_now(&session, Advance::Now).await;
+        assert_eq!(
+            now.changed.len(),
+            1,
+            "the hook's report was never confirmed"
+        );
+        assert_eq!(
+            none, None,
+            "an immediate flush leaves nothing to acknowledge"
+        );
+
+        assert!(
+            !parts.server.commit_for_hook(&session, token).await,
+            "the record already holds what the tool result showed"
+        );
+
+        let (after, _) = parts
+            .server
+            .flush_now(&session, Advance::OnAcknowledgement)
+            .await;
+        assert!(after.changed.is_empty());
     }
 
     /// A flush with nothing to say prints nothing at all: a hook's output is

@@ -105,7 +105,8 @@ impl HookRole {
     /// Record one `Changed`, `Flush`, or `EndSession` request this process
     /// just answered. Not called for `Status`, which is `mcpls hook
     /// doctor` probing rather than a hook firing, and counting it would
-    /// make every doctor run look like a working install.
+    /// make every doctor run look like a working install, nor for `Ack`,
+    /// which is the second half of a `Flush` already counted.
     pub(crate) fn record_hook_request(&self) {
         self.hooks_seen.fetch_add(1, Ordering::Relaxed);
     }
@@ -192,10 +193,11 @@ pub struct HookLocation {
 /// and the sweeper.
 ///
 /// Lock order, the same one the rest of the crate follows: delivery before
-/// cache. Every path through here reaches both only by way of
-/// `McplsServer::flush_for_hook`, which takes them in that order and drops
-/// both before it awaits the payload build, so no arm of this match has to
-/// take either lock itself. Do not add one that does.
+/// cache. Every path through here reaches the cache only by way of
+/// `McplsServer::flush_for_hook`, which takes delivery then cache and drops
+/// both before it awaits the payload build, and reaches delivery alone
+/// only by way of `McplsServer::commit_for_hook` and `end_session`. No arm
+/// of this match takes either lock itself. Do not add one that does.
 pub fn build_handler(
     server: Arc<McplsServer>,
     sweeper: Arc<Sweeper>,
@@ -231,8 +233,9 @@ pub fn build_handler(
                 Request::Flush { session } => {
                     role.record_hook_request();
                     let session = SessionId::from(session);
+                    let (report, token) = server.flush_for_hook(&session).await;
                     let mut parts: Vec<String> = Vec::new();
-                    if let Some(text) = server.flush_for_hook(&session).await {
+                    if let Some(text) = report {
                         parts.push(text);
                     }
                     if let Some(shortfall) = sweeper.last_shortfall() {
@@ -240,7 +243,14 @@ pub fn build_handler(
                     }
                     Response::Flush {
                         context: (!parts.is_empty()).then(|| parts.join("\n")),
+                        token,
                     }
+                }
+                Request::Ack { session, token } => {
+                    server
+                        .commit_for_hook(&SessionId::from(session), token)
+                        .await;
+                    Response::Ack
                 }
                 Request::EndSession { session } => {
                     role.record_hook_request();
@@ -486,6 +496,21 @@ mod tests {
                 .expect("the owner answers")
         }
 
+        /// Send one flush over the real socket and acknowledge its answer
+        /// on the same connection, the way `mcpls hook` does.
+        async fn flush_acknowledged(&self, session: &str) -> Response {
+            crate::hooks::send_and_acknowledge(
+                &self.identity,
+                &[Request::Flush {
+                    session: session.to_string(),
+                }],
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("the owner answers")
+            .remove(0)
+        }
+
         /// How many sweeps the owner's sweeper has run.
         fn sweeps_run(&self) -> usize {
             self.sweeper.sweeps_run()
@@ -727,14 +752,10 @@ mod tests {
     #[tokio::test]
     async fn test_a_flush_op_and_the_tool_share_one_record() {
         let harness = HookHarness::owner_with_one_error().await;
-        let first = harness
-            .send(Request::Flush {
-                session: "s1".to_string(),
-            })
-            .await;
         let Response::Flush {
             context: Some(text),
-        } = first
+            ..
+        } = harness.flush_acknowledged("s1").await
         else {
             panic!("the first flush reports the error");
         };
@@ -747,8 +768,101 @@ mod tests {
             .await;
         assert_eq!(
             second,
-            Response::Flush { context: None },
+            Response::Flush {
+                context: None,
+                token: None
+            },
             "one report per problem, whichever door asked for it"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_an_unacknowledged_flush_is_offered_again() {
+        let harness = HookHarness::owner_with_one_error().await;
+        let first = harness
+            .send(Request::Flush {
+                session: "s1".to_string(),
+            })
+            .await;
+        assert!(
+            matches!(
+                first,
+                Response::Flush {
+                    context: Some(_),
+                    token: Some(_)
+                }
+            ),
+            "a report with content carries the token its acknowledgement names: {first:?}"
+        );
+
+        let second = harness
+            .send(Request::Flush {
+                session: "s1".to_string(),
+            })
+            .await;
+        assert!(
+            matches!(
+                second,
+                Response::Flush {
+                    context: Some(_),
+                    token: Some(_)
+                }
+            ),
+            "the hook that read the first answer may have died before printing \
+             it, and nothing said otherwise, so the report is offered again \
+             rather than lost: {second:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_stale_acknowledgement_commits_nothing() {
+        let harness = HookHarness::owner_with_one_error().await;
+        let Response::Flush {
+            token: Some(stale), ..
+        } = harness
+            .send(Request::Flush {
+                session: "s1".to_string(),
+            })
+            .await
+        else {
+            panic!("the first flush carries a token");
+        };
+        let Response::Flush {
+            token: Some(current),
+            ..
+        } = harness
+            .send(Request::Flush {
+                session: "s1".to_string(),
+            })
+            .await
+        else {
+            panic!("the second flush carries a token");
+        };
+        assert_ne!(stale, current);
+
+        let answer = harness
+            .send(Request::Ack {
+                session: "s1".to_string(),
+                token: stale,
+            })
+            .await;
+        assert_eq!(answer, Response::Ack);
+
+        let third = harness
+            .send(Request::Flush {
+                session: "s1".to_string(),
+            })
+            .await;
+        assert!(
+            matches!(
+                third,
+                Response::Flush {
+                    context: Some(_),
+                    ..
+                }
+            ),
+            "the acknowledged token named a report a later flush replaced, so \
+             the record did not move and the report is still owed: {third:?}"
         );
     }
 
@@ -767,7 +881,13 @@ mod tests {
             .await;
 
         assert!(
-            matches!(other, Response::Flush { context: Some(_) }),
+            matches!(
+                other,
+                Response::Flush {
+                    context: Some(_),
+                    ..
+                }
+            ),
             "two agents in one directory share warm servers and not delivery state"
         );
     }
@@ -791,7 +911,13 @@ mod tests {
             })
             .await;
 
-        assert!(matches!(again, Response::Flush { context: Some(_) }));
+        assert!(matches!(
+            again,
+            Response::Flush {
+                context: Some(_),
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -803,6 +929,7 @@ mod tests {
 
         let Response::Flush {
             context: Some(text),
+            ..
         } = harness
             .send(Request::Flush {
                 session: "s1".to_string(),
@@ -830,16 +957,24 @@ mod tests {
              reading its own record would report nothing while the owner's \
              record holds everything"
         );
+
+        let again = passive.call_flush_tool().await;
+        assert!(
+            !again.contains("broken.rs"),
+            "the passive acknowledged the first answer once it had it in hand, \
+             so the owner does not offer the report again: {again}"
+        );
     }
 
     /// A forward that fails must not fall back to this process's own
     /// record.
     ///
-    /// The owner advances the session's record before it writes a byte back,
-    /// so a forward that fails may already have consumed a report. Answering
-    /// from the local record hands the agent a different record's diff and
-    /// leaves the two disagreeing about what this session has been shown for
-    /// the rest of its life.
+    /// The owner's record is the session's record. A diff against this
+    /// process's own would be against a baseline the session never
+    /// agreed to, and would leave the two disagreeing about what the
+    /// session has been shown for the rest of its life. The failed
+    /// forward costs nothing on the owner's side: its staged report is
+    /// unacknowledged, and the next flush offers it again.
     #[tokio::test]
     async fn test_a_passive_instance_whose_owner_is_gone_says_so_rather_than_reading_itself() {
         let (_dir, unserved) = temp_identity();
@@ -867,9 +1002,9 @@ mod tests {
     /// The forwarded flush waits at least as long as the owner's own op
     /// deadline.
     ///
-    /// The owner answers at its deadline rather than before it, and it has
-    /// already consumed the session's report by then, so a client bound
-    /// tighter loses a report nobody ever sees.
+    /// The owner answers at its deadline rather than before it. A client
+    /// bound tighter gives up on a report it asked for and is offered it
+    /// again next time, which costs the agent a turn for nothing.
     #[tokio::test]
     async fn test_a_forwarded_flush_outwaits_a_slow_owner() {
         let (dir, identity) = temp_identity();
@@ -907,6 +1042,7 @@ mod tests {
                 tokio::time::sleep(delay).await;
                 Response::Flush {
                     context: Some("the owner's own report".to_string()),
+                    token: None,
                 }
             })
         }
@@ -979,11 +1115,18 @@ mod tests {
                 session: "s1".to_string(),
             })
             .await;
-        assert_eq!(early, Response::Flush { context: None });
+        assert_eq!(
+            early,
+            Response::Flush {
+                context: None,
+                token: None
+            }
+        );
 
         harness.delivery.lock().await.set_baseline(HashMap::new());
         let Response::Flush {
             context: Some(text),
+            ..
         } = harness
             .send(Request::Flush {
                 session: "s1".to_string(),
@@ -1369,6 +1512,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
             if let Ok(Response::Flush {
                 context: Some(text),
+                ..
             }) = crate::hooks::send(
                 &identity,
                 &Request::Flush {

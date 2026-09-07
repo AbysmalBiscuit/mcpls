@@ -35,6 +35,16 @@ pub enum Request {
         /// The Claude Code session to flush.
         session: String,
     },
+    /// Sent by a hook once a `flush` answer carrying a token is in its
+    /// hands, so the owner can mark that report delivered. Sent on the
+    /// same connection as the `flush`. Never sent for an answer with no
+    /// token, which had nothing to mark.
+    Ack {
+        /// The Claude Code session the acknowledged flush was for.
+        session: String,
+        /// The token the `flush` answer carried.
+        token: u64,
+    },
     /// Sent by the `SessionEnd` hook so mcpls can drop session-scoped state.
     EndSession {
         /// The Claude Code session that ended.
@@ -71,7 +81,14 @@ pub enum Response {
         /// The diagnostics context to inject before the next turn, absent
         /// when there is nothing new to report.
         context: Option<String>,
+        /// Names the record changes this answer implies, for the
+        /// [`Request::Ack`] that commits them. Absent when the answer
+        /// implies none, which is also when no acknowledgement is owed.
+        token: Option<u64>,
     },
+    /// Answers a [`Request::Ack`], whether or not anything was left to
+    /// commit: the client cannot act on the difference.
+    Ack,
     /// Answers a [`Request::EndSession`].
     EndSession,
     /// Answers a [`Request::Status`].
@@ -103,7 +120,7 @@ pub enum Response {
 
 /// The `Response` literals asserted below are the wire contract for this
 /// protocol, not merely a record of how `serde` happens to serialize these
-/// types today. The design spec pins the three `Request` lines under its
+/// types today. The design spec pins the four `Request` lines under its
 /// Protocol heading; it does not pin `Response`, so these literals are what
 /// defines the response side. Changing one of them changes the protocol.
 #[cfg(test)]
@@ -185,9 +202,10 @@ mod tests {
 
     #[test]
     fn test_the_flush_response_pins_the_wire_shape_with_context_present() {
-        let literal = r#"{"op":"flush","context":"2 errors in a.rs"}"#;
+        let literal = r#"{"op":"flush","context":"2 errors in a.rs","token":7}"#;
         let value = Response::Flush {
             context: Some("2 errors in a.rs".to_string()),
+            token: Some(7),
         };
         assert_eq!(
             serde_json::to_value(&value).expect("serialize"),
@@ -201,11 +219,14 @@ mod tests {
 
     #[test]
     fn test_the_flush_response_pins_the_wire_shape_with_context_absent() {
-        // `Option<String>` has no `skip_serializing_if` here, so an absent
-        // context is a present `context` key holding JSON `null`, not an
-        // omitted key.
-        let literal = r#"{"op":"flush","context":null}"#;
-        let value = Response::Flush { context: None };
+        // Neither `Option` has `skip_serializing_if`, so an absent context
+        // or token is a present key holding JSON `null`, not an omitted
+        // key.
+        let literal = r#"{"op":"flush","context":null,"token":null}"#;
+        let value = Response::Flush {
+            context: None,
+            token: None,
+        };
         assert_eq!(
             serde_json::to_value(&value).expect("serialize"),
             serde_json::from_str::<serde_json::Value>(literal).expect("json")
@@ -282,6 +303,37 @@ mod tests {
     }
 
     #[test]
+    fn test_the_ack_request_pins_the_wire_shape() {
+        let literal = r#"{"op":"ack","session":"s1","token":7}"#;
+        let value = Request::Ack {
+            session: "s1".to_string(),
+            token: 7,
+        };
+        assert_eq!(
+            serde_json::to_value(&value).expect("serialize"),
+            serde_json::from_str::<serde_json::Value>(literal).expect("json")
+        );
+        assert_eq!(
+            serde_json::from_str::<Request>(literal).expect("deserialize"),
+            value
+        );
+    }
+
+    #[test]
+    fn test_the_ack_response_pins_the_wire_shape() {
+        let literal = r#"{"op":"ack"}"#;
+        let value = Response::Ack;
+        assert_eq!(
+            serde_json::to_value(&value).expect("serialize"),
+            serde_json::from_str::<serde_json::Value>(literal).expect("json")
+        );
+        assert_eq!(
+            serde_json::from_str::<Response>(literal).expect("deserialize"),
+            value
+        );
+    }
+
+    #[test]
     fn test_a_multiline_string_field_does_not_produce_a_raw_newline() {
         let value = Response::Error {
             message: "line one\nline two".to_string(),
@@ -302,7 +354,10 @@ mod tests {
         let literal = r#"{"op":"flush"}"#;
         assert_eq!(
             serde_json::from_str::<Response>(literal).expect("deserialize"),
-            Response::Flush { context: None }
+            Response::Flush {
+                context: None,
+                token: None
+            }
         );
     }
 }

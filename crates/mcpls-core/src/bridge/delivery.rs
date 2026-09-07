@@ -1,9 +1,10 @@
 //! Per-session deduplication of language server diagnostics.
 //!
-//! A flush answers one question: what is different since this session last
-//! asked? The record is a hash per file rather than a set of individual
-//! diagnostics, because when a file breaks, its full current error list is
-//! more useful than a delta against a list that has left the context window.
+//! A flush answers one question: what is different since this session was
+//! last confirmed to have been told? The record is a hash per file rather
+//! than a set of individual diagnostics, because when a file breaks, its
+//! full current error list is more useful than a delta against a list that
+//! has left the context window.
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -103,12 +104,27 @@ pub struct FlushReport {
     pub omitted: usize,
 }
 
+/// The record changes one staged report implies, held back until the
+/// reader confirms the report reached it.
+#[derive(Debug)]
+struct PendingFlush {
+    token: u64,
+    /// `Some(hash)` records the file as delivered at that hash; `None`
+    /// forgets it, for a file that cleared or was muted.
+    updates: Vec<(String, Option<u64>)>,
+}
+
 /// Per-session records of what has already been delivered.
 #[derive(Debug)]
 pub struct DiagnosticsDelivery {
     config: DiagnosticsConfig,
     sessions: HashMap<SessionId, HashMap<String, u64>>,
     baseline: Option<HashMap<String, u64>>,
+    /// At most one staged report per session. Never names a session
+    /// `sessions` lacks: `stage` seeds the record before it stages, and
+    /// `end_session` drops both.
+    pending: HashMap<SessionId, PendingFlush>,
+    next_token: u64,
 }
 
 impl DiagnosticsDelivery {
@@ -119,6 +135,8 @@ impl DiagnosticsDelivery {
             config,
             sessions: HashMap::new(),
             baseline: None,
+            pending: HashMap::new(),
+            next_token: 0,
         }
     }
 
@@ -141,6 +159,7 @@ impl DiagnosticsDelivery {
     /// from the baseline again.
     pub fn end_session(&mut self, session: &SessionId) {
         self.sessions.remove(session);
+        self.pending.remove(session);
     }
 
     /// Hash one file's visible diagnostics.
@@ -180,7 +199,18 @@ impl DiagnosticsDelivery {
         Some(hasher.finish())
     }
 
-    /// Report what changed for `session` since its last flush.
+    /// Report what changed for `session` since its last committed flush,
+    /// and stage the record changes that report implies.
+    ///
+    /// The record does not move here. It moves in [`Self::commit`], once
+    /// the reader confirms it has the report, so a reader that gives up
+    /// on its deadline or dies before it prints leaves the record where
+    /// it was and the next `stage` offers the same report again. The
+    /// token is `None` when the report implies no record change, which
+    /// is also when there is nothing for a reader to acknowledge. A
+    /// stage replaces whatever the session had staged before: a report
+    /// nobody has confirmed is superseded by the newer one, and an
+    /// acknowledgement for the old one then commits nothing.
     ///
     /// A zero `max_per_file` or `max_total` means that cap is unlimited,
     /// matching `workspace.max_documents`/`max_file_size`'s convention:
@@ -193,15 +223,78 @@ impl DiagnosticsDelivery {
     /// fresh, untouched budget — no later flush would do better either, so
     /// that file is delivered truncated to the budget instead of withheld
     /// forever.
+    pub fn stage(
+        &mut self,
+        session: &SessionId,
+        entries: &[FileEntry<'_>],
+    ) -> (FlushReport, Option<u64>) {
+        let (report, updates) = self.diff(session, entries);
+        if updates.is_empty() {
+            self.pending.remove(session);
+            return (report, None);
+        }
+        self.next_token += 1;
+        let token = self.next_token;
+        self.pending
+            .insert(session.clone(), PendingFlush { token, updates });
+        (report, Some(token))
+    }
+
+    /// Apply the record changes staged under `token`.
+    ///
+    /// `false`, and nothing written, when `token` is not the session's
+    /// staged report: a later stage replaced it, an immediate flush
+    /// superseded it, or the session ended. The record then already
+    /// reflects something a reader was sent more recently, or nothing.
+    pub fn commit(&mut self, session: &SessionId, token: u64) -> bool {
+        let staged = match self.pending.get(session) {
+            Some(pending) if pending.token == token => self.pending.remove(session),
+            _ => None,
+        };
+        let Some(PendingFlush { updates, .. }) = staged else {
+            return false;
+        };
+        let record = self.sessions.entry(session.clone()).or_default();
+        for (key, hash) in updates {
+            match hash {
+                Some(hash) => {
+                    record.insert(key, hash);
+                }
+                None => {
+                    record.remove(&key);
+                }
+            }
+        }
+        true
+    }
+
+    /// [`Self::stage`] and [`Self::commit`] in one call, for a reader whose
+    /// answer either arrives or ends the session: the MCP tool and the
+    /// footer, whose transport is the session's own.
     pub fn flush(&mut self, session: &SessionId, entries: &[FileEntry<'_>]) -> FlushReport {
-        let record = self
+        let (report, token) = self.stage(session, entries);
+        if let Some(token) = token {
+            self.commit(session, token);
+        }
+        report
+    }
+
+    /// One pass over `entries` against `session`'s committed record: the
+    /// report, and the record writes it implies, in the order `entries`
+    /// gives them.
+    fn diff(
+        &mut self,
+        session: &SessionId,
+        entries: &[FileEntry<'_>],
+    ) -> (FlushReport, Vec<(String, Option<u64>)>) {
+        let record = &*self
             .sessions
             .entry(session.clone())
             .or_insert_with(|| self.baseline.clone().unwrap_or_default());
 
         let mut report = FlushReport::default();
+        let mut updates = Vec::new();
         let mut budget = (self.config.max_total > 0).then_some(self.config.max_total);
-        let mut delivered_any = false;
 
         for entry in entries {
             let hash = Self::visible_hash(entry.diagnostics, entry.floor);
@@ -209,11 +302,11 @@ impl DiagnosticsDelivery {
 
             match (hash, previous) {
                 (None, Some(_)) if entry.floor == SeverityFloor::Off => {
-                    // Muted, not fixed. Dropping the record without
+                    // Muted, not fixed. Forgetting the entry without
                     // reporting means the file starts fresh if its floor
                     // ever rises again, and the agent is not told its
                     // problems are gone when they were only silenced.
-                    record.remove(entry.key);
+                    updates.push((entry.key.to_string(), None));
                 }
                 (None, Some(_)) => {
                     if budget == Some(0) {
@@ -225,7 +318,7 @@ impl DiagnosticsDelivery {
                         if let Some(remaining) = budget.as_mut() {
                             *remaining -= 1;
                         }
-                        record.remove(entry.key);
+                        updates.push((entry.key.to_string(), None));
                         report.cleared.push(entry.key.to_string());
                     }
                 }
@@ -252,7 +345,13 @@ impl DiagnosticsDelivery {
                             budget = Some(remaining - visible.len());
                             Some(0)
                         }
-                        Some(remaining) if !delivered_any => {
+                        // Too big for a whole budget, so no later flush
+                        // does better and withholding it withholds it
+                        // forever. With nothing left to spend, the next
+                        // flush's fresh budget is the better offer.
+                        Some(remaining)
+                            if remaining > 0 && visible.len() > self.config.max_total =>
+                        {
                             let shortfall = visible.len() - remaining;
                             visible.truncate(remaining);
                             budget = Some(0);
@@ -266,8 +365,7 @@ impl DiagnosticsDelivery {
                         continue;
                     };
 
-                    delivered_any = true;
-                    record.insert(entry.key.to_string(), current);
+                    updates.push((entry.key.to_string(), Some(current)));
                     report.changed.push(ChangedFile {
                         key: entry.key.to_string(),
                         diagnostics: visible,
@@ -277,7 +375,7 @@ impl DiagnosticsDelivery {
             }
         }
 
-        report
+        (report, updates)
     }
 }
 
@@ -412,6 +510,121 @@ mod tests {
         assert!(
             after.changed.is_empty(),
             "the hint is below the floor, so nothing visible changed"
+        );
+    }
+
+    #[test]
+    fn test_a_staged_report_is_offered_again_until_it_is_acknowledged() {
+        let mut delivery = DiagnosticsDelivery::new(DiagnosticsConfig::default());
+        let session = SessionId::from("s".to_string());
+        let diags = vec![diagnostic(1, DiagnosticSeverity::ERROR, "boom")];
+        let entries = [entry("a.rs", &diags, SeverityFloor::Warning)];
+
+        let (first, _) = delivery.stage(&session, &entries);
+        assert_eq!(first.changed.len(), 1);
+
+        let (second, token) = delivery.stage(&session, &entries);
+        assert_eq!(
+            second.changed.len(),
+            1,
+            "nothing confirmed the first report reached its reader, so it is \
+             offered again rather than marked delivered"
+        );
+
+        assert!(delivery.commit(
+            &session,
+            token.expect("a report with content carries a token")
+        ));
+
+        let (third, token) = delivery.stage(&session, &entries);
+        assert!(
+            third.changed.is_empty(),
+            "the acknowledged report is not offered again"
+        );
+        assert_eq!(
+            token, None,
+            "nothing to commit means nothing to acknowledge"
+        );
+    }
+
+    #[test]
+    fn test_an_acknowledgement_for_a_replaced_report_commits_nothing() {
+        let mut delivery = DiagnosticsDelivery::new(DiagnosticsConfig::default());
+        let session = SessionId::from("s".to_string());
+        let one = vec![diagnostic(1, DiagnosticSeverity::ERROR, "boom")];
+        let two = vec![
+            diagnostic(1, DiagnosticSeverity::ERROR, "boom"),
+            diagnostic(2, DiagnosticSeverity::ERROR, "bang"),
+        ];
+
+        let (_, stale) = delivery.stage(&session, &[entry("a.rs", &one, SeverityFloor::Warning)]);
+        let (_, current) = delivery.stage(&session, &[entry("a.rs", &two, SeverityFloor::Warning)]);
+
+        assert!(
+            !delivery.commit(&session, stale.expect("token")),
+            "a later report replaced this one; committing it would record a \
+             hash its reader was never sent"
+        );
+        assert!(delivery.commit(&session, current.expect("token")));
+
+        let (after_two, _) =
+            delivery.stage(&session, &[entry("a.rs", &two, SeverityFloor::Warning)]);
+        assert!(
+            after_two.changed.is_empty(),
+            "the record holds the acknowledged report's hash"
+        );
+        let (after_one, _) =
+            delivery.stage(&session, &[entry("a.rs", &one, SeverityFloor::Warning)]);
+        assert_eq!(
+            after_one.changed.len(),
+            1,
+            "and not the replaced report's hash"
+        );
+    }
+
+    #[test]
+    fn test_an_immediate_flush_supersedes_a_staged_report() {
+        let mut delivery = DiagnosticsDelivery::new(DiagnosticsConfig::default());
+        let session = SessionId::from("s".to_string());
+        let diags = vec![diagnostic(1, DiagnosticSeverity::ERROR, "boom")];
+        let entries = [entry("a.rs", &diags, SeverityFloor::Warning)];
+
+        let (_, staged) = delivery.stage(&session, &entries);
+        let now = delivery.flush(&session, &entries);
+        assert_eq!(
+            now.changed.len(),
+            1,
+            "the tool door reports what the hook door has not yet confirmed"
+        );
+
+        assert!(
+            !delivery.commit(&session, staged.expect("token")),
+            "the flush already advanced the record, so a late acknowledgement \
+             has nothing left to apply"
+        );
+
+        let (after, token) = delivery.stage(&session, &entries);
+        assert!(after.changed.is_empty());
+        assert_eq!(token, None);
+    }
+
+    #[test]
+    fn test_ending_a_session_drops_its_staged_report() {
+        let mut delivery = DiagnosticsDelivery::new(DiagnosticsConfig::default());
+        let session = SessionId::from("s".to_string());
+        let diags = vec![diagnostic(1, DiagnosticSeverity::ERROR, "boom")];
+        let entries = [entry("a.rs", &diags, SeverityFloor::Warning)];
+
+        let (_, token) = delivery.stage(&session, &entries);
+        delivery.end_session(&session);
+
+        assert!(!delivery.commit(&session, token.expect("token")));
+        let (again, _) = delivery.stage(&session, &entries);
+        assert_eq!(
+            again.changed.len(),
+            1,
+            "a session that starts over starts from the baseline, not from a \
+             report its previous life never confirmed"
         );
     }
 
@@ -924,6 +1137,42 @@ mod tests {
              agent its problems are gone is a lie"
         );
         assert!(report.changed.is_empty());
+    }
+
+    #[test]
+    fn test_a_clear_that_empties_the_budget_defers_the_next_file_whole() {
+        let mut delivery = DiagnosticsDelivery::new(DiagnosticsConfig {
+            max_total: 1,
+            ..DiagnosticsConfig::default()
+        });
+        let session = SessionId::from("s".to_string());
+        let broken = vec![diagnostic(0, DiagnosticSeverity::ERROR, "boom")];
+
+        delivery.flush(&session, &[entry("a.rs", &broken, SeverityFloor::Warning)]);
+
+        let report = delivery.flush(
+            &session,
+            &[
+                entry("a.rs", &[], SeverityFloor::Warning),
+                entry("b.rs", &broken, SeverityFloor::Warning),
+            ],
+        );
+        assert_eq!(report.cleared, vec!["a.rs".to_string()]);
+        assert!(
+            report.changed.is_empty(),
+            "the clear spent the whole budget, so b.rs waits for a flush that \
+             can carry it rather than being sent empty"
+        );
+
+        let next = delivery.flush(&session, &[entry("b.rs", &broken, SeverityFloor::Warning)]);
+        assert_eq!(
+            next.changed.len(),
+            1,
+            "a deferred file is offered again, and the record must not claim it \
+             was already delivered"
+        );
+        assert_eq!(next.changed[0].diagnostics.len(), 1);
+        assert_eq!(next.changed[0].omitted, 0);
     }
 
     #[test]

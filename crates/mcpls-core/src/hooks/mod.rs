@@ -15,7 +15,9 @@ pub use filters::{PathFilter, watch_paths};
 #[cfg(windows)]
 pub use identity::WINDOWS_PIPE_PREFIX;
 pub use identity::{SocketIdentity, identity_for, identity_hash};
-pub use listener::{HookListener, LockLoss, ProbeOutcome, ServeExit, probe, send, send_many};
+pub use listener::{
+    HookListener, LockLoss, ProbeOutcome, ServeExit, probe, send, send_and_acknowledge, send_many,
+};
 pub use protocol::{ChangeEvent, Request, Response};
 pub use service::{HookLocation, HookRole, Role, build_handler};
 pub(crate) use service::{hook_owner_task, hook_takeover_task};
