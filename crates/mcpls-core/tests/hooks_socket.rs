@@ -504,6 +504,81 @@ async fn test_send_and_acknowledge_acks_a_tokened_flush_on_the_same_connection()
     );
 }
 
+/// A flush that spends the caller's whole bound still leaves its
+/// acknowledgement time to land.
+///
+/// The hook's client bound and the owner's op deadline are configured
+/// independently and default to the same 1500 ms, so an owner answering a
+/// flush at its own deadline hands back a report with none of the client's
+/// bound left. An acknowledgement drawing on that remainder would never be
+/// answered, and the owner would offer the same report on every flush after
+/// it. Here the owner takes 200 ms per op against a 250 ms client bound: the
+/// flush leaves 50 ms, and the acknowledgement still waits out its own 200 ms.
+#[tokio::test]
+async fn test_an_acknowledgement_outlasts_a_flush_that_spent_the_callers_bound() {
+    let (_guard, identity) = temp_identity();
+    let listener = HookListener::acquire(&identity)
+        .await
+        .expect("acquire")
+        .expect("owner");
+    let (_tx, cancel) = tokio::sync::watch::channel(false);
+    let acked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let recorder = Arc::clone(&acked);
+    tokio::spawn(listener.serve(
+        handler(move |req| {
+            let recorder = Arc::clone(&recorder);
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                match req {
+                    Request::Flush { .. } => Response::Flush {
+                        context: Some("2 errors in a.rs".to_string()),
+                        token: Some(7),
+                    },
+                    Request::Ack { .. } => {
+                        recorder.store(true, std::sync::atomic::Ordering::SeqCst);
+                        Response::Ack
+                    }
+                    _ => Response::Error {
+                        message: "unexpected".to_string(),
+                    },
+                }
+            })
+        }),
+        Duration::from_millis(1500),
+        cancel,
+    ));
+
+    let started = std::time::Instant::now();
+    let answers = mcpls_core::hooks::send_and_acknowledge(
+        &identity,
+        &[Request::Flush {
+            session: "s1".to_string(),
+        }],
+        Duration::from_millis(250),
+    )
+    .await
+    .expect("the flush lands inside the caller's bound");
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        answers,
+        vec![Response::Flush {
+            context: Some("2 errors in a.rs".to_string()),
+            token: Some(7),
+        }]
+    );
+    assert!(
+        elapsed >= Duration::from_millis(350),
+        "the acknowledgement has to wait out the owner's own 200ms, which the \
+         caller's bound no longer has room for; returning at about 250ms means \
+         it was cut off and the owner will offer this report again: {elapsed:?}"
+    );
+    assert!(
+        acked.load(std::sync::atomic::Ordering::SeqCst),
+        "and the owner has to have been given the acknowledgement to answer"
+    );
+}
+
 #[tokio::test]
 async fn test_sending_to_nobody_fails_fast() {
     let (_guard, identity) = temp_identity();
