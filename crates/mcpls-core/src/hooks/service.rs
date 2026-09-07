@@ -148,6 +148,21 @@ impl HookRole {
     }
 }
 
+/// A project's socket identity together with the canonicalized directory
+/// it was derived from.
+///
+/// Bundled into one value so a `Status` answer can report both without
+/// every function that threads them from `serve_with` down to
+/// `build_handler` growing a parameter for each.
+#[derive(Debug, Clone)]
+pub struct HookLocation {
+    /// Where the socket and its ownership lock live.
+    pub identity: SocketIdentity,
+    /// The directory this process canonicalized at startup, before
+    /// `identity` was derived from it.
+    pub root: std::path::PathBuf,
+}
+
 /// The handler [`HookListener::serve`] runs, closing over the MCP server
 /// and the sweeper.
 ///
@@ -159,13 +174,13 @@ impl HookRole {
 pub fn build_handler(
     server: Arc<McplsServer>,
     sweeper: Arc<Sweeper>,
-    identity: SocketIdentity,
+    location: HookLocation,
     cancel: watch::Receiver<bool>,
 ) -> impl Fn(Request) -> BoxFuture<'static, Response> + Send + Sync + 'static {
     move |request| {
         let server = Arc::clone(&server);
         let sweeper = Arc::clone(&sweeper);
-        let identity = identity.clone();
+        let location = location.clone();
         let cancelled = *cancel.borrow();
         Box::pin(async move {
             match request {
@@ -203,10 +218,11 @@ pub fn build_handler(
                     Response::EndSession
                 }
                 Request::Status => Response::Status {
-                    hash: identity.hash.clone(),
-                    socket: identity.socket.clone(),
+                    hash: location.identity.hash.clone(),
+                    socket: location.identity.socket.clone(),
                     pid: std::process::id(),
                     owner: true,
+                    root: location.root.clone(),
                 },
             }
         })
@@ -232,7 +248,7 @@ pub fn build_handler(
 /// this listener's place and the next attempt wins the lock back.
 pub(crate) async fn hook_owner_task(
     mut listener: HookListener,
-    identity: SocketIdentity,
+    location: HookLocation,
     role: Arc<HookRole>,
     server: Arc<McplsServer>,
     sweeper: Arc<Sweeper>,
@@ -243,17 +259,17 @@ pub(crate) async fn hook_owner_task(
         let handler = build_handler(
             Arc::clone(&server),
             Arc::clone(&sweeper),
-            identity.clone(),
+            location.clone(),
             cancel.clone(),
         );
         match listener.serve(handler, op_deadline, cancel.clone()).await {
             ServeExit::Cancelled | ServeExit::TransportUnrecoverable => return,
             ServeExit::LockLost(LockLoss::Replaced) => {
-                role.demote_to_passive(identity.clone());
+                role.demote_to_passive(location.identity.clone());
             }
             ServeExit::LockLost(LockLoss::Missing) => {}
         }
-        let Some(reacquired) = acquire_when_free(&identity, &mut cancel).await else {
+        let Some(reacquired) = acquire_when_free(&location.identity, &mut cancel).await else {
             return;
         };
         role.promote_to_owner();
@@ -270,20 +286,20 @@ pub(crate) async fn hook_owner_task(
 /// arbitration exclusive: two processes that both saw a connection refused
 /// would both bind.
 pub(crate) async fn hook_takeover_task(
-    identity: SocketIdentity,
+    location: HookLocation,
     role: Arc<HookRole>,
     server: Arc<McplsServer>,
     sweeper: Arc<Sweeper>,
     op_deadline: Duration,
     mut cancel: watch::Receiver<bool>,
 ) {
-    let Some(listener) = acquire_when_free(&identity, &mut cancel).await else {
+    let Some(listener) = acquire_when_free(&location.identity, &mut cancel).await else {
         return;
     };
     role.promote_to_owner();
     hook_owner_task(
         listener,
-        identity,
+        location,
         role,
         server,
         sweeper,
@@ -391,7 +407,10 @@ mod tests {
                 build_handler(
                     server,
                     Arc::clone(&sweeper),
-                    identity.clone(),
+                    HookLocation {
+                        identity: identity.clone(),
+                        root: dir.path().to_path_buf(),
+                    },
                     cancel_rx.clone(),
                 ),
                 Duration::from_millis(1500),
@@ -945,6 +964,40 @@ mod tests {
         assert!(text.contains("broken.rs"));
     }
 
+    /// `mcpls hook doctor` compares this against the hook's own hash of
+    /// `CLAUDE_PROJECT_DIR`, so a `Status` answer must report the exact
+    /// directory the owner actually started in, not an empty or
+    /// uncanonicalized stand-in.
+    #[tokio::test]
+    async fn test_the_status_response_reports_the_owners_canonicalized_root() {
+        let (dir, identity) = temp_identity();
+        let role = Arc::new(HookRole::owner());
+        let (_tx, cancel) = tokio::sync::watch::channel(false);
+        let (server, sweeper) = takeover_candidate(&dir, Arc::clone(&role));
+        let listener = HookListener::acquire(&identity)
+            .await
+            .expect("acquire")
+            .expect("owner");
+        let canonical_root = dunce::canonicalize(dir.path()).expect("canonicalize");
+        tokio::spawn(hook_owner_task(
+            listener,
+            HookLocation {
+                identity: identity.clone(),
+                root: canonical_root.clone(),
+            },
+            role,
+            server,
+            sweeper,
+            Duration::from_millis(1500),
+            cancel,
+        ));
+
+        let Response::Status { root, .. } = status_from_owner(&identity).await else {
+            panic!("expected a status response");
+        };
+        assert_eq!(root, canonical_root);
+    }
+
     /// A lock file removed by a temporary-file cleaner is not a competitor,
     /// so the owner wins it back and goes on serving.
     #[tokio::test]
@@ -959,7 +1012,10 @@ mod tests {
             .expect("owner");
         tokio::spawn(hook_owner_task(
             listener,
-            identity.clone(),
+            HookLocation {
+                identity: identity.clone(),
+                root: dir.path().to_path_buf(),
+            },
             Arc::clone(&role),
             server,
             sweeper,
@@ -1014,7 +1070,10 @@ mod tests {
             .expect("owner");
         tokio::spawn(hook_owner_task(
             listener,
-            identity.clone(),
+            HookLocation {
+                identity: identity.clone(),
+                root: dir.path().to_path_buf(),
+            },
             Arc::clone(&role),
             server,
             sweeper,
@@ -1064,7 +1123,10 @@ mod tests {
                 Arc::new(HookRole::owner()),
             )))),
             Arc::clone(&harness.sweeper),
-            harness.identity.clone(),
+            HookLocation {
+                identity: harness.identity.clone(),
+                root: harness.dir.path().to_path_buf(),
+            },
             cancel_rx,
         );
         cancel_tx.send(true).expect("cancel");
@@ -1259,7 +1321,10 @@ mod tests {
         let (_tx, cancel) = tokio::sync::watch::channel(false);
         let (server, sweeper) = takeover_candidate(&dir, Arc::clone(&role));
         tokio::spawn(hook_takeover_task(
-            identity.clone(),
+            HookLocation {
+                identity: identity.clone(),
+                root: dir.path().to_path_buf(),
+            },
             Arc::clone(&role),
             server,
             sweeper,

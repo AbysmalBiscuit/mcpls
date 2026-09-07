@@ -773,6 +773,18 @@ pub(crate) async fn serve_with_identity(
         }
     };
 
+    // The directory a `Status` answer reports as this owner's root: the
+    // same working directory `identity_for` above hashed, canonicalized
+    // the same way. Only asked for once an identity actually exists,
+    // since a failure here would just repeat the warning already logged
+    // above.
+    let hook_root = hook_identity.is_some().then(|| {
+        std::env::current_dir()
+            .ok()
+            .and_then(|dir| dunce::canonicalize(&dir).ok())
+            .unwrap_or_default()
+    });
+
     // Acquired before the context is built, so the role is known before the
     // context is frozen into an `Arc`: a process that loses the lock is
     // constructed passive and only ever moves to owner.
@@ -874,7 +886,8 @@ pub(crate) async fn serve_with_identity(
     let hook_server = Arc::new(mcp::McplsServer::from_context(Arc::clone(&context)));
     let mcp_server = mcp::McplsServer::from_context(Arc::clone(&context));
 
-    if let (Some(identity), Some(sweeper)) = (hook_identity, sweeper) {
+    if let (Some(identity), Some(sweeper), Some(root)) = (hook_identity, sweeper, hook_root) {
+        let location = hooks::HookLocation { identity, root };
         let op_deadline = Duration::from_millis(config.diagnostics.hooks.op_deadline_ms);
         let role = Arc::clone(&context.hooks);
         let server = Arc::clone(&hook_server);
@@ -888,7 +901,7 @@ pub(crate) async fn serve_with_identity(
                 Some(listener) => {
                     hooks::hook_owner_task(
                         listener,
-                        identity,
+                        location,
                         role,
                         server,
                         sweeper,
@@ -898,7 +911,7 @@ pub(crate) async fn serve_with_identity(
                     .await;
                 }
                 None => {
-                    hooks::hook_takeover_task(identity, role, server, sweeper, op_deadline, cancel)
+                    hooks::hook_takeover_task(location, role, server, sweeper, op_deadline, cancel)
                         .await;
                 }
             }
