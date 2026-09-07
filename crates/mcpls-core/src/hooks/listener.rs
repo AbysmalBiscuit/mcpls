@@ -529,19 +529,24 @@ pub async fn send_many(
     }
 }
 
-/// What probing a socket once found: an answer, nobody home, or somebody
-/// home who did not answer in time.
+/// What probing a socket once found.
 ///
-/// [`send`] and [`send_many`] collapse the second and third case into one
-/// `Err`, which is right for every hook arm that only cares whether it
-/// got an answer back. `mcpls hook doctor` needs the distinction: a
-/// refused or missing socket has no owner, so looking for one running a
-/// different directory is the right next step, but a socket that
-/// accepted the connection and then went quiet has an owner that is
-/// merely busy, and naming some other project as the reason would be an
-/// accusation with no evidence behind it.
+/// [`send`] and [`send_many`] collapse everything short of a clean answer
+/// into one `Err`, which is right for every hook arm that only cares
+/// whether it got an answer back. `mcpls hook doctor` needs the finer
+/// distinctions: a refused or missing socket has no owner, so looking for
+/// one running a different directory is the right next step; a socket
+/// that accepted the connection and then went quiet has an owner that is
+/// merely busy; and a socket that answered promptly with something this
+/// build cannot read is neither of those, most plausibly a different
+/// mcpls version. Naming some other project as the cause of any but the
+/// first would be an accusation with no evidence behind it, and calling
+/// the last one "busy" would send the reader looking for load that is
+/// not there.
+#[derive(Debug)]
 pub enum ProbeOutcome {
-    /// The peer answered before the deadline.
+    /// The peer answered before the deadline with a `Response` this
+    /// build could parse.
     Answered(Response),
     /// The connection itself could not be made: refused, or the socket
     /// does not exist. Nobody owns this socket.
@@ -549,13 +554,21 @@ pub enum ProbeOutcome {
     /// A connection was accepted, but no complete answer arrived before
     /// the deadline. Something is there.
     Busy,
+    /// A connection was accepted and something came back before the
+    /// deadline, but it could not be turned into a `Response` at all: a
+    /// truncated or garbled line, or a wire shape this build does not
+    /// recognize. The most common real cause is a different mcpls
+    /// version already running; this protocol has gained a required
+    /// field more than once in this codebase's own history.
+    Unintelligible(Error),
 }
 
 /// Probe `identity`'s socket with one `request`.
 ///
-/// Distinguishes a refused or missing socket ([`ProbeOutcome::NoOwner`])
-/// from one that accepted the connection but did not answer within
-/// `timeout` ([`ProbeOutcome::Busy`]).
+/// Distinguishes a refused or missing socket ([`ProbeOutcome::NoOwner`]),
+/// one that accepted the connection but did not answer within `timeout`
+/// ([`ProbeOutcome::Busy`]), and one that answered promptly with
+/// something this build could not read ([`ProbeOutcome::Unintelligible`]).
 pub async fn probe(
     identity: &SocketIdentity,
     request: &Request,
@@ -568,11 +581,16 @@ pub async fn probe(
     };
     match tokio::time::timeout_at(deadline, answer_one(stream, request)).await {
         Ok(Ok(response)) => ProbeOutcome::Answered(response),
-        // The connection was already accepted by this point, so a
-        // failure or a further timeout finishing the exchange means an
-        // owner is there and did not get back to us, not that nobody is
-        // listening.
-        Ok(Err(_)) | Err(_) => ProbeOutcome::Busy,
+        // The connection was already accepted and something came back
+        // before the deadline, so this is not a busy owner: the reply
+        // itself could not be read, most plausibly because a different
+        // mcpls version is on the other end. `Err(_)` here is a
+        // deserialize or framing failure, never a timeout: the exchange
+        // is not itself time-bounded, only the outer `timeout_at` is.
+        Ok(Err(error)) => ProbeOutcome::Unintelligible(error),
+        // Nothing usable arrived before the deadline at all: the
+        // connection was accepted but the owner never got back to us.
+        Err(_) => ProbeOutcome::Busy,
     }
 }
 
@@ -654,20 +672,24 @@ const fn classify_gave_up_connect(saw_pipe_busy: bool) -> ProbeOutcome {
 
 /// Write `request` on `stream` and read back one response line.
 async fn answer_one(stream: Box<dyn HookStream>, request: &Request) -> Result<Response> {
-    let (reader, mut writer) = tokio::io::split(stream);
-    let mut line = serde_json::to_string(request)?;
-    line.push('\n');
-    write_line(&mut writer, &line).await?;
-    let line = BufReader::new(reader)
-        .lines()
-        .next_line()
-        .await?
-        .ok_or_else(|| Error::Transport("the hook socket closed before answering".to_string()))?;
-    Ok(serde_json::from_str(&line)?)
+    let mut responses = exchange(stream, std::slice::from_ref(request)).await?;
+    Ok(responses.remove(0))
 }
 
 async fn send_many_inner(identity: &SocketIdentity, requests: &[Request]) -> Result<Vec<Response>> {
     let stream = connect(identity).await?;
+    exchange(stream, requests).await
+}
+
+/// Write every request in `requests` on `stream`, in order, then read
+/// back one response line for each.
+///
+/// The one place that writes the request framing and reads the response
+/// framing, for both [`send_many_inner`] and [`answer_one`]: if the two
+/// ever disagreed on either, `mcpls hook doctor` would misread a healthy
+/// owner's answer and report [`ProbeOutcome::Busy`] for it, which is
+/// exactly the misdiagnosis this module exists to prevent.
+async fn exchange(stream: Box<dyn HookStream>, requests: &[Request]) -> Result<Vec<Response>> {
     let (reader, mut writer) = tokio::io::split(stream);
 
     for request in requests {
@@ -899,5 +921,74 @@ mod classify_tests {
             classify_gave_up_connect(false),
             ProbeOutcome::NoOwner
         ));
+    }
+}
+
+/// `probe`'s whole guarantee otherwise lived one crate away, exercised
+/// only indirectly through `mcpls hook doctor`'s own tests. Unix-only:
+/// the Windows connect path is `probe_connect_phase`'s separate branch,
+/// covered by `classify_tests` above rather than by binding a real pipe
+/// here.
+#[cfg(all(test, not(windows)))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod probe_tests {
+    use super::*;
+
+    /// A `SocketIdentity` whose socket lives inside a fresh `TempDir`,
+    /// built by hand rather than through `identity_for`, which would put
+    /// it in the real runtime directory.
+    fn temp_identity(dir: &std::path::Path) -> SocketIdentity {
+        SocketIdentity {
+            socket: dir.join("probe-test.sock"),
+            lock: dir.join("probe-test.lock"),
+            hash: "probe-test".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_probe_reports_no_owner_for_a_socket_that_does_not_exist() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let identity = temp_identity(dir.path());
+
+        let outcome = probe(&identity, &Request::Status, Duration::from_millis(50)).await;
+
+        assert!(matches!(outcome, ProbeOutcome::NoOwner), "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn test_probe_reports_busy_for_a_connection_accepted_and_never_answered() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let identity = temp_identity(dir.path());
+        let listener = tokio::net::UnixListener::bind(&identity.socket).expect("bind");
+        tokio::spawn(async move {
+            let (stream, _addr) = listener.accept().await.expect("accept");
+            // Accepted, then held open forever without being read from or
+            // written to: a real owner too busy to get back to the
+            // client, not a missing one.
+            std::future::pending::<()>().await;
+            drop(stream);
+        });
+
+        let outcome = probe(&identity, &Request::Status, Duration::from_millis(50)).await;
+
+        assert!(matches!(outcome, ProbeOutcome::Busy), "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn test_probe_reports_unintelligible_for_a_reply_that_will_not_parse() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let identity = temp_identity(dir.path());
+        let listener = tokio::net::UnixListener::bind(&identity.socket).expect("bind");
+        tokio::spawn(async move {
+            let (mut stream, _addr) = listener.accept().await.expect("accept");
+            stream.write_all(b"not json at all\n").await.expect("write");
+        });
+
+        let outcome = probe(&identity, &Request::Status, Duration::from_millis(500)).await;
+
+        assert!(
+            matches!(outcome, ProbeOutcome::Unintelligible(_)),
+            "{outcome:?}"
+        );
     }
 }
