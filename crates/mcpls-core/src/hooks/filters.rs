@@ -445,6 +445,12 @@ mod tests {
              and does not buy them, and it can only be true while these two \
              answers stay apart"
         );
+        assert!(
+            !watch_paths(dir.path()).contains(&kept),
+            "the guide's sentence is about the negated file, and a list that \
+             named the file rather than its directory would honour the \
+             negation the guide says the watcher does not honour"
+        );
     }
 
     #[test]
