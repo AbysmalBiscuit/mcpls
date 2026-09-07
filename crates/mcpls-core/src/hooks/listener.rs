@@ -537,12 +537,11 @@ pub async fn send_many(
 /// distinctions: a refused or missing socket has no owner, so looking for
 /// one running a different directory is the right next step; a socket
 /// that accepted the connection and then went quiet has an owner that is
-/// merely busy; and a socket that answered promptly with something this
-/// build cannot read is neither of those, most plausibly a different
-/// mcpls version. Naming some other project as the cause of any but the
-/// first would be an accusation with no evidence behind it, and calling
-/// the last one "busy" would send the reader looking for load that is
-/// not there.
+/// merely busy; and a socket whose exchange failed before a readable
+/// answer arrived is neither of those. Naming some other project as the
+/// cause of any but the first would be an accusation with no evidence
+/// behind it, and calling the last one "busy" would send the reader
+/// looking for load that is not there.
 #[derive(Debug)]
 pub enum ProbeOutcome {
     /// The peer answered before the deadline with a `Response` this
@@ -554,12 +553,14 @@ pub enum ProbeOutcome {
     /// A connection was accepted, but no complete answer arrived before
     /// the deadline. Something is there.
     Busy,
-    /// A connection was accepted and something came back before the
-    /// deadline, but it could not be turned into a `Response` at all: a
-    /// truncated or garbled line, or a wire shape this build does not
-    /// recognize. The most common real cause is a different mcpls
-    /// version already running; this protocol has gained a required
-    /// field more than once in this codebase's own history.
+    /// A connection was accepted and the exchange then failed before a
+    /// readable answer arrived: the write failed, the read failed, the
+    /// peer hung up without answering, or what came back could not be
+    /// turned into a `Response`. Something holds the socket; the `Error`
+    /// carries which of the four happened. A wire shape this build does
+    /// not recognize lands in the last of them, and this protocol has
+    /// gained a required field more than once in this codebase's own
+    /// history, but the other three have nothing to do with versions.
     Unintelligible(Error),
 }
 
@@ -567,8 +568,8 @@ pub enum ProbeOutcome {
 ///
 /// Distinguishes a refused or missing socket ([`ProbeOutcome::NoOwner`]),
 /// one that accepted the connection but did not answer within `timeout`
-/// ([`ProbeOutcome::Busy`]), and one that answered promptly with
-/// something this build could not read ([`ProbeOutcome::Unintelligible`]).
+/// ([`ProbeOutcome::Busy`]), and one whose exchange failed before a
+/// readable answer arrived ([`ProbeOutcome::Unintelligible`]).
 pub async fn probe(
     identity: &SocketIdentity,
     request: &Request,
