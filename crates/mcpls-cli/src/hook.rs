@@ -264,10 +264,37 @@ async fn doctor_scanning(project_dir: &Path, identity: &SocketIdentity, prefix: 
             lines.push(format!("owner pid: {pid}"));
             lines.push(hooks_seen_line(hooks_seen));
         }
-        // A connection was accepted but nothing usable came back: there
+        // An owner deliberately explained itself; print that rather than
+        // discarding it behind a timing guess.
+        ProbeOutcome::Answered(Response::Error { message }) => {
+            lines.push(format!(
+                "server sees: an owner answered with an error: {message}"
+            ));
+            lines.push("owner pid: none".to_string());
+        }
+        // Some other, unexpected answer to a Status request. An owner
+        // exists, evidenced by the answer itself, so this is not a
+        // no-owner state either.
+        ProbeOutcome::Answered(other) => {
+            lines.push(format!(
+                "server sees: an owner answered, but not with its own status: {other:?}"
+            ));
+            lines.push("owner pid: none".to_string());
+        }
+        // A connection was accepted and something came back before the
+        // deadline, but this build could not read it: a version skew is
+        // the likely cause, not a busy owner.
+        ProbeOutcome::Unintelligible(error) => {
+            lines.push(format!(
+                "server sees: a socket answered but the reply could not be read: {error}; \
+                 a different mcpls version running is the usual cause"
+            ));
+            lines.push("owner pid: none".to_string());
+        }
+        // A connection was accepted but nothing came back at all: there
         // is an owner, so naming some other directory as the reason
         // would be a guess. The foreign scan does not run here.
-        ProbeOutcome::Answered(_) | ProbeOutcome::Busy => {
+        ProbeOutcome::Busy => {
             lines.push(format!(
                 "server sees: a socket answered nothing within {}ms; an owner may be busy",
                 SOCKET_TIMEOUT.as_millis()
@@ -329,7 +356,13 @@ fn hooks_seen_line(count: u64) -> String {
 /// answered nobody.
 enum ForeignOwners {
     /// The scan ran and nothing else answered either.
-    None,
+    None {
+        /// Whether the runtime location held more candidates than
+        /// [`MAX_FOREIGN_CANDIDATES`] allowed this scan to examine. When
+        /// true, "nothing is listening" covers only the candidates this
+        /// scan actually reached.
+        truncated: bool,
+    },
     /// An owner answered whose root is an ancestor or descendant of the
     /// project directory: the shape a server started one level up, or a
     /// `CLAUDE_PROJECT_DIR` pointing into a subdirectory, actually has.
@@ -360,9 +393,13 @@ enum ForeignOwners {
 /// socket.
 fn no_owner_line(foreign: ForeignOwners) -> String {
     match foreign {
-        ForeignOwners::None => {
+        ForeignOwners::None { truncated: false } => {
             "server sees: no owner; nothing is listening on this project's socket".to_string()
         }
+        ForeignOwners::None { truncated: true } => format!(
+            "server sees: no owner; checked {MAX_FOREIGN_CANDIDATES} other candidates and \
+             none answered, but more may exist beyond the scan's limit"
+        ),
         ForeignOwners::Related { root, pid } => format!(
             "server sees: no owner for this directory; an mcpls is running for {} \
              (pid {pid}) instead",
@@ -441,7 +478,7 @@ async fn find_foreign_owner(
         }
     }
     if unrelated == 0 {
-        ForeignOwners::None
+        ForeignOwners::None { truncated }
     } else {
         ForeignOwners::Unrelated {
             count: unrelated,
@@ -683,6 +720,17 @@ mod tests {
         /// test sets it to prove the doctor tells this apart from nobody
         /// being there at all.
         silent: bool,
+        /// When set, `Status` answers with `Response::Error { message }`
+        /// instead of its usual `Response::Status`, the shape an owner
+        /// uses to explain a request it could not satisfy. `None` by
+        /// default.
+        status_error: Option<String>,
+        /// When set, `Status` answers with this exact JSON line instead
+        /// of going through `Response`'s own serialization at all,
+        /// standing in for a wire shape this build's `Response` cannot
+        /// represent (a previous version missing a field this build now
+        /// requires). `None` by default.
+        status_raw_line: Option<String>,
     }
 
     impl Default for OwnerBehavior {
@@ -696,6 +744,8 @@ mod tests {
                 status_hooks_seen: 0,
                 status_owner: true,
                 silent: false,
+                status_error: None,
+                status_raw_line: None,
             }
         }
     }
@@ -722,14 +772,19 @@ mod tests {
                 context: behavior.flush_text.clone(),
             },
             Request::EndSession { .. } => Response::EndSession,
-            Request::Status => Response::Status {
-                hash: behavior.status_hash.clone(),
-                socket: PathBuf::new(),
-                pid: std::process::id(),
-                owner: behavior.status_owner,
-                root: behavior.status_root.clone(),
-                hooks_seen: behavior.status_hooks_seen,
-            },
+            Request::Status => behavior.status_error.as_ref().map_or_else(
+                || Response::Status {
+                    hash: behavior.status_hash.clone(),
+                    socket: PathBuf::new(),
+                    pid: std::process::id(),
+                    owner: behavior.status_owner,
+                    root: behavior.status_root.clone(),
+                    hooks_seen: behavior.status_hooks_seen,
+                },
+                |message| Response::Error {
+                    message: message.clone(),
+                },
+            ),
         }
     }
 
@@ -903,6 +958,38 @@ mod tests {
             )
         }
 
+        /// An owner bound on `identity` that answers `Status` with a
+        /// well-formed `Response::Error` instead of its usual
+        /// `Response::Status`, the shape an owner uses to explain a
+        /// request it deliberately could not satisfy.
+        fn start_answering_status_with_error(identity: SocketIdentity, message: &str) -> Self {
+            let dir = tempfile::tempdir().expect("a temp dir");
+            Self::start_on(
+                dir,
+                identity,
+                OwnerBehavior {
+                    status_error: Some(message.to_string()),
+                    ..OwnerBehavior::default()
+                },
+            )
+        }
+
+        /// An owner bound on `identity` that answers `Status` with a raw
+        /// JSON line this build's own `Response` cannot represent,
+        /// standing in for a previous version's wire shape missing a
+        /// field this build now requires.
+        fn start_answering_status_with_raw_line(identity: SocketIdentity, raw_line: &str) -> Self {
+            let dir = tempfile::tempdir().expect("a temp dir");
+            Self::start_on(
+                dir,
+                identity,
+                OwnerBehavior {
+                    status_raw_line: Some(raw_line.to_string()),
+                    ..OwnerBehavior::default()
+                },
+            )
+        }
+
         /// The directory the dispatcher treats as `CLAUDE_PROJECT_DIR`.
         fn project_dir(&self) -> &Path {
             self.dir.path()
@@ -954,12 +1041,24 @@ mod tests {
             if matches!(request, Request::Flush { .. }) && !behavior.flush_delay.is_zero() {
                 tokio::time::sleep(behavior.flush_delay).await;
             }
-            let response = answer(&request, &behavior);
+
+            // A raw line bypasses `Response`'s own serialization entirely,
+            // for a test standing in for a wire shape this build's
+            // `Response` cannot represent at all (a previous version
+            // missing a field this build now requires).
+            let mut out = if matches!(request, Request::Status)
+                && let Some(raw) = &behavior.status_raw_line
+            {
+                raw.clone()
+            } else {
+                let response = answer(&request, &behavior);
+                let Ok(serialized) = serde_json::to_string(&response) else {
+                    return;
+                };
+                serialized
+            };
             requests.lock().expect("requests lock").push(request);
 
-            let Ok(mut out) = serde_json::to_string(&response) else {
-                return;
-            };
             out.push('\n');
             if writer.write_all(out.as_bytes()).await.is_err() {
                 return;
@@ -1591,6 +1690,25 @@ mod tests {
         super::doctor_scanning(project, &identity, TEST_PIPE_PREFIX).await
     }
 
+    /// Run the doctor for `project` against a real owner that answers
+    /// `Status` with a well-formed `Response::Error`.
+    async fn doctor_with_owner_answering_error(project: &Path, message: &str) -> String {
+        let socket_dir = tempfile::tempdir().expect("a temp dir");
+        let identity = local_identity_for(project, socket_dir.path());
+        let _owner = RecordingOwner::start_answering_status_with_error(identity.clone(), message);
+        super::doctor_scanning(project, &identity, TEST_PIPE_PREFIX).await
+    }
+
+    /// Run the doctor for `project` against a real owner that answers
+    /// `Status` with a raw line this build's `Response` cannot parse.
+    async fn doctor_with_owner_answering_raw_status(project: &Path, raw_line: &str) -> String {
+        let socket_dir = tempfile::tempdir().expect("a temp dir");
+        let identity = local_identity_for(project, socket_dir.path());
+        let _owner =
+            RecordingOwner::start_answering_status_with_raw_line(identity.clone(), raw_line);
+        super::doctor_scanning(project, &identity, TEST_PIPE_PREFIX).await
+    }
+
     /// Every line asserted by its exact text and position, not merely by
     /// label, and the line count pinned too: a deleted line, a bare label
     /// with its payload dropped, or a value swapped for a look-alike (the
@@ -1676,6 +1794,28 @@ mod tests {
         );
         assert_eq!(lines[3], "owner pid: none");
         assert!(lines[4].starts_with("mcpls on PATH: "));
+    }
+
+    /// The runtime location only exists once an owner has bound there,
+    /// so its absence is the ordinary shape of a machine mcpls has never
+    /// run on, not a scan failure. This is the first thing a new
+    /// install's first `mcpls hook doctor` run would see.
+    #[tokio::test]
+    async fn test_doctor_reports_a_clean_no_owner_when_the_runtime_location_was_never_created() {
+        let project = tempfile::tempdir().expect("a temp dir");
+        let never_created = project.path().join("does-not-exist-mcpls-dir");
+        let identity = local_identity_for(project.path(), &never_created);
+
+        let out = super::doctor_scanning(project.path(), &identity, TEST_PIPE_PREFIX).await;
+
+        assert_eq!(
+            out.lines()
+                .find(|line| line.starts_with("server sees: "))
+                .expect("a server-sees line is always printed"),
+            "server sees: no owner; nothing is listening on this project's socket",
+            "a machine where mcpls has never bound must not be reported as \
+             a scan failure: {out}"
+        );
     }
 
     /// A server started one level up or down from `CLAUDE_PROJECT_DIR` is
@@ -1795,6 +1935,37 @@ mod tests {
         );
     }
 
+    /// The same overreach, but for the case where nothing among the
+    /// examined candidates answered at all rather than answering
+    /// unrelated: `ForeignOwners::None` must carry `truncated` too, not
+    /// only `Unrelated`.
+    #[tokio::test]
+    async fn test_doctor_admits_a_truncated_scan_found_nothing_conclusively() {
+        let project = tempfile::tempdir().expect("a temp dir");
+        let socket_dir = tempfile::tempdir().expect("a temp dir");
+        let identity = local_identity_for(project.path(), socket_dir.path());
+        // Stale candidate files, none of them a real listener: nothing
+        // answers, but there are more of them than the scan's own cap,
+        // so it cannot have examined all of them.
+        for i in 0..MAX_FOREIGN_CANDIDATES + 4 {
+            std::fs::write(socket_dir.path().join(format!("stale-{i}.sock")), b"").expect("write");
+        }
+
+        let out = super::doctor_scanning(project.path(), &identity, TEST_PIPE_PREFIX).await;
+
+        assert_eq!(
+            out.lines()
+                .find(|line| line.starts_with("server sees: "))
+                .expect("a server-sees line is always printed"),
+            format!(
+                "server sees: no owner; checked {MAX_FOREIGN_CANDIDATES} other candidates \
+                 and none answered, but more may exist beyond the scan's limit"
+            ),
+            "with more stale candidates than the scan examines, it must not \
+             claim the clean 'nothing is listening' it never established: {out}"
+        );
+    }
+
     /// A future forwarding proxy answers `Status` with `owner: false`; the
     /// scan must treat that exactly like no answer at all, not like an
     /// owner it can name.
@@ -1868,6 +2039,54 @@ mod tests {
             ),
             "a busy owner on this project's own socket must not be reported \
              as no owner with some unrelated directory named as the cause: {out}"
+        );
+    }
+
+    /// An owner that deliberately answers with an error has an
+    /// explanation to give, and folding that into the busy line (as an
+    /// earlier draft of this feature did) throws it away and replaces it
+    /// with a guess about timing that the owner's prompt answer already
+    /// disproves.
+    #[tokio::test]
+    async fn test_doctor_prints_an_owners_error_rather_than_calling_it_busy() {
+        let project = tempfile::tempdir().expect("a temp dir");
+
+        let out = doctor_with_owner_answering_error(project.path(), "boom").await;
+
+        assert_eq!(
+            out.lines()
+                .find(|line| line.starts_with("server sees: "))
+                .expect("a server-sees line is always printed"),
+            "server sees: an owner answered with an error: boom",
+            "{out}"
+        );
+    }
+
+    /// A previous version's `Status` answer, missing a field this build
+    /// now requires, is not the same fact as a busy owner: something
+    /// answered at once, it just cannot be read. This is what a machine
+    /// upgraded mid-session looks like from the doctor's side, and it is
+    /// exactly when someone is likely to reach for this command.
+    #[tokio::test]
+    async fn test_doctor_reports_an_unreadable_reply_rather_than_calling_it_busy() {
+        let project = tempfile::tempdir().expect("a temp dir");
+        let raw = r#"{"op":"status","hash":"abc","socket":"x","pid":1,"owner":true,"root":"/x"}"#;
+
+        let out = doctor_with_owner_answering_raw_status(project.path(), raw).await;
+
+        let server_sees = out
+            .lines()
+            .find(|line| line.starts_with("server sees: "))
+            .expect("a server-sees line is always printed");
+        assert!(
+            server_sees.contains("could not be read"),
+            "an owner that answered promptly with something this build \
+             cannot parse is not a busy owner: {out}"
+        );
+        assert!(
+            !server_sees.contains("may be busy"),
+            "calling a version mismatch 'busy' sends the reader looking \
+             for load that does not exist: {out}"
         );
     }
 
