@@ -300,7 +300,7 @@ impl Translator {
     ///
     /// A caller that knows exactly what happened passes one kind. A caller
     /// that has narrowed it to two -- the sweep, for a path present on disk
-    /// that the tracker has never held -- passes both, most preferred
+    /// that the tracker is not holding -- passes both, most preferred
     /// first, so a server that registered for only one of them still hears
     /// about the file instead of being dropped by the caller's guess.
     ///
