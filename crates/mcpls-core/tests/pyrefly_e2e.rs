@@ -123,20 +123,16 @@ struct E2eConfig {
     diagnostics: DiagnosticsTable,
 }
 
-/// How long the one-time session baseline is given to commit, in
-/// milliseconds, via `bridge::settle::ServerSettle`'s deadline backstop.
+/// How long nothing may be outstanding before `bridge::settle::ServerSettle`
+/// treats a session as quiet, in milliseconds.
 ///
-/// pyrefly never sends `$/progress` before the first document-affecting
-/// request, so `quiet_since` (set only when an outstanding operation ends)
-/// stays `None` through mcpls's startup, and the baseline can only commit
-/// through the deadline branch of `should_settle`, not the quiet one. The
-/// production default (five minutes) exists to cover a real server's
-/// indexing; here nothing is indexing, so shortening it is what lets the
-/// baseline land before the sub-case's own apply, rather than after it.
+/// pyrefly never sends `$/progress`, so its own one-time session baseline
+/// settles through `ServerSettle`'s fixed no-progress grace instead of
+/// through this value; it is left short here only because nothing in this
+/// suite depends on a longer one.
 #[derive(Serialize, Deserialize)]
 struct DiagnosticsTable {
     settle_quiet_ms: u64,
-    settle_deadline_ms: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -193,7 +189,6 @@ fn write_config(pyrefly_binary: &Path, workspace_root: &Path, config_path: &Path
         apply: ApplyTable { rename: true },
         diagnostics: DiagnosticsTable {
             settle_quiet_ms: 200,
-            settle_deadline_ms: 500,
         },
     };
     let content = toml::to_string(&cfg).expect("failed to serialize e2e config");
