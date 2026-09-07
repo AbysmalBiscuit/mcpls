@@ -239,7 +239,7 @@ const MAX_FOREIGN_CANDIDATES: usize = 16;
 /// command allowed to print on failure, because breaking that silence is
 /// its entire purpose.
 pub async fn doctor(project_dir: &Path, identity: &SocketIdentity) -> String {
-    doctor_scanning(project_dir, identity, foreign_scan_prefix()).await
+    doctor_scanning(project_dir, identity, &foreign_scan_prefix()).await
 }
 
 /// `doctor`'s body, parameterized on the prefix its runtime-directory scan
@@ -325,19 +325,19 @@ async fn doctor_scanning(project_dir: &Path, identity: &SocketIdentity, prefix: 
     lines.join("\n")
 }
 
-/// The prefix the production scan filters Windows pipe names by: exactly
-/// what `identity_for` names its own pipes with, so the scan neither
-/// misses a real owner nor matches some unrelated pipe by coincidence.
-/// Unused on Unix, where the scan is already confined to the directory
-/// `identity`'s own socket lives in.
+/// The prefix the production scan filters Windows pipe names by: the one
+/// `windows_pipe_prefix` builds, which is the only place the naming scheme
+/// exists, so the scan sees this user's own mcpls pipes and no other user's
+/// and the two cannot drift apart. Unused on Unix, where the scan is
+/// already confined to the directory `identity`'s own socket lives in.
 #[cfg(windows)]
-const fn foreign_scan_prefix() -> &'static str {
-    mcpls_core::hooks::WINDOWS_PIPE_PREFIX
+fn foreign_scan_prefix() -> String {
+    mcpls_core::hooks::windows_pipe_prefix()
 }
 
 #[cfg(not(windows))]
-const fn foreign_scan_prefix() -> &'static str {
-    ""
+const fn foreign_scan_prefix() -> String {
+    String::new()
 }
 
 /// The `server sees` line for how many `Changed`, `Flush`, or `EndSession`
@@ -1825,7 +1825,7 @@ mod tests {
     }
 
     /// The prefix these tests' own pipes carry on Windows, distinct from
-    /// `mcpls_core::hooks::WINDOWS_PIPE_PREFIX`: the pipe namespace is
+    /// `mcpls_core::hooks::windows_pipe_prefix`: the pipe namespace is
     /// machine-global, so a scan filtered on the real prefix would
     /// enumerate an actual mcpls running on the developer's own machine,
     /// not only the one a test bound itself. Every doctor call in this

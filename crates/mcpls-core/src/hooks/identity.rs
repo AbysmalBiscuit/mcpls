@@ -60,15 +60,24 @@ pub fn identity_hash(dir: &Path) -> Result<String> {
     Ok(format!("{:016x}", hasher.finish()))
 }
 
-/// The prefix every mcpls socket carries on Windows.
+/// The prefix every named pipe this user's mcpls binds on Windows carries.
 ///
-/// The named pipe namespace is machine-global rather than scoped to a
-/// per-project directory. Exposed so a caller enumerating other owners'
-/// pipes (`mcpls hook doctor`'s scan for one running in a different
-/// directory) filters on the exact prefix this crate binds, rather than a
-/// second copy of the string that could drift from it.
+/// The pipe namespace is machine-global rather than per-user the way the
+/// Unix runtime directory is, so the user belongs in the name and therefore
+/// in its prefix. With nobody named it is the bare `mcpls-` a single-user
+/// host has always used.
+///
+/// [`identity_for`] builds its own pipe name from this, and `mcpls hook
+/// doctor`'s scan for an owner running in a different directory filters on
+/// it. One function serves both, so the scan cannot come to enumerate pipes
+/// `identity_for` would never bind -- another user's -- by holding a second
+/// copy of the naming scheme. This is what confines the scan to one user on
+/// Windows; on Unix the runtime directory already does it.
 #[cfg(windows)]
-pub const WINDOWS_PIPE_PREFIX: &str = "mcpls-";
+#[must_use]
+pub fn windows_pipe_prefix() -> String {
+    current_user().map_or_else(|| "mcpls-".to_string(), |user| format!("mcpls-{user}-"))
+}
 
 /// Derive the socket identity for `dir`.
 ///
@@ -97,9 +106,9 @@ pub fn identity_for(dir: &Path) -> Result<SocketIdentity> {
         // to the bare hash where it names nobody; what stops one user
         // reaching the other's pipe at all is that pipe's own access
         // control, not its name.
-        let user = current_user().map_or_else(String::new, |user| format!("{user}-"));
+        let prefix = windows_pipe_prefix();
         Ok(SocketIdentity {
-            socket: PathBuf::from(format!(r"\\.\pipe\{WINDOWS_PIPE_PREFIX}{user}{hash}")),
+            socket: PathBuf::from(format!(r"\\.\pipe\{prefix}{hash}")),
             lock: PathBuf::new(),
             hash,
         })
@@ -275,10 +284,10 @@ mod tests {
 
         assert_eq!(
             identity.socket,
-            PathBuf::from(format!(
-                r"\\.\pipe\{WINDOWS_PIPE_PREFIX}{user}-{}",
-                identity.hash
-            ))
+            PathBuf::from(format!(r"\\.\pipe\mcpls-{user}-{}", identity.hash)),
+            "spelled out rather than built from windows_pipe_prefix, which is \
+             the thing under test: a name assembled from the same function \
+             would agree with it however that function changed"
         );
     }
 
