@@ -69,6 +69,7 @@ async fn setup_rust_analyzer() -> Arc<Mutex<Translator>> {
         initialization_options: None,
         position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
         notification_tx: None,
+        watch_registry: None,
     };
 
     let server = LspServer::spawn(server_init_config)

@@ -12,8 +12,9 @@ use tokio::task::JoinHandle;
 use tokio::time::{Duration, timeout};
 use tracing::{debug, error, trace, warn};
 
-use crate::config::LspServerConfig;
+use crate::config::{LspServerConfig, ServerId};
 use crate::error::{Error, Result};
+use crate::lsp::WatchRegistry;
 use crate::lsp::transport::LspTransport;
 use crate::lsp::types::{
     InboundMessage, JsonRpcError, JsonRpcRequest, JsonRpcResponse, LspNotification, RequestId,
@@ -179,6 +180,7 @@ impl LspClient {
         let request_counter = Arc::new(AtomicI64::new(1));
         let pending_requests = Arc::new(Mutex::new(HashMap::new()));
         let apply_sink = Arc::new(Mutex::new(None));
+        let server = config.id();
 
         let (command_tx, command_rx) = mpsc::channel(100);
 
@@ -189,6 +191,8 @@ impl LspClient {
             Arc::clone(&pending_requests),
             Arc::clone(&apply_sink),
             None,
+            None,
+            server,
         ));
 
         Self {
@@ -210,6 +214,8 @@ impl LspClient {
         config: LspServerConfig,
         transport: LspTransport,
         notification_tx: mpsc::Sender<LspNotification>,
+        watch_registry: Option<Arc<WatchRegistry>>,
+        server: ServerId,
     ) -> Self {
         let state = Arc::new(Mutex::new(super::ServerState::Initializing));
         let request_counter = Arc::new(AtomicI64::new(1));
@@ -225,6 +231,8 @@ impl LspClient {
             Arc::clone(&pending_requests),
             Arc::clone(&apply_sink),
             Some(notification_tx),
+            watch_registry,
+            server,
         ));
 
         Self {
@@ -517,6 +525,7 @@ impl LspClient {
     /// - Outbound requests and notifications
     /// - Inbound responses and server notifications
     /// - Matching responses to pending requests
+    #[allow(clippy::too_many_arguments)]
     async fn message_loop(
         mut transport: LspTransport,
         mut command_rx: mpsc::Receiver<ClientCommand>,
@@ -524,6 +533,8 @@ impl LspClient {
         pending_requests: Arc<Mutex<PendingRequests>>,
         apply_sink: Arc<Mutex<Option<ApplySink>>>,
         notification_tx: Option<mpsc::Sender<LspNotification>>,
+        watch_registry: Option<Arc<WatchRegistry>>,
+        server: ServerId,
     ) -> Result<()> {
         debug!("Message loop started");
         let result = Self::message_loop_inner(
@@ -533,6 +544,8 @@ impl LspClient {
             &pending_requests,
             &apply_sink,
             notification_tx.as_ref(),
+            watch_registry.as_ref(),
+            &server,
         )
         .await;
         if let Err(ref e) = result {
@@ -554,6 +567,7 @@ impl LspClient {
         crate::util::truncate_str(message, MAX_ERROR_MESSAGE_LOG_BYTES)
     }
 
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn message_loop_inner(
         transport: &mut LspTransport,
         command_rx: &mut mpsc::Receiver<ClientCommand>,
@@ -561,6 +575,8 @@ impl LspClient {
         pending_requests: &Arc<Mutex<PendingRequests>>,
         apply_sink: &Arc<Mutex<Option<ApplySink>>>,
         notification_tx: Option<&mpsc::Sender<LspNotification>>,
+        watch_registry: Option<&Arc<WatchRegistry>>,
+        server: &ServerId,
     ) -> Result<()> {
         loop {
             tokio::select! {
@@ -648,7 +664,13 @@ impl LspClient {
                             // through `command_tx`, so awaiting it here
                             // would deadlock against a full channel.
                             let sink = apply_sink.lock().await.clone();
-                            Self::spawn_server_request_responder(command_tx.clone(), sink, request);
+                            Self::spawn_server_request_responder(
+                                command_tx.clone(),
+                                sink,
+                                watch_registry.cloned(),
+                                server.clone(),
+                                request,
+                            );
                         }
                         InboundMessage::Notification(notification) => {
                             debug!("Received notification: {}", notification.method);
@@ -690,10 +712,18 @@ impl LspClient {
     fn spawn_server_request_responder(
         command_tx: mpsc::Sender<ClientCommand>,
         apply_sink: Option<ApplySink>,
+        watch_registry: Option<Arc<WatchRegistry>>,
+        server: ServerId,
         request: JsonRpcRequest,
     ) {
         tokio::spawn(async move {
-            let response = Self::server_request_response(request, apply_sink).await;
+            let response = Self::server_request_response(
+                request,
+                apply_sink,
+                watch_registry.as_ref(),
+                &server,
+            )
+            .await;
             let id = response.id.clone();
             if command_tx
                 .send(ClientCommand::SendResponse { response })
@@ -711,6 +741,8 @@ impl LspClient {
     async fn server_request_response(
         request: JsonRpcRequest,
         apply_sink: Option<ApplySink>,
+        watch_registry: Option<&Arc<WatchRegistry>>,
+        server: &ServerId,
     ) -> JsonRpcResponse {
         if request.method == "workspace/applyEdit" {
             let applied = Self::forward_apply_edit(request.params.as_ref(), apply_sink).await;
@@ -721,7 +753,12 @@ impl LspClient {
                 error: None,
             };
         }
-        match Self::server_request_result(&request.method, request.params.as_ref()) {
+        match Self::server_request_result(
+            &request.method,
+            request.params.as_ref(),
+            watch_registry,
+            server,
+        ) {
             Ok(result) => JsonRpcResponse {
                 jsonrpc: JSONRPC_VERSION.to_string(),
                 id: request.id,
@@ -762,11 +799,19 @@ impl LspClient {
     fn server_request_result(
         method: &str,
         params: Option<&Value>,
+        registry: Option<&Arc<WatchRegistry>>,
+        server: &ServerId,
     ) -> std::result::Result<Value, JsonRpcError> {
         match method {
-            "client/registerCapability"
-            | "client/unregisterCapability"
-            | "workspace/workspaceFolders"
+            "client/registerCapability" => {
+                Self::record_watch_registrations(params, registry, server);
+                Ok(Value::Null)
+            }
+            "client/unregisterCapability" => {
+                Self::drop_watch_registrations(params, registry, server);
+                Ok(Value::Null)
+            }
+            "workspace/workspaceFolders"
             | "workspace/diagnostic/refresh"
             | "workspace/semanticTokens/refresh"
             | "workspace/inlayHint/refresh"
@@ -782,6 +827,67 @@ impl LspClient {
         }
     }
 
+    /// Store every `workspace/didChangeWatchedFiles` registration in a
+    /// `client/registerCapability` payload. Registrations for other methods
+    /// are answered and not recorded.
+    fn record_watch_registrations(
+        params: Option<&Value>,
+        registry: Option<&Arc<WatchRegistry>>,
+        server: &ServerId,
+    ) {
+        let Some(registry) = registry else { return };
+        let Some(registrations) = params
+            .and_then(|p| p.get("registrations"))
+            .and_then(Value::as_array)
+        else {
+            return;
+        };
+        for registration in registrations {
+            if registration.get("method").and_then(Value::as_str)
+                != Some("workspace/didChangeWatchedFiles")
+            {
+                continue;
+            }
+            let Some(id) = registration.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(watchers) = registration
+                .get("registerOptions")
+                .and_then(|o| o.get("watchers"))
+            else {
+                continue;
+            };
+            registry.register(server, id, watchers);
+        }
+    }
+
+    /// Drop every `workspace/didChangeWatchedFiles` registration a
+    /// `client/unregisterCapability` payload names. The protocol spells the
+    /// field `unregisterations`.
+    fn drop_watch_registrations(
+        params: Option<&Value>,
+        registry: Option<&Arc<WatchRegistry>>,
+        server: &ServerId,
+    ) {
+        let Some(registry) = registry else { return };
+        let Some(entries) = params
+            .and_then(|p| p.get("unregisterations"))
+            .and_then(Value::as_array)
+        else {
+            return;
+        };
+        for entry in entries {
+            if entry.get("method").and_then(Value::as_str)
+                != Some("workspace/didChangeWatchedFiles")
+            {
+                continue;
+            }
+            if let Some(id) = entry.get("id").and_then(Value::as_str) {
+                registry.unregister(server, id);
+            }
+        }
+    }
+
     fn workspace_configuration_result(params: Option<&Value>) -> Value {
         let item_count = params
             .and_then(|value| value.get("items"))
@@ -793,9 +899,139 @@ impl LspClient {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use std::path::PathBuf;
+
+    use serde_json::json;
+
     use super::*;
+
+    /// An absolute path to `rel`, rooted on a drive letter under Windows so
+    /// a bare `/work/...` does not fail to look absolute there.
+    fn abs(rel: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!("C:\\work\\{}", rel.replace('/', "\\")))
+        } else {
+            PathBuf::from(format!("/work/{rel}"))
+        }
+    }
+
+    #[test]
+    #[allow(clippy::unnecessary_literal_unwrap)]
+    fn test_a_watched_files_registration_reaches_the_registry() {
+        let registry = Some(Arc::new(WatchRegistry::new()));
+        let go = ServerId::from("go");
+        let params = json!({
+            "registrations": [{
+                "id": "r1",
+                "method": "workspace/didChangeWatchedFiles",
+                "registerOptions": { "watchers": [{ "globPattern": "**/*.go" }] }
+            }]
+        });
+
+        let result = LspClient::server_request_result(
+            "client/registerCapability",
+            Some(&params),
+            registry.as_ref(),
+            &go,
+        );
+
+        assert_eq!(result.expect("the arm answers"), Value::Null);
+        assert_eq!(
+            registry
+                .expect("the registry is present")
+                .servers_for(&abs("main.go"), lsp_types::FileChangeType::CHANGED),
+            vec![go]
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unnecessary_literal_unwrap)]
+    fn test_an_unregister_drops_it_again() {
+        let registry = Some(Arc::new(WatchRegistry::new()));
+        let go = ServerId::from("go");
+        let register = json!({
+            "registrations": [{
+                "id": "r1",
+                "method": "workspace/didChangeWatchedFiles",
+                "registerOptions": { "watchers": [{ "globPattern": "**/*.go" }] }
+            }]
+        });
+        let unregister = json!({
+            "unregisterations": [{ "id": "r1", "method": "workspace/didChangeWatchedFiles" }]
+        });
+
+        let _ = LspClient::server_request_result(
+            "client/registerCapability",
+            Some(&register),
+            registry.as_ref(),
+            &go,
+        );
+        let _ = LspClient::server_request_result(
+            "client/unregisterCapability",
+            Some(&unregister),
+            registry.as_ref(),
+            &go,
+        );
+
+        assert!(
+            registry
+                .expect("the registry is present")
+                .servers_for(&abs("main.go"), lsp_types::FileChangeType::CHANGED)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unnecessary_literal_unwrap)]
+    fn test_a_registration_for_another_method_is_answered_and_ignored() {
+        let registry = Some(Arc::new(WatchRegistry::new()));
+        let go = ServerId::from("go");
+        let params = json!({
+            "registrations": [{
+                "id": "r1",
+                "method": "textDocument/semanticTokens",
+                "registerOptions": {}
+            }]
+        });
+
+        let result = LspClient::server_request_result(
+            "client/registerCapability",
+            Some(&params),
+            registry.as_ref(),
+            &go,
+        );
+
+        assert_eq!(
+            result.expect("registerCapability still answers null for every method"),
+            Value::Null,
+            "a server registering something mcpls does not track must not get an error"
+        );
+        assert!(
+            registry
+                .expect("the registry is present")
+                .servers_for(&abs("main.go"), lsp_types::FileChangeType::CHANGED)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_a_registration_with_no_registry_is_still_answered() {
+        let result = LspClient::server_request_result(
+            "client/registerCapability",
+            Some(&json!({ "registrations": [] })),
+            None,
+            &ServerId::from("go"),
+        );
+
+        assert_eq!(
+            result.expect("the arm answers"),
+            Value::Null,
+            "an embedder that passes no registry must not turn every server's \
+             registration into a JSON-RPC error"
+        );
+    }
 
     #[test]
     fn test_request_id_generation() {
@@ -903,7 +1139,8 @@ mod tests {
             params: Some(serde_json::json!({ "registrations": [] })),
         };
 
-        let response = LspClient::server_request_response(request, None).await;
+        let response =
+            LspClient::server_request_response(request, None, None, &ServerId::from("test")).await;
 
         assert_eq!(response.id, RequestId::String("ts1".to_string()));
         assert_eq!(response.result, Some(Value::Null));
@@ -919,7 +1156,8 @@ mod tests {
             params: Some(serde_json::json!({ "token": "1" })),
         };
 
-        let response = LspClient::server_request_response(request, None).await;
+        let response =
+            LspClient::server_request_response(request, None, None, &ServerId::from("test")).await;
 
         assert_eq!(response.id, RequestId::String("wdp1".to_string()));
         assert_eq!(response.result, Some(Value::Null));
@@ -944,7 +1182,8 @@ mod tests {
             params: None,
         };
 
-        let response = LspClient::server_request_response(request, None).await;
+        let response =
+            LspClient::server_request_response(request, None, None, &ServerId::from("test")).await;
 
         assert!(response.result.is_none());
         match response.error {
@@ -965,7 +1204,8 @@ mod tests {
             params: Some(serde_json::json!({ "edit": { "changes": {} } })),
         };
 
-        let response = LspClient::server_request_response(request, None).await;
+        let response =
+            LspClient::server_request_response(request, None, None, &ServerId::from("test")).await;
 
         assert_eq!(
             response.result,
@@ -990,7 +1230,9 @@ mod tests {
             params: Some(serde_json::json!({ "edit": { "changes": {} } })),
         };
 
-        let response = LspClient::server_request_response(request, Some(tx)).await;
+        let response =
+            LspClient::server_request_response(request, Some(tx), None, &ServerId::from("test"))
+                .await;
 
         assert_eq!(
             response.result,
@@ -1010,7 +1252,9 @@ mod tests {
             params: Some(serde_json::json!({ "edit": { "changes": {} } })),
         };
 
-        let response = LspClient::server_request_response(request, Some(tx)).await;
+        let response =
+            LspClient::server_request_response(request, Some(tx), None, &ServerId::from("test"))
+                .await;
 
         assert_eq!(
             response.result,

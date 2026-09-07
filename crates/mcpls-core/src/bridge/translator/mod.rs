@@ -21,7 +21,7 @@ use crate::bridge::state::ResourceLimits;
 use crate::bridge::{DocumentTracker, NotificationCache, lock_std};
 use crate::config::{ApplyConfig, ServerId, ToolKind, ToolRouter};
 use crate::error::{Error, Result};
-use crate::lsp::{LspClient, LspServer, ServerInitConfig};
+use crate::lsp::{LspClient, LspServer, ServerInitConfig, WatchRegistry};
 
 mod assist;
 mod call_hierarchy;
@@ -136,6 +136,9 @@ pub struct Translator {
     /// before every call that opens a document, so no tool call can read a
     /// tracked document a completed write has already invalidated.
     pending_invalidations: InvalidationQueue,
+    /// Registrations from `client/registerCapability`, shared with the
+    /// clients that write them.
+    watch_registry: Option<Arc<WatchRegistry>>,
     /// Time source for respawn-backoff bookkeeping ([`respawn`](self::respawn)).
     /// Always [`SystemClock`] in production; overridden via
     /// [`Self::with_clock`] in tests so backoff-window tests can advance
@@ -211,6 +214,7 @@ impl Translator {
             apply_sink_lock: Arc::new(Mutex::new(())),
             applier: Arc::new(Applier::new(Vec::new(), ApplyConfig::default())),
             pending_invalidations: InvalidationQueue::default(),
+            watch_registry: None,
             clock: Arc::new(SystemClock),
         }
     }
@@ -245,6 +249,56 @@ impl Translator {
     pub fn with_notification_cache(mut self, cache: Arc<Mutex<NotificationCache>>) -> Self {
         self.notification_cache = Some(cache);
         self
+    }
+
+    /// Attach the registry that decides which servers hear about a changed
+    /// file.
+    #[must_use]
+    pub fn with_watch_registry(mut self, registry: Arc<WatchRegistry>) -> Self {
+        self.watch_registry = Some(registry);
+        self
+    }
+
+    /// Drop every watched-file registration `server` holds.
+    pub fn forget_watch_registrations(&self, server: &ServerId) {
+        if let Some(registry) = &self.watch_registry {
+            registry.forget_server(server);
+        }
+    }
+
+    /// Tell every server that registered a matching glob that `path`
+    /// changed this way.
+    ///
+    /// Sent per server rather than broadcast: a server that did not ask is
+    /// told nothing, which is the difference between this and shouting at
+    /// everything with a language id.
+    ///
+    /// `pub(crate)` because stage C's sweep, in `crate::hooks::sweep`,
+    /// reports untracked changed paths the same way.
+    pub(crate) async fn notify_watched_files(&self, path: &Path, kind: lsp_types::FileChangeType) {
+        let Some(registry) = &self.watch_registry else {
+            return;
+        };
+        let Ok(uri) = crate::bridge::path_to_uri(path) else {
+            return;
+        };
+        for server in registry.servers_for(path, kind) {
+            let Some(client) = lock_std(&self.lsp_clients).get(&server).cloned() else {
+                continue;
+            };
+            let params = lsp_types::DidChangeWatchedFilesParams {
+                changes: vec![lsp_types::FileEvent {
+                    uri: uri.clone(),
+                    typ: kind,
+                }],
+            };
+            if let Err(error) = client
+                .notify("workspace/didChangeWatchedFiles", params)
+                .await
+            {
+                tracing::warn!(%server, path = %path.display(), %error, "watched files notify failed");
+            }
+        }
     }
 
     /// Install the applier that permitted tools write through.
@@ -386,6 +440,8 @@ impl Translator {
         match path.try_exists() {
             Ok(false) => {
                 self.close_one_document_locked(path).await;
+                self.notify_watched_files(path, lsp_types::FileChangeType::DELETED)
+                    .await;
                 return ResyncStep::Done;
             }
             Ok(true) => {}
@@ -409,7 +465,11 @@ impl Translator {
             .await
         {
             Ok(Some(resync)) => resync,
-            Ok(None) => return ResyncStep::Done,
+            Ok(None) => {
+                self.notify_watched_files(path, lsp_types::FileChangeType::CHANGED)
+                    .await;
+                return ResyncStep::Done;
+            }
             Err(error) => {
                 tracing::warn!(
                     path = %path.display(),
@@ -463,6 +523,8 @@ impl Translator {
                 .mark_save_sent(path, server, resync.version, generation);
         }
 
+        self.notify_watched_files(path, lsp_types::FileChangeType::CHANGED)
+            .await;
         ResyncStep::Done
     }
 
@@ -1312,6 +1374,104 @@ mod tests {
                 .snapshot(&path)
                 .is_some(),
             "a stat error is not proof the file is gone; the document stays tracked"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_watching_server_is_told_an_applied_file_changed() {
+        let harness = TranslatorHarness::with_one_server("go").await;
+        harness.register_watcher("go", "r1", "**/*.go");
+        let path = harness.write_file("main.go", "package main");
+        harness.open(&path, "go").await;
+        harness.rewrite_file(&path, "package main\nfunc a() {}");
+        harness.queue_invalidation(&path);
+
+        harness.translator.resync_changed_documents().await;
+
+        assert!(
+            harness
+                .notifications_for("go")
+                .contains(&"workspace/didChangeWatchedFiles".to_string()),
+            "gopls at default settings runs no watcher of its own, so this \
+             notification is the only way it learns a rename rewrote this file"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_server_that_registered_nothing_is_not_told() {
+        let harness = TranslatorHarness::with_one_server("go").await;
+        let path = harness.write_file("main.go", "package main");
+        harness.open(&path, "go").await;
+        harness.rewrite_file(&path, "package main\nfunc a() {}");
+        harness.queue_invalidation(&path);
+
+        harness.translator.resync_changed_documents().await;
+
+        assert!(
+            !harness
+                .notifications_for("go")
+                .contains(&"workspace/didChangeWatchedFiles".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_deleted_file_is_reported_as_deleted() {
+        let harness = TranslatorHarness::with_one_server("go").await;
+        harness.register_watcher("go", "r1", "**/*.go");
+        let path = harness.write_file("main.go", "package main");
+        harness.open(&path, "go").await;
+        std::fs::remove_file(&path).expect("remove");
+        harness.queue_invalidation(&path);
+
+        harness.translator.resync_changed_documents().await;
+
+        let params = harness
+            .last_watched_files_params("go")
+            .expect("a notification went out");
+        assert_eq!(
+            params["changes"][0]["type"],
+            serde_json::json!(3),
+            "the kind comes from the file being absent, not from anything the \
+             apply summary said, because a cancellation loses that summary"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_an_untracked_applied_file_is_still_reported() {
+        let harness = TranslatorHarness::with_one_server("go").await;
+        harness.register_watcher("go", "r1", "**/*.go");
+        let path = harness.write_file("other.go", "package main");
+        harness.queue_invalidation(&path);
+
+        harness.translator.resync_changed_documents().await;
+
+        assert!(
+            harness
+                .notifications_for("go")
+                .contains(&"workspace/didChangeWatchedFiles".to_string()),
+            "a rename's fanout writes files no tool call ever opened, and those \
+             are exactly what a watching server has no other way to learn about"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_respawn_clears_that_server_s_registrations() {
+        let harness = TranslatorHarness::with_one_server("go").await;
+        harness.register_watcher("go", "r1", "**/*.go");
+        harness
+            .translator
+            .forget_watch_registrations(&ServerId::from("go"));
+        let path = harness.write_file("main.go", "package main");
+        harness.open(&path, "go").await;
+        harness.rewrite_file(&path, "package main\nfunc a() {}");
+        harness.queue_invalidation(&path);
+
+        harness.translator.resync_changed_documents().await;
+
+        assert!(
+            !harness
+                .notifications_for("go")
+                .contains(&"workspace/didChangeWatchedFiles".to_string())
         );
     }
 }

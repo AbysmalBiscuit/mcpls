@@ -502,6 +502,7 @@ fn applicable_server_configs(
     config: &ServerConfig,
     workspace_roots: &[PathBuf],
     max_depth: Option<usize>,
+    watch_registry: &Arc<lsp::WatchRegistry>,
 ) -> Vec<ServerInitConfig> {
     config
         .lsp_servers
@@ -526,6 +527,7 @@ fn applicable_server_configs(
                 initialization_options: lsp_config.initialization_options.clone(),
                 position_encodings: config.workspace.position_encodings.clone(),
                 notification_tx: None,
+                watch_registry: Some(Arc::clone(watch_registry)),
             })
         })
         .collect()
@@ -589,6 +591,7 @@ fn applicable_server_configs(
 ///     std::process::exit(exit_code);
 /// }
 /// ```
+#[allow(clippy::too_many_lines)]
 pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<(), Error> {
     info!("Starting MCPLS server...");
 
@@ -642,7 +645,13 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     let extension_map = config.build_effective_extension_map();
     let max_depth = Some(config.workspace.heuristics_max_depth);
 
-    let applicable_configs = applicable_server_configs(&config, &workspace_roots, max_depth);
+    // One registry for the process. The clients write it from their
+    // `registerCapability` arms and the translator reads it to decide whom
+    // to notify, so both sides must hold the same `Arc`.
+    let watch_registry = Arc::new(lsp::WatchRegistry::new());
+
+    let applicable_configs =
+        applicable_server_configs(&config, &workspace_roots, max_depth, &watch_registry);
 
     info!(
         "Attempting to spawn {} applicable LSP server(s)...",
@@ -670,6 +679,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         extension_map,
         router,
         Arc::clone(&notification_cache),
+        watch_registry,
     );
 
     // Mark applicable servers as "expected" so a tool call that arrives while
@@ -788,6 +798,7 @@ fn build_translator(
     extension_map: HashMap<String, String>,
     router: ToolRouter,
     notification_cache: Arc<Mutex<NotificationCache>>,
+    watch_registry: Arc<lsp::WatchRegistry>,
 ) -> Translator {
     let applier = Arc::new(Applier::new(workspace_roots.clone(), config.apply.clone()));
     let mut translator = Translator::new()
@@ -795,6 +806,7 @@ fn build_translator(
         .with_extensions(extension_map)
         .with_router(router)
         .with_notification_cache(notification_cache)
+        .with_watch_registry(watch_registry)
         .with_applier(applier);
     translator.set_workspace_roots(workspace_roots);
     translator
@@ -1761,6 +1773,7 @@ mod tests {
             HashMap::new(),
             ToolRouter::default(),
             Arc::new(Mutex::new(NotificationCache::new())),
+            Arc::new(lsp::WatchRegistry::new()),
         );
 
         assert!(

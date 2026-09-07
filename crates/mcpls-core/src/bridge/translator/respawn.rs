@@ -279,6 +279,7 @@ impl Translator {
         drop(old_server); // dropped after the `lsp_servers` guard, not under it
 
         self.document_tracker.forget_server(id);
+        self.forget_watch_registrations(id);
 
         // Only the diagnostics-route server for this language ever writes
         // to the cache (see `diagnostics_pump`'s `caches_diagnostics` gate
@@ -480,6 +481,7 @@ sleep __SLEEP__
                 initialization_options: None,
                 position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
                 notification_tx: None,
+                watch_registry: None,
             }
         }
 
