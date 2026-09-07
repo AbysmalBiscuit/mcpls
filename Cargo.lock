@@ -1006,7 +1006,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "clap_complete_nushell",
- "futures",
+ "dunce",
  "mcpls-core",
  "predicates",
  "serde",
