@@ -257,11 +257,18 @@ async fn doctor_scanning(project_dir: &Path, identity: &SocketIdentity, prefix: 
     ];
 
     match probe(identity, &Request::Status, SOCKET_TIMEOUT).await {
+        // `owner: true` is required here for the same reason the foreign
+        // scan requires it: a status answered by anything that is not the
+        // socket's own owner describes some other process's session, and
+        // printing its root and pid as this project's would send a reader
+        // after the wrong process. A `false` falls through to the
+        // unexpected-answer arm below.
         ProbeOutcome::Answered(Response::Status {
             hash,
             pid,
             root,
             hooks_seen,
+            owner: true,
             ..
         }) => {
             lines.push(format!("server sees: {} -> {hash}", root.display()));
@@ -2054,6 +2061,41 @@ mod tests {
             "hooks seen: 3 request(s) since this owner started"
         );
         assert!(lines[5].starts_with("mcpls on PATH: "));
+    }
+
+    /// A `Status` that does not claim ownership describes some other
+    /// process's session, so its root and pid must not be printed as this
+    /// project's: a reader would go after the wrong process. The foreign
+    /// scan already requires `owner: true`; the own-socket arm now does
+    /// too, and the answer falls into the line already written for an
+    /// owner that answered with something else.
+    #[tokio::test]
+    async fn test_doctor_does_not_read_a_non_owner_answer_as_this_projects_owner() {
+        let project = tempfile::tempdir().expect("a temp dir");
+        let other = tempfile::tempdir().expect("a temp dir");
+        let socket_dir = tempfile::tempdir().expect("a temp dir");
+        let identity = local_identity_for(project.path(), socket_dir.path());
+        let _proxy = RecordingOwner::start_reporting_non_owner(identity.clone(), other.path());
+
+        let out = super::doctor_scanning(project.path(), &identity, TEST_PIPE_PREFIX).await;
+
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 5, "expected exactly five lines: {out}");
+        assert_eq!(
+            lines[2],
+            format!(
+                "server sees: an owner answered, but not with its own status: {:?}",
+                Response::Status {
+                    hash: mcpls_core::hooks::identity_hash(other.path()).expect("hash"),
+                    socket: PathBuf::new(),
+                    pid: std::process::id(),
+                    owner: false,
+                    root: other.path().to_path_buf(),
+                    hooks_seen: 0,
+                }
+            )
+        );
+        assert_eq!(lines[3], super::OWNER_PID_UNKNOWN);
     }
 
     /// `SessionStart` never touches the socket by design, so a server
