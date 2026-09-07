@@ -470,8 +470,26 @@ async fn connect(identity: &SocketIdentity) -> io::Result<Box<dyn HookStream>> {
 
 #[cfg(windows)]
 async fn connect(identity: &SocketIdentity) -> io::Result<Box<dyn HookStream>> {
-    let client = tokio::net::windows::named_pipe::ClientOptions::new().open(&identity.socket)?;
-    Ok(Box::new(client))
+    use tokio::net::windows::named_pipe::ClientOptions;
+
+    // Win32 `ERROR_PIPE_BUSY` (231): the pipe exists but every instance is
+    // connected to a client right now. Hardcoded rather than pulled in
+    // from `windows-sys` for one constant; see
+    // https://learn.microsoft.com/windows/win32/debug/system-error-codes--0-499-
+    // for the value. Tokio's own `ClientOptions::open` documentation gives
+    // a sleep-and-retry loop as the intended handling for exactly this,
+    // rather than treating it as a hard failure. The overall `send`/
+    // `send_many` timeout bounds this loop, not a retry count here.
+    const ERROR_PIPE_BUSY: i32 = 231;
+    loop {
+        match ClientOptions::new().open(&identity.socket) {
+            Ok(client) => return Ok(Box::new(client)),
+            Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -490,12 +508,32 @@ impl HookTransport for UnixTransport {
 }
 
 /// The first pipe instance is created during [`HookListener::acquire`], to
-/// prove exclusivity. `accept` pops whichever instance is in `next` and, in
-/// the same synchronous step with no await between the two, creates and
-/// stores its replacement before awaiting `connect` on the popped one: a
-/// ready instance is therefore in `next` at every point either a
-/// concurrent client's `connect` or this future's own cancellation could
-/// observe it, rather than only after the previous connection completed.
+/// prove exclusivity. `accept` never lets the instance count reach zero:
+/// it creates the replacement *before* touching `next`, so if that create
+/// fails (the platform's 255-instance cap, or a transient resource error),
+/// `next` is left exactly as it was rather than emptied. A pipe with zero
+/// instances stops existing under that name, which would let a competing
+/// process's own `first_pipe_instance` claim it while this one still
+/// believes it owns the session -- worse than any refusal, since the
+/// symptom is a silent takeover rather than a failed connect.
+///
+/// Once the replacement exists, taking the ready instance out of `next`
+/// and storing the replacement in its place happens in one synchronous
+/// step with no await between the two, so nothing -- another `accept`, or
+/// this future's own cancellation -- can observe `next` empty there
+/// either.
+///
+/// What this does *not* establish, and what Windows does not document:
+/// which of two simultaneously-listening instances (the one just popped,
+/// about to be `connect`-awaited, and the fresh replacement sitting in
+/// `next`) an incoming client is assigned to. This code relies on
+/// observed platform behaviour, not a documented guarantee, that a client
+/// attaches to the longer-listening instance first. If that assumption
+/// is ever wrong, the failure mode is a `connect` stalling until the
+/// popped instance happens to receive a client, rather than the clean
+/// `ERROR_PIPE_BUSY` refusal this design otherwise produces -- a stall is
+/// harder to diagnose than a refusal. This has not been verified against
+/// real concurrent clients on Windows.
 #[cfg(windows)]
 struct PipeTransport {
     path: std::path::PathBuf,
@@ -508,24 +546,27 @@ impl HookTransport for PipeTransport {
         Box::pin(async move {
             use tokio::net::windows::named_pipe::ServerOptions;
 
-            // Take the ready instance and create its replacement here,
-            // before awaiting `connect`: both are synchronous, so nothing
-            // -- another accept, or this select! branch losing to
-            // cancellation and dropping this future -- can observe `next`
-            // empty. Creating the replacement only after `connect`
-            // returns would leave a window with no free instance, in
-            // which a second client's own connect gets ERROR_PIPE_BUSY.
+            // Create the replacement before touching `next` at all: if
+            // this fails, `next` is untouched and the pipe keeps whatever
+            // instance it already had, rather than losing it to a create
+            // that never lands.
+            let replacement = ServerOptions::new().create(&self.path)?;
+
             let server = {
                 let mut next = self
                     .next
                     .lock()
                     .map_err(|_| io::Error::other("hook pipe transport lock poisoned"))?;
-                let server = match next.take() {
-                    Some(server) => server,
-                    None => ServerOptions::new().create(&self.path)?,
-                };
-                *next = Some(ServerOptions::new().create(&self.path)?);
+                let server = next.take();
+                *next = Some(replacement);
                 server
+            };
+            // `next` is populated by acquire and by every prior accept, so
+            // this is always `Some` in practice; the fallback exists so a
+            // missing instance is recovered from rather than panicked on.
+            let server = match server {
+                Some(server) => server,
+                None => ServerOptions::new().create(&self.path)?,
             };
 
             server.connect().await?;
