@@ -329,7 +329,7 @@ Every op answers within `op_deadline_ms` (1500), whether or not the work behind 
 
 Claude Code has a `FileChanged` hook event backed by a real file watcher, delivering `{file_path, event}` where event is `change`, `add`, or `unlink`. That covers every writer, which is the point.
 
-Its watcher passes no ignore list, so the watched set has to be constrained where it is declared, by returning `watchPaths` from `SessionStart`. That list is built by walking to depth one with the `ignore` crate, already a dependency, and returning the non-ignored subdirectories plus root-level files. `target/`, `node_modules/`, and `.git/` are therefore never watched.
+Its watcher passes no ignore list, so the watched set has to be constrained where it is declared, by returning `watchPaths` from `SessionStart`. That list is built by walking to depth one with the `ignore` crate, already a dependency, and returning the non-ignored subdirectories plus root-level files, against the same matcher filter 1 uses. `target/`, `node_modules/`, and `.git/` are therefore never watched, whether or not the project's own `.gitignore` names them.
 
 **The hook computes it locally and does not ask the socket.** `SessionStart` fires while the host is still spawning the MCP server, which is the same race that took the baseline off this hook, and the socket is bound only after mcpls loads its config. A `SessionStart` that asked over the socket would hit an unbound path, exit 0 with nothing under the silent-failure rule, and leave the session with either no `FileChanged` coverage at all or an unbounded watcher over `target/`, depending on how the host reads an absent `watchPaths`. Neither is acceptable and neither would be visible. So the hook walks `CLAUDE_PROJECT_DIR` itself; it needs no configuration to do that, and filter 1 inside mcpls still drops anything outside the configured roots. Where the project directory and the configured roots differ, the watcher is bounded by the project directory and the diagnostics by the roots, and `doctor` prints both so the difference is visible.
 
@@ -337,7 +337,7 @@ Its watcher passes no ignore list, so the watched set has to be constrained wher
 
 Two filters then run inside mcpls, in order:
 
-1. The path resolves under a configured root and is not ignored by `.gitignore`.
+1. The path resolves under a configured root and is not ignored. The ignore matcher is a built-in floor of `target` and `node_modules`, as whole path components at any depth, with the root's own `.gitignore` layered over it. The floor comes first, so a project that genuinely keeps sources under either name re-admits them with a negation. Without the floor, a project whose `.gitignore` is missing or incomplete hands its entire build output to the tracker, and the resulting `DocumentLimitExceeded` fails every later tool call rather than degrading.
 2. The path matches at least one registered watcher glob, or has a routable extension.
 
 A path passing neither is dropped without touching the tracker. This is what keeps a `cargo check` from filling `DocumentTracker` to its document ceiling with build artifacts, after which every real tool call would fail with `DocumentLimitExceeded`.
