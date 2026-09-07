@@ -34,7 +34,7 @@
 
 Every file a task modifies, so a worker sees the whole footprint before starting.
 
-- `crates/mcpls-core/src/bridge/delivery.rs`: `DiagnosticsDelivery` gains `pending` and `next_token`; `flush` becomes `stage` + `commit`, with `flush` kept as the immediate form. Task 1.
+- `crates/mcpls-core/src/bridge/delivery.rs`: `DiagnosticsDelivery` gains `pending` and `next_token`; `flush` becomes `stage` + `commit`, with `flush` kept as the immediate form. `flush`'s total-budget guard also stops using `delivered_any` as a proxy for an untouched budget. Task 1.
 - `crates/mcpls-core/src/hooks/protocol.rs`: `Response::Flush` gains `token`; `Request::Ack` and `Response::Ack` are added; the pinned literals change. Task 2.
 - `crates/mcpls-core/src/hooks/listener.rs`: the client half grows a `Connection` that can run more than one exchange, and `send_and_acknowledge`; the deadline overrun message becomes per-op. Task 2.
 - `crates/mcpls-core/src/hooks/mod.rs`: re-exports `send_and_acknowledge`. Task 2.
@@ -450,6 +450,90 @@ The module doc at the top of the file says "A flush answers one question: what i
 
 Run: `cargo nextest run -p mcpls-core bridge::delivery`
 Expected: PASS, the four new tests and every existing one (the existing ones call `flush`, whose behaviour is unchanged).
+
+- [ ] **Step 5: write the failing test for the clear-then-change budget hole**
+
+`flush` decides whether to deliver a file truncated by asking `!delivered_any`, which is a proxy for "the budget is untouched". A cleared file spends budget at `delivery.rs:225` without setting that flag, so the proxy and the real condition come apart, and a file that would fit a fresh budget is delivered with zero diagnostics and then permanently recorded as delivered.
+
+Add to `crates/mcpls-core/src/bridge/delivery.rs`'s test module:
+
+```rust
+#[test]
+fn test_a_clear_that_empties_the_budget_defers_the_next_file_whole() {
+    let mut delivery = DiagnosticsDelivery::new(DiagnosticsConfig {
+        max_total: 1,
+        ..DiagnosticsConfig::default()
+    });
+    let session = SessionId::from("s".to_string());
+    let broken = vec![diagnostic(0, DiagnosticSeverity::ERROR, "boom")];
+
+    delivery.flush(&session, &[entry("a.rs", &broken, SeverityFloor::Warning)]);
+
+    let report = delivery.flush(
+        &session,
+        &[
+            entry("a.rs", &[], SeverityFloor::Warning),
+            entry("b.rs", &broken, SeverityFloor::Warning),
+        ],
+    );
+    assert_eq!(report.cleared, vec!["a.rs".to_string()]);
+    assert!(
+        report.changed.is_empty(),
+        "the clear spent the whole budget, so b.rs waits for a flush that \
+         can carry it rather than being sent empty"
+    );
+
+    let next = delivery.flush(&session, &[entry("b.rs", &broken, SeverityFloor::Warning)]);
+    assert_eq!(
+        next.changed.len(),
+        1,
+        "a deferred file is offered again, and the record must not claim it \
+         was already delivered"
+    );
+    assert_eq!(next.changed[0].diagnostics.len(), 1);
+    assert_eq!(next.changed[0].omitted, 0);
+}
+```
+
+- [ ] **Step 6: run it and watch it fail**
+
+Run: `cargo nextest run -p mcpls-core test_a_clear_that_empties_the_budget_defers_the_next_file_whole`
+Expected: FAIL on the `report.changed.is_empty()` assertion. `b.rs` arrives with an empty `diagnostics` vec and `omitted: 1`, and the third assertion would fail too, because the record already holds `b.rs`'s hash.
+
+- [ ] **Step 7: test the real condition instead of the proxy**
+
+In `flush`, replace the `!delivered_any` arm of the `budget_omitted` match:
+
+```rust
+                    let budget_omitted = match budget {
+                        None => Some(0),
+                        Some(remaining) if visible.len() <= remaining => {
+                            budget = Some(remaining - visible.len());
+                            Some(0)
+                        }
+                        // Too big for a whole budget, so no later flush
+                        // does better and withholding it withholds it
+                        // forever. With nothing left to spend, the next
+                        // flush's fresh budget is the better offer.
+                        Some(remaining)
+                            if remaining > 0 && visible.len() > self.config.max_total =>
+                        {
+                            let shortfall = visible.len() - remaining;
+                            visible.truncate(remaining);
+                            budget = Some(0);
+                            Some(shortfall)
+                        }
+                        Some(_) => None,
+                    };
+```
+
+That leaves `delivered_any` read nowhere. Delete both its declaration (`let mut delivered_any = false;`) and its assignment (`delivered_any = true;`).
+
+- [ ] **Step 8: run the delivery tests and watch them pass**
+
+Run: `cargo nextest run -p mcpls-core bridge::delivery`
+Expected: PASS. `test_a_file_larger_than_the_total_budget_is_delivered_truncated_once` still truncates five into two, because five exceeds a whole budget of two and the budget is untouched. `test_cleared_files_spend_the_total_budget` is unaffected: it carries no changed file.
+
 
 ---
 
