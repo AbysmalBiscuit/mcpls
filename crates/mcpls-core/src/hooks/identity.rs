@@ -189,17 +189,30 @@ fn user_component(raw: Option<std::ffi::OsString>) -> Option<String> {
 ///
 /// `$XDG_RUNTIME_DIR/mcpls` where that is set, which is the tmpfs a session
 /// owns and which is cleaned when the session ends. Otherwise the system
-/// temporary directory, which is `$TMPDIR` on macOS and `/tmp` on Linux,
-/// with a per-user suffix so two users on one machine do not collide on a
-/// shared `/tmp`. No user to name gives an unsuffixed directory, which is
-/// right for a single-user machine and no worse than what a shared `/tmp`
-/// already offers.
+/// temporary directory, which is shared between everyone on the machine and
+/// so needs the user in its name.
 #[cfg(not(windows))]
 fn runtime_dir() -> PathBuf {
     if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
         return PathBuf::from(runtime).join("mcpls");
     }
-    current_user().map_or_else(
+    shared_temp_runtime_dir(current_user())
+}
+
+/// The runtime directory under the system temporary directory -- `$TMPDIR`
+/// on macOS, `/tmp` on Linux -- which every user on the machine shares, so
+/// `user` goes into its name and two of them do not collide on one socket.
+/// No user to name gives an unsuffixed directory, which is right for a
+/// single-user machine and no worse than what a shared `/tmp` already
+/// offers.
+///
+/// Takes the user rather than reading the environment itself, for the same
+/// reason [`user_component`] does: the choice of directory is a rule about
+/// a name, and it can be exercised without a test setting a process-global
+/// variable, which this workspace cannot do at all.
+#[cfg(not(windows))]
+fn shared_temp_runtime_dir(user: Option<String>) -> PathBuf {
+    user.map_or_else(
         || std::env::temp_dir().join("mcpls"),
         |user| std::env::temp_dir().join(format!("mcpls-{user}")),
     )
@@ -217,6 +230,26 @@ mod tests {
             Some("DOMAINAdaLovelace".to_string()),
             "a name reaches a directory path on one platform and a pipe name \
              on the other, and neither takes a separator here"
+        );
+    }
+
+    /// Unix only: `/tmp` is shared between everyone on the machine, so two
+    /// users at the same project path would otherwise bind one socket, and
+    /// the second would forward its flushes and its writes into the first
+    /// user's process -- the collision the Windows pipe name closes on the
+    /// other platform.
+    #[test]
+    #[cfg(not(windows))]
+    fn test_a_shared_temp_runtime_dir_carries_the_user() {
+        assert_eq!(
+            shared_temp_runtime_dir(Some("ada".to_string())),
+            std::env::temp_dir().join("mcpls-ada")
+        );
+        assert_eq!(
+            shared_temp_runtime_dir(None),
+            std::env::temp_dir().join("mcpls"),
+            "a machine whose environment names nobody has no second user to \
+             separate this from, and a bare separator names none either"
         );
     }
 
