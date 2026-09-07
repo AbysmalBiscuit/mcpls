@@ -5,5 +5,7 @@
 //! listener binds, waits, and does nothing.
 
 pub mod identity;
+pub mod protocol;
 
 pub use identity::{SocketIdentity, identity_for};
+pub use protocol::{ChangeEvent, Request, Response};
