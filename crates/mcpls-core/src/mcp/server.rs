@@ -342,7 +342,12 @@ impl FooterTiming {
 ///
 /// Sampling starts at `grace` rather than at zero, and that is what covers
 /// the case where the check has not begun yet: flycheck starts about 90 ms
-/// after a `didSave`, and before it does the workspace reads as quiet.
+/// after a `didSave`, and before it does the workspace reads as quiet. A
+/// `grace` larger than the cap is spent up to the cap and no further: the
+/// first sleep is the smaller of the two, because a configuration asking
+/// for a shorter total wait than the grace has asked for the total, and
+/// paying the whole grace would put the excess outside every bound the
+/// configuration names.
 ///
 /// The 50 ms sampling step means a call that never goes quiet can overshoot
 /// `timing.cap` by up to one step: the tick that pushes `elapsed` past the
@@ -360,8 +365,8 @@ where
     Fut: Future<Output = Instant>,
 {
     const STEP: Duration = Duration::from_millis(50);
-    let mut elapsed = timing.grace;
-    let mut now = tick(timing.grace).await;
+    let mut elapsed = timing.grace.min(timing.cap);
+    let mut now = tick(elapsed).await;
     loop {
         if footer_should_stop(settle, epoch_before, now, timing.quiet) {
             return elapsed;
@@ -2379,17 +2384,33 @@ mod tests {
         );
     }
 
-    /// A `wait_for_footer_quiet_at` tick that never suspends: it advances an
-    /// internal counter by each requested step and reports `start` plus the
-    /// running total, so a test can drive the exact loop that ships without
-    /// paying any of its real time.
-    fn instant_tick(start: Instant) -> impl Fn(Duration) -> std::future::Ready<Instant> {
+    /// A `wait_for_footer_quiet_at` tick that never suspends: it records
+    /// every step it was asked to sleep into `steps`, advances an internal
+    /// counter by it, and reports `start` plus the running total, so a test
+    /// can drive the exact loop that ships without paying any of its real
+    /// time.
+    ///
+    /// The steps are recorded rather than only accumulated because what the
+    /// loop reports and what it actually spends are two facts: a caller
+    /// reading only the return value cannot see a sleep the loop paid and
+    /// then declined to count.
+    fn instant_tick(
+        start: Instant,
+        steps: &std::cell::RefCell<Vec<Duration>>,
+    ) -> impl Fn(Duration) -> std::future::Ready<Instant> {
         let accumulated = std::cell::Cell::new(Duration::ZERO);
         move |step| {
+            steps.borrow_mut().push(step);
             let total = accumulated.get() + step;
             accumulated.set(total);
             std::future::ready(start + total)
         }
+    }
+
+    /// The steps an `instant_tick` records, for a test that only asserts on
+    /// what the loop returned.
+    fn unread_steps() -> std::cell::RefCell<Vec<Duration>> {
+        std::cell::RefCell::new(Vec::new())
     }
 
     /// Branch one: the grace period elapses before quiet is consulted.
@@ -2408,7 +2429,7 @@ mod tests {
                 quiet: Duration::from_millis(200),
                 cap: Duration::from_secs(15),
             },
-            instant_tick(start),
+            instant_tick(start, &unread_steps()),
         )
         .await;
 
@@ -2443,7 +2464,7 @@ mod tests {
                 quiet: Duration::from_millis(200),
                 cap: Duration::from_secs(15),
             },
-            instant_tick(start),
+            instant_tick(start, &unread_steps()),
         )
         .await;
 
@@ -2476,7 +2497,7 @@ mod tests {
                 quiet: Duration::from_millis(200),
                 cap: Duration::from_secs(15),
             },
-            instant_tick(start),
+            instant_tick(start, &unread_steps()),
         )
         .await;
 
@@ -2485,6 +2506,48 @@ mod tests {
             Duration::from_secs(15),
             "the footer is best effort: it reports what has landed rather than \
              waiting on a build that has not finished"
+        );
+    }
+
+    /// `footer_wait_ms` documents a total, so a larger `footer_grace_ms`
+    /// must not be paid in full.
+    ///
+    /// The value returned and the time actually spent are two facts, and
+    /// only the first was bounded: the loop slept the whole grace before it
+    /// ever looked at the cap, then reported the cap. A user who lowered
+    /// `footer_wait_ms` to make writes snappier still paid the default
+    /// grace on every write, and the overshoot grew with the gap rather
+    /// than staying inside the documented one sampling step.
+    #[tokio::test]
+    async fn test_a_grace_beyond_the_cap_is_not_paid_beyond_it() {
+        let settle = ServerSettle::new(Duration::from_secs(1), Duration::from_secs(600));
+        let rust = ServerId::from("rust");
+        let start = Instant::now();
+        let epoch_before = settle.progress_epoch();
+        // No `end_at`: nothing here ever reads as quiet, so only the cap can
+        // end the wait.
+        settle.begin(&rust, &json!("flycheck"));
+        let steps = unread_steps();
+
+        let ended = wait_for_footer_quiet_at(
+            &settle,
+            epoch_before,
+            FooterTiming {
+                grace: Duration::from_millis(250),
+                quiet: Duration::from_millis(200),
+                cap: Duration::from_millis(100),
+            },
+            instant_tick(start, &steps),
+        )
+        .await;
+
+        assert_eq!(ended, Duration::from_millis(100));
+        assert_eq!(
+            steps.borrow().iter().sum::<Duration>(),
+            Duration::from_millis(100),
+            "the cap is documented as the whole wait, grace included, so a \
+             wait that reported the cap while sleeping the grace was reporting \
+             a number it had not honoured"
         );
     }
 
@@ -2507,7 +2570,7 @@ mod tests {
                 quiet: Duration::from_millis(200),
                 cap: Duration::from_secs(15),
             },
-            instant_tick(start),
+            instant_tick(start, &unread_steps()),
         )
         .await;
 
