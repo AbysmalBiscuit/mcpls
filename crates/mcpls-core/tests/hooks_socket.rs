@@ -226,6 +226,54 @@ async fn test_an_op_answers_within_its_deadline_while_its_work_runs_on() {
     );
 }
 
+/// The deadline bounds the answer, not the work: a handler that outruns it
+/// keeps running and its result reaches the next flush. A plain `timeout`
+/// around the handler's future would cancel it here instead, and no
+/// client-visible behaviour would change -- this is what actually tells
+/// the two implementations apart, since the previous test only checks that
+/// an answer arrives on time, which both would satisfy.
+#[tokio::test]
+async fn test_overrunning_work_completes_after_its_deadline_answered() {
+    let (_guard, identity) = temp_identity();
+    let listener = HookListener::acquire(&identity)
+        .await
+        .expect("acquire")
+        .expect("owner");
+    let (_tx, cancel) = tokio::sync::watch::channel(false);
+    let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<()>(1);
+
+    tokio::spawn(listener.serve(
+        handler(move |_req| {
+            let done_tx = done_tx.clone();
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                let _ = done_tx.send(()).await;
+                Response::Flush { context: None }
+            })
+        }),
+        Duration::from_millis(100),
+        cancel,
+    ));
+
+    let answer = send(
+        &identity,
+        &Request::Flush {
+            session: "s1".to_string(),
+        },
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("the owner answers at its deadline");
+    assert!(matches!(answer, Response::Error { .. }), "got {answer:?}");
+
+    let landed = tokio::time::timeout(Duration::from_secs(3), done_rx.recv()).await;
+    assert_eq!(
+        landed.expect("the overrunning work must not be cancelled at the deadline"),
+        Some(()),
+        "the deadline answers; it does not cancel"
+    );
+}
+
 #[tokio::test]
 async fn test_two_requests_share_one_connection() {
     let (_guard, identity) = temp_identity();
