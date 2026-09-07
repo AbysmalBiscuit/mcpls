@@ -8,14 +8,13 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
 use super::Translator;
 use super::encoding_ctx::EncodingCtx;
@@ -97,10 +96,7 @@ pub(super) fn diag_info(diagnostics: Vec<lsp_types::Diagnostic>) -> DiagnosticIn
 }
 
 pub(super) struct FakeServer {
-    /// Kept alive so the pipes `write_stdout` reads from stay open; killed
-    /// directly by [`RecordingServer`] to simulate a transport that starts
-    /// rejecting sends.
-    write_half: Child,
+    _write_half: Child,
     _read_half: Child,
     pub(super) read_half_stdin: ChildStdin,
     pub(super) write_stdout: ChildStdout,
@@ -131,7 +127,7 @@ pub(super) fn fake_lsp_client() -> (LspClient, FakeServer) {
     (
         client,
         FakeServer {
-            write_half,
+            _write_half: write_half,
             _read_half: read_half,
             read_half_stdin: read_stdin,
             write_stdout,
@@ -277,32 +273,19 @@ pub(super) fn translator_with_capabilities_and_encoding(
     (translator, server)
 }
 
-/// One command [`RecordingServer`] accepts from [`TranslatorHarness`], run on
-/// the recording server's own background runtime.
-enum ServerCommand {
-    /// Reject every notification after the `usize`-th one received so far.
-    FailAfter(usize),
-    /// Undo a previous `FailAfter`: swap in a fresh fake client/transport
-    /// pair and hand it back so the harness can re-register it.
-    Allow,
-}
-
-/// The live fake-server pair a [`RecordingServer`]'s background runtime
-/// currently has installed: the client half the harness hands to the
-/// `Translator`, and the notification-count threshold armed by
-/// `ServerCommand::FailAfter` for the matching transport half.
-struct LiveServer {
-    client: LspClient,
-    fail_after: Arc<AtomicUsize>,
-}
+/// The notification method [`RecordingServer::notifications`] sends through
+/// its own client to find out what has actually reached the log so far.
+///
+/// Never sent by production code (no real LSP method starts this way), and
+/// never recorded into the log itself -- the reader task intercepts it.
+const SENTINEL_METHOD: &str = "mcpls/harness-sentinel";
 
 /// Reads one `Content-Length`-framed JSON-RPC message off `reader`, or
 /// `None` once the stream closes.
 ///
 /// Unlike [`read_framed_message`], EOF is an expected outcome here rather
-/// than a bug to panic on: [`RecordingServer`]'s reader loop keeps running
-/// after a deliberate `ServerCommand::FailAfter` kill closes the pipe out
-/// from under it.
+/// than a bug to panic on: a [`RecordingServer`] shut down mid-read looks
+/// exactly like this to its reader task.
 async fn try_read_frame<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> Option<JsonValue> {
     let mut headers = HashMap::new();
     let mut line = String::new();
@@ -324,106 +307,81 @@ async fn try_read_frame<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> O
     serde_json::from_slice(&content).ok()
 }
 
-/// Spawns a [`fake_lsp_client`] pair and a reader task that appends every
-/// notification method it sees to `log`, killing the fake server's write
-/// half once `fail_after`'s count is reached.
-///
-/// Must run on a runtime the caller has already entered: the constructed
-/// `LspClient`'s own background message loop, and the reader task this
-/// spawns, both need somewhere to be driven.
-fn spawn_live_server(log: &Arc<StdMutex<Vec<String>>>) -> LiveServer {
-    let (client, server) = fake_lsp_client();
-    let fail_after = Arc::new(AtomicUsize::new(usize::MAX));
-    let threshold = Arc::clone(&fail_after);
-    let log = Arc::clone(log);
-    tokio::spawn(async move {
-        // Names the whole struct, not just `write_stdout`, so Rust's
-        // disjoint closure capture moves all of `server` in here -- the
-        // other fields exist only to keep the fake server's processes
-        // alive via `kill_on_drop`, and a capture of `write_stdout` alone
-        // would otherwise drop (and kill) the rest the moment this
-        // function returns.
-        let mut server = server;
-        let mut wire = BufReader::new(&mut server.write_stdout);
-        while let Some(message) = try_read_frame(&mut wire).await {
-            let method = message["method"].as_str().unwrap_or_default().to_string();
-            let mut log = lock_std(&log);
-            log.push(method);
-            if log.len() >= threshold.load(Ordering::SeqCst) {
-                let _ = server.write_half.start_kill();
-            }
-        }
-    });
-    LiveServer { client, fail_after }
-}
-
 /// A fake LSP server recording the notifications it receives, run on its own
-/// OS thread and Tokio runtime.
+/// OS thread and Tokio runtime so its background message loop makes
+/// progress independently of the test's own runtime.
 ///
 /// [`LspClient::notify`] only enqueues onto that client's own background
 /// message loop; nothing about a successful `notify().await` waits for the
-/// wire write to happen. On the test's own single-threaded runtime, that
-/// background task never gets a turn to run before a plain, synchronous
-/// `notifications_for` call returns -- there is no `.await` between them for
-/// the scheduler to interleave on. Running the fake server on a separate
-/// thread with its own runtime gives it real, OS-scheduled concurrency
-/// instead, so by the time a test calls `notifications_for` the write has
-/// actually landed.
+/// wire write to happen, and there is no `.await` between a drain call and
+/// a plain, synchronous `notifications_for` check for the two runtimes to
+/// interleave on. `notifications_for` closes that gap deterministically
+/// instead of guessing at a delay: it sends a [`SENTINEL_METHOD`]
+/// notification through this same client, whose channel to the transport
+/// preserves order, and reads back everything logged before the sentinel is
+/// observed -- which, by that ordering, is exactly what was sent before it.
 struct RecordingServer {
     log: Arc<StdMutex<Vec<String>>>,
-    commands: mpsc::UnboundedSender<ServerCommand>,
-    // `mpsc::Receiver` is `Send` but not `Sync`; wrapped so `RecordingServer`
-    // (and the `TranslatorHarness` holding it) stays `Sync`, which an
-    // `async fn` taking `&self` needs its returned future to be.
-    fresh_clients: StdMutex<std::sync::mpsc::Receiver<LspClient>>,
+    sentinel_waiter: Arc<StdMutex<Option<std::sync::mpsc::Sender<Vec<String>>>>>,
+    client: LspClient,
     shutdown: Option<oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl RecordingServer {
-    /// Start the background thread/runtime and its first fake server,
-    /// returning the client half for the harness to register.
+    /// Start the background thread/runtime and its fake server, returning
+    /// the client half for the harness to register.
     fn spawn() -> (LspClient, Self) {
         let log = Arc::new(StdMutex::new(Vec::new()));
-        let (initial_tx, initial_rx) = std::sync::mpsc::channel::<LspClient>();
-        let (fresh_tx, fresh_rx) = std::sync::mpsc::channel::<LspClient>();
-        let (command_tx, mut command_rx) = mpsc::unbounded_channel::<ServerCommand>();
-        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+        let sentinel_waiter: Arc<StdMutex<Option<std::sync::mpsc::Sender<Vec<String>>>>> =
+            Arc::new(StdMutex::new(None));
+        let (client_tx, client_rx) = std::sync::mpsc::channel::<LspClient>();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
         let log_for_thread = Arc::clone(&log);
+        let waiter_for_thread = Arc::clone(&sentinel_waiter);
         let thread = std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("build the fake-server runtime");
             rt.block_on(async move {
-                let mut current = spawn_live_server(&log_for_thread);
-                initial_tx
-                    .send(current.client.clone())
-                    .expect("harness awaiting the initial client");
-                loop {
-                    tokio::select! {
-                        _ = &mut shutdown_rx => break,
-                        Some(command) = command_rx.recv() => match command {
-                            ServerCommand::FailAfter(n) => {
-                                current.fail_after.store(n, Ordering::SeqCst);
+                let (client, server) = fake_lsp_client();
+                client_tx.send(client).expect("harness awaiting the client");
+                tokio::spawn(async move {
+                    // Names the whole struct, not just `write_stdout`, so
+                    // Rust's disjoint closure capture moves all of `server`
+                    // in here -- the other fields exist only to keep the
+                    // fake server's processes alive via `kill_on_drop`, and
+                    // a capture of `write_stdout` alone would otherwise
+                    // drop (and kill) the rest the moment this async block
+                    // is constructed.
+                    let mut server = server;
+                    let mut wire = BufReader::new(&mut server.write_stdout);
+                    while let Some(message) = try_read_frame(&mut wire).await {
+                        let method = message["method"].as_str().unwrap_or_default();
+                        if method == SENTINEL_METHOD {
+                            let prefix = lock_std(&log_for_thread).clone();
+                            let waiter = lock_std(&waiter_for_thread).take();
+                            if let Some(waiter) = waiter {
+                                let _ = waiter.send(prefix);
                             }
-                            ServerCommand::Allow => {
-                                current = spawn_live_server(&log_for_thread);
-                                let _ = fresh_tx.send(current.client.clone());
-                            }
-                        },
+                            continue;
+                        }
+                        lock_std(&log_for_thread).push(method.to_string());
                     }
-                }
+                });
+                let _ = shutdown_rx.await;
             });
         });
 
-        let client = initial_rx
+        let client = client_rx
             .recv()
-            .expect("the fake-server thread to hand back its first client");
+            .expect("the fake-server thread to hand back its client");
+        let sentinel_client = client.clone();
         (
             client,
             Self {
                 log,
-                commands: command_tx,
-                fresh_clients: StdMutex::new(fresh_rx),
+                sentinel_waiter,
+                client: sentinel_client,
                 shutdown: Some(shutdown_tx),
                 thread: Some(thread),
             },
@@ -432,53 +390,24 @@ impl RecordingServer {
 
     /// The notification methods received so far, in order.
     ///
-    /// Waits for the log to stop growing for a short quiet window rather
-    /// than reading it immediately: the fake server's runtime is a separate
-    /// OS thread, so a notification `.await`ed moments ago may not have
-    /// reached the log yet. Bounded overall so a genuinely missing
-    /// notification still fails promptly instead of hanging the test.
+    /// Deterministic rather than timing-based: everything the resync sent
+    /// travels through the same client's command channel, in order, ahead
+    /// of the sentinel this sends after it, so by the time the sentinel is
+    /// observed every earlier notification has already been written and
+    /// logged. The 500ms bound only guards against a genuinely hung
+    /// transport; it is not part of the normal completion path.
     fn notifications(&self) -> Vec<String> {
-        const QUIET_WINDOW: Duration = Duration::from_millis(15);
-        const MAX_WAIT: Duration = Duration::from_millis(500);
-
-        let deadline = Instant::now() + MAX_WAIT;
-        let mut last_len = usize::MAX;
-        let mut stable_since = Instant::now();
-        loop {
-            let current = lock_std(&self.log).clone();
-            let now = Instant::now();
-            if current.len() == last_len {
-                if now.duration_since(stable_since) >= QUIET_WINDOW || now >= deadline {
-                    return current;
-                }
-            } else {
-                last_len = current.len();
-                stable_since = now;
-            }
-            if now >= deadline {
-                return current;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        *lock_std(&self.sentinel_waiter) = Some(tx);
+        let _ = futures::executor::block_on(
+            self.client.notify(SENTINEL_METHOD, serde_json::Value::Null),
+        );
+        rx.recv_timeout(Duration::from_millis(500))
+            .unwrap_or_else(|_| lock_std(&self.log).clone())
     }
 
     fn clear(&self) {
         lock_std(&self.log).clear();
-    }
-
-    fn fail_after(&self, n: usize) {
-        self.commands
-            .send(ServerCommand::FailAfter(n))
-            .expect("the fake-server thread is still running");
-    }
-
-    fn allow(&self) -> LspClient {
-        self.commands
-            .send(ServerCommand::Allow)
-            .expect("the fake-server thread is still running");
-        lock_std(&self.fresh_clients)
-            .recv()
-            .expect("the fake-server thread to hand back a fresh client")
     }
 }
 
@@ -525,6 +454,16 @@ impl TranslatorHarness {
     /// async surface, so this returns an already-ready future instead of
     /// forcing callers to special-case it.
     pub(super) fn with_one_server(language_id: &str) -> impl Future<Output = Self> {
+        Self::with_one_server_and_limits(language_id, ResourceLimits::default())
+    }
+
+    /// As [`Self::with_one_server`], with a caller-chosen [`ResourceLimits`]
+    /// -- for tests that need a resync's disk read to fail on purpose (e.g.
+    /// a `max_file_size` a rewrite exceeds).
+    pub(super) fn with_one_server_and_limits(
+        language_id: &str,
+        limits: ResourceLimits,
+    ) -> impl Future<Output = Self> {
         let dir = TempDir::new().expect("temp dir");
         let server_id = ServerId::from(language_id);
 
@@ -533,6 +472,7 @@ impl TranslatorHarness {
                 Self::extension_for(language_id).to_string(),
                 language_id.to_string(),
             )]))
+            .with_resource_limits(limits)
             .with_router(ToolRouter::catch_all([(
                 server_id.clone(),
                 language_id.to_string(),
@@ -603,28 +543,13 @@ impl TranslatorHarness {
     }
 
     /// Forget everything recorded so far.
+    #[allow(
+        dead_code,
+        reason = "unused until a test needs to isolate a later drain's own sends"
+    )]
     pub(super) fn clear_notifications(&self) {
         for server in self.servers.values() {
             server.clear();
         }
-    }
-
-    /// Make `server`'s transport reject every send after the first `n`.
-    pub(super) fn fail_notifications_after(&self, server: &str, n: usize) {
-        self.servers
-            .get(server)
-            .unwrap_or_else(|| panic!("{server} is not registered with this harness"))
-            .fail_after(n);
-    }
-
-    /// Undo `fail_notifications_after`.
-    pub(super) fn allow_notifications(&self, server: &str) {
-        let server_id = ServerId::from(server);
-        let fresh = self
-            .servers
-            .get(server)
-            .unwrap_or_else(|| panic!("{server} is not registered with this harness"))
-            .allow();
-        self.translator.register_client(server_id, fresh);
     }
 }
