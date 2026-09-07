@@ -20,8 +20,13 @@ use crate::bridge::lock_std;
 use crate::config::ServerId;
 
 /// One watcher: a compiled glob and the kinds it wants.
+///
+/// `pattern` is kept alongside the compiled `glob` because `GlobMatcher`
+/// carries no equality of its own; `register` needs the source string back
+/// to deduplicate a re-registered watcher against ones already stored.
 #[derive(Debug)]
 struct Watcher {
+    pattern: String,
     glob: GlobMatcher,
     kinds: u32,
 }
@@ -65,24 +70,27 @@ impl WatchRegistry {
     /// not compile is skipped the same way. Either case leaves the rest of
     /// the array in force.
     ///
-    /// A registration under an id already in use for this server replaces
-    /// it, except when the new array is empty and a non-empty registration
-    /// already exists for that id: that replacement is ignored, at `warn`.
-    /// LSP's way to say "stop watching" is `client/unregisterCapability`; a
-    /// `registerCapability` carrying no watchers conveys nothing on its own
-    /// and is indistinguishable from a server re-announcing a stale or
-    /// incomplete payload, so honouring it as "watch nothing" would let one
-    /// server's quirk silently kill the whole feature. The two ways this
-    /// can be wrong are not symmetric: ignoring a genuine "watch nothing"
-    /// costs a few notifications the server discards, while honouring a
-    /// spurious one stops file watching dead with no error anywhere. A
-    /// *first* registration for an id that happens to be empty is still
-    /// stored as given -- there is nothing working yet for it to replace.
+    /// A registration under an id already in use for this server adds to
+    /// it rather than replacing it, deduplicating by the pair of glob
+    /// pattern string and change-kind mask. pyrefly registers `FILEWATCHER`
+    /// more than once per session with disjoint, complementary watcher
+    /// sets -- workspace patterns (including `**/*.py`) right after
+    /// `initialized`, then interpreter- and bytecode-derived patterns on
+    /// the first `didOpen` -- and means both to stay in force at once.
+    /// Replace semantics does not model that: treating the second
+    /// registration as superseding the first silently dropped `**/*.py`,
+    /// the one glob that mattered, a message before any registration ever
+    /// arrived empty. Deduplication is what keeps accumulation bounded: a
+    /// server that re-registers globs it already holds adds nothing, so
+    /// the stored set can never exceed the number of distinct globs that
+    /// server has ever asked for -- for any server, not only pyrefly. An
+    /// empty array now contributes nothing by construction and needs no
+    /// special case.
     ///
-    /// The lock is held across the check and the insert deliberately:
+    /// The lock is held across the dedup check and the pushes deliberately:
     /// dropping it in between would let two concurrent registrations for
-    /// the same id interleave, so each saw a working registration to
-    /// compare against and neither ever wrote.
+    /// the same id interleave, so each saw the other's watchers as absent
+    /// and both pushed the same one.
     #[allow(clippy::significant_drop_tightening)]
     pub fn register(&self, server: &ServerId, id: &str, watchers: &serde_json::Value) {
         let mut compiled = Vec::new();
@@ -115,25 +123,39 @@ impl WatchRegistry {
                 .and_then(|k| u32::try_from(k).ok())
                 .unwrap_or(ALL_KINDS);
             compiled.push(Watcher {
+                pattern: pattern.to_owned(),
                 glob: glob.compile_matcher(),
                 kinds,
             });
         }
         let mut by_server = lock_std(&self.by_server);
-        let registrations = by_server.entry(server.clone()).or_default();
-        if compiled.is_empty()
-            && registrations
-                .get(id)
-                .is_some_and(|existing| !existing.is_empty())
-        {
-            tracing::warn!(
-                %server,
-                registration = id,
-                "ignoring an empty watcher registration that would replace a working one"
-            );
-            return;
+        let existing = by_server
+            .entry(server.clone())
+            .or_default()
+            .entry(id.to_string())
+            .or_default();
+        for watcher in compiled {
+            let already_held = existing
+                .iter()
+                .any(|w| w.pattern == watcher.pattern && w.kinds == watcher.kinds);
+            if !already_held {
+                existing.push(watcher);
+            }
         }
-        registrations.insert(id.to_string(), compiled);
+    }
+
+    /// The number of distinct watchers stored for `(server, id)`.
+    ///
+    /// Test-only: production code has no reason to count watchers, only to
+    /// match against them, but a test that asserts accumulation stays
+    /// bounded needs to see the count directly rather than inferring it
+    /// from `servers_for`'s yes/no answer.
+    #[cfg(test)]
+    fn watcher_count(&self, server: &ServerId, id: &str) -> usize {
+        lock_std(&self.by_server)
+            .get(server)
+            .and_then(|by_id| by_id.get(id))
+            .map_or(0, Vec::len)
     }
 
     /// Drop the registration `id` holds for `server`.
@@ -287,6 +309,34 @@ mod tests {
     }
 
     #[test]
+    fn test_disjoint_registrations_under_one_id_both_stay_matchable() {
+        let registry = WatchRegistry::new();
+        let python = ServerId::from("python");
+        registry.register(
+            &python,
+            "FILEWATCHER",
+            &json!([{ "globPattern": "**/*.py" }]),
+        );
+        registry.register(
+            &python,
+            "FILEWATCHER",
+            &json!([{ "globPattern": "**/*.pyc" }]),
+        );
+
+        assert_eq!(
+            registry.servers_for(&abs("main.py"), lsp_types::FileChangeType::CHANGED),
+            vec![python.clone()],
+            "pyrefly registers its workspace patterns and its \
+             interpreter-derived patterns as two separate calls under the \
+             same id, and means both to stay in force -- this is that case"
+        );
+        assert_eq!(
+            registry.servers_for(&abs("main.pyc"), lsp_types::FileChangeType::CHANGED),
+            vec![python]
+        );
+    }
+
+    #[test]
     fn test_an_empty_reregistration_does_not_replace_a_working_one() {
         let registry = WatchRegistry::new();
         let python = ServerId::from("python");
@@ -300,9 +350,32 @@ mod tests {
         assert_eq!(
             registry.servers_for(&abs("main.py"), lsp_types::FileChangeType::CHANGED),
             vec![python],
-            "a server re-registering the same id with no watchers has no way to \
-             say 'stop watching' -- that is what unregisterCapability is for -- \
-             so the empty payload must not erase the working registration"
+            "an empty registration adds no watchers under accumulation, so \
+             it can no longer erase a working one -- this now holds for \
+             free rather than needing a special case for the empty array"
+        );
+    }
+
+    #[test]
+    fn test_reregistering_the_same_globs_does_not_grow_the_stored_set() {
+        let registry = WatchRegistry::new();
+        let python = ServerId::from("python");
+        registry.register(
+            &python,
+            "FILEWATCHER",
+            &json!([{ "globPattern": "**/*.py" }]),
+        );
+        registry.register(
+            &python,
+            "FILEWATCHER",
+            &json!([{ "globPattern": "**/*.py" }]),
+        );
+
+        assert_eq!(
+            registry.watcher_count(&python, "FILEWATCHER"),
+            1,
+            "re-registering a glob the server already holds must add nothing, \
+             or accumulation would grow the stored set without bound"
         );
     }
 
