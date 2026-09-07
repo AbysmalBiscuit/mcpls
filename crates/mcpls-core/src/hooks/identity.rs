@@ -85,8 +85,19 @@ pub fn identity_for(dir: &Path) -> Result<SocketIdentity> {
 
     #[cfg(windows)]
     {
+        // The pipe namespace is machine-global, so the project hash is not
+        // a whole identity on its own: two users with the same project
+        // path on one host would derive one pipe name, and the second
+        // process to start would read as passive and forward its flushes
+        // and the files it wrote into the first user's mcpls, which would
+        // then answer user B's `get_new_diagnostics` from user A's
+        // delivery record. The user goes into the name for the same reason
+        // the Unix runtime directory carries it. This keeps two users'
+        // sessions apart; what stops one user reaching the other's pipe at
+        // all is that pipe's own access control, not its name.
+        let user = current_user().map_or_else(String::new, |user| format!("{user}-"));
         Ok(SocketIdentity {
-            socket: PathBuf::from(format!(r"\\.\pipe\{WINDOWS_PIPE_PREFIX}{hash}")),
+            socket: PathBuf::from(format!(r"\\.\pipe\{WINDOWS_PIPE_PREFIX}{user}{hash}")),
             lock: PathBuf::new(),
             hash,
         })
@@ -124,39 +135,71 @@ fn ensure_socket_path_fits(socket: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Who this process is running as, reduced to characters safe in a path
+/// and in a pipe name, or `None` when the environment names nobody.
+///
+/// Read from the environment rather than from the OS. The workspace sets
+/// `unsafe_code = "deny"`, so neither `unsafe { libc::getuid() }` nor a
+/// `GetUserName` call compiles here, and a safe wrapper crate would be a
+/// whole dependency bought for one string. Do not reinstate either call.
+///
+/// `%USERNAME%` is read first on Windows, where it is the variable the
+/// system itself sets and `$USER` and `$LOGNAME` appear only under ported
+/// shells. One function for both platforms so the two socket namespaces
+/// name the same user the same way.
+///
+/// The variables are read here and reduced by [`user_component`], which is
+/// where the rules about what a name may contain live.
+fn current_user() -> Option<String> {
+    #[cfg(windows)]
+    let raw = std::env::var_os("USERNAME")
+        .or_else(|| std::env::var_os("USER"))
+        .or_else(|| std::env::var_os("LOGNAME"));
+    #[cfg(not(windows))]
+    let raw = std::env::var_os("USER").or_else(|| std::env::var_os("LOGNAME"));
+
+    user_component(raw)
+}
+
+/// `raw` reduced to what both a path component and a pipe name can carry,
+/// or `None` when the environment named nobody or nothing usable survives.
+///
+/// A username can carry a path separator on some systems, and a Windows
+/// pipe name may carry none at all after its prefix, so everything outside
+/// ASCII alphanumerics and `-`, `_`, `.` is dropped. A name emptied by that
+/// is `None` rather than an empty string: an empty component separates
+/// nobody, and a socket path is better off saying so than carrying a
+/// separator with nothing in front of it.
+///
+/// Takes the raw value rather than reading the environment itself, so the
+/// rule can be exercised without a test setting a process-global variable
+/// -- which this workspace cannot do at all, `std::env::set_var` being
+/// `unsafe` and `unsafe_code` denied.
+fn user_component(raw: Option<std::ffi::OsString>) -> Option<String> {
+    raw.and_then(|raw| raw.into_string().ok())
+        .map(|name| {
+            name.chars()
+                .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+                .collect::<String>()
+        })
+        .filter(|name| !name.is_empty())
+}
+
 /// Where sockets go on this platform.
 ///
 /// `$XDG_RUNTIME_DIR/mcpls` where that is set, which is the tmpfs a session
 /// owns and which is cleaned when the session ends. Otherwise the system
 /// temporary directory, which is `$TMPDIR` on macOS and `/tmp` on Linux,
 /// with a per-user suffix so two users on one machine do not collide on a
-/// shared `/tmp`.
-///
-/// The suffix comes from `$USER` or `$LOGNAME` rather than from `getuid`.
-/// The workspace sets `unsafe_code = "deny"`, so `unsafe { libc::getuid() }`
-/// does not compile here, and a safe wrapper crate would be a whole
-/// dependency bought for one integer. Do not reinstate the uid call. Both
-/// variables being absent gives an unsuffixed directory, which is right for
-/// a single-user machine and no worse than what a shared `/tmp` already
-/// offers.
-///
-/// A username can carry a path separator on some systems, so it is reduced
-/// to ASCII alphanumerics and `-`, `_`, `.` before it goes into a path.
+/// shared `/tmp`. No user to name gives an unsuffixed directory, which is
+/// right for a single-user machine and no worse than what a shared `/tmp`
+/// already offers.
 #[cfg(not(windows))]
 fn runtime_dir() -> PathBuf {
     if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
         return PathBuf::from(runtime).join("mcpls");
     }
-    let user = std::env::var_os("USER")
-        .or_else(|| std::env::var_os("LOGNAME"))
-        .and_then(|raw| raw.into_string().ok())
-        .map(|name| {
-            name.chars()
-                .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-                .collect::<String>()
-        })
-        .filter(|name| !name.is_empty());
-    user.map_or_else(
+    current_user().map_or_else(
         || std::env::temp_dir().join("mcpls"),
         |user| std::env::temp_dir().join(format!("mcpls-{user}")),
     )
@@ -166,6 +209,43 @@ fn runtime_dir() -> PathBuf {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_a_username_cannot_carry_a_separator_into_a_socket_path() {
+        assert_eq!(
+            user_component(Some("DOMAIN\\Ada Lovelace".into())),
+            Some("DOMAINAdaLovelace".to_string()),
+            "a name reaches a directory path on one platform and a pipe name \
+             on the other, and neither takes a separator here"
+        );
+    }
+
+    #[test]
+    fn test_a_username_nothing_survives_of_names_nobody() {
+        assert_eq!(user_component(Some("!@#$".into())), None);
+        assert_eq!(user_component(None), None);
+    }
+
+    /// Windows only: the pipe namespace is machine-global, so two users at
+    /// the same project path would otherwise derive one identity, and the
+    /// second would forward its flushes and its writes into the first
+    /// user's process.
+    #[test]
+    #[cfg(windows)]
+    fn test_a_windows_pipe_name_carries_the_user() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let user = current_user().expect("a Windows session always names a user");
+
+        let identity = identity_for(dir.path()).expect("identity");
+
+        assert_eq!(
+            identity.socket,
+            PathBuf::from(format!(
+                r"\\.\pipe\{WINDOWS_PIPE_PREFIX}{user}-{}",
+                identity.hash
+            ))
+        );
+    }
 
     #[test]
     fn test_the_same_directory_hashes_the_same_way_twice() {
