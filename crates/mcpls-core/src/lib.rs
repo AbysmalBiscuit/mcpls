@@ -1115,21 +1115,25 @@ async fn baseline_task(
                 if !settle.should_settle() {
                     continue;
                 }
-                let snapshot = {
+                let baseline: HashMap<String, u64> = {
                     let cache = cache.lock().await;
-                    cache.diagnostics_snapshot()
+                    cache
+                        .diagnostics_entries()
+                        .into_iter()
+                        .filter_map(|(key, info, owner)| {
+                            bridge::DiagnosticsDelivery::visible_hash(
+                                &info.diagnostics,
+                                floors.for_server(owner),
+                            )
+                            .map(|hash| (key.to_string(), hash))
+                        })
+                        .collect()
                 };
-                let baseline: HashMap<String, u64> = snapshot
-                    .iter()
-                    .filter_map(|(key, info, owner)| {
-                        bridge::DiagnosticsDelivery::visible_hash(
-                            &info.diagnostics,
-                            floors.for_server(owner),
-                        )
-                        .map(|hash| (key.clone(), hash))
-                    })
-                    .collect();
                 let baseline_len = baseline.len();
+                // Cache guard is dropped above before delivery's is taken --
+                // the opposite of the flush's delivery-before-cache order,
+                // but safe here because this task never holds both locks at
+                // once.
                 delivery.lock().await.set_baseline(baseline);
                 debug!("diagnostics baseline taken over {baseline_len} file(s)");
                 return;

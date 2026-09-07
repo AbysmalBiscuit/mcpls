@@ -744,6 +744,26 @@ impl NotificationCache {
         snapshot
     }
 
+    /// Every cached entry with a known owner, ordered by key.
+    ///
+    /// Borrows rather than cloning, so a caller that only needs to hash or
+    /// filter does not copy up to 1000 entries of up to 1 MiB each. The
+    /// caller holds the lock for as long as it holds the result, so it must
+    /// not await while it does.
+    #[must_use]
+    pub fn diagnostics_entries(&self) -> Vec<(&str, &DiagnosticInfo, &ServerId)> {
+        let mut entries: Vec<(&str, &DiagnosticInfo, &ServerId)> = self
+            .diagnostics
+            .iter()
+            .filter_map(|(key, info)| {
+                let owner = self.diagnostics_owners.get(key)?;
+                Some((key.as_str(), info, owner))
+            })
+            .collect();
+        entries.sort_unstable_by_key(|(key, _, _)| *key);
+        entries
+    }
+
     /// Server that published the currently cached diagnostics for `uri`, if
     /// any. Used to look up that server's negotiated position encoding for a
     /// cache-only read that has no live LSP round trip of its own to resolve
