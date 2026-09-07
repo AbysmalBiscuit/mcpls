@@ -12,7 +12,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 use mcpls_core::hooks::{
-    ChangeEvent, Request, Response, SocketIdentity, send, send_many, watch_paths,
+    ChangeEvent, ProbeOutcome, Request, Response, SocketIdentity, probe, send, send_many,
+    watch_paths,
 };
 use serde::Deserialize;
 
@@ -251,22 +252,33 @@ async fn doctor_scanning(project_dir: &Path, identity: &SocketIdentity, prefix: 
         format!("hook sees: {} -> {}", project_dir.display(), identity.hash),
     ];
 
-    let status = send(identity, &Request::Status, SOCKET_TIMEOUT).await.ok();
-    if let Some(Response::Status {
-        hash,
-        pid,
-        root,
-        hooks_seen,
-        ..
-    }) = status
-    {
-        lines.push(format!("server sees: {} -> {hash}", root.display()));
-        lines.push(format!("owner pid: {pid}"));
-        lines.push(hooks_seen_line(hooks_seen));
-    } else {
-        let foreign = find_foreign_owner(identity, project_dir, prefix).await;
-        lines.push(no_owner_line(foreign));
-        lines.push("owner pid: none".to_string());
+    match probe(identity, &Request::Status, SOCKET_TIMEOUT).await {
+        ProbeOutcome::Answered(Response::Status {
+            hash,
+            pid,
+            root,
+            hooks_seen,
+            ..
+        }) => {
+            lines.push(format!("server sees: {} -> {hash}", root.display()));
+            lines.push(format!("owner pid: {pid}"));
+            lines.push(hooks_seen_line(hooks_seen));
+        }
+        // A connection was accepted but nothing usable came back: there
+        // is an owner, so naming some other directory as the reason
+        // would be a guess. The foreign scan does not run here.
+        ProbeOutcome::Answered(_) | ProbeOutcome::Busy => {
+            lines.push(format!(
+                "server sees: a socket answered nothing within {}ms; an owner may be busy",
+                SOCKET_TIMEOUT.as_millis()
+            ));
+            lines.push("owner pid: none".to_string());
+        }
+        ProbeOutcome::NoOwner => {
+            let foreign = find_foreign_owner(identity, project_dir, prefix).await;
+            lines.push(no_owner_line(foreign));
+            lines.push("owner pid: none".to_string());
+        }
     }
 
     lines.push(mcpls_on_path().map_or_else(
@@ -304,7 +316,9 @@ const fn foreign_scan_prefix() -> &'static str {
 fn hooks_seen_line(count: u64) -> String {
     if count == 0 {
         "hooks seen: none since this owner started; send a prompt or make an \
-         edit in this session, then run the doctor again"
+         edit in your Claude Code session for this project, then run the \
+         doctor again; if it is still none after that, the plugin's hooks \
+         are not reaching this server"
             .to_string()
     } else {
         format!("hooks seen: {count} request(s) since this owner started")
@@ -325,7 +339,16 @@ enum ForeignOwners {
     /// directory. Naming one of them would blame whichever happened to
     /// come first out of `read_dir`, an innocent project, for this
     /// project's own silence.
-    Unrelated(usize),
+    Unrelated {
+        /// How many unrelated owners answered among the candidates this
+        /// scan actually examined.
+        count: usize,
+        /// Whether the runtime location held more candidates than
+        /// [`MAX_FOREIGN_CANDIDATES`] allowed this scan to examine. When
+        /// true, "none relate to this project" is not something the scan
+        /// established for the candidates past its own limit.
+        truncated: bool,
+    },
     /// The scan itself could not run, so nothing above is known one way
     /// or the other. Distinct from `None`, which is an answer the scan
     /// actually earned; this is the scan reporting that it never got to
@@ -345,12 +368,26 @@ fn no_owner_line(foreign: ForeignOwners) -> String {
              (pid {pid}) instead",
             root.display()
         ),
-        ForeignOwners::Unrelated(1) => "server sees: no owner for this directory; 1 other \
-             mcpls instance is running, none for this directory or a parent of it"
+        ForeignOwners::Unrelated {
+            count: 1,
+            truncated: false,
+        } => "server sees: no owner for this directory; 1 other mcpls instance is \
+             running, none for this directory or a parent of it"
             .to_string(),
-        ForeignOwners::Unrelated(count) => format!(
+        ForeignOwners::Unrelated {
+            count,
+            truncated: false,
+        } => format!(
             "server sees: no owner for this directory; {count} other mcpls instances are \
              running, none for this directory or a parent of it"
+        ),
+        ForeignOwners::Unrelated {
+            count,
+            truncated: true,
+        } => format!(
+            "server sees: no owner for this directory; checked {count} other mcpls \
+             instances, none for this directory or a parent of it, but more may exist \
+             beyond the scan's limit"
         ),
         ForeignOwners::ScanFailed(reason) => format!(
             "server sees: no owner for this directory; could not scan for other mcpls \
@@ -382,6 +419,7 @@ async fn find_foreign_owner(
         Ok(candidates) => candidates,
         Err(error) => return ForeignOwners::ScanFailed(error.to_string()),
     };
+    let truncated = candidates.len() > MAX_FOREIGN_CANDIDATES;
     let mut unrelated = 0usize;
     for candidate in candidates.into_iter().take(MAX_FOREIGN_CANDIDATES) {
         let probe = SocketIdentity {
@@ -405,7 +443,10 @@ async fn find_foreign_owner(
     if unrelated == 0 {
         ForeignOwners::None
     } else {
-        ForeignOwners::Unrelated(unrelated)
+        ForeignOwners::Unrelated {
+            count: unrelated,
+            truncated,
+        }
     }
 }
 
@@ -636,6 +677,12 @@ mod tests {
         /// ignores an answer that says it is not the owner, the way a
         /// future forwarding proxy would.
         status_owner: bool,
+        /// Whether a connection is accepted and then held open without
+        /// ever being read or answered, standing in for a real owner that
+        /// is busy past the client's deadline. `false` by default; one
+        /// test sets it to prove the doctor tells this apart from nobody
+        /// being there at all.
+        silent: bool,
     }
 
     impl Default for OwnerBehavior {
@@ -648,6 +695,7 @@ mod tests {
                 status_root: PathBuf::new(),
                 status_hooks_seen: 0,
                 status_owner: true,
+                silent: false,
             }
         }
     }
@@ -840,6 +888,21 @@ mod tests {
             )
         }
 
+        /// An owner bound on `identity` that accepts a connection and then
+        /// never reads or answers it, standing in for a real owner too
+        /// busy to get back to the client within its deadline.
+        fn start_silent(identity: SocketIdentity) -> Self {
+            let dir = tempfile::tempdir().expect("a temp dir");
+            Self::start_on(
+                dir,
+                identity,
+                OwnerBehavior {
+                    silent: true,
+                    ..OwnerBehavior::default()
+                },
+            )
+        }
+
         /// The directory the dispatcher treats as `CLAUDE_PROJECT_DIR`.
         fn project_dir(&self) -> &Path {
             self.dir.path()
@@ -872,6 +935,15 @@ mod tests {
     ) where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
     {
+        if behavior.silent {
+            // Accepted, and then never read from or written to: a real
+            // connection with a real owner on the other end of it, who
+            // simply never gets back to the client. `stream` stays open
+            // for as long as this future is polled, which is exactly as
+            // long as the test that spawned it keeps its runtime alive.
+            std::future::pending::<()>().await;
+        }
+
         let (reader, mut writer) = tokio::io::split(stream);
         let mut lines = tokio::io::BufReader::new(reader).lines();
 
@@ -1470,6 +1542,22 @@ mod tests {
         super::doctor_scanning(project, &identity, TEST_PIPE_PREFIX).await
     }
 
+    /// Run the doctor for `project` against several real, unrelated
+    /// owners at once, none of which relate to `project`'s own
+    /// directory.
+    async fn doctor_with_unrelated_owners(project: &Path, others: &[&Path]) -> String {
+        let socket_dir = tempfile::tempdir().expect("a temp dir");
+        let identity = local_identity_for(project, socket_dir.path());
+        let _owners: Vec<_> = others
+            .iter()
+            .map(|other| {
+                let other_identity = local_identity_for(other, socket_dir.path());
+                RecordingOwner::start_reporting_status(other_identity, other, 0)
+            })
+            .collect();
+        super::doctor_scanning(project, &identity, TEST_PIPE_PREFIX).await
+    }
+
     /// Run the doctor for `project` where the only reachable socket
     /// answers `Status` with `owner: false`, as a forwarding proxy would.
     async fn doctor_with_non_owner(project: &Path, elsewhere: &Path) -> String {
@@ -1477,6 +1565,29 @@ mod tests {
         let identity = local_identity_for(project, socket_dir.path());
         let elsewhere_identity = local_identity_for(elsewhere, socket_dir.path());
         let _owner = RecordingOwner::start_reporting_non_owner(elsewhere_identity, elsewhere);
+        super::doctor_scanning(project, &identity, TEST_PIPE_PREFIX).await
+    }
+
+    /// Run the doctor for `project` against a real owner that accepts the
+    /// connection and then never answers, standing in for one busy past
+    /// the deadline.
+    async fn doctor_with_busy_owner(project: &Path) -> String {
+        let socket_dir = tempfile::tempdir().expect("a temp dir");
+        let identity = local_identity_for(project, socket_dir.path());
+        let _owner = RecordingOwner::start_silent(identity.clone());
+        super::doctor_scanning(project, &identity, TEST_PIPE_PREFIX).await
+    }
+
+    /// The same, with a second, real, related owner also present in the
+    /// same runtime directory: proves the foreign scan does not run at
+    /// all when this project's own socket is merely busy, rather than
+    /// running it and happening not to name the related owner.
+    async fn doctor_with_busy_owner_and_related_owner(project: &Path, related: &Path) -> String {
+        let socket_dir = tempfile::tempdir().expect("a temp dir");
+        let identity = local_identity_for(project, socket_dir.path());
+        let _busy = RecordingOwner::start_silent(identity.clone());
+        let related_identity = local_identity_for(related, socket_dir.path());
+        let _related = RecordingOwner::start_reporting_status(related_identity, related, 0);
         super::doctor_scanning(project, &identity, TEST_PIPE_PREFIX).await
     }
 
@@ -1535,10 +1646,13 @@ mod tests {
         assert!(
             out.contains(
                 "hooks seen: none since this owner started; send a prompt or \
-                 make an edit in this session, then run the doctor again"
+                 make an edit in your Claude Code session for this project, \
+                 then run the doctor again; if it is still none after that, \
+                 the plugin's hooks are not reaching this server"
             ),
-            "the doctor must still state the count as a fact and hand the \
-             reader the action that resolves the ambiguity: {out}"
+            "the doctor must still state the count as a fact, hand the \
+             reader the action that resolves the ambiguity, and say what a \
+             still-zero count after that action means: {out}"
         );
     }
 
@@ -1632,6 +1746,55 @@ mod tests {
         );
     }
 
+    /// The singular count had a test; the plural sentence did not, and
+    /// replacing it entirely leaves every other test green.
+    #[tokio::test]
+    async fn test_doctor_reports_a_plural_count_of_unrelated_owners() {
+        let project = tempfile::tempdir().expect("a temp dir");
+        let other_a = tempfile::tempdir().expect("a temp dir");
+        let other_b = tempfile::tempdir().expect("a temp dir");
+
+        let out =
+            doctor_with_unrelated_owners(project.path(), &[other_a.path(), other_b.path()]).await;
+
+        assert_eq!(
+            out.lines()
+                .find(|line| line.starts_with("server sees: "))
+                .expect("a server-sees line is always printed"),
+            "server sees: no owner for this directory; 2 other mcpls \
+             instances are running, none for this directory or a parent of it",
+            "{out}"
+        );
+    }
+
+    /// Past `MAX_FOREIGN_CANDIDATES`, the scan has not actually examined
+    /// every socket in the runtime location, so it must not claim none of
+    /// them relate to this project: that is a positive claim the
+    /// truncated scan never earned.
+    #[tokio::test]
+    async fn test_doctor_admits_the_scan_was_truncated_past_its_candidate_limit() {
+        let project = tempfile::tempdir().expect("a temp dir");
+        let others: Vec<_> = (0..=MAX_FOREIGN_CANDIDATES)
+            .map(|_| tempfile::tempdir().expect("a temp dir"))
+            .collect();
+        let other_paths: Vec<&Path> = others.iter().map(tempfile::TempDir::path).collect();
+
+        let out = doctor_with_unrelated_owners(project.path(), &other_paths).await;
+
+        assert_eq!(
+            out.lines()
+                .find(|line| line.starts_with("server sees: "))
+                .expect("a server-sees line is always printed"),
+            format!(
+                "server sees: no owner for this directory; checked {MAX_FOREIGN_CANDIDATES} \
+                 other mcpls instances, none for this directory or a parent of it, but more \
+                 may exist beyond the scan's limit"
+            ),
+            "with more candidates than the scan examines, it must not assert \
+             an absence it never established: {out}"
+        );
+    }
+
     /// A future forwarding proxy answers `Status` with `owner: false`; the
     /// scan must treat that exactly like no answer at all, not like an
     /// owner it can name.
@@ -1648,6 +1811,63 @@ mod tests {
                 .expect("a server-sees line is always printed"),
             "server sees: no owner; nothing is listening on this project's socket",
             "{out}"
+        );
+    }
+
+    /// A connection that was accepted and never answered means an owner
+    /// exists and is merely busy, which must read differently from
+    /// nobody being there at all: the reader's next step is "wait", not
+    /// "start the host" or "go debug some other directory". Drives a
+    /// real listener that really accepts the connection, not a mocked
+    /// error, since that is the exact distinction at stake.
+    #[tokio::test]
+    async fn test_doctor_reports_a_busy_owner_rather_than_no_owner() {
+        let project = tempfile::tempdir().expect("a temp dir");
+
+        let out = doctor_with_busy_owner(project.path()).await;
+
+        assert_eq!(
+            out.lines()
+                .find(|line| line.starts_with("server sees: "))
+                .expect("a server-sees line is always printed"),
+            format!(
+                "server sees: a socket answered nothing within {}ms; an owner may be busy",
+                SOCKET_TIMEOUT.as_millis()
+            ),
+            "{out}"
+        );
+        assert_eq!(
+            out.lines()
+                .find(|line| line.starts_with("owner pid: "))
+                .expect("an owner pid line is always printed"),
+            "owner pid: none",
+            "{out}"
+        );
+    }
+
+    /// A busy owner on this project's own socket must not trigger the
+    /// foreign-owner scan at all, even when a real, related owner exists
+    /// elsewhere: there is already an owner here, so there is nothing to
+    /// look for. If the scan ran anyway, this would show the related
+    /// owner's line instead of the busy line.
+    #[tokio::test]
+    async fn test_doctor_does_not_scan_for_a_foreign_owner_when_its_own_owner_is_busy() {
+        let project = tempfile::tempdir().expect("a temp dir");
+        let nested = project.path().join("nested");
+        std::fs::create_dir(&nested).expect("mkdir");
+
+        let out = doctor_with_busy_owner_and_related_owner(project.path(), &nested).await;
+
+        assert_eq!(
+            out.lines()
+                .find(|line| line.starts_with("server sees: "))
+                .expect("a server-sees line is always printed"),
+            format!(
+                "server sees: a socket answered nothing within {}ms; an owner may be busy",
+                SOCKET_TIMEOUT.as_millis()
+            ),
+            "a busy owner on this project's own socket must not be reported \
+             as no owner with some unrelated directory named as the cause: {out}"
         );
     }
 
