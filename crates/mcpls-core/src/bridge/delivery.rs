@@ -345,13 +345,12 @@ impl DiagnosticsDelivery {
                             budget = Some(remaining - visible.len());
                             Some(0)
                         }
-                        // Too big for a whole budget, so no later flush
-                        // does better and withholding it withholds it
-                        // forever. With nothing left to spend, the next
-                        // flush's fresh budget is the better offer.
-                        Some(remaining)
-                            if remaining > 0 && visible.len() > self.config.max_total =>
-                        {
+                        // The budget is untouched and this file still does
+                        // not fit it, so no later flush offers more of it
+                        // and withholding it withholds it forever.
+                        // Truncated to the whole budget is the best any
+                        // flush can do.
+                        Some(remaining) if remaining == self.config.max_total => {
                             let shortfall = visible.len() - remaining;
                             visible.truncate(remaining);
                             budget = Some(0);
@@ -1173,6 +1172,44 @@ mod tests {
         );
         assert_eq!(next.changed[0].diagnostics.len(), 1);
         assert_eq!(next.changed[0].omitted, 0);
+    }
+
+    #[test]
+    fn test_a_partly_spent_budget_defers_rather_than_truncating() {
+        let mut delivery = DiagnosticsDelivery::new(DiagnosticsConfig {
+            max_total: 2,
+            ..DiagnosticsConfig::default()
+        });
+        let session = SessionId::from("s".to_string());
+        let one = vec![diagnostic(0, DiagnosticSeverity::ERROR, "boom")];
+        let five: Vec<_> = (1..6)
+            .map(|i| diagnostic(i, DiagnosticSeverity::ERROR, "boom"))
+            .collect();
+
+        let first = delivery.flush(
+            &session,
+            &[
+                entry("a.rs", &one, SeverityFloor::Warning),
+                entry("b.rs", &five, SeverityFloor::Warning),
+            ],
+        );
+        assert_eq!(first.changed.len(), 1, "a.rs fits and is delivered");
+        assert_eq!(first.changed[0].key, "a.rs");
+        assert_eq!(
+            first.omitted, 1,
+            "a.rs spent one of the two, so what is left shows less of b.rs \
+             than a fresh budget would; b.rs waits rather than being cut to a \
+             fifth of itself and recorded as delivered"
+        );
+
+        let second = delivery.flush(&session, &[entry("b.rs", &five, SeverityFloor::Warning)]);
+        assert_eq!(second.changed.len(), 1);
+        assert_eq!(
+            second.changed[0].diagnostics.len(),
+            2,
+            "the whole budget is the most any flush can offer this file"
+        );
+        assert_eq!(second.changed[0].omitted, 3);
     }
 
     #[test]
