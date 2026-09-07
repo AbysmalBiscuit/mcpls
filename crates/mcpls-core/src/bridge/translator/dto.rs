@@ -78,6 +78,11 @@ pub struct Diagnostic {
     pub message: String,
     /// Optional diagnostic code.
     pub code: Option<String>,
+    /// The tool that produced this diagnostic (e.g. `"rustc"`,
+    /// `"rust-analyzer"`). This is how a caller tells a build error, which
+    /// requires a completed build, apart from an editor-model diagnostic,
+    /// which does not.
+    pub source: Option<String>,
 }
 
 /// Result of a diagnostics request.

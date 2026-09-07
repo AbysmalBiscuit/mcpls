@@ -69,6 +69,7 @@ pub(super) async fn diagnostic_to_mcp(
             lsp_types::NumberOrString::Number(n) => n.to_string(),
             lsp_types::NumberOrString::String(s) => s.clone(),
         }),
+        source: diag.source.clone(),
     }
 }
 
@@ -760,6 +761,7 @@ mod tests {
             severity: DiagnosticSeverity::Error,
             message: "mismatched types".to_string(),
             code: Some("E0308".to_string()),
+            source: None,
         };
         let pull = DiagnosticsResult {
             diagnostics: vec![pull_diag.clone()],
@@ -800,6 +802,7 @@ mod tests {
             severity: DiagnosticSeverity::Error,
             message: "syntax error".to_string(),
             code: None,
+            source: None,
         };
         let pull = DiagnosticsResult {
             diagnostics: vec![pull_diag.clone()],
@@ -873,6 +876,7 @@ mod tests {
             severity: DiagnosticSeverity::Error,
             message: "mismatched types".to_string(),
             code: None,
+            source: None,
         };
         let pull = DiagnosticsResult {
             diagnostics: vec![pull_diag],
@@ -921,6 +925,7 @@ mod tests {
             severity: DiagnosticSeverity::Error,
             message: "not all trait items implemented, missing: `fn hello`".to_string(),
             code: Some("E0046".to_string()),
+            source: None,
         };
         let pull = DiagnosticsResult {
             diagnostics: vec![pull_diag.clone()],
@@ -979,6 +984,7 @@ mod tests {
             severity: DiagnosticSeverity::Error,
             message: "mismatched types: expected `i32`, found `&str`".to_string(),
             code: Some("E0308".to_string()),
+            source: None,
         };
         let pull = DiagnosticsResult {
             diagnostics: vec![pull_diag.clone()],
