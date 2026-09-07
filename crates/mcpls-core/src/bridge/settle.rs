@@ -10,14 +10,33 @@
 //! see on their own: a notification dropped from a full channel before its
 //! pump existed. A server that reports no progress at all is not this case:
 //! restarting the deadline also stamps its first quiet moment, so it settles
-//! on the debounce like any other quiet workspace rather than waiting out
-//! the backstop.
+//! once its own grace has passed rather than waiting out the backstop. That
+//! grace is longer than `quiet_for`, deliberately: `quiet_for` bridges gaps
+//! between phases a server that is already talking has started, not the
+//! silence before a slower one has said anything at all.
 
 use std::collections::HashSet;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::config::ServerId;
+
+/// How long a server that has never reported any `$/progress` is given,
+/// once [`ServerSettle::restart_deadline`] runs, before its silence counts
+/// as having nothing to report.
+///
+/// Measured against this repository's own workspace (method and raw numbers
+/// in `docs/superpowers/notes/2026-09-07-stage-b-measurements.md`):
+/// rust-analyzer's first `$/progress` `begin` arrived 3.8-4.7 ms after
+/// `initialized`, across six samples split evenly between a workspace with
+/// no `target/` directory yet and one already built. Two seconds is roughly
+/// 500 times that observed latency -- room for scheduling and channel
+/// delays, a slower machine, and a larger workspace than this one -- while
+/// staying two orders of magnitude under the five-minute deadline, so a
+/// server that is merely slow to speak is not mistaken for one that never
+/// will, and a server that truly never reports anything still settles in
+/// about two seconds instead of waiting out the backstop.
+const NO_PROGRESS_GRACE: Duration = Duration::from_secs(2);
 
 /// Outstanding `$/progress` operations across every server.
 #[derive(Debug)]
@@ -69,18 +88,23 @@ impl ServerSettle {
     /// so unconditionally rather than on the arrival of server traffic: a
     /// server that never reports progress produces no event to hang this on.
     ///
-    /// This is also where such a server's quiet debounce gets its start:
-    /// nothing is outstanding yet at this point, so if nothing has been
-    /// stamped either, this counts as the first quiet moment. A server that
-    /// begins reporting progress afterwards clears the stamp the same way
-    /// any other `begin` does.
+    /// This is also where such a server's clock gets its start: nothing is
+    /// outstanding yet at this point, so if nothing has been stamped
+    /// either, this counts as its first quiet moment. Unlike a stamp from a
+    /// real `end`, [`Self::should_settle_at`] only trusts this one once
+    /// `NO_PROGRESS_GRACE` has passed rather than the shorter `quiet_for`,
+    /// so a server that has simply not spoken yet is not mistaken for one
+    /// that never will. A server that begins reporting progress before then
+    /// clears the stamp the same way any other `begin` does, and its later
+    /// `end` re-stamps under the ordinary debounce instead.
     pub fn restart_deadline(&self) {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
-        state.deadline = Instant::now() + self.deadline_after;
+        let now = Instant::now();
+        state.deadline = now + self.deadline_after;
         if state.outstanding.is_empty() && state.quiet_since.is_none() {
-            state.quiet_since = Some(Instant::now());
+            state.quiet_since = Some(now);
         }
     }
 
@@ -140,12 +164,16 @@ impl ServerSettle {
     ///
     /// Differs from [`Self::should_settle_at`] in two ways, both deliberate.
     /// There is no deadline: the footer carries its own, much shorter, cap.
-    /// And a workspace that has never reported any progress counts as
-    /// quiet, where the baseline's judgment waits for a first `end`. The
-    /// baseline can afford to wait because it has five minutes and one
-    /// chance to get the workspace's real state; a footer runs after its own
-    /// grace period on every write, and a configured server that reports no
-    /// `$/progress` would otherwise make every footer burn its whole cap.
+    /// And a workspace that has never reported any progress counts as quiet
+    /// immediately here, with no grace of its own -- unlike the baseline's
+    /// judgment, which waits out its own `NO_PROGRESS_GRACE` before reaching
+    /// the same conclusion. The baseline pays that grace once per session; a
+    /// footer runs on every write, after its own grace period has already
+    /// elapsed once, and cannot afford to wait again inside this check, or a
+    /// configured server that reports no `$/progress` would make every
+    /// footer burn its whole cap. Applying that grace before the first call
+    /// here is the caller's job -- this method enforces none of its own for
+    /// the never-reported case.
     #[must_use]
     pub fn is_quiet_at(&self, now: Instant, quiet_for: Duration) -> bool {
         let Ok(state) = self.state.lock() else {
@@ -158,6 +186,11 @@ impl ServerSettle {
     }
 
     /// Whether the workspace counts as analyzed as of `now`.
+    ///
+    /// A quiet stamp from a real `end` needs only `quiet_for` to elapse. One
+    /// from [`Self::restart_deadline`], on a server that has never begun any
+    /// work, needs `NO_PROGRESS_GRACE` instead -- see that constant's doc
+    /// for why.
     #[must_use]
     pub fn should_settle_at(&self, now: Instant) -> bool {
         let Ok(state) = self.state.lock() else {
@@ -166,10 +199,18 @@ impl ServerSettle {
         if now >= state.deadline {
             return true;
         }
-        state.outstanding.is_empty()
-            && state
-                .quiet_since
-                .is_some_and(|since| now.duration_since(since) >= self.quiet_for)
+        if !state.outstanding.is_empty() {
+            return false;
+        }
+        let Some(since) = state.quiet_since else {
+            return false;
+        };
+        let required = if state.epoch == 0 {
+            NO_PROGRESS_GRACE
+        } else {
+            self.quiet_for
+        };
+        now.duration_since(since) >= required
     }
 
     /// [`Self::should_settle_at`] as of now.
@@ -304,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn test_a_server_that_never_reports_progress_settles_on_the_deadline() {
+    fn test_a_tracker_whose_deadline_was_never_restarted_settles_only_at_the_deadline() {
         let settle = ServerSettle::new(Duration::from_secs(1), Duration::from_secs(60));
         assert!(!settle.should_settle_at(Instant::now() + Duration::from_secs(30)));
         assert!(
@@ -363,16 +404,66 @@ mod tests {
 
     #[test]
     fn test_restart_deadline_rescues_a_server_that_never_reports_progress() {
-        let quiet_for = Duration::from_millis(10);
-        let settle = ServerSettle::new(quiet_for, Duration::from_secs(600));
+        // A short `quiet_for` here, so that if a regression makes this
+        // settle via the ordinary debounce instead of `NO_PROGRESS_GRACE`,
+        // the first assertion below (querying well past `quiet_for` but
+        // still short of the grace) catches it rather than passing
+        // vacuously.
+        let settle = ServerSettle::new(Duration::from_millis(1), Duration::from_secs(600));
         settle.restart_deadline();
         let restarted = Instant::now();
 
         assert!(
-            settle.should_settle_at(restarted + quiet_for * 2),
-            "a server that never reports progress must settle on the quiet \
-             debounce once the servers are spawned, not wait for the \
-             five-minute backstop"
+            !settle.should_settle_at(restarted + NO_PROGRESS_GRACE / 2),
+            "a server that has not spoken yet gets the full no-progress \
+             grace before its silence counts as having nothing to report"
+        );
+        assert!(
+            settle.should_settle_at(restarted + NO_PROGRESS_GRACE),
+            "a server that never reports progress must settle on the \
+             no-progress grace once the servers are spawned, not wait for \
+             the five-minute backstop"
+        );
+    }
+
+    #[test]
+    fn test_a_begin_inside_the_grace_stops_the_no_progress_settlement() {
+        let settle = ServerSettle::new(Duration::from_secs(1), Duration::from_secs(600));
+        settle.restart_deadline();
+        let restarted = Instant::now();
+        settle.begin(&ServerId::from("rust"), &json!("rustAnalyzer/Fetching"));
+
+        assert!(
+            !settle.should_settle_at(restarted + NO_PROGRESS_GRACE * 2),
+            "a begin arriving inside the grace clears the provisional \
+             stamp; a server that spoke late must not be baselined empty \
+             just because the grace window would otherwise have elapsed"
+        );
+    }
+
+    #[test]
+    fn test_a_begin_before_the_grace_elapses_switches_to_the_normal_debounce() {
+        let quiet_for = Duration::from_millis(10);
+        let settle = ServerSettle::new(quiet_for, Duration::from_secs(600));
+        settle.restart_deadline();
+        let rust = ServerId::from("rust");
+
+        // A server that speaks up before the no-progress grace elapses is
+        // no longer judged by the grace at all from here on: it gets the
+        // ordinary, much shorter quiet debounce once its own work ends.
+        settle.begin(&rust, &json!("rustAnalyzer/Fetching"));
+        let end_at = Instant::now();
+        settle.end_at(&rust, &json!("rustAnalyzer/Fetching"), end_at);
+
+        assert!(
+            !settle.should_settle_at(end_at + quiet_for / 2),
+            "a real end still needs its own quiet debounce to elapse"
+        );
+        assert!(
+            settle.should_settle_at(end_at + quiet_for * 2),
+            "once real progress has begun and ended, the ordinary quiet \
+             debounce governs, not the no-progress grace -- this must \
+             settle well before the grace would elapse, not wait for it"
         );
     }
 

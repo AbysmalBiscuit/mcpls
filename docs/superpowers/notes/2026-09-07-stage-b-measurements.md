@@ -100,3 +100,38 @@ About 4.3 seconds for an edit in mcpls-core and about 0.3 seconds for one in mcp
 ### To re-measure
 
 Warm the target directory with one plain `cargo check --manifest-path /home/lev/Git/lev/mcpls-diag-bc/Cargo.toml --workspace --all-targets`, then repeat the touch-and-time loop. The numbers drift upward as the codebase grows, so re-run this rather than trusting the figures above whenever the footer cap is revisited.
+
+## rust-analyzer's first `$/progress` after `initialized`
+
+### Method
+
+A minimal Python probe (not in the tree; a socket wrapper around `subprocess`, LSP framing, and a reader thread) spawned a server over stdio, sent `initialize` with `window.workDoneProgress = true` and `general.positionEncodings = ["utf-16"]`, waited for the `initialize` response, sent `initialized`, and timestamped every inbound message relative to the moment `initialized` was sent. Requests from the server were answered with a `null` result so the server would not stall.
+
+Run against this repository's own workspace (`/home/lev/Git/lev/mcpls-diag-bc`, `rust-analyzer 1.98.1`), copied to a scratch directory (rsync, excluding `.git` and `target`) so the run could remove and rebuild `target/` without touching the checkout. "Cold" means the scratch copy's `target/` directory did not exist when rust-analyzer was spawned; "warm" means `cargo check --workspace --all-targets` had already populated it. Three samples of each, alternating: three cold runs (removing `target/` between each), then one `cargo check --workspace --all-targets` to build it, then three warm runs.
+
+The same probe was run for 20 seconds against pyrefly (`pyrefly lsp --indexing-mode lazy-blocking`) over the repository's own `crates/mcpls-core/tests/fixtures/python_workspace` fixture, with no document ever opened, to confirm it sends no `$/progress` at all -- the premise `NO_PROGRESS_GRACE` (`bridge/settle.rs`) exists for.
+
+### Raw observations
+
+rust-analyzer's first `$/progress` arrived as a `begin` with `title: "Fetching"`, before `window/workDoneProgress/create` had even completed, in effectively every run. Elapsed time from `initialized` to that `begin`, in milliseconds:
+
+| # | condition | elapsed (ms) |
+| --- | --- | --- |
+| 1 | cold (no `target/`) | 4.735 |
+| 2 | cold (no `target/`) | 4.059 |
+| 3 | cold (no `target/`) | 3.912 |
+| 4 | warm (`target/` built) | 3.862 |
+| 5 | warm (`target/` built) | 4.407 |
+| 6 | warm (`target/` built) | 3.777 |
+
+All six runs logged the identical four-event opening sequence: `window/workDoneProgress/create`, then two `$/progress` notifications at the same timestamp (the `begin` and, in the same batch, its "Fetching" partner event), then one more `$/progress` about 30 ms later. Cold and warm are indistinguishable at this timescale -- the `target/` directory's presence affects how long the *fetch itself* takes, not how quickly rust-analyzer announces that it is starting one.
+
+pyrefly sent exactly two messages in the 20-second window (`client/registerCapability`, `workspace/configuration`) and no `$/progress` at any point, confirming it never reports progress at all.
+
+### Conclusion
+
+rust-analyzer announces its first `$/progress` `begin` within about 5 ms of `initialized`, regardless of whether its build cache is warm, because the announcement is the start of the operation, not its completion. This is the basis for `NO_PROGRESS_GRACE` in `crates/mcpls-core/src/bridge/settle.rs`: two seconds, roughly 500 times the slowest sample observed here, chosen to absorb scheduling and channel latency, a slower machine, and a workspace larger than this one, while staying two orders of magnitude under the five-minute deadline backstop. pyrefly's continued silence over a 20-second window confirms the no-progress case this constant exists for is real and not an artifact of a short observation window.
+
+### To re-measure
+
+Rebuild the probe as described above, rsync the repository (excluding `.git` and `target`) to a scratch directory, and run it against `rust-analyzer` with no arguments, timing from the moment `initialized` is sent to the first `$/progress` notification. Take several samples with `target/` absent, then run `cargo check --workspace --all-targets` once and take several more with it present. Separately, run the same probe against `pyrefly lsp --indexing-mode lazy-blocking` over `crates/mcpls-core/tests/fixtures/python_workspace` for at least 20 seconds with no document opened, and confirm no `$/progress` arrives.
