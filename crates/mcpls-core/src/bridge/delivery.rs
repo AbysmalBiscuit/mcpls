@@ -203,14 +203,17 @@ impl DiagnosticsDelivery {
     /// and stage the record changes that report implies.
     ///
     /// The record does not move here. It moves in [`Self::commit`], once
-    /// the reader confirms it has the report, so a reader that gives up
-    /// on its deadline or dies before it prints leaves the record where
-    /// it was and the next `stage` offers the same report again. The
-    /// token is `None` when the report implies no record change, which
-    /// is also when there is nothing for a reader to acknowledge. A
-    /// stage replaces whatever the session had staged before: a report
-    /// nobody has confirmed is superseded by the newer one, and an
-    /// acknowledgement for the old one then commits nothing.
+    /// the reader confirms the answer carrying this report reached it, so
+    /// a reader that gives up on its deadline or dies before it reads the
+    /// answer leaves the record where it was and the next `stage` offers
+    /// the same report again. What comes back is a confirmation of the
+    /// answer and not of its files: a caller whose rendering of the report
+    /// drops a file still commits that file's hash. The token is `None`
+    /// when the report implies no record change, which is also when there
+    /// is nothing for a reader to acknowledge. A stage replaces whatever
+    /// the session had staged before: a report nobody has confirmed is
+    /// superseded by the newer one, and an acknowledgement for the old one
+    /// then commits nothing.
     ///
     /// A zero `max_per_file` or `max_total` means that cap is unlimited,
     /// matching `workspace.max_documents`/`max_file_size`'s convention:
@@ -578,6 +581,40 @@ mod tests {
             after_one.changed.len(),
             1,
             "and not the replaced report's hash"
+        );
+    }
+
+    #[test]
+    fn test_a_stage_with_nothing_to_report_drops_the_older_staged_report() {
+        let mut delivery = DiagnosticsDelivery::new(DiagnosticsConfig::default());
+        let session = SessionId::from("s".to_string());
+        let broken = vec![diagnostic(1, DiagnosticSeverity::ERROR, "boom")];
+
+        let (first, token) =
+            delivery.stage(&session, &[entry("a.rs", &broken, SeverityFloor::Warning)]);
+        assert_eq!(first.changed.len(), 1);
+
+        let (fixed, none) = delivery.stage(&session, &[entry("a.rs", &[], SeverityFloor::Warning)]);
+        assert!(
+            fixed.changed.is_empty() && fixed.cleared.is_empty(),
+            "the file broke and was fixed before the record ever took its \
+             hash, so there is nothing to report either way"
+        );
+        assert_eq!(none, None);
+
+        assert!(
+            !delivery.commit(&session, token.expect("token")),
+            "the report that token named is no longer the session's staged one"
+        );
+
+        let (again, _) =
+            delivery.stage(&session, &[entry("a.rs", &broken, SeverityFloor::Warning)]);
+        assert_eq!(
+            again.changed.len(),
+            1,
+            "committing the older report would have recorded a hash no reader \
+             was ever confirmed to have, and the next flush would then say the \
+             file is clean rather than broken"
         );
     }
 

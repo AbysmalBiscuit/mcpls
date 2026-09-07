@@ -776,6 +776,30 @@ mod tests {
         );
     }
 
+    /// `mcpls hook doctor` reads `hooks_seen` to tell a server nothing has
+    /// ever sent a hook to apart from one a host is really driving, so an
+    /// acknowledgement counted alongside its own flush would make every
+    /// install look twice as busy as it is.
+    #[tokio::test]
+    async fn test_an_acknowledgement_is_not_counted_as_a_hook_request() {
+        let harness = HookHarness::owner_with_one_error().await;
+        let answer = harness.flush_acknowledged("s1").await;
+        assert!(
+            matches!(answer, Response::Flush { token: Some(_), .. }),
+            "the flush has to carry a token, or no acknowledgement follows it \
+             and this proves nothing: {answer:?}"
+        );
+
+        let Response::Status { hooks_seen, .. } = harness.send(Request::Status).await else {
+            panic!("expected a status response");
+        };
+        assert_eq!(
+            hooks_seen, 1,
+            "one hook fired, and the flush and the acknowledgement it sent are \
+             its two halves"
+        );
+    }
+
     #[tokio::test]
     async fn test_an_unacknowledged_flush_is_offered_again() {
         let harness = HookHarness::owner_with_one_error().await;

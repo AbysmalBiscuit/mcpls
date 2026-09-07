@@ -489,9 +489,10 @@ fn overrun_message(request: &Request, op_deadline: Duration) -> String {
             "op exceeded {ms}ms; nothing confirmed this report was delivered, so the next \
              flush offers it again"
         ),
-        Request::Ack { .. } => {
-            format!("op exceeded {ms}ms; the record advances when the work finishes")
-        }
+        Request::Ack { .. } => format!(
+            "op exceeded {ms}ms; the record advances when the work finishes, unless a later \
+             flush replaced this report"
+        ),
         Request::EndSession { .. } => {
             format!("op exceeded {ms}ms; the session's record is dropped when the work finishes")
         }
@@ -546,12 +547,32 @@ pub async fn send_many(
 ) -> Result<Vec<Response>> {
     match tokio::time::timeout(timeout, send_many_inner(identity, requests)).await {
         Ok(result) => result,
-        Err(_elapsed) => Err(Error::Transport(format!(
-            "the hook socket did not answer within {}ms",
-            timeout.as_millis()
-        ))),
+        Err(_elapsed) => Err(timed_out(timeout)),
     }
 }
+
+/// What a caller is told when its own bound elapsed before the owner
+/// answered. One producer for [`send_many`] and [`send_and_acknowledge`],
+/// so the two cannot come to describe the same failure differently.
+fn timed_out(timeout: Duration) -> Error {
+    Error::Transport(format!(
+        "the hook socket did not answer within {}ms",
+        timeout.as_millis()
+    ))
+}
+
+/// How long an acknowledgement gets, measured from the moment the flush
+/// answer is in hand.
+///
+/// Its own allowance rather than what is left of the caller's, because an
+/// owner that answers a flush at its own deadline leaves a caller bound to
+/// the same number nothing to spend, and the two are configured
+/// independently and default to the same 1500 ms. A caller in that state
+/// would print a report the owner never commits, and be offered the same
+/// report on every flush after it. The exchange itself is one round trip
+/// on a connection that is already open, so this bounds a peer that has
+/// stopped answering rather than one that is merely slow.
+const ACK_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Send `requests` down one connection and, when the last flush among
 /// them was answered with a token, acknowledge it on that connection
@@ -561,8 +582,9 @@ pub async fn send_many(
 /// the time it is sent the caller's report is in hand, and an owner that
 /// never hears it offers the same report again next time; withholding the
 /// report over a failed acknowledgement would be the one outcome the
-/// acknowledgement exists to rule out. The acknowledgement shares the
-/// caller's deadline but not its error path.
+/// acknowledgement exists to rule out. The acknowledgement runs under
+/// [`ACK_TIMEOUT`], its own allowance, rather than under what `timeout`
+/// has left, and its outcome is discarded either way.
 ///
 /// It is sent before the caller prints, not after. The host reads a
 /// hook's output at the hook's exit and discards it if the hook is
@@ -581,23 +603,17 @@ pub async fn send_and_acknowledge(
     requests: &[Request],
     timeout: Duration,
 ) -> Result<Vec<Response>> {
-    let deadline = tokio::time::Instant::now() + timeout;
-    let exchanged = tokio::time::timeout_at(deadline, async {
+    let exchanged = tokio::time::timeout(timeout, async {
         let mut connection = Connection::open(identity).await?;
         let responses = connection.exchange(requests).await?;
         Ok::<_, Error>((connection, responses))
     })
     .await
-    .map_err(|_elapsed| {
-        Error::Transport(format!(
-            "the hook socket did not answer within {}ms",
-            timeout.as_millis()
-        ))
-    })?;
+    .map_err(|_elapsed| timed_out(timeout))?;
     let (mut connection, responses) = exchanged?;
 
     if let Some(ack) = acknowledgement_for(requests, &responses) {
-        match tokio::time::timeout_at(deadline, connection.exchange(&[ack])).await {
+        match tokio::time::timeout(ACK_TIMEOUT, connection.exchange(&[ack])).await {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => {
                 tracing::debug!(%error, "the flush acknowledgement was not answered; the owner offers the report again");
@@ -1096,13 +1112,14 @@ mod overrun_tests {
     }
 
     #[test]
-    fn test_an_ack_overrun_says_the_record_still_advances() {
+    fn test_an_ack_overrun_does_not_promise_an_advance_commit_may_refuse() {
         assert_eq!(
             message_for(&Request::Ack {
                 session: "s1".to_string(),
                 token: 7,
             }),
-            "op exceeded 1500ms; the record advances when the work finishes"
+            "op exceeded 1500ms; the record advances when the work finishes, unless a later \
+             flush replaced this report"
         );
     }
 
@@ -1119,6 +1136,73 @@ mod overrun_tests {
     #[test]
     fn test_a_status_overrun_promises_nothing_beyond_the_deadline() {
         assert_eq!(message_for(&Request::Status), "op exceeded 1500ms");
+    }
+}
+
+/// The rules [`send_and_acknowledge`] follows without a socket: which
+/// answer it acknowledges, and what it says when a caller's own bound
+/// elapsed. Both are reachable as plain functions, and both are things a
+/// caller acts on.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod client_rule_tests {
+    use super::*;
+
+    fn flush(session: &str) -> Request {
+        Request::Flush {
+            session: session.to_string(),
+        }
+    }
+
+    fn answered(token: Option<u64>) -> Response {
+        Response::Flush {
+            context: Some("2 errors in a.rs".to_string()),
+            token,
+        }
+    }
+
+    #[test]
+    fn test_the_acknowledgement_names_the_last_tokened_flush() {
+        let requests = [flush("s1"), flush("s2")];
+        let responses = [answered(Some(1)), answered(Some(2))];
+        assert_eq!(
+            acknowledgement_for(&requests, &responses),
+            Some(Request::Ack {
+                session: "s2".to_string(),
+                token: 2,
+            }),
+            "a connection carrying two flushes leaves the earlier report \
+             superseded by the later one, so acknowledging the earlier token \
+             would commit a report the owner has already replaced"
+        );
+    }
+
+    #[test]
+    fn test_a_later_tokenless_flush_leaves_the_earlier_one_acknowledged() {
+        let requests = [flush("s1"), flush("s2")];
+        let responses = [answered(Some(1)), answered(None)];
+        assert_eq!(
+            acknowledgement_for(&requests, &responses),
+            Some(Request::Ack {
+                session: "s1".to_string(),
+                token: 1,
+            }),
+            "an answer with no token implies no record change, so the last \
+             answer that does is the one still owed an acknowledgement"
+        );
+    }
+
+    #[test]
+    fn test_no_tokened_flush_means_no_acknowledgement() {
+        assert_eq!(acknowledgement_for(&[flush("s1")], &[answered(None)]), None);
+    }
+
+    #[test]
+    fn test_the_timeout_message_names_the_bound_that_elapsed() {
+        let Error::Transport(message) = timed_out(Duration::from_millis(1500)) else {
+            panic!("a client bound that elapsed is a transport failure");
+        };
+        assert_eq!(message, "the hook socket did not answer within 1500ms");
     }
 }
 

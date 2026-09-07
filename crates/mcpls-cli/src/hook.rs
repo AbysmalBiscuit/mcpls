@@ -27,9 +27,10 @@ const SOCKET_TIMEOUT: Duration = Duration::from_millis(50);
 /// tighter than the server's own deadline for finishing that work is never
 /// right, since it only cuts off answers from an owner that is going to
 /// reply anyway. A missing owner still fails fast, because the connect
-/// itself fails immediately rather than waiting out this bound. The
-/// acknowledgement that follows a flush answer shares this bound and never
-/// turns a report already in hand into an error.
+/// itself fails immediately rather than waiting out this bound. This bound
+/// covers the flush alone: an owner answering at its own deadline would
+/// leave nothing of it for the acknowledgement that follows, so that
+/// acknowledgement runs under an allowance of its own.
 const FLUSH_SOCKET_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// The hook payload Claude Code writes to stdin, keeping only the fields
@@ -1777,7 +1778,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_a_flush_with_nothing_to_report_is_not_acknowledged() {
+    async fn test_a_tokenless_flush_is_not_acknowledged() {
         let recorder = RecordingOwner::start_with_flush(None);
         let out = dispatch_against(
             &json!({ "hook_event_name": "UserPromptSubmit", "session_id": "s1" }),
