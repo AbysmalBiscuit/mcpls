@@ -643,7 +643,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         // arbitrary placeholder rather than paying for `current_dir()`.
         canonicalize_workspace_roots(&config.workspace.roots, Path::new(""))?
     };
-    let extension_map = config.build_effective_extension_map();
+    let extension_map = Arc::new(config.build_effective_extension_map());
     let max_depth = Some(config.workspace.heuristics_max_depth);
 
     // One registry for the process. The clients write it from their
@@ -677,10 +677,10 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     let translator = build_translator(
         &config,
         workspace_roots.clone(),
-        extension_map,
+        (*extension_map).clone(),
         router,
         Arc::clone(&notification_cache),
-        watch_registry,
+        Arc::clone(&watch_registry),
     );
 
     // Mark applicable servers as "expected" so a tool call that arrives while
@@ -728,6 +728,60 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         &config.lsp_servers,
     ));
 
+    // The hook socket is an optimization, not a requirement: a process that
+    // cannot derive its own identity still answers every MCP tool, so this
+    // must not turn an unreadable working directory into a startup failure
+    // (see #348, which is why the workspace roots above avoid `current_dir`
+    // when they can).
+    let hook_identity = if config.diagnostics.hooks.enabled {
+        match std::env::current_dir()
+            .map_err(Error::Io)
+            .and_then(|dir| hooks::identity_for(&dir))
+        {
+            Ok(identity) => Some(identity),
+            Err(error) => {
+                warn!(
+                    "hooks are configured on but this project's socket identity could not be \
+                     derived, so no socket is served: {error}"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Acquired before the context is built, so the role is known before the
+    // context is frozen into an `Arc`: a process that loses the lock is
+    // constructed passive and only ever moves to owner.
+    let ownership = match &hook_identity {
+        Some(identity) => hooks::HookListener::acquire(identity).await?,
+        None => None,
+    };
+    let role = match (&hook_identity, &ownership) {
+        (None, _) => hooks::HookRole::disabled(),
+        (Some(_), Some(_)) => hooks::HookRole::owner(),
+        (Some(identity), None) => hooks::HookRole::passive(identity.clone()),
+    };
+
+    // Built whether this process owns the socket or not. A passive
+    // instance's sweeper is idle until it takes over, and building it here
+    // means a takeover has nothing left to construct.
+    let sweeper = hook_identity.as_ref().map(|_| {
+        let sweeper = Arc::new(hooks::Sweeper::new(
+            Arc::clone(&translator),
+            hooks::PathFilter::new(
+                Arc::clone(&workspace_roots_snapshot),
+                Arc::clone(&extension_map),
+                Some(Arc::clone(&watch_registry)),
+            ),
+            Duration::from_millis(config.diagnostics.hooks.sweep_quiet_ms),
+            config.workspace.max_documents,
+        ));
+        tokio::spawn(Arc::clone(&sweeper).run(cancel_rx.clone()));
+        sweeper
+    });
+
     let pump_shared = PumpShared {
         notification_cache: Arc::clone(&notification_cache),
         subs: Arc::clone(&subscriptions),
@@ -762,7 +816,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     };
 
     info!("Starting MCP server with rmcp...");
-    let mcp_server = mcp::McplsServer::new(
+    let mut context = mcp::BridgeContext::new(
         Arc::clone(&translator),
         Arc::clone(&notification_cache),
         Arc::clone(&workspace_roots_snapshot),
@@ -773,6 +827,40 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         config.diagnostics,
         settle,
     );
+    context.hooks = Arc::new(role);
+    let context = Arc::new(context);
+    // `run_stdio` takes an `McplsServer` by value while the socket handler
+    // needs one it can keep. Both are built over the same
+    // `Arc<BridgeContext>`, which is where all the state lives, so they are
+    // the same server in every sense that matters.
+    let hook_server = Arc::new(mcp::McplsServer::from_context(Arc::clone(&context)));
+    let mcp_server = mcp::McplsServer::from_context(Arc::clone(&context));
+
+    if let (Some(identity), Some(sweeper)) = (hook_identity, sweeper) {
+        let op_deadline = Duration::from_millis(config.diagnostics.hooks.op_deadline_ms);
+        match ownership {
+            Some(listener) => {
+                tokio::spawn(hooks::hook_owner_task(
+                    listener,
+                    identity,
+                    Arc::clone(&hook_server),
+                    sweeper,
+                    op_deadline,
+                    cancel_rx.clone(),
+                ));
+            }
+            None => {
+                tokio::spawn(hooks::hook_takeover_task(
+                    identity,
+                    Arc::clone(&context.hooks),
+                    Arc::clone(&hook_server),
+                    sweeper,
+                    op_deadline,
+                    cancel_rx.clone(),
+                ));
+            }
+        }
+    }
     info!("MCPLS server initialized successfully");
 
     let result = match transport {

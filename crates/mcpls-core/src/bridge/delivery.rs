@@ -32,6 +32,27 @@ impl SessionId {
     pub fn process_default() -> Self {
         std::env::var("CLAUDE_CODE_SESSION_ID").map_or_else(|_| Self("local".to_string()), Self)
     }
+
+    /// The session id the host exported, or the per-process constant.
+    ///
+    /// Claude Code exports `CLAUDE_CODE_SESSION_ID` into the environment of
+    /// the stdio MCP servers it spawns, and the hook payload carries the
+    /// same value, so both doors key on one record. Where the variable is
+    /// absent, a per-process constant is correct: one process per client is
+    /// what stdio means.
+    #[must_use]
+    pub fn from_env_or_process() -> Self {
+        std::env::var("CLAUDE_CODE_SESSION_ID")
+            .ok()
+            .filter(|id| !id.is_empty())
+            .map_or_else(Self::process_default, Self::from)
+    }
+}
+
+impl std::fmt::Display for SessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 /// One file's current diagnostics, as the caller assembled them.
@@ -106,6 +127,12 @@ impl DiagnosticsDelivery {
     #[must_use]
     pub const fn has_baseline(&self) -> bool {
         self.baseline.is_some()
+    }
+
+    /// Drop `session`'s record, so a later flush for the same id starts
+    /// from the baseline again.
+    pub fn end_session(&mut self, session: &SessionId) {
+        self.sessions.remove(session);
     }
 
     /// Hash one file's visible diagnostics.

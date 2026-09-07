@@ -30,17 +30,26 @@ use super::tools::{
 };
 use crate::bridge::resources::{make_uri, parse_uri};
 use crate::bridge::{
-    Diagnostic, DiagnosticInfo, DiagnosticsDelivery, FileEntry, FloorTable, FlushReport,
-    NotificationCache, PositionEncoding, ResourceSubscriptions, ServerSettle, SessionId,
-    Translator, uri_to_path, validate_path_against_roots,
+    Diagnostic, DiagnosticInfo, DiagnosticSeverity, DiagnosticsDelivery, FileEntry, FloorTable,
+    FlushReport, NotificationCache, PositionEncoding, ResourceSubscriptions, ServerSettle,
+    SessionId, Translator, uri_to_path, validate_path_against_roots,
 };
 use crate::config::{DiagnosticsConfig, ServerId, ToolKind};
+use crate::hooks::{self, ChangeEvent, Role};
 
 /// MCP server that exposes LSP capabilities as tools.
 #[derive(Clone)]
 pub struct McplsServer {
     context: Arc<BridgeContext>,
 }
+
+/// How long a tool call waits on the hook socket before falling back to
+/// what this process can answer on its own.
+///
+/// A tool call must never stall behind a socket whose owner has gone: the
+/// connect and the answer together are bounded well below anything an agent
+/// would notice, and every failure is silent.
+const HOOK_FORWARD_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// The apply toggle a tool's writes answer to, for the tools that write.
 ///
@@ -173,17 +182,17 @@ fn build_resource_diagnostics_response(
 /// One file whose visible diagnostics changed since the caller's last
 /// `get_new_diagnostics` call.
 #[derive(Debug, Clone, serde::Serialize)]
-struct NewDiagnosticsFile {
+pub struct NewDiagnosticsFile {
     /// Path the caller can open, derived from the notification's URI.
-    file_path: String,
+    pub file_path: String,
     /// Diagnostics at or above the file's severity floor, capped.
-    diagnostics: Vec<Diagnostic>,
+    pub diagnostics: Vec<Diagnostic>,
     /// Admitted diagnostics the caps held back this call. The file is
     /// recorded as seen in full regardless, so these are not offered
     /// again: the count is what tells the agent to look at the file
     /// itself. The whole-flush `omitted` count on the response is the
     /// other thing -- those files a later call does offer again.
-    omitted: usize,
+    pub omitted: usize,
 }
 
 /// A tool result with the diagnostics that call produced appended.
@@ -197,14 +206,14 @@ struct WithDiagnostics<T> {
 
 /// Response shape for `get_new_diagnostics`.
 #[derive(Debug, Clone, serde::Serialize)]
-struct NewDiagnosticsResult {
+pub struct NewDiagnosticsResult {
     /// Files whose visible diagnostics differ from the caller's last call.
-    changed: Vec<NewDiagnosticsFile>,
+    pub changed: Vec<NewDiagnosticsFile>,
     /// Paths that had diagnostics before and have none now.
-    cleared: Vec<String>,
+    pub cleared: Vec<String>,
     /// Whole files the total budget could not fit this call. The caps held
     /// them back; the next call offers them again in full.
-    omitted: usize,
+    pub omitted: usize,
     /// An explanation the payload's other fields can't carry on their own:
     /// either that a real report isn't available yet (the language servers
     /// are still settling, so a caller shouldn't mistake "too early to
@@ -213,7 +222,7 @@ struct NewDiagnosticsResult {
     /// The two never overlap: the startup case returns before `omitted`
     /// could be anything but zero.
     #[serde(skip_serializing_if = "Option::is_none")]
-    note: Option<String>,
+    pub note: Option<String>,
 }
 
 impl NewDiagnosticsResult {
@@ -349,6 +358,51 @@ fn routable_entries_borrowed<'a>(
         .collect()
 }
 
+/// One flush rendered as the lines a hook prints, or `None` when the flush
+/// found nothing to say.
+///
+/// A hook's output is injected into the agent's context, so an empty report
+/// must produce no text at all rather than an empty structure the agent
+/// then has to interpret.
+fn render_for_hook(report: &NewDiagnosticsResult) -> Option<String> {
+    if report.changed.is_empty() && report.cleared.is_empty() && report.note.is_none() {
+        return None;
+    }
+    let mut lines: Vec<String> = Vec::new();
+    for file in &report.changed {
+        lines.push(format!("{}:", file.file_path));
+        for diagnostic in &file.diagnostics {
+            lines.push(format!(
+                "  {}:{} {} {}",
+                diagnostic.range.start.line,
+                diagnostic.range.start.character,
+                severity_label(&diagnostic.severity),
+                diagnostic.message
+            ));
+        }
+        if file.omitted > 0 {
+            lines.push(format!("  ({} more not shown)", file.omitted));
+        }
+    }
+    for path in &report.cleared {
+        lines.push(format!("{path}: no diagnostics"));
+    }
+    if let Some(note) = &report.note {
+        lines.push(note.clone());
+    }
+    Some(lines.join("\n"))
+}
+
+/// How one severity reads in a hook's plain-text output.
+const fn severity_label(severity: &DiagnosticSeverity) -> &'static str {
+    match severity {
+        DiagnosticSeverity::Error => "error",
+        DiagnosticSeverity::Warning => "warning",
+        DiagnosticSeverity::Information => "info",
+        DiagnosticSeverity::Hint => "hint",
+    }
+}
+
 /// What the payload build needs about one cached entry, after the cache
 /// guard is gone.
 ///
@@ -427,6 +481,16 @@ impl McplsServer {
             diagnostics,
             settle,
         ));
+        Self::from_context(context)
+    }
+
+    /// A server over an already-built context.
+    ///
+    /// `serve_with` decides this process's hook role before the context is
+    /// frozen into an `Arc`, and the socket handler needs a server sharing
+    /// that same context, so both are built from one `Arc<BridgeContext>`
+    /// rather than through [`Self::new`].
+    pub(crate) const fn from_context(context: Arc<BridgeContext>) -> Self {
         Self { context }
     }
 
@@ -605,6 +669,7 @@ impl McplsServer {
             Ok(result) => result,
             Err(err) => return Err(McpError::internal_error(err.to_string(), None)),
         };
+        self.forward_apply_targets(&result.files_written).await;
         let footer = self.footer_if_written(result.applied).await;
         to_tool_result(Ok(WithDiagnostics {
             result,
@@ -677,6 +742,9 @@ impl McplsServer {
             apply,
         }): Parameters<FormatDocumentParams>,
     ) -> Result<String, McpError> {
+        // `FormatDocumentResult` carries no file list: the only file a
+        // format writes is the document it formatted.
+        let formatted = file_path.clone();
         let result = match self
             .context
             .translator
@@ -686,6 +754,10 @@ impl McplsServer {
             Ok(result) => result,
             Err(err) => return Err(McpError::internal_error(err.to_string(), None)),
         };
+        if result.applied {
+            self.forward_apply_targets(std::slice::from_ref(&formatted))
+                .await;
+        }
         let footer = self.footer_if_written(result.applied).await;
         to_tool_result(Ok(WithDiagnostics {
             result,
@@ -800,6 +872,7 @@ impl McplsServer {
             Ok(result) => result,
             Err(err) => return Err(McpError::internal_error(err.to_string(), None)),
         };
+        self.forward_apply_targets(&result.files_written).await;
         let footer = self.footer_if_written(result.applied).await;
         to_tool_result(Ok(WithDiagnostics {
             result,
@@ -906,7 +979,23 @@ impl McplsServer {
             idempotent_hint = false
         )
     )]
-    async fn get_new_diagnostics(&self) -> Result<String, McpError> {
+    pub(crate) async fn get_new_diagnostics(&self) -> Result<String, McpError> {
+        // Ahead of the baseline check: a passive instance's own baseline
+        // says nothing about the record it is asking for, which lives in
+        // the owner. Falling through on a send failure answers from this
+        // process's own record, because a socket that has gone away is not
+        // a reason to answer nothing.
+        if let Role::Passive { identity } = self.context.hooks.get() {
+            let request = hooks::Request::Flush {
+                session: SessionId::from_env_or_process().to_string(),
+            };
+            if let Ok(hooks::Response::Flush { context }) =
+                hooks::send(&identity, &request, HOOK_FORWARD_TIMEOUT).await
+            {
+                return to_tool_result(Ok(context.unwrap_or_default()));
+            }
+        }
+
         let baselined = {
             let delivery = self.context.delivery.lock().await;
             delivery.has_baseline()
@@ -915,7 +1004,7 @@ impl McplsServer {
             return to_tool_result(Ok(NewDiagnosticsResult::starting_up()));
         }
 
-        let session = SessionId::process_default();
+        let session = SessionId::from_env_or_process();
 
         // `delivery` first, then the cache. The flush borrows its entries
         // straight out of the cache guard, so both are held together; taking
@@ -948,6 +1037,51 @@ impl McplsServer {
             (report, sources)
         };
         self.new_diagnostics_payload(&report, &sources).await
+    }
+
+    /// `session`'s flush, rendered as the text a hook prints, or `None`
+    /// when nothing changed.
+    ///
+    /// The same flush the tool runs, against the same record, so a hook and
+    /// an agent never see the same diagnostic twice. Silent before a
+    /// baseline exists for the same reason the footer is: `flush` seeds a
+    /// session's record from the baseline and `set_baseline` never rewrites
+    /// one that already exists, so flushing early would leave that session
+    /// permanently believing the workspace started clean.
+    pub(crate) async fn flush_for_hook(&self, session: &SessionId) -> Option<String> {
+        if !self.context.delivery.lock().await.has_baseline() {
+            return None;
+        }
+        render_for_hook(&self.flush_now(session).await)
+    }
+
+    /// Drop `session`'s delivery record.
+    pub(crate) async fn end_session(&self, session: &SessionId) {
+        self.context.delivery.lock().await.end_session(session);
+    }
+
+    /// Forward the paths an apply wrote to the socket's owner.
+    ///
+    /// A passive instance's language servers are warm but nobody is feeding
+    /// them, so a write made through this process would otherwise never
+    /// reach the servers the owner's flush reads. Silent on every failure,
+    /// for the same reason the hook is: a tool call must not fail because
+    /// the socket was unavailable.
+    pub(crate) async fn forward_apply_targets(&self, files_written: &[String]) {
+        let Role::Passive { identity } = self.context.hooks.get() else {
+            return;
+        };
+        if files_written.is_empty() {
+            return;
+        }
+        let request = hooks::Request::Changed {
+            session: SessionId::from_env_or_process().to_string(),
+            paths: files_written.iter().map(PathBuf::from).collect(),
+            event: ChangeEvent::Change,
+        };
+        if let Err(error) = hooks::send(&identity, &request, HOOK_FORWARD_TIMEOUT).await {
+            tracing::debug!(%error, "could not forward apply targets to the hook owner");
+        }
     }
 
     /// Build `get_new_diagnostics`'s payload from one flush's report.
@@ -1017,7 +1151,7 @@ impl McplsServer {
     ///
     /// One method rather than an `if` repeated at three call sites, so a
     /// fourth write tool cannot be added with the guard forgotten.
-    async fn footer_if_written(&self, applied: bool) -> Option<NewDiagnosticsResult> {
+    pub(crate) async fn footer_if_written(&self, applied: bool) -> Option<NewDiagnosticsResult> {
         if !applied {
             return None;
         }
@@ -1035,7 +1169,15 @@ impl McplsServer {
     /// grace included — by `footer_wait_ms`; the real worst case for one
     /// call is that value plus at most one 50 ms sampling tick, never the
     /// grace and the cap stacked on top of each other.
-    async fn footer_for_write(&self) -> Option<NewDiagnosticsResult> {
+    pub(crate) async fn footer_for_write(&self) -> Option<NewDiagnosticsResult> {
+        // Ahead of the config check, so enabling the footer in a passive
+        // instance's config still produces nothing: this footer would
+        // consume from this process's own record while the next flush reads
+        // the owner's, delivering the same diagnostics twice from one door
+        // and never from the other.
+        if matches!(self.context.hooks.get(), Role::Passive { .. }) {
+            return None;
+        }
         if !self.context.diagnostics.footer {
             return None;
         }
@@ -1055,7 +1197,7 @@ impl McplsServer {
         )
         .await;
 
-        let session = SessionId::process_default();
+        let session = SessionId::from_env_or_process();
         let mut report = self.flush_now(&session).await;
         report.note = Some(report.note.take().map_or_else(
             || {
