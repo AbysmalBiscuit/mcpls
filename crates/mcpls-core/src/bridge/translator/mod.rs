@@ -163,6 +163,23 @@ impl Drop for PendingDrain<'_> {
     }
 }
 
+/// What [`Translator::resync_one_document`] accomplished for one path, and
+/// what [`Translator::resync_changed_documents`] should do next because of
+/// it.
+enum ResyncStep {
+    /// Fully resynchronized, or gone, or not tracked: leave the queue.
+    Done,
+    /// The stat or the read of this path itself failed. That says nothing
+    /// about any other path, so the drain leaves this one queued and moves
+    /// on to the next.
+    ReadFailed,
+    /// A notify failed on this path's connection to a server. Every other
+    /// path still queued for that same server is behind the same broken
+    /// connection, so the drain stops here instead of failing through the
+    /// rest of the queue one path at a time.
+    NotifyFailed,
+}
+
 /// Upper bound on how long [`Translator::shutdown_servers`] waits for a
 /// single LSP server's graceful `shutdown`/`exit` handshake before giving up
 /// and letting `kill_on_drop` terminate it instead.
@@ -336,32 +353,54 @@ impl Translator {
             queue: &self.pending_invalidations,
             remaining: self.pending_invalidations.take(),
         };
-        while let Some(path) = drain.remaining.first().cloned() {
-            if self.resync_one_document(&path).await {
-                drain.remaining.remove(0);
-            } else {
-                // Leave it queued and stop: a server that rejected one
-                // notification will reject the next, and the paths behind
-                // this one are still owed their own drain.
-                break;
+        let mut index = 0;
+        while index < drain.remaining.len() {
+            let path = drain.remaining[index].clone();
+            match self.resync_one_document(&path).await {
+                ResyncStep::Done => {
+                    drain.remaining.remove(index);
+                }
+                // A bad stat or a bad read of this path says nothing about
+                // any other, so it stays queued for a later drain and this
+                // one moves on rather than blocking behind it forever.
+                ResyncStep::ReadFailed => index += 1,
+                // A rejected notification came back over this path's own
+                // connection, which every path still queued for the same
+                // server would hit too, so stop rather than spend the rest
+                // of the drain on failures just as certain.
+                ResyncStep::NotifyFailed => break,
             }
         }
     }
 
-    /// Resynchronize one path. Returns whether it is finished and can leave
-    /// the queue.
+    /// Resynchronize one path.
     ///
     /// `_path_guard` is held for the whole call, across every notify below,
     /// deliberately: dropping it early would let a concurrent `ensure_open`
     /// commit a version this resync has already decided against, leaving
     /// the tracker unable to tell a server it still needs the resync.
     #[allow(clippy::significant_drop_tightening, clippy::used_underscore_binding)]
-    async fn resync_one_document(&self, path: &Path) -> bool {
+    async fn resync_one_document(&self, path: &Path) -> ResyncStep {
         let _path_guard = self.document_tracker.lock_path(path).await;
 
-        if !path.exists() {
-            self.close_one_document_locked(path).await;
-            return true;
+        match path.try_exists() {
+            Ok(false) => {
+                self.close_one_document_locked(path).await;
+                return ResyncStep::Done;
+            }
+            Ok(true) => {}
+            Err(error) => {
+                // A stat error (e.g. a parent directory gone briefly, or a
+                // permission problem) is not proof the file is gone: treat
+                // it the same as a failed read rather than closing a
+                // document whose file may still be sitting right there.
+                tracing::warn!(
+                    path = %path.display(),
+                    %error,
+                    "could not stat an applied file; leaving it queued"
+                );
+                return ResyncStep::ReadFailed;
+            }
         }
 
         let resync = match self
@@ -370,14 +409,14 @@ impl Translator {
             .await
         {
             Ok(Some(resync)) => resync,
-            Ok(None) => return true,
+            Ok(None) => return ResyncStep::Done,
             Err(error) => {
                 tracing::warn!(
                     path = %path.display(),
                     %error,
                     "could not re-read an applied file; leaving it queued"
                 );
-                return false;
+                return ResyncStep::ReadFailed;
             }
         };
 
@@ -399,7 +438,7 @@ impl Translator {
             };
             if let Err(error) = client.notify("textDocument/didChange", params).await {
                 tracing::warn!(%server, path = %path.display(), %error, "resync didChange failed");
-                return false;
+                return ResyncStep::NotifyFailed;
             }
             self.document_tracker
                 .mark_change_sent(path, server, resync.version, generation);
@@ -418,13 +457,13 @@ impl Translator {
             };
             if let Err(error) = client.notify("textDocument/didSave", params).await {
                 tracing::warn!(%server, path = %path.display(), %error, "resync didSave failed");
-                return false;
+                return ResyncStep::NotifyFailed;
             }
             self.document_tracker
                 .mark_save_sent(path, server, resync.version, generation);
         }
 
-        true
+        ResyncStep::Done
     }
 
     /// Forget one path and tell every server holding it open, closing it.
@@ -1014,29 +1053,150 @@ mod tests {
         assert!(harness.notifications_for("rust").is_empty());
     }
 
+    /// A drain cancelled between its `didChange` and its `didSave` leaves
+    /// the tracker with the change marked sent and the save still owed.
+    ///
+    /// Genuine mid-call cancellation cannot be induced from outside: a
+    /// `notify` call's success means only that its message was enqueued,
+    /// the two enqueues here are separated by nothing but synchronous
+    /// bookkeeping (`mark_change_sent`, `generation_for`), and observing
+    /// the first frame on the wire is itself a cross-thread round trip that
+    /// always loses that race -- confirmed empirically: spawning the exact
+    /// two-notify shape and aborting on the first frame's arrival stopped
+    /// the second notify zero times out of twenty. So this constructs the
+    /// exact post-cancellation tracker state directly, through the same
+    /// `resync_from_disk`/`mark_change_sent` calls `resync_one_document`
+    /// itself would have made, and proves that state actually needs both
+    /// before relying on it.
     #[tokio::test]
     async fn test_a_second_drain_sends_the_save_a_cancellation_lost() {
         let harness = TranslatorHarness::with_one_server("rust").await;
         let path = harness.write_file("a.rs", "fn a() {}");
         harness.open(&path, "rust").await;
         harness.rewrite_file(&path, "fn a() -> i32 { }");
+
+        let server_id = ServerId::from("rust");
+        let tracker = harness.translator.document_tracker();
+        let guard = tracker.lock_path(&path).await;
+        let resync = tracker
+            .resync_from_disk(&path, &guard)
+            .await
+            .expect("resync_from_disk reads the rewritten file")
+            .expect("the path is tracked");
+        assert_eq!(
+            resync.needs_change,
+            vec![server_id.clone()],
+            "the premise of this test is that a change is owed before setup runs"
+        );
+        assert_eq!(
+            resync.needs_save,
+            vec![server_id.clone()],
+            "and that a save is too, or marking only the change proves nothing"
+        );
+        tracker.mark_change_sent(
+            &path,
+            &server_id,
+            resync.version,
+            tracker.generation_for(&server_id),
+        );
+        drop(guard);
+
         harness.queue_invalidation(&path);
-
-        // Drop the drain future after its didChange and before its didSave, the
-        // way a cancelled tool call would.
-        harness.fail_notifications_after("rust", 1);
-        harness.translator.resync_changed_documents().await;
-        harness.clear_notifications();
-        harness.allow_notifications("rust");
-
         harness.translator.resync_changed_documents().await;
 
-        assert!(
-            harness
-                .notifications_for("rust")
-                .contains(&"textDocument/didSave".to_string()),
+        assert_eq!(
+            harness.notifications_for("rust"),
+            vec!["textDocument/didSave".to_string()],
             "the content now matches disk, so a comparison alone would call this \
              finished and the file would never be checked"
+        );
+    }
+
+    /// A path whose disk read fails (here, by growing past the configured
+    /// size limit) says nothing about any other path. It must not stall
+    /// the drain: the healthy path behind it still gets resynchronized,
+    /// and the failing path alone stays queued for a later attempt.
+    #[tokio::test]
+    async fn test_a_read_failure_leaves_only_that_path_queued_behind_it() {
+        let limits = ResourceLimits {
+            max_documents: 0,
+            max_file_size: 16,
+        };
+        let harness = TranslatorHarness::with_one_server_and_limits("rust", limits).await;
+
+        let big = harness.write_file("big.rs", "fn a() {}");
+        let small = harness.write_file("small.rs", "fn b() {}");
+        harness.open(&big, "rust").await;
+        harness.open(&small, "rust").await;
+
+        harness.rewrite_file(&big, "fn a_but_now_far_too_long_to_fit_the_limit() {}");
+        harness.rewrite_file(&small, "fn c() {}");
+        harness.queue_invalidation(&big);
+        harness.queue_invalidation(&small);
+
+        harness.translator.resync_changed_documents().await;
+
+        assert_eq!(
+            harness.notifications_for("rust"),
+            vec![
+                "textDocument/didChange".to_string(),
+                "textDocument/didSave".to_string(),
+            ],
+            "the failing path must not block the healthy one queued behind it"
+        );
+        assert_eq!(
+            harness.translator.pending_invalidations.take(),
+            vec![big],
+            "only the path whose own read failed stays queued"
+        );
+    }
+
+    /// `Path::exists()` reports `false` for any stat error, not only
+    /// absence -- an inaccessible parent directory looks identical to a
+    /// deleted file. Closing the document on that basis would drop a
+    /// document whose file never moved. Unix-only: the permission trick
+    /// this drives has no Windows equivalent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_a_stat_error_leaves_the_document_tracked_and_queued() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let harness = TranslatorHarness::with_one_server("rust").await;
+        let path = harness.write_file("a.rs", "fn a() {}");
+        harness.open(&path, "rust").await;
+        harness.queue_invalidation(&path);
+
+        let dir = path.parent().expect("a.rs has a parent").to_path_buf();
+        let original_mode = std::fs::metadata(&dir)
+            .expect("stat the directory")
+            .permissions()
+            .mode();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000))
+            .expect("lock the directory down");
+
+        harness.translator.resync_changed_documents().await;
+
+        // Restore access before any assertion can panic and skip this,
+        // leaving the harness's own `TempDir` unable to clean itself up.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(original_mode))
+            .expect("restore the directory's permissions");
+
+        assert!(
+            harness.notifications_for("rust").is_empty(),
+            "a stat error must not close the document or notify anyone"
+        );
+        assert_eq!(
+            harness.translator.pending_invalidations.take(),
+            vec![path.clone()],
+            "the path stays queued for a later attempt, not treated as gone"
+        );
+        assert!(
+            harness
+                .translator
+                .document_tracker()
+                .snapshot(&path)
+                .is_some(),
+            "a stat error is not proof the file is gone; the document stays tracked"
         );
     }
 }
