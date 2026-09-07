@@ -268,13 +268,16 @@ impl HookListener {
     /// exponentially between [`Self::ACCEPT_BACKOFF_FLOOR`] and
     /// [`Self::ACCEPT_BACKOFF_CEILING`] rather than retrying immediately,
     /// so it cannot spin a core or flood the log while the condition
-    /// lasts. It never gives up and returns early: this socket is
-    /// best-effort infrastructure whose every failure mode downstream
-    /// already degrades to "no diagnostics this turn" rather than an
-    /// error a caller must handle, so exiting the accept loop over a
-    /// transient condition would trade a recoverable, momentary
+    /// lasts, and warns once per run of failures rather than on every one
+    /// of them. It otherwise never gives up and returns early: this
+    /// socket is best-effort infrastructure whose every failure mode
+    /// downstream already degrades to "no diagnostics this turn" rather
+    /// than an error a caller must handle, so exiting the accept loop
+    /// over a transient condition would trade a recoverable, momentary
     /// degradation for a permanent one lasting the rest of the process's
-    /// life.
+    /// life. The one exception is a poisoned Windows pipe-transport lock,
+    /// which cannot recover by retrying at all: that stands down rather
+    /// than retrying forever into a condition that can never clear.
     ///
     /// On Unix, also stands down if [`Self::still_owns_lock`] reports the
     /// lock file no longer names the inode this listener holds: something
@@ -292,6 +295,7 @@ impl HookListener {
     {
         let handler = Arc::new(handler);
         let mut accept_backoff = Self::ACCEPT_BACKOFF_FLOOR;
+        let mut consecutive_accept_errors: u32 = 0;
         // Unconditionally constructed so its type does not depend on
         // platform, and gated off on Windows (where there is no lock file
         // to lose) with the `if` precondition below rather than `cfg`.
@@ -324,11 +328,31 @@ impl HookListener {
                     match accepted {
                         Ok(stream) => {
                             accept_backoff = Self::ACCEPT_BACKOFF_FLOOR;
+                            consecutive_accept_errors = 0;
                             let handler = Arc::clone(&handler);
                             tokio::spawn(serve_connection(stream, handler, op_deadline));
                         }
                         Err(e) => {
-                            tracing::warn!("hook socket accept failed: {e}");
+                            #[cfg(windows)]
+                            if is_pipe_transport_poisoned(&e) {
+                                tracing::warn!(
+                                    "hook socket accept failed permanently and will not \
+                                     recover by retrying, giving up: {e}"
+                                );
+                                return;
+                            }
+
+                            consecutive_accept_errors += 1;
+                            if consecutive_accept_errors == 1
+                                || consecutive_accept_errors.is_multiple_of(100)
+                            {
+                                tracing::warn!(
+                                    "hook socket accept failed ({consecutive_accept_errors} \
+                                     in a row): {e}"
+                                );
+                            } else {
+                                tracing::debug!("hook socket accept failed: {e}");
+                            }
                             tokio::select! {
                                 () = tokio::time::sleep(accept_backoff) => {}
                                 result = cancel.changed() => {
@@ -507,6 +531,31 @@ impl HookTransport for UnixTransport {
     }
 }
 
+/// Marks the one `accept` error [`HookListener::serve`] cannot recover
+/// from by retrying: a poisoned [`std::sync::Mutex`] never un-poisons, so
+/// a [`PipeTransport`] whose `next` mutex is poisoned would otherwise
+/// return this on every future `accept` forever.
+#[cfg(windows)]
+#[derive(Debug)]
+struct PipeTransportPoisoned;
+
+#[cfg(windows)]
+impl std::fmt::Display for PipeTransportPoisoned {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "hook pipe transport lock poisoned")
+    }
+}
+
+#[cfg(windows)]
+impl std::error::Error for PipeTransportPoisoned {}
+
+#[cfg(windows)]
+fn is_pipe_transport_poisoned(e: &io::Error) -> bool {
+    e.get_ref()
+        .and_then(|inner| inner.downcast_ref::<PipeTransportPoisoned>())
+        .is_some()
+}
+
 /// The first pipe instance is created during [`HookListener::acquire`], to
 /// prove exclusivity. `accept` never lets the instance count reach zero:
 /// it creates the replacement *before* touching `next`, so if that create
@@ -556,7 +605,7 @@ impl HookTransport for PipeTransport {
                 let mut next = self
                     .next
                     .lock()
-                    .map_err(|_| io::Error::other("hook pipe transport lock poisoned"))?;
+                    .map_err(|_| io::Error::other(PipeTransportPoisoned))?;
                 let server = next.take();
                 *next = Some(replacement);
                 server
