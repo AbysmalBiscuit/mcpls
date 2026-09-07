@@ -582,12 +582,13 @@ pub async fn probe(
     };
     match tokio::time::timeout_at(deadline, answer_one(stream, request)).await {
         Ok(Ok(response)) => ProbeOutcome::Answered(response),
-        // The connection was already accepted and something came back
-        // before the deadline, so this is not a busy owner: the reply
-        // itself could not be read, most plausibly because a different
-        // mcpls version is on the other end. `Err(_)` here is a
-        // deserialize or framing failure, never a timeout: the exchange
-        // is not itself time-bounded, only the outer `timeout_at` is.
+        // The connection was already accepted and the exchange then
+        // failed, so this is not a busy owner. `Err(_)` here is a write
+        // failure, a read failure, a peer that hung up without sending
+        // anything, or a reply that would not parse; it is never a
+        // timeout, because the exchange is not itself time-bounded and
+        // only the outer `timeout_at` is. Which of the four it was lives
+        // in the error, not in this variant.
         Ok(Err(error)) => ProbeOutcome::Unintelligible(error),
         // Nothing usable arrived before the deadline at all: the
         // connection was accepted but the owner never got back to us.

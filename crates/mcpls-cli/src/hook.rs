@@ -375,6 +375,18 @@ enum ForeignOwners {
     Related {
         root: PathBuf,
         pid: u32,
+        /// How many further owners answered whose root also relates to
+        /// the project directory. The name above is whichever of them the
+        /// scan reached first in its sorted order, and a count here is
+        /// what tells a reader it was one of several rather than the only
+        /// candidate.
+        others: usize,
+        /// Whether the runtime location held more candidates than
+        /// [`MAX_FOREIGN_CANDIDATES`] allowed this scan to examine. The
+        /// named owner is evidence truncation cannot falsify, but the
+        /// counts printed beside it are bounded by the cap exactly as
+        /// every other variant's are.
+        truncated: bool,
         /// How many candidates were live but unidentifiable, counted the
         /// same way as [`ForeignOwners::None::unidentified`]. Naming an
         /// owner does not end the scan, so this is the same total the
@@ -421,6 +433,21 @@ impl ForeignOwners {
             Self::ScanFailed(_) => 0,
         }
     }
+
+    /// Whether the runtime location held more candidates than the scan
+    /// was allowed to examine.
+    ///
+    /// The cap bounds the scan itself rather than any one of its
+    /// outcomes, so every variant the scan actually ran carries it.
+    /// `ScanFailed` never got as far as listing the candidates.
+    const fn truncated(&self) -> bool {
+        match self {
+            Self::None { truncated, .. }
+            | Self::Unrelated { truncated, .. }
+            | Self::Related { truncated, .. } => *truncated,
+            Self::ScanFailed(_) => false,
+        }
+    }
 }
 
 /// The `server sees` line to print when nothing answers this project's own
@@ -430,8 +457,14 @@ impl ForeignOwners {
 /// clause rather than folded into the counts above it. They are evidence
 /// that something is running, but not evidence of whose it is, and the
 /// lines above only ever count owners that named their own root.
+///
+/// The candidate cap bounds the whole scan rather than any one of its
+/// outcomes, so the clause disclosing it is appended last, to every
+/// variant the scan ran. A count printed without it reads as a total
+/// when it is a floor.
 fn no_owner_line(foreign: ForeignOwners) -> String {
     let unidentified = foreign.unidentified();
+    let truncated = foreign.truncated();
     let line = match foreign {
         ForeignOwners::None {
             truncated: false, ..
@@ -440,43 +473,37 @@ fn no_owner_line(foreign: ForeignOwners) -> String {
             truncated: true, ..
         } => format!(
             "server sees: no owner; checked {MAX_FOREIGN_CANDIDATES} other candidates and \
-             none named an owner, but more may exist beyond the scan's limit"
+             none named an owner"
         ),
-        ForeignOwners::Related { root, pid, .. } => format!(
-            "server sees: no owner for this directory; an mcpls is running for {} \
-             (pid {pid}) instead",
-            root.display()
-        ),
-        ForeignOwners::Unrelated {
-            count: 1,
-            truncated: false,
-            ..
-        } => "server sees: no owner for this directory; 1 other mcpls instance is \
+        ForeignOwners::Related {
+            root, pid, others, ..
+        } => {
+            let named = format!(
+                "server sees: no owner for this directory; an mcpls is running for {} \
+                 (pid {pid}) instead",
+                root.display()
+            );
+            match others {
+                0 => named,
+                1 => format!("{named}; 1 other mcpls instance also relates to this directory"),
+                n => format!("{named}; {n} other mcpls instances also relate to this directory"),
+            }
+        }
+        ForeignOwners::Unrelated { count: 1, .. } => {
+            "server sees: no owner for this directory; 1 other mcpls instance is \
              running, none for this directory or a parent of it"
-            .to_string(),
-        ForeignOwners::Unrelated {
-            count,
-            truncated: false,
-            ..
-        } => format!(
+                .to_string()
+        }
+        ForeignOwners::Unrelated { count, .. } => format!(
             "server sees: no owner for this directory; {count} other mcpls instances are \
              running, none for this directory or a parent of it"
-        ),
-        ForeignOwners::Unrelated {
-            count,
-            truncated: true,
-            ..
-        } => format!(
-            "server sees: no owner for this directory; {count} other mcpls instances are \
-             running, none for this directory or a parent of it, but more may exist \
-             beyond the scan's limit"
         ),
         ForeignOwners::ScanFailed(reason) => format!(
             "server sees: no owner for this directory; could not scan for other mcpls \
              instances: {reason}"
         ),
     };
-    match unidentified {
+    let line = match unidentified {
         0 => line,
         n => {
             let subject = if n == 1 {
@@ -489,6 +516,11 @@ fn no_owner_line(foreign: ForeignOwners) -> String {
                  build could read"
             )
         }
+    };
+    if truncated {
+        format!("{line}; more may exist beyond the scan's limit")
+    } else {
+        line
     }
 }
 
@@ -498,10 +530,12 @@ fn no_owner_line(foreign: ForeignOwners) -> String {
 /// "something is running, for a directory that explains this one's
 /// silence".
 ///
-/// Candidates are probed in sorted order, and the candidate cap applies
-/// to that order rather than to whatever the runtime location happened to
-/// list. Two runs against an unchanged machine therefore print the same
-/// answer, including which owner gets named when more than one relates.
+/// Candidates are probed in sorted order, so the set the cap applies to
+/// is the same on every run against an unchanged runtime location rather
+/// than whatever that location happened to list first. Which of those
+/// candidates answer inside the probe deadline is a property of the
+/// machine at the moment of the run, so the answer itself can still move
+/// between runs even when the candidates do not.
 ///
 /// Sockets are named by their own directory's hash, which is the entire
 /// reason `identity`'s own probe above can never observe a live owner
@@ -530,6 +564,7 @@ async fn find_foreign_owner(
     // order the runtime directory happened to list its entries in. The
     // candidate cap is what bounds the wait.
     let mut related = Option::<(PathBuf, u32)>::None;
+    let mut related_count = 0usize;
     for socket in candidates.into_iter().take(MAX_FOREIGN_CANDIDATES) {
         let candidate = SocketIdentity {
             socket,
@@ -544,6 +579,7 @@ async fn find_foreign_owner(
                 ..
             }) => {
                 if root.starts_with(project_dir) || project_dir.starts_with(&root) {
+                    related_count += 1;
                     related.get_or_insert((root, pid));
                 } else {
                     unrelated += 1;
@@ -566,6 +602,8 @@ async fn find_foreign_owner(
         ForeignOwners::Related {
             root,
             pid,
+            others: related_count - 1,
+            truncated,
             unidentified,
         }
     } else if unrelated == 0 {
@@ -652,17 +690,11 @@ pub fn doctor_without_identity(project_dir: &Path, error: &mcpls_core::Error) ->
         format!("hook sees: {} -> unknown", project_dir.display()),
         "server sees: nothing can run here; no socket exists to probe".to_string(),
         "owner pid: none".to_string(),
-        mcpls_on_path().map_or_else(
-            || "mcpls on PATH: not found".to_string(),
-            |path| format!("mcpls on PATH: {}", path.display()),
-        ),
+        on_path_line(mcpls_on_path().as_deref()),
     ];
     lines.join("\n")
 }
 
-/// The absolute path to an executable named `mcpls` (`mcpls.exe` on
-/// Windows) on the first `PATH` entry that has one, or `None`.
-///
 /// What an owner prints for its pid when it exists but did not say which
 /// process it is. Distinct from `none`, which the doctor prints only when
 /// nothing holds the socket at all: the two send a reader to different
@@ -682,6 +714,9 @@ fn on_path_line(found: Option<&Path>) -> String {
     )
 }
 
+/// The absolute path to an executable named `mcpls` (`mcpls.exe` on
+/// Windows) on the first `PATH` entry that has one, or `None`.
+///
 /// Hooks invoke `mcpls` by name off `PATH` rather than by an absolute
 /// path, so a hook environment missing the install directory makes every
 /// hook do nothing, invisibly. Walking `PATH` by hand rather than
@@ -2131,6 +2166,86 @@ mod tests {
         );
     }
 
+    /// The scan now runs to the cap rather than stopping at the first
+    /// related answer, so a second related owner is a fact it holds. The
+    /// name it prints is whichever sorted first, and reporting only that
+    /// one presents a pick as the sole candidate.
+    #[tokio::test]
+    async fn test_doctor_says_a_named_owner_was_one_of_several_related_ones() {
+        let parent = tempfile::tempdir().expect("a temp dir");
+        let child = parent.path().join("child");
+        let project = child.join("grandchild");
+        std::fs::create_dir_all(&project).expect("create the project directory");
+
+        let socket_dir = tempfile::tempdir().expect("a temp dir");
+        let identity = local_identity_for(&project, socket_dir.path());
+        let first = SocketIdentity {
+            socket: socket_dir.path().join("aaa-first.sock"),
+            ..local_identity_for(parent.path(), socket_dir.path())
+        };
+        let second = SocketIdentity {
+            socket: socket_dir.path().join("bbb-second.sock"),
+            ..local_identity_for(&child, socket_dir.path())
+        };
+        let _first = RecordingOwner::start_reporting_status(first, parent.path(), 0);
+        let _second = RecordingOwner::start_reporting_status(second, &child, 0);
+
+        let out = super::doctor_scanning(&project, &identity, TEST_PIPE_PREFIX).await;
+
+        let server_sees = out
+            .lines()
+            .find(|line| line.starts_with("server sees: "))
+            .expect("a server-sees line is always printed");
+        assert_eq!(
+            server_sees,
+            format!(
+                "server sees: no owner for this directory; an mcpls is running for {} \
+                 (pid {}) instead; 1 other mcpls instance also relates to this directory",
+                parent.path().display(),
+                std::process::id()
+            ),
+            "the scan saw two owners that could explain this directory's \
+             silence and named one of them: {out}"
+        );
+    }
+
+    /// The counts printed beside a named owner are bounded by the same
+    /// candidate cap as every other variant's, so the same disclosure
+    /// belongs on this line. Without it one clause reads as a total here
+    /// and as a floor two variants over, from identical evidence.
+    #[tokio::test]
+    async fn test_doctor_admits_a_truncated_scan_even_when_it_names_an_owner() {
+        let parent = tempfile::tempdir().expect("a temp dir");
+        let project = parent.path().join("child");
+        std::fs::create_dir_all(&project).expect("create the project directory");
+
+        let socket_dir = tempfile::tempdir().expect("a temp dir");
+        let identity = local_identity_for(&project, socket_dir.path());
+        let related = SocketIdentity {
+            socket: socket_dir.path().join("aaa-related.sock"),
+            ..local_identity_for(parent.path(), socket_dir.path())
+        };
+        let _related = RecordingOwner::start_reporting_status(related, parent.path(), 0);
+        // Sorted after the related owner, so the cap cuts these rather
+        // than the answer the line is built from.
+        for i in 0..MAX_FOREIGN_CANDIDATES + 4 {
+            std::fs::write(socket_dir.path().join(format!("zzz-stale-{i}.sock")), b"")
+                .expect("write");
+        }
+
+        let out = super::doctor_scanning(&project, &identity, TEST_PIPE_PREFIX).await;
+
+        let server_sees = out
+            .lines()
+            .find(|line| line.starts_with("server sees: "))
+            .expect("a server-sees line is always printed");
+        assert!(
+            server_sees.ends_with("; more may exist beyond the scan's limit"),
+            "the cap bounds this scan as much as any other, and the line \
+             must say so wherever it applies: {out}"
+        );
+    }
+
     /// `none` is the doctor's token for nothing holding the socket. Every
     /// arm reached by an accepted connection has an owner that simply did
     /// not name its process, which sends a reader somewhere else entirely.
@@ -2234,9 +2349,9 @@ mod tests {
     }
 
     /// An owner that answers this project's own socket with a valid
-    /// response of the wrong kind is neither unreachable nor unreadable,
-    /// and the line saying so was the one user-visible string the
-    /// deletion sweep could remove without failing a test.
+    /// response of the wrong kind is neither unreachable nor unreadable.
+    /// The answer itself is the whole diagnostic value of the line, so it
+    /// is asserted alongside the prose rather than left removable.
     #[tokio::test]
     async fn test_doctor_reports_an_answer_that_is_not_a_status() {
         let project = tempfile::tempdir().expect("a temp dir");
@@ -2256,6 +2371,12 @@ mod tests {
             "an owner that answered the wrong response is a different \
              fact from one that could not be read and one that said \
              nothing: {out}"
+        );
+        assert!(
+            server_sees.contains("queued: 0"),
+            "the response the owner actually sent is what makes this line \
+             worth reading; without it the reader learns only that \
+             something unexpected happened: {out}"
         );
     }
 
@@ -2301,7 +2422,7 @@ mod tests {
             format!(
                 "server sees: no owner for this directory; {MAX_FOREIGN_CANDIDATES} \
                  other mcpls instances are running, none for this directory or a parent \
-                 of it, but more may exist beyond the scan's limit"
+                 of it; more may exist beyond the scan's limit"
             ),
             "with more candidates than the scan examines, it must not assert \
              an absence it never established; and the count is how many \
@@ -2333,7 +2454,7 @@ mod tests {
                 .expect("a server-sees line is always printed"),
             format!(
                 "server sees: no owner; checked {MAX_FOREIGN_CANDIDATES} other candidates \
-                 and none named an owner, but more may exist beyond the scan's limit"
+                 and none named an owner; more may exist beyond the scan's limit"
             ),
             "with more stale candidates than the scan examines, it must not \
              claim the clean 'nothing is listening' it never established: {out}"
@@ -2470,6 +2591,13 @@ mod tests {
              holds the socket; naming one of them as the cause states \
              what the probe did not establish: {out}"
         );
+        assert!(
+            server_sees.contains("missing field"),
+            "the error is the only thing on this line that tells a write \
+             failure from a read failure from a hang-up from a parse \
+             failure, which is the whole reason the prose is allowed to \
+             stay silent about which one it was: {out}"
+        );
     }
 
     /// A directory the scan cannot read (permissions, most plausibly) is
@@ -2517,6 +2645,12 @@ mod tests {
             !server_sees.contains("nothing is listening"),
             "'I could not look' and 'I looked and found nothing' are \
              different facts: {out}"
+        );
+        assert!(
+            server_sees.contains("Permission denied"),
+            "the reason is why this state is distinguishable from a clean \
+             negative at all; a bare 'could not scan' leaves the reader \
+             with nothing to act on: {out}"
         );
     }
 
@@ -2573,6 +2707,31 @@ mod tests {
     /// must fail this without depending on the ambient `PATH`, which is
     /// why the entry here is built from the real current directory
     /// instead of assumed to already be relative.
+    /// A file named `mcpls` that nobody can execute is not an mcpls a
+    /// hook can invoke, and reporting it as one sends a reader looking
+    /// for a broken hook wiring that is really a broken install. Unix
+    /// only: Windows decides executability by extension, which the
+    /// filename already carries.
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_on_path_skips_a_file_without_the_executable_bit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let exe_path = dir.path().join("mcpls");
+        std::fs::write(&exe_path, "").expect("write");
+        std::fs::set_permissions(&exe_path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        let path_var = std::env::join_paths([dir.path()]).expect("join paths");
+
+        assert_eq!(
+            super::resolve_on_path(&path_var, "mcpls"),
+            None,
+            "a non-executable file by the right name is not something a \
+             hook can run"
+        );
+    }
+
     #[test]
     fn test_resolve_on_path_absolutizes_a_relative_path_entry() {
         let dir = tempfile::tempdir().expect("a temp dir");
