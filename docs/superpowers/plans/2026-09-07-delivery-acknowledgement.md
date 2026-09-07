@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Stop a hook flush from marking diagnostics delivered before the hook has them, so a hook that gives up on its deadline or is killed before it prints costs the agent a repeat rather than a permanent, silent loss.
+**Goal:** Stop a hook flush from marking diagnostics delivered before the hook has them, so a hook that gives up on its deadline, or dies before the answer is in its hands, costs the agent a repeat rather than a permanent, silent loss.
 
 **Architecture:** `DiagnosticsDelivery::flush` splits into `stage`, which computes the report and parks the record changes it implies under a token, and `commit`, which applies them when that token comes back. The hook socket's `flush` answer carries the token; the hook sends an `ack` on the same connection once the answer is in hand; only that `ack` commits. The MCP tool and the footer keep advancing immediately, because their transport is the session's own and losing it ends the session. The owner never waits for an acknowledgement: a staged report nobody acknowledges is simply replaced by the session's next `stage`, which diffs against the committed record and so offers it again.
 
@@ -77,7 +77,7 @@ Each case names the record the reader ends up with, the worst thing the agent se
 
 6. **`end_session` between stage and ack.** `end_session` drops the record and the pending. The ack finds nothing and returns `false`. The session is over; there is no reader to lose anything. Pinned by `test_ending_a_session_drops_its_staged_report` (delivery.rs).
 
-7. **The ack is written but its answer is not read before the client deadline.** `send_and_acknowledge` wraps only the connect and the flush exchange in the deadline-gated region that can return `Err`. The ack exchange runs after the answers are in hand, under the same deadline but with its outcome discarded. So a deadline landing between the ack write and the ack read leaves the owner committed and the hook printing: exactly once. A deadline landing before the ack write leaves the owner uncommitted and the hook printing: a repeat next time. Pinned by `test_a_refused_acknowledgement_still_injects_the_context` (hook.rs), which has the owner hang up after the flush answer.
+7. **The ack is written but its answer is not read before the client deadline.** `send_and_acknowledge` wraps only the connect and the flush exchange in the deadline-gated region that can return `Err`. The ack exchange runs after the answers are in hand, under an allowance of its own (`ACK_TIMEOUT`) rather than what is left of the caller's, and with its outcome discarded. So a deadline landing between the ack write and the ack read leaves the owner committed and the hook printing: exactly once. A deadline landing before the ack write leaves the owner uncommitted and the hook printing: a repeat next time. Pinned by `test_a_refused_acknowledgement_still_injects_the_context` (hook.rs), which has the owner hang up after the flush answer.
 
 8. **A stage that finds nothing to report while an older pending exists.** The cache moved back to match the record (a file broke and was fixed before anyone saw it). `stage` removes the older pending and returns no token. A late ack for the older report writes nothing. Without the removal the late ack would record the broken hash and the next flush would print a spurious "no diagnostics" line. Not a loss either way; the removal avoids the noise. Pinned by `test_a_stage_with_nothing_to_report_drops_the_older_staged_report` (delivery.rs), which commits the older token after the empty stage and proves the record still reports the file. The `token == None` assertion in `test_a_staged_report_is_offered_again_until_it_is_acknowledged` does not pin it: a successful commit has already emptied `pending` by the time that assertion runs, so the removal is a no-op there.
 
@@ -243,7 +243,7 @@ Replace the struct at `crates/mcpls-core/src/bridge/delivery.rs:106-112` with:
 
 ```rust
 /// The record changes one staged report implies, held back until the
-/// reader confirms the report reached it.
+/// reader confirms the answer carrying that report reached it.
 #[derive(Debug)]
 struct PendingFlush {
     token: u64,
@@ -275,9 +275,13 @@ Replace `flush` (`:183-281`) with three methods. `diff` is the existing pass wit
     /// and stage the record changes that report implies.
     ///
     /// The record does not move here. It moves in [`Self::commit`], once
-    /// the reader confirms it has the report, so a reader that gives up
-    /// on its deadline or dies before it prints leaves the record where
-    /// it was and the next `stage` offers the same report again. The
+    /// the reader confirms the answer carrying this report reached it,
+    /// so a reader that gives up before that answer is in hand, or dies
+    /// holding it without confirming, leaves the record where it was and
+    /// the next `stage` offers the same report again. What comes back is
+    /// a confirmation of the answer and not of its files: a caller whose
+    /// rendering of the report drops a file still commits that file's
+    /// hash. The
     /// token is `None` when the report implies no record change, which
     /// is also when there is nothing for a reader to acknowledge. A
     /// stage replaces whatever the session had staged before: a report
@@ -1701,7 +1705,7 @@ Replace the `PostToolBatch` and `UserPromptSubmit` arms (`:131-168`):
         }
 ```
 
-Update the doc comment on `FLUSH_SOCKET_TIMEOUT` (`:24-31`) so its last sentence reads: "A missing owner still fails fast, because the connect itself fails immediately rather than waiting out this bound. The acknowledgement that follows a flush answer shares this bound and never turns a report already in hand into an error."
+Update the doc comment on `FLUSH_SOCKET_TIMEOUT` (`:24-31`) so its last sentence reads: "A missing owner still fails fast, because the connect itself fails immediately rather than waiting out this bound." Say that this bound covers the flush alone, and that the acknowledgement following it draws on `ACK_TIMEOUT` instead, because an owner answering at its own deadline would otherwise leave the acknowledgement nothing to spend.
 
 - [ ] **Step 4: run the client tests and watch them pass**
 
@@ -1718,7 +1722,7 @@ In `docs/superpowers/specs/2026-09-06-diagnostics-injection-design.md`, under `#
 
 In the paragraph that follows, replace the sentence `` `flush` drains the delivery record and does not resync. `` with:
 
-> `flush` stages the session's report and answers it with a token; the record advances only when an `ack` carrying that token arrives, which the hook sends on the same connection once the answer is in hand. A report nobody acknowledges is offered again by the next `flush`, so a hook that gives up on its deadline, or is killed before it prints, costs a repeat rather than a loss. An answer with nothing to commit carries no token and gets no `ack`. The MCP tool and the footer advance the record in the flush itself: their transport is the session's own, and losing it ends the session. `flush` does not resync.
+> `flush` stages the session's report and answers it with a token; the record advances only when an `ack` carrying that token arrives, which the hook sends on the same connection once the answer is in hand. A report nobody acknowledges is offered again by the next `flush`, so a hook that gives up on its deadline, or dies before the answer is in its hands, costs a repeat rather than a loss. One window stays open: a hook killed after its `ack` has left and before it exits loses that report, because the host discards a killed hook's output whenever it was written, which is also why sending the `ack` after the print would not close it. An answer with nothing to commit carries no token and gets no `ack`. The MCP tool and the footer advance the record in the flush itself: their transport is the session's own, and losing it ends the session. `flush` does not resync.
 
 Then, still in the same section, the sentence beginning "Work already started keeps running after the deadline answers; what it produces reaches the next flush." is true for `changed` and, with the staged record, for `flush`; leave it.
 
@@ -1766,6 +1770,8 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01PZTxadnYDr7Eh3XuzZzc9y
 EOF
 ```
+
+Two claims in that message were narrowed after it was written, and an executor should write the narrower ones. "The record only ever takes a hash some reader confirmed having in hand" is a confirmation of the answer rather than of its files: a caller whose rendering drops a file still commits that file's hash, which `stage`'s doc and the invariant above now say. And the acknowledgement does not cover a hook killed between the `ack` leaving it and the process exiting, which the amended spec paragraph names as the residual window.
 
 ---
 

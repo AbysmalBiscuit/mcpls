@@ -105,7 +105,7 @@ pub struct FlushReport {
 }
 
 /// The record changes one staged report implies, held back until the
-/// reader confirms the report reached it.
+/// reader confirms the answer carrying that report reached it.
 #[derive(Debug)]
 struct PendingFlush {
     token: u64,
@@ -204,9 +204,9 @@ impl DiagnosticsDelivery {
     ///
     /// The record does not move here. It moves in [`Self::commit`], once
     /// the reader confirms the answer carrying this report reached it, so
-    /// a reader that gives up on its deadline or dies before it reads the
-    /// answer leaves the record where it was and the next `stage` offers
-    /// the same report again. What comes back is a confirmation of the
+    /// a reader that gives up before that answer is in hand, or dies
+    /// holding it without confirming, leaves the record where it was and
+    /// the next `stage` offers the same report again. What comes back is a confirmation of the
     /// answer and not of its files: a caller whose rendering of the report
     /// drops a file still commits that file's hash. The token is `None`
     /// when the report implies no record change, which is also when there
