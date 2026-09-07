@@ -93,8 +93,10 @@ pub fn identity_for(dir: &Path) -> Result<SocketIdentity> {
         // then answer user B's `get_new_diagnostics` from user A's
         // delivery record. The user goes into the name for the same reason
         // the Unix runtime directory carries it. This keeps two users'
-        // sessions apart; what stops one user reaching the other's pipe at
-        // all is that pipe's own access control, not its name.
+        // sessions apart wherever the environment names them, and falls back
+        // to the bare hash where it names nobody; what stops one user
+        // reaching the other's pipe at all is that pipe's own access
+        // control, not its name.
         let user = current_user().map_or_else(String::new, |user| format!("{user}-"));
         Ok(SocketIdentity {
             socket: PathBuf::from(format!(r"\\.\pipe\{WINDOWS_PIPE_PREFIX}{user}{hash}")),
