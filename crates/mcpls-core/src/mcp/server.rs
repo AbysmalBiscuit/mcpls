@@ -3,9 +3,11 @@
 //! This module provides the MCP server that exposes LSP capabilities
 //! as MCP tools using the rmcp SDK.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use lsp_types::Uri;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -222,25 +224,66 @@ impl NewDiagnosticsResult {
     }
 }
 
-/// Build the `FileEntry` list a `get_new_diagnostics` flush should see from
-/// a diagnostics snapshot.
+/// Build the `FileEntry` list a flush should see, borrowing straight out of
+/// a held cache guard rather than a cloned snapshot.
 ///
 /// Excludes any entry whose URI `uri_to_path` can't map to a filesystem
 /// path *before* `flush` ever runs, rather than dropping it from the
 /// payload afterward: `flush` records a hash for every entry it is given,
 /// so a post-hoc drop would still mark the file delivered -- permanently
 /// hiding diagnostics that were in fact never shown to anyone.
-fn routable_entries<'a>(
-    snapshot: &'a [(String, DiagnosticInfo, ServerId)],
+fn routable_entries_borrowed<'a>(
+    cache: &'a NotificationCache,
     floors: &FloorTable,
 ) -> Vec<FileEntry<'a>> {
-    snapshot
-        .iter()
+    cache
+        .diagnostics_entries()
+        .into_iter()
         .filter(|(_, info, _)| uri_to_path(&info.uri).is_some())
         .map(|(key, info, owner)| FileEntry {
             key,
             diagnostics: &info.diagnostics,
             floor: floors.for_server(owner),
+        })
+        .collect()
+}
+
+/// What the payload build needs about one cached entry, after the cache
+/// guard is gone.
+///
+/// Carries `version` as well as the URI and the owner, because
+/// `new_diagnostics_payload` rebuilds a `DiagnosticInfo` from these three
+/// before handing it to `Translator::diagnostics_from_cache_entry`. A pair
+/// of URI and owner alone would silently change what the converter sees.
+#[derive(Debug, Clone)]
+struct DiagnosticSource {
+    uri: Uri,
+    version: Option<i32>,
+    owner: ServerId,
+}
+
+/// The URI, version and owning server of every key a report names, cloned
+/// so the payload can be built after both guards are released.
+fn source_map(
+    cache: &NotificationCache,
+    report: &FlushReport,
+) -> HashMap<String, DiagnosticSource> {
+    report
+        .changed
+        .iter()
+        .map(|file| file.key.as_str())
+        .chain(report.cleared.iter().map(String::as_str))
+        .filter_map(|key| {
+            let info = cache.get_diagnostics(key)?;
+            let owner = cache.diagnostics_owner(key)?;
+            Some((
+                key.to_string(),
+                DiagnosticSource {
+                    uri: info.uri.clone(),
+                    version: info.version,
+                    owner: owner.clone(),
+                },
+            ))
         })
         .collect()
 }
@@ -743,19 +786,37 @@ impl McplsServer {
         }
 
         let session = SessionId::process_default();
-        let snapshot = {
-            let cache = self.context.notification_cache.lock().await;
-            cache.diagnostics_snapshot()
-        };
 
-        let entries = routable_entries(&snapshot, &self.context.floors);
+        // `delivery` first, then the cache. The flush borrows its entries
+        // straight out of the cache guard, so both are held together; taking
+        // them in this order everywhere is what keeps that from deadlocking.
+        // Neither guard outlives this block: `new_diagnostics_payload` awaits
+        // per changed file, and holding the cache lock across those awaits
+        // would block the diagnostics pump, which loses publishes rather than
+        // waiting for them.
+        to_tool_result(Ok(self.flush_now(&session).await))
+    }
 
-        let report = {
+    /// Flush `session`'s record and render it.
+    ///
+    /// The caller checks `has_baseline()` first. Both the tool and the
+    /// footer must, because `flush` seeds a session's record from the
+    /// baseline and `set_baseline` never rewrites one that already exists.
+    // `delivery`'s guard outlives its own last use (the `flush` call) so
+    // that it is still held once `notification_cache`'s guard is taken,
+    // which is what keeps every site honoring the delivery-before-cache
+    // order rather than each choosing its own.
+    #[allow(clippy::significant_drop_tightening)]
+    async fn flush_now(&self, session: &SessionId) -> NewDiagnosticsResult {
+        let (report, sources) = {
             let mut delivery = self.context.delivery.lock().await;
-            delivery.flush(&session, &entries)
+            let cache = self.context.notification_cache.lock().await;
+            let entries = routable_entries_borrowed(&cache, &self.context.floors);
+            let report = delivery.flush(session, &entries);
+            let sources = source_map(&cache, &report);
+            (report, sources)
         };
-
-        to_tool_result(Ok(self.new_diagnostics_payload(&report, &snapshot).await))
+        self.new_diagnostics_payload(&report, &sources).await
     }
 
     /// Build `get_new_diagnostics`'s payload from one flush's report.
@@ -767,23 +828,22 @@ impl McplsServer {
     async fn new_diagnostics_payload(
         &self,
         report: &FlushReport,
-        snapshot: &[(String, DiagnosticInfo, ServerId)],
+        sources: &HashMap<String, DiagnosticSource>,
     ) -> NewDiagnosticsResult {
         let mut changed = Vec::with_capacity(report.changed.len());
         for file in &report.changed {
-            let Some((_, info, owner)) = snapshot.iter().find(|(key, _, _)| *key == file.key)
-            else {
+            let Some(source) = sources.get(&file.key) else {
                 continue;
             };
             // Drop an entry whose URI does not map to a path rather than
             // showing the agent a URI it cannot open.
-            let Some(path) = uri_to_path(&info.uri) else {
+            let Some(path) = uri_to_path(&source.uri) else {
                 continue;
             };
-            let encoding = self.context.translator.position_encoding_for(owner);
+            let encoding = self.context.translator.position_encoding_for(&source.owner);
             let entry = DiagnosticInfo {
-                uri: info.uri.clone(),
-                version: info.version,
+                uri: source.uri.clone(),
+                version: source.version,
                 diagnostics: file.diagnostics.clone(),
             };
             let converted = Translator::diagnostics_from_cache_entry(
@@ -802,8 +862,8 @@ impl McplsServer {
         let cleared = report
             .cleared
             .iter()
-            .filter_map(|key| snapshot.iter().find(|(k, _, _)| k == key))
-            .filter_map(|(_, info, _)| uri_to_path(&info.uri))
+            .filter_map(|key| sources.get(key))
+            .filter_map(|source| uri_to_path(&source.uri))
             .map(|path| path.display().to_string())
             .collect();
 
@@ -1180,7 +1240,7 @@ impl ServerHandler for McplsServer {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -1193,6 +1253,76 @@ mod tests {
             Arc::new(Mutex::new(DiagnosticsDelivery::new(config))),
             Arc::new(FloorTable::new(&config, &[])),
         )
+    }
+
+    /// An `McplsServer` together with the `Arc`s it shares, so a test can
+    /// reach the same cache and the same delivery record the server sees.
+    ///
+    /// `McplsServer::new` moves its arguments into a private
+    /// `BridgeContext`, so a test that needs both sides keeps its own
+    /// clones from before the call.
+    struct TestServer {
+        server: McplsServer,
+        notification_cache: Arc<Mutex<NotificationCache>>,
+        delivery: Arc<Mutex<DiagnosticsDelivery>>,
+    }
+
+    fn test_server_parts() -> TestServer {
+        let translator = Arc::new(Translator::new());
+        let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
+        let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
+        let (delivery, floors) = default_delivery_and_floors();
+        let server = McplsServer::new(
+            translator,
+            Arc::clone(&notification_cache),
+            workspace_roots,
+            subscriptions,
+            false,
+            Arc::clone(&delivery),
+            floors,
+        );
+        TestServer {
+            server,
+            notification_cache,
+            delivery,
+        }
+    }
+
+    /// The same, with an empty baseline adopted so `has_baseline()` is true
+    /// and the flush is not answered with `starting_up()`.
+    async fn test_server_with_baseline() -> TestServer {
+        let parts = test_server_parts();
+        parts.delivery.lock().await.set_baseline(HashMap::new());
+        parts
+    }
+
+    /// A guard for the change rather than a red-first test: it passes against
+    /// the current code, which clones the snapshot and releases the lock, and it
+    /// must keep passing afterwards. What it catches is the naive shape of the
+    /// fix, borrowing out of the cache guard all the way through the payload
+    /// build.
+    #[tokio::test]
+    #[allow(clippy::significant_drop_tightening)]
+    async fn test_a_flush_does_not_hold_the_cache_lock_while_building_its_payload() {
+        let parts = test_server_with_baseline().await;
+        let cache = Arc::clone(&parts.notification_cache);
+        let server = parts.server;
+
+        // Hold the cache lock from another task the moment the flush is in
+        // flight. If the flush holds it across its payload build, this never
+        // acquires and the timeout fires.
+        let flush = tokio::spawn(async move { server.get_new_diagnostics().await });
+        tokio::task::yield_now().await;
+        let grabbed = tokio::time::timeout(std::time::Duration::from_secs(5), cache.lock()).await;
+
+        assert!(
+            grabbed.is_ok(),
+            "the diagnostics pump takes this same lock, and the transport drops \
+             notifications on a full channel rather than blocking, so a flush \
+             that holds it across its awaits loses publishes under hook traffic"
+        );
+        flush.await.expect("the flush task").expect("the flush");
     }
 
     fn create_test_server() -> McplsServer {
@@ -1732,7 +1862,7 @@ mod tests {
     /// would still record it delivered, permanently hiding diagnostics
     /// that were in fact never shown.
     #[test]
-    fn test_routable_entries_excludes_unmappable_uri() {
+    fn test_routable_entries_borrowed_excludes_unmappable_uri() {
         // `Url::to_file_path` needs a drive letter on Windows, so a bare
         // `file:///workspace/...` maps to no path there and would be
         // excluded for the wrong reason.
@@ -1741,36 +1871,26 @@ mod tests {
         #[cfg(not(windows))]
         let ok_uri: lsp_types::Uri = "file:///workspace/a.rs".parse().unwrap();
         let bad_uri: lsp_types::Uri = "http://example.com/not-a-file.rs".parse().unwrap();
-        let snapshot = vec![
-            (
-                "a".to_string(),
-                DiagnosticInfo {
-                    uri: ok_uri,
-                    version: Some(1),
-                    diagnostics: vec![diagnostic_at("ok")],
-                },
-                crate::config::ServerId::from("rust"),
-            ),
-            (
-                "b".to_string(),
-                DiagnosticInfo {
-                    uri: bad_uri,
-                    version: Some(1),
-                    diagnostics: vec![diagnostic_at("unreachable")],
-                },
-                crate::config::ServerId::from("rust"),
-            ),
-        ];
+        let owner = crate::config::ServerId::from("rust");
+
+        let mut cache = NotificationCache::new();
+        cache.store_diagnostics(&owner, &ok_uri, Some(1), vec![diagnostic_at("ok")]);
+        cache.store_diagnostics(
+            &owner,
+            &bad_uri,
+            Some(1),
+            vec![diagnostic_at("unreachable")],
+        );
         let floors = FloorTable::new(&crate::config::DiagnosticsConfig::default(), &[]);
 
-        let entries = routable_entries(&snapshot, &floors);
+        let entries = routable_entries_borrowed(&cache, &floors);
 
         assert_eq!(
             entries.len(),
             1,
             "the unmappable-URI file must be excluded before flush ever sees it"
         );
-        assert_eq!(entries[0].key, "a");
+        assert_eq!(entries[0].diagnostics[0].message, "ok");
     }
 
     /// A non-zero `omitted` count is meaningless to an agent unless the
@@ -1785,7 +1905,9 @@ mod tests {
             ..Default::default()
         };
 
-        let payload = server.new_diagnostics_payload(&report, &[]).await;
+        let payload = server
+            .new_diagnostics_payload(&report, &HashMap::new())
+            .await;
 
         assert_eq!(payload.omitted, 2);
         let note = payload
@@ -1805,7 +1927,9 @@ mod tests {
         let server = create_test_server();
         let report = FlushReport::default();
 
-        let payload = server.new_diagnostics_payload(&report, &[]).await;
+        let payload = server
+            .new_diagnostics_payload(&report, &HashMap::new())
+            .await;
 
         assert_eq!(payload.omitted, 0);
         assert!(payload.note.is_none());
@@ -1845,7 +1969,8 @@ mod tests {
         // this into the baseline once the servers went quiet.
         // `Url::to_file_path` needs a drive letter on Windows, so a bare
         // `file:///workspace/...` maps to no path there and would be
-        // dropped by `routable_entries` before any of this is exercised.
+        // dropped by `routable_entries_borrowed` before any of this is
+        // exercised.
         #[cfg(windows)]
         let pre_existing_uri: lsp_types::Uri =
             "file:///C:/workspace/pre_existing.rs".parse().unwrap();
