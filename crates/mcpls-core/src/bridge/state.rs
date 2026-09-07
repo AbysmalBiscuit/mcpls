@@ -590,20 +590,32 @@ impl DocumentTracker {
     /// untracked path to the servers that asked to watch it is the watched
     /// files registry's job, and opening it is the sweep's.
     ///
-    /// The caller must hold `path`'s lock from [`Self::lock_path`]; a debug
-    /// build asserts that some caller does, though not that it is this one.
+    /// The caller must hold `path`'s lock: `_guard` is that lock's proof of
+    /// possession, obtained from [`Self::lock_path`], rather than a
+    /// documented-only precondition. A debug build asserts that `_guard` is
+    /// the lock for `path` specifically, catching a guard for the wrong
+    /// path being passed through.
     ///
     /// # Errors
     ///
     /// Returns an error if the file cannot be read or exceeds the
     /// configured size limit.
-    pub async fn resync_from_disk(&self, path: &Path) -> Result<Option<Resync>> {
-        debug_assert!(
-            lock_std(&self.path_locks)
-                .get(path)
-                .is_some_and(|lock| lock.try_lock().is_err()),
-            "resync_from_disk requires the caller to hold path's lock_path guard"
-        );
+    pub async fn resync_from_disk(
+        &self,
+        path: &Path,
+        _guard: &PathLockGuard<'_>,
+    ) -> Result<Option<Resync>> {
+        // `_guard` is unused in release, where `debug_assert_eq!` compiles
+        // out -- the leading underscore silences that build's unused-
+        // parameter warning, at the cost of tripping this one here.
+        #[allow(clippy::used_underscore_binding)]
+        {
+            debug_assert_eq!(
+                _guard.path(),
+                path,
+                "resync_from_disk's guard must be the lock for this path"
+            );
+        }
         let read_at = SystemTime::now();
         if !lock_std(&self.documents).contains_key(path) {
             return Ok(None);
@@ -1059,6 +1071,13 @@ pub struct PathLockGuard<'a> {
     path: PathBuf,
     arc: Arc<AsyncMutex<()>>,
     guard: Option<OwnedMutexGuard<()>>,
+}
+
+impl PathLockGuard<'_> {
+    /// The path this guard holds the lock for.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 impl Drop for PathLockGuard<'_> {
@@ -2961,12 +2980,13 @@ mod tests {
 
         std::fs::write(&path, "fn a() -> i32 { }").expect("rewrite");
 
-        let _guard = tracker.lock_path(&path).await;
+        let guard = tracker.lock_path(&path).await;
         let resync = tracker
-            .resync_from_disk(&path)
+            .resync_from_disk(&path, &guard)
             .await
             .expect("resync")
             .expect("the path is tracked");
+        drop(guard);
 
         assert_eq!(resync.needs_change, vec![rust.clone()]);
         assert_eq!(resync.needs_save, vec![rust]);
@@ -2988,12 +3008,13 @@ mod tests {
             .await
             .expect("open");
 
-        let _guard = tracker.lock_path(&path).await;
+        let guard = tracker.lock_path(&path).await;
         let resync = tracker
-            .resync_from_disk(&path)
+            .resync_from_disk(&path, &guard)
             .await
             .expect("resync")
             .expect("the path is tracked");
+        drop(guard);
 
         assert!(
             resync.needs_change.is_empty(),
@@ -3025,22 +3046,24 @@ mod tests {
 
         let generation = tracker.generation_for(&rust);
         let version = {
-            let _guard = tracker.lock_path(&path).await;
+            let guard = tracker.lock_path(&path).await;
             let resync = tracker
-                .resync_from_disk(&path)
+                .resync_from_disk(&path, &guard)
                 .await
                 .expect("resync")
                 .expect("tracked");
+            drop(guard);
             tracker.mark_change_sent(&path, &rust, resync.version, generation);
             resync.version
         };
 
-        let _guard = tracker.lock_path(&path).await;
+        let guard = tracker.lock_path(&path).await;
         let again = tracker
-            .resync_from_disk(&path)
+            .resync_from_disk(&path, &guard)
             .await
             .expect("resync")
             .expect("tracked");
+        drop(guard);
         assert!(again.needs_change.is_empty());
         assert_eq!(again.needs_save, vec![rust]);
         assert_eq!(
@@ -3056,10 +3079,10 @@ mod tests {
         std::fs::write(&path, "fn a() {}").expect("write");
 
         let tracker = DocumentTracker::new(ResourceLimits::default(), extension_map());
-        let _guard = tracker.lock_path(&path).await;
+        let guard = tracker.lock_path(&path).await;
         assert!(
             tracker
-                .resync_from_disk(&path)
+                .resync_from_disk(&path, &guard)
                 .await
                 .expect("resync")
                 .is_none()
@@ -3083,9 +3106,9 @@ mod tests {
 
         let stale = tracker.generation_for(&rust);
         let version = {
-            let _guard = tracker.lock_path(&path).await;
+            let guard = tracker.lock_path(&path).await;
             tracker
-                .resync_from_disk(&path)
+                .resync_from_disk(&path, &guard)
                 .await
                 .expect("resync")
                 .expect("tracked")
@@ -3121,9 +3144,9 @@ mod tests {
 
         let stale = tracker.generation_for(&rust);
         let version = {
-            let _guard = tracker.lock_path(&path).await;
+            let guard = tracker.lock_path(&path).await;
             tracker
-                .resync_from_disk(&path)
+                .resync_from_disk(&path, &guard)
                 .await
                 .expect("resync")
                 .expect("tracked")
