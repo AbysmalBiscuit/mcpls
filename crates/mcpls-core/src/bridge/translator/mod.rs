@@ -1112,6 +1112,121 @@ mod tests {
         );
     }
 
+    /// A failed notify must never be followed by the mark for it: that
+    /// ordering is what lets a genuinely cancelled or refused send be
+    /// retried correctly later, and it is the one property the test above
+    /// cannot see, because a mark that ran early is invisible once the
+    /// notify goes on to succeed anyway.
+    ///
+    /// Kills the transport before the drain starts rather than partway
+    /// through: every notify then fails on its own, with no race to win
+    /// against the drain's own, much faster, synchronous bookkeeping.
+    #[tokio::test]
+    async fn test_a_failed_notify_marks_nothing_and_stays_queued() {
+        let harness = TranslatorHarness::with_one_server("rust").await;
+        let server_id = ServerId::from("rust");
+
+        // Both paths must be opened (and, for the second, pre-marked)
+        // while the transport still works: `open` and `mark_change_sent`'s
+        // own setup below need a live connection, even though the drain
+        // this test actually exercises must not.
+        let path = harness.write_file("a.rs", "fn a() {}");
+        harness.open(&path, "rust").await;
+        harness.rewrite_file(&path, "fn a() -> i32 { }");
+
+        let saved_path = harness.write_file("b.rs", "fn b() {}");
+        harness.open(&saved_path, "rust").await;
+        harness.rewrite_file(&saved_path, "fn b() -> i32 { }");
+        let tracker = harness.translator.document_tracker();
+        let guard = tracker.lock_path(&saved_path).await;
+        let resync = tracker
+            .resync_from_disk(&saved_path, &guard)
+            .await
+            .expect("resync_from_disk reads the rewritten file")
+            .expect("the path is tracked");
+        tracker.mark_change_sent(
+            &saved_path,
+            &server_id,
+            resync.version,
+            tracker.generation_for(&server_id),
+        );
+        drop(guard);
+
+        harness.kill_transport("rust").await;
+        let dead_client = lock_std(&harness.translator.lsp_clients)
+            .get(&server_id)
+            .cloned()
+            .expect("the server stays registered, just dead");
+        assert!(
+            dead_client
+                .notify("textDocument/didChange", serde_json::Value::Null)
+                .await
+                .is_err(),
+            "the premise of this test is that every notify on this connection now fails"
+        );
+
+        // A fresh rewrite owes both a change and a save. The didChange
+        // itself now fails, so this half catches a mark_change_sent that
+        // ran before its notify.
+        harness.queue_invalidation(&path);
+
+        harness.translator.resync_changed_documents().await;
+
+        let state = harness
+            .translator
+            .document_tracker()
+            .snapshot(&path)
+            .expect("a failed notify does not close the document");
+        let version = state.version();
+        assert_eq!(
+            state.servers_needing_change(version),
+            vec![server_id.clone()],
+            "a premature mark_change_sent would clear this even though the \
+             didChange never reached the wire"
+        );
+        assert_eq!(
+            state.servers_needing_save(version),
+            vec![server_id.clone()],
+            "the save is owed too, since the change never went out to unlock it"
+        );
+        assert_eq!(
+            harness.translator.pending_invalidations.take(),
+            vec![path],
+            "a failed notify leaves the path queued for a later drain"
+        );
+
+        // `saved_path`'s change was already marked sent above, before the
+        // transport died, which isolates the save loop specifically: with
+        // nothing left to do but the save, this half catches a
+        // mark_save_sent that ran before its own notify -- the mutation
+        // the first half cannot reach, since its didChange fails before
+        // the save loop ever starts.
+        harness.queue_invalidation(&saved_path);
+
+        harness.translator.resync_changed_documents().await;
+
+        let state = harness
+            .translator
+            .document_tracker()
+            .snapshot(&saved_path)
+            .expect("a failed notify does not close the document");
+        assert!(
+            state.servers_needing_change(state.version()).is_empty(),
+            "the change was already marked sent by this test's own setup"
+        );
+        assert_eq!(
+            state.servers_needing_save(state.version()),
+            vec![server_id],
+            "a premature mark_save_sent would clear this even though the \
+             didSave never reached the wire"
+        );
+        assert_eq!(
+            harness.translator.pending_invalidations.take(),
+            vec![saved_path],
+            "a failed notify leaves the path queued for a later drain"
+        );
+    }
+
     /// A path whose disk read fails (here, by growing past the configured
     /// size limit) says nothing about any other path. It must not stall
     /// the drain: the healthy path behind it still gets resynchronized,
