@@ -12,6 +12,8 @@ pub mod service;
 pub mod sweep;
 
 pub use filters::{PathFilter, watch_paths};
+#[cfg(windows)]
+pub use identity::WINDOWS_PIPE_PREFIX;
 pub use identity::{SocketIdentity, identity_for, identity_hash};
 pub use listener::{HookListener, LockLoss, ServeExit, send, send_many};
 pub use protocol::{ChangeEvent, Request, Response};

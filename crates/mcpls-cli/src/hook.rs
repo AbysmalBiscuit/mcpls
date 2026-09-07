@@ -234,6 +234,18 @@ const MAX_FOREIGN_CANDIDATES: usize = 16;
 /// command allowed to print on failure, because breaking that silence is
 /// its entire purpose.
 pub async fn doctor(project_dir: &Path, identity: &SocketIdentity) -> String {
+    doctor_scanning(project_dir, identity, foreign_scan_prefix()).await
+}
+
+/// `doctor`'s body, parameterized on the prefix its runtime-directory scan
+/// filters Windows pipe names by.
+///
+/// Production always reaches this through `doctor`, with the real prefix.
+/// A test on Windows needs a different one: the pipe namespace is
+/// machine-global, so a scan filtered on the real prefix would enumerate
+/// an actual mcpls running on the developer's own machine, not only the
+/// one the test bound itself.
+async fn doctor_scanning(project_dir: &Path, identity: &SocketIdentity, prefix: &str) -> String {
     let mut lines = vec![
         format!("socket: {}", identity.socket.display()),
         format!("hook sees: {} -> {}", project_dir.display(), identity.hash),
@@ -252,7 +264,8 @@ pub async fn doctor(project_dir: &Path, identity: &SocketIdentity) -> String {
         lines.push(format!("owner pid: {pid}"));
         lines.push(hooks_seen_line(hooks_seen));
     } else {
-        lines.push(no_owner_line(find_foreign_owner(identity).await));
+        let foreign = find_foreign_owner(identity, project_dir, prefix).await;
+        lines.push(no_owner_line(foreign));
         lines.push("owner pid: none".to_string());
     }
 
@@ -264,51 +277,100 @@ pub async fn doctor(project_dir: &Path, identity: &SocketIdentity) -> String {
     lines.join("\n")
 }
 
+/// The prefix the production scan filters Windows pipe names by: exactly
+/// what `identity_for` names its own pipes with, so the scan neither
+/// misses a real owner nor matches some unrelated pipe by coincidence.
+/// Unused on Unix, where the scan is already confined to the directory
+/// `identity`'s own socket lives in.
+#[cfg(windows)]
+const fn foreign_scan_prefix() -> &'static str {
+    mcpls_core::hooks::WINDOWS_PIPE_PREFIX
+}
+
+#[cfg(not(windows))]
+const fn foreign_scan_prefix() -> &'static str {
+    ""
+}
+
 /// The `server sees` line for how many `Changed`, `Flush`, or `EndSession`
 /// requests the answering owner has served since it started.
 ///
-/// A count of zero is not neutral: it means a live, reachable mcpls that
-/// has never once been asked to do anything, which is what a plugin never
-/// registered with the host looks like. That state must not read as
-/// healthy just because a server happens to be up.
+/// A count of zero does not, on its own, mean a plugin was never wired up:
+/// `SessionStart` never touches the socket by design, so a server that
+/// started moments ago, or just took over from a previous owner, reads
+/// exactly the same as one nobody ever registered. The doctor cannot tell
+/// those apart, so it states the count and hands the reader the one thing
+/// that resolves the ambiguity, rather than guessing at a cause.
 fn hooks_seen_line(count: u64) -> String {
     if count == 0 {
-        "hooks seen: none since this owner started; the plugin's hooks may not be \
-         registered with your host"
+        "hooks seen: none since this owner started; send a prompt or make an \
+         edit in this session, then run the doctor again"
             .to_string()
     } else {
         format!("hooks seen: {count} request(s) since this owner started")
     }
 }
 
+/// What the runtime-directory scan found when this project's own socket
+/// answered nobody.
+enum ForeignOwners {
+    /// Nothing else answered either.
+    None,
+    /// An owner answered whose root is an ancestor or descendant of the
+    /// project directory: the shape a server started one level up, or a
+    /// `CLAUDE_PROJECT_DIR` pointing into a subdirectory, actually has.
+    /// This is the one case the scan can name with evidence behind it.
+    Related { root: PathBuf, pid: u32 },
+    /// One or more owners answered, but none relate to this project's
+    /// directory. Naming one of them would blame whichever happened to
+    /// come first out of `read_dir`, an innocent project, for this
+    /// project's own silence.
+    Unrelated(usize),
+}
+
 /// The `server sees` line to print when nothing answers this project's own
-/// socket: names a foreign owner's directory and pid when one was found,
-/// or says plainly that nothing is listening.
-fn no_owner_line(foreign: Option<(PathBuf, u32)>) -> String {
-    foreign.map_or_else(
-        || "server sees: no owner; nothing is listening on this project's socket".to_string(),
-        |(root, pid)| {
-            format!(
-                "server sees: no owner for this directory; an mcpls is running for {} \
-                 (pid {pid}) instead",
-                root.display()
-            )
-        },
-    )
+/// socket.
+fn no_owner_line(foreign: ForeignOwners) -> String {
+    match foreign {
+        ForeignOwners::None => {
+            "server sees: no owner; nothing is listening on this project's socket".to_string()
+        }
+        ForeignOwners::Related { root, pid } => format!(
+            "server sees: no owner for this directory; an mcpls is running for {} \
+             (pid {pid}) instead",
+            root.display()
+        ),
+        ForeignOwners::Unrelated(1) => "server sees: no owner for this directory; 1 other \
+             mcpls instance is running, none for this directory or a parent of it"
+            .to_string(),
+        ForeignOwners::Unrelated(count) => format!(
+            "server sees: no owner for this directory; {count} other mcpls instances are \
+             running, none for this directory or a parent of it"
+        ),
+    }
 }
 
 /// Look for an mcpls answering some other project's socket in the same
 /// runtime location as `identity`'s own, so a doctor run against an
 /// unreachable socket can tell "nothing is running" apart from
-/// "something is running, for a different directory".
+/// "something is running, for a directory that explains this one's
+/// silence".
 ///
 /// Sockets are named by their own directory's hash, which is the entire
 /// reason `identity`'s own probe above can never observe a live owner
 /// whose directory hashed differently: that owner bound a different
 /// socket file, not this one. This is the only way the doctor can learn
-/// about it at all.
-async fn find_foreign_owner(identity: &SocketIdentity) -> Option<(PathBuf, u32)> {
-    for candidate in foreign_candidates(identity).take(MAX_FOREIGN_CANDIDATES) {
+/// about it at all. An owner is only ever named when its root is an
+/// ancestor or descendant of `project_dir`: anything else is a different
+/// project entirely, and naming it would accuse it of a failure it has
+/// nothing to do with.
+async fn find_foreign_owner(
+    identity: &SocketIdentity,
+    project_dir: &Path,
+    prefix: &str,
+) -> ForeignOwners {
+    let mut unrelated = 0usize;
+    for candidate in foreign_candidates(identity, prefix).take(MAX_FOREIGN_CANDIDATES) {
         let probe = SocketIdentity {
             socket: candidate,
             lock: PathBuf::new(),
@@ -321,16 +383,24 @@ async fn find_foreign_owner(identity: &SocketIdentity) -> Option<(PathBuf, u32)>
             ..
         }) = send(&probe, &Request::Status, SOCKET_TIMEOUT).await
         {
-            return Some((root, pid));
+            if root.starts_with(project_dir) || project_dir.starts_with(&root) {
+                return ForeignOwners::Related { root, pid };
+            }
+            unrelated += 1;
         }
     }
-    None
+    if unrelated == 0 {
+        ForeignOwners::None
+    } else {
+        ForeignOwners::Unrelated(unrelated)
+    }
 }
 
 /// The other sockets that might have an owner, alongside `identity`'s own
-/// in the same runtime directory.
+/// in the same runtime directory. `prefix` is unused: the directory
+/// itself is already this scan's whole scope on Unix.
 #[cfg(not(windows))]
-fn foreign_candidates(identity: &SocketIdentity) -> impl Iterator<Item = PathBuf> {
+fn foreign_candidates(identity: &SocketIdentity, _prefix: &str) -> impl Iterator<Item = PathBuf> {
     let own = identity.socket.clone();
     identity
         .socket
@@ -343,11 +413,12 @@ fn foreign_candidates(identity: &SocketIdentity) -> impl Iterator<Item = PathBuf
 }
 
 /// The other named pipes that might have an owner, read from the
-/// system-wide pipe namespace and filtered to this project's naming
-/// convention, since Windows has no per-project directory to list instead.
+/// system-wide pipe namespace and filtered to `prefix`, since Windows has
+/// no per-project directory to list instead.
 #[cfg(windows)]
-fn foreign_candidates(identity: &SocketIdentity) -> impl Iterator<Item = PathBuf> {
+fn foreign_candidates(identity: &SocketIdentity, prefix: &str) -> impl Iterator<Item = PathBuf> {
     let own = identity.socket.clone();
+    let prefix = prefix.to_string();
     std::fs::read_dir(r"\\.\pipe\")
         .ok()
         .into_iter()
@@ -358,7 +429,7 @@ fn foreign_candidates(identity: &SocketIdentity) -> impl Iterator<Item = PathBuf
                 && path
                     .file_name()
                     .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("mcpls-"))
+                    .is_some_and(|name| name.starts_with(prefix.as_str()))
         })
 }
 
@@ -401,7 +472,18 @@ pub fn doctor_without_identity(project_dir: &Path, error: &mcpls_core::Error) ->
 fn mcpls_on_path() -> Option<PathBuf> {
     let exe_name = if cfg!(windows) { "mcpls.exe" } else { "mcpls" };
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
+    resolve_on_path(&path, exe_name)
+}
+
+/// The absolute path to `exe_name` on the first entry of `path_var` (a
+/// `PATH`-shaped value) that has an executable file by that name, or
+/// `None`.
+///
+/// Split out of `mcpls_on_path` so a test can supply a `PATH` of its own
+/// choosing rather than mutating this process's real environment, which a
+/// multi-threaded test binary sharing one process cannot safely do.
+fn resolve_on_path(path_var: &std::ffi::OsStr, exe_name: &str) -> Option<PathBuf> {
+    std::env::split_paths(path_var)
         .map(|dir| dir.join(exe_name))
         .find(|candidate| is_executable_file(candidate))
         .map(|candidate| std::path::absolute(&candidate).unwrap_or(candidate))
@@ -512,7 +594,7 @@ mod tests {
     /// defaults to off; a test exercising either sets it explicitly, so a
     /// regression that narrows a client's tolerance has something in the
     /// suite that would notice.
-    #[derive(Clone, Default)]
+    #[derive(Clone)]
     struct OwnerBehavior {
         flush_text: Option<String>,
         flush_delay: Duration,
@@ -523,6 +605,26 @@ mod tests {
         status_hash: String,
         status_root: PathBuf,
         status_hooks_seen: u64,
+        /// Whether `Status` answers as the socket's owner. `true` by
+        /// default, since only an owner ever answers in every other test;
+        /// one test sets this to `false` to prove the foreign-owner scan
+        /// ignores an answer that says it is not the owner, the way a
+        /// future forwarding proxy would.
+        status_owner: bool,
+    }
+
+    impl Default for OwnerBehavior {
+        fn default() -> Self {
+            Self {
+                flush_text: None,
+                flush_delay: Duration::ZERO,
+                changed_errors: false,
+                status_hash: String::new(),
+                status_root: PathBuf::new(),
+                status_hooks_seen: 0,
+                status_owner: true,
+            }
+        }
     }
 
     /// A plausible answer to `request` under `behavior`.
@@ -551,7 +653,7 @@ mod tests {
                 hash: behavior.status_hash.clone(),
                 socket: PathBuf::new(),
                 pid: std::process::id(),
-                owner: true,
+                owner: behavior.status_owner,
                 root: behavior.status_root.clone(),
                 hooks_seen: behavior.status_hooks_seen,
             },
@@ -689,6 +791,25 @@ mod tests {
                     status_hash: hash,
                     status_root: root.to_path_buf(),
                     status_hooks_seen: hooks_seen,
+                    ..OwnerBehavior::default()
+                },
+            )
+        }
+
+        /// An owner bound on `identity`, answering `Status` with `owner:
+        /// false`, the shape a forwarding proxy would answer with rather
+        /// than an actual owner.
+        fn start_reporting_non_owner(identity: SocketIdentity, root: &Path) -> Self {
+            let hash = mcpls_core::hooks::identity_hash(root)
+                .expect("identity hash for the reported root");
+            let dir = tempfile::tempdir().expect("a temp dir");
+            Self::start_on(
+                dir,
+                identity,
+                OwnerBehavior {
+                    status_hash: hash,
+                    status_root: root.to_path_buf(),
+                    status_owner: false,
                     ..OwnerBehavior::default()
                 },
             )
@@ -1249,6 +1370,19 @@ mod tests {
         );
     }
 
+    /// The prefix these tests' own pipes carry on Windows, distinct from
+    /// `mcpls_core::hooks::WINDOWS_PIPE_PREFIX`: the pipe namespace is
+    /// machine-global, so a scan filtered on the real prefix would
+    /// enumerate an actual mcpls running on the developer's own machine,
+    /// not only the one a test bound itself. Every doctor call in this
+    /// module goes through `doctor_scanning` with this prefix rather than
+    /// the public `doctor`, so the scan can never see past this suite's
+    /// own pipes on Windows.
+    #[cfg(windows)]
+    const TEST_PIPE_PREFIX: &str = "mcpls-doctor-test-";
+    #[cfg(not(windows))]
+    const TEST_PIPE_PREFIX: &str = "";
+
     /// The identity `identity_for(project)` would derive, with its socket
     /// and lock moved into `dir` in place of the real runtime directory
     /// `identity_for` would otherwise choose.
@@ -1262,7 +1396,7 @@ mod tests {
     fn local_identity_for(project: &Path, dir: &Path) -> SocketIdentity {
         let hash = mcpls_core::hooks::identity_hash(project).expect("identity hash");
         #[cfg(windows)]
-        let socket = PathBuf::from(format!(r"\\.\pipe\mcpls-doctor-{hash}"));
+        let socket = PathBuf::from(format!(r"\\.\pipe\{TEST_PIPE_PREFIX}{hash}"));
         #[cfg(not(windows))]
         let socket = dir.join(format!("{hash}.sock"));
         SocketIdentity {
@@ -1283,7 +1417,7 @@ mod tests {
         let socket_dir = tempfile::tempdir().expect("a temp dir");
         let identity = local_identity_for(project, socket_dir.path());
         let _owner = RecordingOwner::start_reporting_status(identity.clone(), project, hooks_seen);
-        let out = super::doctor(project, &identity).await;
+        let out = super::doctor_scanning(project, &identity, TEST_PIPE_PREFIX).await;
         (out, identity)
     }
 
@@ -1291,7 +1425,7 @@ mod tests {
     async fn doctor_with_nothing_running(project: &Path) -> (String, SocketIdentity) {
         let socket_dir = tempfile::tempdir().expect("a temp dir");
         let identity = local_identity_for(project, socket_dir.path());
-        let out = super::doctor(project, &identity).await;
+        let out = super::doctor_scanning(project, &identity, TEST_PIPE_PREFIX).await;
         (out, identity)
     }
 
@@ -1308,7 +1442,17 @@ mod tests {
         let identity = local_identity_for(project, socket_dir.path());
         let foreign_identity = local_identity_for(foreign, socket_dir.path());
         let _owner = RecordingOwner::start_reporting_status(foreign_identity, foreign, 0);
-        super::doctor(project, &identity).await
+        super::doctor_scanning(project, &identity, TEST_PIPE_PREFIX).await
+    }
+
+    /// Run the doctor for `project` where the only reachable socket
+    /// answers `Status` with `owner: false`, as a forwarding proxy would.
+    async fn doctor_with_non_owner(project: &Path, elsewhere: &Path) -> String {
+        let socket_dir = tempfile::tempdir().expect("a temp dir");
+        let identity = local_identity_for(project, socket_dir.path());
+        let elsewhere_identity = local_identity_for(elsewhere, socket_dir.path());
+        let _owner = RecordingOwner::start_reporting_non_owner(elsewhere_identity, elsewhere);
+        super::doctor_scanning(project, &identity, TEST_PIPE_PREFIX).await
     }
 
     /// Every line asserted by its exact text and position, not merely by
@@ -1343,20 +1487,33 @@ mod tests {
         assert!(lines[5].starts_with("mcpls on PATH: "));
     }
 
+    /// `SessionStart` never touches the socket by design, so a server
+    /// that started moments ago, or just took over from a previous
+    /// owner, reads exactly like one nobody ever registered. The old
+    /// wording asserted "may not be registered" on this state, which is a
+    /// false alarm against a perfectly healthy, freshly started owner;
+    /// the doctor cannot tell the two apart and must not guess which one
+    /// it is looking at.
     #[tokio::test]
-    async fn test_doctor_warns_when_the_live_owner_has_never_seen_a_hook() {
+    async fn test_doctor_states_zero_hooks_seen_without_claiming_the_plugin_is_unregistered() {
         let project = tempfile::tempdir().expect("a temp dir");
 
         let (out, _identity) = doctor_with_own_owner(project.path(), 0).await;
 
         assert!(
+            !out.contains("may not be registered") && !out.contains("may be unregistered"),
+            "a live, reachable owner that has never been sent a hook is \
+             indistinguishable from one that started a moment ago; \
+             asserting non-registration here is a guess dressed as a \
+             finding: {out}"
+        );
+        assert!(
             out.contains(
-                "hooks seen: none since this owner started; the plugin's hooks \
-                 may not be registered with your host"
+                "hooks seen: none since this owner started; send a prompt or \
+                 make an edit in this session, then run the doctor again"
             ),
-            "a live, reachable owner that has never been sent a hook is the \
-             most likely shape of a plugin that was never wired up to the \
-             host, and must not read as a healthy install: {out}"
+            "the doctor must still state the count as a fact and hand the \
+             reader the action that resolves the ambiguity: {out}"
         );
     }
 
@@ -1382,12 +1539,18 @@ mod tests {
         assert!(lines[4].starts_with("mcpls on PATH: "));
     }
 
+    /// A server started one level up or down from `CLAUDE_PROJECT_DIR` is
+    /// exactly the shape a directory disagreement takes in reality, so the
+    /// foreign owner here lives in a subdirectory of `project`, not an
+    /// unrelated tempdir: only that relationship earns the specific,
+    /// named answer.
     #[tokio::test]
-    async fn test_doctor_finds_a_foreign_owner_running_for_a_different_directory() {
+    async fn test_doctor_finds_a_related_foreign_owner_running_for_a_different_directory() {
         let project = tempfile::tempdir().expect("a temp dir");
-        let elsewhere = tempfile::tempdir().expect("a temp dir");
+        let nested = project.path().join("nested");
+        std::fs::create_dir(&nested).expect("mkdir");
 
-        let out = doctor_with_foreign_owner(project.path(), elsewhere.path()).await;
+        let out = doctor_with_foreign_owner(project.path(), &nested).await;
 
         let server_sees = out
             .lines()
@@ -1398,7 +1561,7 @@ mod tests {
             format!(
                 "server sees: no owner for this directory; an mcpls is running \
                  for {} (pid {}) instead",
-                elsewhere.path().display(),
+                nested.display(),
                 std::process::id()
             ),
             "a server started in a different directory than CLAUDE_PROJECT_DIR \
@@ -1407,15 +1570,59 @@ mod tests {
              nothing running at all: {out}"
         );
         assert!(
-            !server_sees.contains(&project.path().display().to_string()),
-            "the foreign owner's root must not be confused with this \
-             project's own directory: {server_sees}"
-        );
-        assert!(
             out.contains("owner pid: none"),
             "the foreign pid belongs in the server-sees line; owner pid \
              reports whether THIS project's own socket has an owner, which \
              it does not: {out}"
+        );
+    }
+
+    /// The old behaviour named whichever owner `read_dir` happened to
+    /// list first, so a developer with several unrelated projects open
+    /// could be told a healthy, unrelated server was the reason their own
+    /// hooks were dead. This must not happen: an owner sharing no
+    /// ancestor/descendant relationship with `project_dir` is reported as
+    /// a count, never as a name.
+    #[tokio::test]
+    async fn test_doctor_does_not_accuse_an_unrelated_project_of_being_the_reason() {
+        let project = tempfile::tempdir().expect("a temp dir");
+        let innocent = tempfile::tempdir().expect("a temp dir");
+
+        let out = doctor_with_foreign_owner(project.path(), innocent.path()).await;
+
+        assert!(
+            !out.contains(&innocent.path().display().to_string()),
+            "an unrelated project's server has nothing to do with this \
+             project's own silence; naming it sends the reader to debug a \
+             server that is not the problem, which is worse than the plain \
+             ambiguity it would replace: {out}"
+        );
+        assert_eq!(
+            out.lines()
+                .find(|line| line.starts_with("server sees: "))
+                .expect("a server-sees line is always printed"),
+            "server sees: no owner for this directory; 1 other mcpls \
+             instance is running, none for this directory or a parent of it",
+            "{out}"
+        );
+    }
+
+    /// A future forwarding proxy answers `Status` with `owner: false`; the
+    /// scan must treat that exactly like no answer at all, not like an
+    /// owner it can name.
+    #[tokio::test]
+    async fn test_doctor_ignores_a_reachable_socket_that_answers_it_is_not_the_owner() {
+        let project = tempfile::tempdir().expect("a temp dir");
+        let elsewhere = tempfile::tempdir().expect("a temp dir");
+
+        let out = doctor_with_non_owner(project.path(), elsewhere.path()).await;
+
+        assert_eq!(
+            out.lines()
+                .find(|line| line.starts_with("server sees: "))
+                .expect("a server-sees line is always printed"),
+            "server sees: no owner; nothing is listening on this project's socket",
+            "{out}"
         );
     }
 
@@ -1440,6 +1647,66 @@ mod tests {
             "the line has to carry an absolute path or a plain 'not found'; a \
              relative PATH entry (a bare 'bin', '.', or an empty ':: ' entry) \
              means nothing to whatever directory a hook later runs in: {line}"
+        );
+    }
+
+    /// A path from `base` to `target`, built from `..` components and
+    /// `target`'s own path past their common ancestor. Just enough to
+    /// build a relative `PATH` entry for a test without mutating this
+    /// process's actual current directory, which a multi-threaded test
+    /// binary sharing one process cannot safely do.
+    fn relative_from(base: &Path, target: &Path) -> PathBuf {
+        let base: Vec<_> = base.components().collect();
+        let target: Vec<_> = target.components().collect();
+        let common = base
+            .iter()
+            .zip(target.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let mut relative = PathBuf::new();
+        for _ in common..base.len() {
+            relative.push("..");
+        }
+        for component in &target[common..] {
+            relative.push(component.as_os_str());
+        }
+        relative
+    }
+
+    /// This is the exact bug finding 3 named: `resolve_on_path` found the
+    /// binary but returned the relative `PATH` entry it found it under
+    /// verbatim. Deleting the absolutizing `.map` from `resolve_on_path`
+    /// must fail this without depending on the ambient `PATH`, which is
+    /// why the entry here is built from the real current directory
+    /// instead of assumed to already be relative.
+    #[test]
+    fn test_resolve_on_path_absolutizes_a_relative_path_entry() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let exe_name = if cfg!(windows) { "mcpls.exe" } else { "mcpls" };
+        let exe_path = dir.path().join(exe_name);
+        std::fs::write(&exe_path, "").expect("write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&exe_path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+
+        let cwd = std::env::current_dir().expect("cwd");
+        let relative = relative_from(&cwd, dir.path());
+        assert!(
+            relative.is_relative(),
+            "the point of this test is a PATH entry that is not already \
+             absolute: {relative:?}"
+        );
+        let path_var = std::env::join_paths([relative]).expect("join paths");
+
+        let found =
+            super::resolve_on_path(&path_var, exe_name).expect("the executable is right there");
+        assert!(
+            found.is_absolute(),
+            "a relative PATH entry must never reach the doctor's output \
+             verbatim: {found:?}"
         );
     }
 
