@@ -8,8 +8,10 @@ pub mod filters;
 pub mod identity;
 pub mod listener;
 pub mod protocol;
+pub mod sweep;
 
 pub use filters::{PathFilter, watch_paths};
 pub use identity::{SocketIdentity, identity_for};
 pub use listener::{HookListener, send, send_many};
 pub use protocol::{ChangeEvent, Request, Response};
+pub use sweep::{SweepKind, Sweeper};

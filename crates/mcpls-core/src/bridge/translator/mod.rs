@@ -570,13 +570,6 @@ impl Translator {
     /// learned a file changed adds to it and then drives
     /// [`Self::resync_changed_documents`], rather than resyncing one path
     /// directly and losing the rest if it is cancelled.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "no non-test caller lands until the file-watcher sweep does"
-        )
-    )]
     pub(crate) fn queue_invalidations(&self, paths: &[PathBuf]) {
         self.pending_invalidations.extend(paths);
     }

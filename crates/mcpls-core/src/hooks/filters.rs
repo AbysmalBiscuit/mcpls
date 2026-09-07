@@ -56,6 +56,11 @@ impl PathFilter {
     }
 
     /// Whether `path` survives both filters.
+    ///
+    /// Decided entirely from `path` and the configured roots: nothing here
+    /// touches the filesystem, so a path reported as a deletion -- nothing
+    /// left to stat -- is admitted exactly like one that still exists. A
+    /// delete is a change the sweep still has to act on.
     #[must_use]
     pub fn admits(&self, path: &Path) -> bool {
         let Some(ignore) = self
@@ -70,11 +75,7 @@ impl PathFilter {
             return false;
         }
 
-        let routable = path
-            .extension()
-            .and_then(std::ffi::OsStr::to_str)
-            .is_some_and(|ext| self.extensions.contains_key(ext));
-        if routable {
+        if self.routable_extension(path) {
             return true;
         }
         self.registry.as_ref().is_some_and(|registry| {
@@ -82,6 +83,21 @@ impl PathFilter {
                 .servers_for(path, FileChangeType::CHANGED)
                 .is_empty()
         })
+    }
+
+    /// Whether `path`'s extension is one this filter routes directly to a
+    /// language server, independent of any watcher glob a server may have
+    /// registered for it.
+    ///
+    /// Exposed so a caller deciding what to do with an already-admitted,
+    /// untracked path -- open it as a document, or just notify whichever
+    /// server asked to watch it -- can tell which of `admits`'s two reasons
+    /// applied, without re-deriving the extension check itself.
+    #[must_use]
+    pub(crate) fn routable_extension(&self, path: &Path) -> bool {
+        path.extension()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|ext| self.extensions.contains_key(ext))
     }
 }
 
