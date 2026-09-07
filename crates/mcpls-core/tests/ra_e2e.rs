@@ -183,6 +183,15 @@ fn settle_deadline_ms() -> u64 {
 struct DiagnosticsTable {
     settle_quiet_ms: u64,
     settle_deadline_ms: u64,
+    hooks: HooksTable,
+}
+
+/// Hooks off. These suites exercise the MCP and LSP layers, and leaving
+/// hooks on would have every spawned server bind a socket and a lock in the
+/// user's shared runtime directory, which nothing ever removes.
+#[derive(Serialize, Deserialize)]
+struct HooksTable {
+    enabled: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -216,6 +225,7 @@ fn write_config(ra_binary: &Path, workspace_root: &Path, config_path: &Path) {
         diagnostics: DiagnosticsTable {
             settle_quiet_ms: SETTLE_QUIET_MS,
             settle_deadline_ms: settle_deadline_ms(),
+            hooks: HooksTable { enabled: false },
         },
     };
     let content = toml::to_string(&cfg).expect("failed to serialize e2e config");

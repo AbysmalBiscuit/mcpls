@@ -625,7 +625,7 @@ Array of text edits to apply formatting:
 ]
 ```
 
-With `apply: true` the response also carries `applied` and `files_written`, the absolute paths whose content actually changed — every one of them is stale in any cache you hold. `files_written` reports the path the applier resolved, which is canonical even when `file_path` was not.
+With `apply: true` the response also carries `applied` and `files_written`, the absolute paths whose content actually changed. Every one of them is stale in any cache you hold. `files_written` reports the path the applier resolved, which is canonical even when `file_path` was not.
 
 ### Example Use Cases
 

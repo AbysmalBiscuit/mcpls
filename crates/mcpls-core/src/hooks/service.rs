@@ -1098,6 +1098,14 @@ mod tests {
         }
     }
 
+    /// A command that starts, reads nothing, and never answers
+    /// `initialize`, so routing keeps reporting the server as still
+    /// starting for as long as a test needs it to.
+    #[cfg(all(unix, feature = "transport-http"))]
+    const NEVER_ANSWERS: (&str, &[&str]) = ("/bin/sleep", &["30"]);
+    #[cfg(all(windows, feature = "transport-http"))]
+    const NEVER_ANSWERS: (&str, &[&str]) = ("powershell", &["-Command", "Start-Sleep 30"]);
+
     /// A loopback HTTP transport on an ephemeral port.
     ///
     /// The stdio transport reads real process stdin, which a test runner
@@ -1147,8 +1155,8 @@ mod tests {
     /// routing then reports it as still starting, which is a file that
     /// should have been checked and was not. A command that cannot spawn
     /// would not do -- the background spawn fails, every route is dropped,
-    /// and the sweep goes silent. Unix only for that command.
-    #[cfg(all(unix, feature = "transport-http"))]
+    /// and the sweep goes silent.
+    #[cfg(feature = "transport-http")]
     #[tokio::test]
     async fn test_serve_with_runs_the_sweep_loop_it_built() {
         use crate::config::{HooksConfig, LspServerConfig};
@@ -1161,8 +1169,12 @@ mod tests {
         let mut config = bare_config_over(workspace.path());
         config.lsp_servers = vec![LspServerConfig {
             language_id: "rust".to_string(),
-            command: "/bin/sleep".to_string(),
-            args: vec!["30".to_string()],
+            command: NEVER_ANSWERS.0.to_string(),
+            args: NEVER_ANSWERS
+                .1
+                .iter()
+                .map(|arg| (*arg).to_string())
+                .collect(),
             env: HashMap::new(),
             file_patterns: vec!["**/*.rs".to_string()],
             initialization_options: None,

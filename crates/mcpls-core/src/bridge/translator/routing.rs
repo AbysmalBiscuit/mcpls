@@ -621,7 +621,17 @@ mod tests {
             },
             lsp_servers: vec![],
             apply: crate::config::ApplyConfig::default(),
-            diagnostics: crate::config::DiagnosticsConfig::default(),
+            // Hooks off: this test is about routing, and a `serve()` that
+            // binds derives its socket from the process working directory,
+            // leaving a socket and a lock behind in the user's shared
+            // runtime directory that nothing ever removes.
+            diagnostics: crate::config::DiagnosticsConfig {
+                hooks: crate::config::HooksConfig {
+                    enabled: false,
+                    ..crate::config::HooksConfig::default()
+                },
+                ..crate::config::DiagnosticsConfig::default()
+            },
             project_config_ignored: false,
         };
 

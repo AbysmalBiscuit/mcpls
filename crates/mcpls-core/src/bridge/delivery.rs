@@ -28,15 +28,6 @@ impl From<String> for SessionId {
 }
 
 impl SessionId {
-    /// The session this process serves when the host names none.
-    ///
-    /// Correct for stdio, where the host spawns one mcpls per client.
-    #[must_use]
-    pub fn process_default() -> Self {
-        std::env::var("CLAUDE_CODE_SESSION_ID")
-            .map_or_else(|_| Self(PROCESS_DEFAULT_SESSION.to_string()), Self)
-    }
-
     /// The session id the host exported, or the per-process constant.
     ///
     /// Claude Code exports `CLAUDE_CODE_SESSION_ID` into the environment of
