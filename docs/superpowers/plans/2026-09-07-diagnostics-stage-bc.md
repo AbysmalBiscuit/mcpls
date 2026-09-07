@@ -16,7 +16,7 @@
 - `cargo fmt --check` must be clean at every commit. Every task runs `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings` as its own step, after its tests pass and before its commit step. A task that skips that step is not finished.
 - Every `#[cfg(test)] mod tests` block this plan writes into, or creates, opens with `#[allow(clippy::unwrap_used, clippy::expect_used)]` directly under the `#[cfg(test)]` attribute, because `unwrap_used` and `expect_used` warn workspace-wide (`Cargo.toml:55-56`) and the clippy gate above turns warnings into errors. `crates/mcpls-core/src/lsp/lifecycle.rs:946` shows the same allow applied per test, and `crates/mcpls-core/src/lsp/client.rs:801` shows it applied to the whole module; use the module form. Where the module already carries `#[allow(clippy::unwrap_used)]`, widen it to both lints rather than adding a second attribute.
 - No `std::sync::Mutex` guard is held across an `.await`: those guards are acquired, used, and dropped inside one synchronous section. A `tokio::sync::Mutex` guard may be held across an `.await`, provided a documented lock order exists and every site follows it. That order is delivery before cache: take `context.delivery` first, then `context.notification_cache`, and never the reverse. Task 10 establishes it, Task 13's footer inherits it through `flush_now`, and Task 19's socket handler cites it explicitly. A site that needs only one of the two takes only that one, which is why `baseline_task` may take the cache alone and then `delivery` alone.
-- Commits follow Conventional Commits: `type(scope): description`, imperative, 50 characters or fewer including the prefix, no trailing period, lowercase after the colon, body wrapped at 72 columns, ending with the trailer `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`. Every commit step in this plan spells the message with `git commit -F -` and a quoted heredoc, so the trailer and the wrapping are reproduced exactly rather than retyped. Commits are GPG signed; if signing fails, stop and report rather than passing `--no-gpg-sign` or any other signing override.
+- Commits follow Conventional Commits: `type(scope): description`, imperative, 50 characters or fewer including the prefix, no trailing period, lowercase after the colon, body wrapped at 72 columns, ending with two trailer lines, `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>` followed by `Claude-Session: https://claude.ai/code/session_01PZTxadnYDr7Eh3XuzZzc9y`. Every commit step in this plan spells the message with `git commit -F -` and a quoted heredoc, so the trailer and the wrapping are reproduced exactly rather than retyped. Commits are GPG signed; if signing fails, stop and report rather than passing `--no-gpg-sign` or any other signing override.
 - Stage all changes selectively. Never sweep unrelated edits or generated files into a commit. `git add` a specific file or a specific directory this task owns, never a whole top-level directory such as `docs/`.
 - Every test that builds a filesystem path must build it with a drive letter on Windows, the way `crates/mcpls-core/src/mcp/server.rs:1736` already does. `Url::from_file_path` fails without one.
 - Configuration values from the spec, verbatim: `footer = false`, `footer_grace_ms = 250`, `footer_quiet_ms = 200`, `footer_wait_ms = 15000`, `[diagnostics.hooks] enabled = true`, `sweep_quiet_ms = 500`, `op_deadline_ms = 1500`, hook connect timeout 50 ms, passive lock retry 5 s.
@@ -154,6 +154,7 @@ file it never opened, and how long this repository's own cargo check
 takes. Record the answers and the recipe for re-taking each.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PZTxadnYDr7Eh3XuzZzc9y
 EOF
 ```
 
@@ -368,6 +369,7 @@ ServerId gains Ord so the two new server lists sort, which is what
 keeps a resync's notification order reproducible.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PZTxadnYDr7Eh3XuzZzc9y
 EOF
 ```
 
@@ -743,6 +745,7 @@ same-length rewrite landing inside the debounce window, and the apply
 queue is itself proof the file was written.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PZTxadnYDr7Eh3XuzZzc9y
 EOF
 ```
 
@@ -1065,6 +1068,7 @@ interrupted between the two notifications the content matches and the
 save is still owed.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PZTxadnYDr7Eh3XuzZzc9y
 EOF
 ```
 
@@ -1292,6 +1296,7 @@ didChange alone, and the sub-case would pass with the resync's didSave
 half entirely broken.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PZTxadnYDr7Eh3XuzZzc9y
 EOF
 ```
 
@@ -1693,6 +1698,7 @@ Globs compile with literal_separator on: globset lets a star cross a
 separator by default and LSP's grammar does not.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PZTxadnYDr7Eh3XuzZzc9y
 EOF
 ```
 
@@ -2301,6 +2307,7 @@ than a builder, because the message loop that answers registerCapability
 is spawned during construction and no later builder could reach it.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PZTxadnYDr7Eh3XuzZzc9y
 EOF
 ```
 
@@ -2588,6 +2595,7 @@ analysis currency for open documents rather than delivery for unopened
 ones.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PZTxadnYDr7Eh3XuzZzc9y
 EOF
 ```
 
@@ -2817,6 +2825,7 @@ changed file, and holding the cache lock across those awaits would
 block the diagnostics pump, which drops publishes rather than waiting.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PZTxadnYDr7Eh3XuzZzc9y
 EOF
 ```
 
@@ -3023,6 +3032,7 @@ A file whose floor drops to off is dropped from the record without
 being reported cleared: its problems were silenced, not fixed.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PZTxadnYDr7Eh3XuzZzc9y
 EOF
 ```
 
@@ -3301,6 +3311,7 @@ end_at takes the instant rather than reading the clock, so the three
 branches of the footer's wait can be asserted without sleeping.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PZTxadnYDr7Eh3XuzZzc9y
 EOF
 ```
 
@@ -3794,6 +3805,7 @@ BridgeContext gains the diagnostics config and the settle tracker,
 which the pump already owned and nothing at the MCP layer could reach.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PZTxadnYDr7Eh3XuzZzc9y
 EOF
 ```
 
@@ -4116,6 +4128,7 @@ design where one side used each would disagree on every Windows
 install with nothing to look at.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PZTxadnYDr7Eh3XuzZzc9y
 EOF
 ```
 
@@ -4256,6 +4269,7 @@ file that exists again by the time the hook connects, so the sweep
 stats rather than trusting it.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PZTxadnYDr7Eh3XuzZzc9y
 EOF
 ```
 
@@ -4653,6 +4667,7 @@ has finished, because the host's own hook timeout is 600 seconds and a
 hook that hangs blocks the agent.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PZTxadnYDr7Eh3XuzZzc9y
 EOF
 ```
 
@@ -4843,6 +4858,7 @@ ceiling and every later tool call would fail with
 DocumentLimitExceeded.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PZTxadnYDr7Eh3XuzZzc9y
 EOF
 ```
 
@@ -5117,6 +5133,7 @@ host sent: an atomic save arrives as an unlink for a file that exists
 again by the time the hook connects.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PZTxadnYDr7Eh3XuzZzc9y
 EOF
 ```
 
@@ -5752,6 +5769,7 @@ which has no socket and which the design keeps free of host-specific
 knowledge.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PZTxadnYDr7Eh3XuzZzc9y
 EOF
 ```
 
@@ -6017,6 +6035,7 @@ because diagnostics were unavailable. That makes a broken install
 invisible, which is what mcpls hook doctor answers.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PZTxadnYDr7Eh3XuzZzc9y
 EOF
 ```
 
@@ -6199,6 +6218,7 @@ Response::Status carries the owner's startup directory so the two
 hashes can be shown side by side.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PZTxadnYDr7Eh3XuzZzc9y
 EOF
 ```
 
@@ -6305,6 +6325,7 @@ The mcpls skill moves under the plugin with its references directory,
 so the two ship and install together.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PZTxadnYDr7Eh3XuzZzc9y
 EOF
 ```
 
