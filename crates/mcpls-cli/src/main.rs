@@ -9,9 +9,10 @@ use mcpls_core::ProjectConfigTrust;
 
 mod args;
 mod completions;
+mod hook;
 mod logging;
 
-use args::{Args, Command};
+use args::{Args, Command, HookAction};
 
 #[tokio::main]
 async fn main() {
@@ -24,6 +25,29 @@ async fn main() {
         if let Err(err) = completions::emit(*shell, &mut out) {
             eprintln!("failed to write completion script: {err}");
             std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
+
+    // A hook invocation needs neither a loaded config nor a log subscriber,
+    // and reading stdin and writing hook JSON is the whole command.
+    if let Some(Command::Hook { action }) = &args.command {
+        match action {
+            None => {
+                use std::io::Read as _;
+                let mut stdin = String::new();
+                let _ = std::io::stdin().read_to_string(&mut stdin);
+                let project_dir = std::env::var_os("CLAUDE_PROJECT_DIR")
+                    .map_or_else(|| std::path::PathBuf::from("."), std::path::PathBuf::from);
+                let out = match mcpls_core::hooks::identity_for(&project_dir) {
+                    Ok(identity) => hook::dispatch_payload(&stdin, &project_dir, &identity).await,
+                    Err(_) => String::new(),
+                };
+                print!("{out}");
+            }
+            Some(HookAction::Doctor) => {
+                // `mcpls hook doctor` is implemented once the doctor lands.
+            }
         }
         std::process::exit(0);
     }
