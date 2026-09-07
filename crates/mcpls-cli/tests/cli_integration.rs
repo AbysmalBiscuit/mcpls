@@ -135,6 +135,11 @@ fn test_config_with_empty_file() {
     clear_ambient_env(&mut cmd)
         .arg("--config")
         .arg(&config_path)
+        // An empty file parses to an all-default config, so this reaches
+        // `serve_with`, which binds the real hook socket at
+        // `identity_for`'s runtime directory unless redirected here, before
+        // failing fast on the stdio transport having no client attached.
+        .env("XDG_RUNTIME_DIR", temp_dir.path())
         .assert()
         .failure();
 }
@@ -158,6 +163,11 @@ fn test_trust_project_config_env_false_does_not_grant_trust() {
         .env_remove("MCPLS_TRUST_PROJECT_CONFIG");
     let output = cmd
         .current_dir(temp_dir.path())
+        // This path proceeds all the way to `serve_with`, which binds the
+        // real hook socket at `identity_for`'s runtime directory unless
+        // redirected here; the untrusted-ignore assertion below does not
+        // depend on where that socket lands.
+        .env("XDG_RUNTIME_DIR", temp_dir.path())
         .env("MCPLS_TRUST_PROJECT_CONFIG", "false")
         // Generous bound: the untrusted path is expected to block on stdio
         // (proving it never bailed out on the broken TOML), so this timeout
@@ -222,6 +232,9 @@ fn test_trust_project_config_env_0_does_not_grant_trust() {
         .env_remove("MCPLS_TRUST_PROJECT_CONFIG");
     let output = cmd
         .current_dir(temp_dir.path())
+        // See test_trust_project_config_env_false_does_not_grant_trust
+        // above for why this redirects the real hook socket.
+        .env("XDG_RUNTIME_DIR", temp_dir.path())
         .env("MCPLS_TRUST_PROJECT_CONFIG", "0")
         // See test_trust_project_config_env_false_does_not_grant_trust above
         // for why this timeout is expected to always elapse.
