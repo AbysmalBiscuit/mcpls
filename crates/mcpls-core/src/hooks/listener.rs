@@ -34,6 +34,19 @@ trait HookStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
 impl<T> HookStream for T where T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
 
 /// A bound listener, and the lock proving this process owns it.
+///
+/// Ownership is exactly this value's lifetime, not the process's. [`serve`]
+/// takes `self` by value and keeps it alive for as long as it runs, so
+/// ownership lasts exactly as long as whatever task `serve` runs on is
+/// alive and unaborted -- dropping that task early (`JoinHandle::abort`,
+/// or the task's own panic) drops this `HookListener` and releases the
+/// lock immediately, indistinguishably from this process exiting, even
+/// though the process itself may still be running and may still believe
+/// it owns the session. Whoever wires `serve` into a long-running task
+/// must keep that task alive for exactly as long as the process should be
+/// considered the session owner: nothing else in this type enforces it.
+///
+/// [`serve`]: Self::serve
 pub struct HookListener {
     transport: Box<dyn HookTransport>,
     /// Held for as long as `Self` lives; dropping it (including on process
@@ -64,23 +77,9 @@ impl HookListener {
 
     #[cfg(not(windows))]
     fn acquire_blocking(identity: &SocketIdentity) -> Result<Option<Self>> {
-        use fs4::fs_std::FileExt as _;
-
-        if let Some(parent) = identity.lock.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let lock = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&identity.lock)?;
-
-        match lock.try_lock_exclusive() {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(None),
-            Err(e) => return Err(e.into()),
-        }
+        let Some(lock) = Self::lock_file(identity)? else {
+            return Ok(None);
+        };
 
         // Holding the lock makes this the only process allowed to touch
         // `socket`: a crashed owner leaves its socket file behind, and
@@ -96,6 +95,73 @@ impl HookListener {
             transport: Box::new(UnixTransport { listener }),
             _lock: lock,
         }))
+    }
+
+    /// The most attempts [`Self::lock_file`] makes before giving up on a
+    /// lock path that keeps getting replaced out from under it.
+    #[cfg(not(windows))]
+    const LOCK_FILE_MAX_ATTEMPTS: u32 = 5;
+
+    /// Open, create if needed, and exclusively lock `identity.lock`.
+    ///
+    /// Returns `Ok(None)` when someone else already holds it and `Ok(Some)`
+    /// when this call now owns it. Nothing in mcpls ever deletes this file,
+    /// so the create/unlink/bind race that motivates comparing identity
+    /// after a rename does not arise from mcpls's own code. But nothing
+    /// stops an external cleaner (an age-based `systemd-tmpfiles` policy
+    /// over `/tmp/mcpls-<user>` is the realistic case) from deleting it
+    /// while an owner still holds a lock on the now-unlinked inode. A
+    /// newcomer that opens the path afterward creates a fresh inode there
+    /// and locks *that* uncontended -- exclusive at the inode level, but
+    /// no longer exclusive at the path, since the original owner is still
+    /// holding a lock nobody else can see. Comparing this handle's `fstat`
+    /// against a fresh `stat` of the path, taken after the lock succeeds,
+    /// catches that: a mismatch means the path was replaced while this
+    /// call was opening or locking it, so this handle no longer protects
+    /// anything and the attempt retries against whatever is at the path
+    /// now, up to [`Self::LOCK_FILE_MAX_ATTEMPTS`] times.
+    ///
+    /// Windows has no equivalent: there is no lock *file* whose path an
+    /// external cleaner could sever from the handle holding it, since
+    /// exclusivity there comes from the named pipe's own
+    /// `first_pipe_instance` semantics rather than from a filesystem path.
+    #[cfg(not(windows))]
+    fn lock_file(identity: &SocketIdentity) -> Result<Option<std::fs::File>> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        use fs4::fs_std::FileExt as _;
+
+        if let Some(parent) = identity.socket.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        for _ in 0..Self::LOCK_FILE_MAX_ATTEMPTS {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&identity.lock)?;
+
+            match file.try_lock_exclusive() {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+                Err(e) => return Err(e.into()),
+            }
+
+            let locked = file.metadata()?;
+            let replaced = std::fs::metadata(&identity.lock).map_or(true, |current| {
+                current.ino() != locked.ino() || current.dev() != locked.dev()
+            });
+            if !replaced {
+                return Ok(Some(file));
+            }
+        }
+
+        Err(Error::Transport(format!(
+            "the lock file at {} was replaced repeatedly while acquiring it",
+            identity.lock.display()
+        )))
     }
 
     #[cfg(windows)]
