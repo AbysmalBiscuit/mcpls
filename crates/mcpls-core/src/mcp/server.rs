@@ -4,6 +4,7 @@
 //! as MCP tools using the rmcp SDK.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -252,32 +253,57 @@ impl FooterTiming {
     }
 }
 
-/// How long a footer would wait, given a clock.
+/// How long a footer waits before it reports what it has.
 ///
-/// Pure so the three branches that can end the wait are each assertable:
-/// the grace period elapsing before anything is consulted, quiet arriving,
-/// and the cap expiring. `at` maps elapsed time to the `Instant` the settle
-/// tracker stamps against.
+/// This is the wait `footer_for_write` runs: the loop ends the first time
+/// `footer_should_stop` reads the tracker as quiet or as running work that
+/// predates the edit, and otherwise samples again every 50 ms until
+/// `timing.cap` is reached. The cap bounds the *whole* wait, grace
+/// included, rather than sitting on top of it — a call that never goes
+/// quiet costs at most `timing.cap`, not `timing.grace + timing.cap`, which
+/// is what `footer_wait_ms`'s own "in total" documents.
+///
+/// `tick` performs the delay between samples and reports the `Instant`
+/// reached. `footer_for_write` passes a closure that awaits
+/// `tokio::time::sleep` and reads `Instant::now()`, so production pays real
+/// wall-clock time. A test that has already fixed every `begin`/`end_at`
+/// timestamp relative to a `start: Instant` can instead pass a closure that
+/// advances a counter and returns `start + elapsed` without ever
+/// suspending, so the branch tests below run instantly against the exact
+/// loop that ships rather than a replica of it.
 ///
 /// Sampling starts at `grace` rather than at zero, and that is what covers
 /// the case where the check has not begun yet: flycheck starts about 90 ms
 /// after a `didSave`, and before it does the workspace reads as quiet.
-#[cfg(test)]
-fn wait_for_footer_quiet_at(
+///
+/// The 50 ms sampling step means a call that never goes quiet can overshoot
+/// `timing.cap` by up to one step: the tick that pushes `elapsed` past the
+/// cap has already been paid in real time by the time the loop notices, and
+/// a completed sleep cannot be undone. That residual is bounded and
+/// constant — at most 50 ms — not proportional to `timing.cap`.
+async fn wait_for_footer_quiet_at<F, Fut>(
     settle: &ServerSettle,
     epoch_before: u64,
     timing: FooterTiming,
-    at: impl Fn(Duration) -> Instant,
-) -> Duration {
+    tick: F,
+) -> Duration
+where
+    F: Fn(Duration) -> Fut,
+    Fut: Future<Output = Instant>,
+{
     const STEP: Duration = Duration::from_millis(50);
     let mut elapsed = timing.grace;
-    while elapsed < timing.cap {
-        if footer_should_stop(settle, epoch_before, at(elapsed), timing.quiet) {
+    let mut now = tick(timing.grace).await;
+    loop {
+        if footer_should_stop(settle, epoch_before, now, timing.quiet) {
             return elapsed;
         }
+        if elapsed >= timing.cap {
+            return timing.cap;
+        }
+        now = tick(STEP).await;
         elapsed += STEP;
     }
-    timing.cap
 }
 
 /// Whether a footer has waited long enough, as of `now`.
@@ -1004,6 +1030,11 @@ impl McplsServer {
     /// from the baseline, and `set_baseline` does not rewrite a record that
     /// already exists, so a footer flushing early would leave that session
     /// permanently believing the workspace started clean.
+    ///
+    /// Waits via `wait_for_footer_quiet_at`, which bounds the whole wait —
+    /// grace included — by `footer_wait_ms`; the real worst case for one
+    /// call is that value plus at most one 50 ms sampling tick, never the
+    /// grace and the cap stacked on top of each other.
     async fn footer_for_write(&self) -> Option<NewDiagnosticsResult> {
         if !self.context.diagnostics.footer {
             return None;
@@ -1013,20 +1044,16 @@ impl McplsServer {
         }
         let timing = FooterTiming::from_config(&self.context.diagnostics);
         let epoch_before = self.context.settle.progress_epoch();
-        tokio::time::sleep(timing.grace).await;
-
-        let start = Instant::now();
-        while start.elapsed() < timing.cap {
-            if footer_should_stop(
-                &self.context.settle,
-                epoch_before,
-                Instant::now(),
-                timing.quiet,
-            ) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        wait_for_footer_quiet_at(
+            &self.context.settle,
+            epoch_before,
+            timing,
+            |step| async move {
+                tokio::time::sleep(step).await;
+                Instant::now()
+            },
+        )
+        .await;
 
         let session = SessionId::process_default();
         let mut report = self.flush_now(&session).await;
@@ -1607,9 +1634,22 @@ mod tests {
         );
     }
 
+    /// A `wait_for_footer_quiet_at` tick that never suspends: it advances an
+    /// internal counter by each requested step and reports `start` plus the
+    /// running total, so a test can drive the exact loop that ships without
+    /// paying any of its real time.
+    fn instant_tick(start: Instant) -> impl Fn(Duration) -> std::future::Ready<Instant> {
+        let accumulated = std::cell::Cell::new(Duration::ZERO);
+        move |step| {
+            let total = accumulated.get() + step;
+            accumulated.set(total);
+            std::future::ready(start + total)
+        }
+    }
+
     /// Branch one: the grace period elapses before quiet is consulted.
-    #[test]
-    fn test_the_footer_wait_never_returns_before_its_grace_period() {
+    #[tokio::test]
+    async fn test_the_footer_wait_never_returns_before_its_grace_period() {
         let settle = ServerSettle::new(Duration::from_secs(1), Duration::from_secs(600));
         let start = Instant::now();
 
@@ -1623,8 +1663,9 @@ mod tests {
                 quiet: Duration::from_millis(200),
                 cap: Duration::from_secs(15),
             },
-            |elapsed| start + elapsed,
-        );
+            instant_tick(start),
+        )
+        .await;
 
         assert_eq!(
             ended,
@@ -1636,8 +1677,8 @@ mod tests {
     }
 
     /// Branch two: quiet ends the wait early.
-    #[test]
-    fn test_the_footer_wait_ends_on_quiet_rather_than_on_its_cap() {
+    #[tokio::test]
+    async fn test_the_footer_wait_ends_on_quiet_rather_than_on_its_cap() {
         let settle = ServerSettle::new(Duration::from_secs(1), Duration::from_secs(600));
         let rust = ServerId::from("rust");
         let start = Instant::now();
@@ -1657,8 +1698,9 @@ mod tests {
                 quiet: Duration::from_millis(200),
                 cap: Duration::from_secs(15),
             },
-            |elapsed| start + elapsed,
-        );
+            instant_tick(start),
+        )
+        .await;
 
         assert!(
             ended < Duration::from_secs(1),
@@ -1672,8 +1714,8 @@ mod tests {
     }
 
     /// Branch three: the cap ends it when quiet never arrives.
-    #[test]
-    fn test_the_footer_wait_ends_on_its_cap_when_quiet_never_arrives() {
+    #[tokio::test]
+    async fn test_the_footer_wait_ends_on_its_cap_when_quiet_never_arrives() {
         let settle = ServerSettle::new(Duration::from_secs(1), Duration::from_secs(600));
         let rust = ServerId::from("rust");
         let start = Instant::now();
@@ -1689,8 +1731,9 @@ mod tests {
                 quiet: Duration::from_millis(200),
                 cap: Duration::from_secs(15),
             },
-            |elapsed| start + elapsed,
-        );
+            instant_tick(start),
+        )
+        .await;
 
         assert_eq!(
             ended,
@@ -1701,8 +1744,8 @@ mod tests {
     }
 
     /// Work that was already running when the edit landed does not eat the cap.
-    #[test]
-    fn test_an_index_already_in_flight_does_not_hold_the_footer() {
+    #[tokio::test]
+    async fn test_an_index_already_in_flight_does_not_hold_the_footer() {
         let settle = ServerSettle::new(Duration::from_secs(1), Duration::from_secs(600));
         let rust = ServerId::from("rust");
         let start = Instant::now();
@@ -1719,8 +1762,9 @@ mod tests {
                 quiet: Duration::from_millis(200),
                 cap: Duration::from_secs(15),
             },
-            |elapsed| start + elapsed,
-        );
+            instant_tick(start),
+        )
+        .await;
 
         assert_eq!(
             ended,
