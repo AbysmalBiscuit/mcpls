@@ -1297,32 +1297,34 @@ mod tests {
         parts
     }
 
-    /// A guard for the change rather than a red-first test: it passes against
-    /// the current code, which clones the snapshot and releases the lock, and it
-    /// must keep passing afterwards. What it catches is the naive shape of the
-    /// fix, borrowing out of the cache guard all the way through the payload
-    /// build.
+    /// The flush acquires `delivery` before `notification_cache`. With the
+    /// cache lock held from the outside, the flush stalls at a point where it
+    /// must already own `delivery`; the opposite acquisition order would leave
+    /// `delivery` free at that moment.
     #[tokio::test]
-    #[allow(clippy::significant_drop_tightening)]
-    async fn test_a_flush_does_not_hold_the_cache_lock_while_building_its_payload() {
+    async fn test_a_flush_takes_delivery_before_the_cache() {
         let parts = test_server_with_baseline().await;
         let cache = Arc::clone(&parts.notification_cache);
+        let delivery = Arc::clone(&parts.delivery);
         let server = parts.server;
 
-        // Hold the cache lock from another task the moment the flush is in
-        // flight. If the flush holds it across its payload build, this never
-        // acquires and the timeout fires.
+        let held = cache.lock().await;
         let flush = tokio::spawn(async move { server.get_new_diagnostics().await });
-        tokio::task::yield_now().await;
-        let grabbed = tokio::time::timeout(std::time::Duration::from_secs(5), cache.lock()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         assert!(
-            grabbed.is_ok(),
-            "the diagnostics pump takes this same lock, and the transport drops \
-             notifications on a full channel rather than blocking, so a flush \
-             that holds it across its awaits loses publishes under hook traffic"
+            delivery.try_lock().is_err(),
+            "a flush blocked on the cache lock must already hold delivery; \
+             finding delivery free means the cache was taken first, and two \
+             sites taking these locks in opposite orders deadlock"
         );
-        flush.await.expect("the flush task").expect("the flush");
+
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(5), flush)
+            .await
+            .expect("the flush finished once the cache lock was free")
+            .expect("the flush task")
+            .expect("the flush");
     }
 
     fn create_test_server() -> McplsServer {
