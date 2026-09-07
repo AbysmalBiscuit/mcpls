@@ -90,6 +90,11 @@ pub enum Response {
     },
 }
 
+/// The `Response` literals asserted below are the wire contract for this
+/// protocol, not merely a record of how `serde` happens to serialize these
+/// types today. The design spec pins the three `Request` lines under its
+/// Protocol heading; it does not pin `Response`, so these literals are what
+/// defines the response side. Changing one of them changes the protocol.
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -151,5 +156,102 @@ mod tests {
             };
             assert_eq!(event, expected);
         }
+    }
+
+    #[test]
+    fn test_the_changed_response_pins_the_wire_shape() {
+        let literal = r#"{"op":"changed","queued":3}"#;
+        let value = Response::Changed { queued: 3 };
+        assert_eq!(
+            serde_json::to_value(&value).expect("serialize"),
+            serde_json::from_str::<serde_json::Value>(literal).expect("json")
+        );
+        assert_eq!(
+            serde_json::from_str::<Response>(literal).expect("deserialize"),
+            value
+        );
+    }
+
+    #[test]
+    fn test_the_flush_response_pins_the_wire_shape_with_context_present() {
+        let literal = r#"{"op":"flush","context":"2 errors in a.rs"}"#;
+        let value = Response::Flush {
+            context: Some("2 errors in a.rs".to_string()),
+        };
+        assert_eq!(
+            serde_json::to_value(&value).expect("serialize"),
+            serde_json::from_str::<serde_json::Value>(literal).expect("json")
+        );
+        assert_eq!(
+            serde_json::from_str::<Response>(literal).expect("deserialize"),
+            value
+        );
+    }
+
+    #[test]
+    fn test_the_flush_response_pins_the_wire_shape_with_context_absent() {
+        // `Option<String>` has no `skip_serializing_if` here, so an absent
+        // context is a present `context` key holding JSON `null`, not an
+        // omitted key.
+        let literal = r#"{"op":"flush","context":null}"#;
+        let value = Response::Flush { context: None };
+        assert_eq!(
+            serde_json::to_value(&value).expect("serialize"),
+            serde_json::from_str::<serde_json::Value>(literal).expect("json")
+        );
+        assert_eq!(
+            serde_json::from_str::<Response>(literal).expect("deserialize"),
+            value
+        );
+    }
+
+    #[test]
+    fn test_the_end_session_response_pins_the_wire_shape() {
+        let literal = r#"{"op":"end_session"}"#;
+        let value = Response::EndSession;
+        assert_eq!(
+            serde_json::to_value(&value).expect("serialize"),
+            serde_json::from_str::<serde_json::Value>(literal).expect("json")
+        );
+        assert_eq!(
+            serde_json::from_str::<Response>(literal).expect("deserialize"),
+            value
+        );
+    }
+
+    #[test]
+    fn test_the_status_response_pins_the_wire_shape() {
+        let literal =
+            r#"{"op":"status","hash":"abc123","socket":"mcpls.sock","pid":42,"owner":true}"#;
+        let value = Response::Status {
+            hash: "abc123".to_string(),
+            socket: PathBuf::from("mcpls.sock"),
+            pid: 42,
+            owner: true,
+        };
+        assert_eq!(
+            serde_json::to_value(&value).expect("serialize"),
+            serde_json::from_str::<serde_json::Value>(literal).expect("json")
+        );
+        assert_eq!(
+            serde_json::from_str::<Response>(literal).expect("deserialize"),
+            value
+        );
+    }
+
+    #[test]
+    fn test_the_error_response_pins_the_wire_shape() {
+        let literal = r#"{"op":"error","message":"boom"}"#;
+        let value = Response::Error {
+            message: "boom".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(&value).expect("serialize"),
+            serde_json::from_str::<serde_json::Value>(literal).expect("json")
+        );
+        assert_eq!(
+            serde_json::from_str::<Response>(literal).expect("deserialize"),
+            value
+        );
     }
 }
