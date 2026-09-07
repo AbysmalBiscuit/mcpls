@@ -63,6 +63,14 @@ pub struct Sweeper {
     last_opened_count: AtomicUsize,
     /// Files the last sweep could not check, and why.
     last_shortfall: StdMutex<Option<String>>,
+    /// Publishes the sweep count each time a sweep finishes.
+    ///
+    /// A watcher subscribed before the sweep it cares about sees exactly one
+    /// change when that sweep completes, so a caller can await the event a
+    /// sweep happened instead of assuming `run`'s task has already been
+    /// polled -- under a paused clock, advancing time moves the clock but
+    /// does not itself guarantee a separately spawned task gets scheduled.
+    completed: watch::Sender<usize>,
 }
 
 impl Sweeper {
@@ -89,6 +97,7 @@ impl Sweeper {
             last_kinds: StdMutex::new(Vec::new()),
             last_opened_count: AtomicUsize::new(0),
             last_shortfall: StdMutex::new(None),
+            completed: watch::channel(0).0,
         }
     }
 
@@ -176,6 +185,16 @@ impl Sweeper {
         self.last_opened_count.load(Ordering::Relaxed)
     }
 
+    /// A receiver that changes once the next sweep completes.
+    ///
+    /// Subscribe before triggering the activity under test, then await
+    /// `changed()` (under a timeout) rather than assuming `run`'s task has
+    /// been polled. Test-only.
+    #[cfg(test)]
+    pub(crate) fn subscribe_completions(&self) -> watch::Receiver<usize> {
+        self.completed.subscribe()
+    }
+
     /// Take the whole pending set and act on it.
     ///
     /// Tracked and deleted paths (and any that arrived while absent, even if
@@ -246,7 +265,10 @@ impl Sweeper {
 
         *lock_std(&self.last_kinds) = kinds;
         self.last_opened_count.store(opened, Ordering::Relaxed);
-        self.sweeps_run.fetch_add(1, Ordering::Relaxed);
+        let sweeps_run = self.sweeps_run.fetch_add(1, Ordering::Relaxed) + 1;
+        // No receivers is not an error: a caller that never subscribed just
+        // never learns a sweep happened, which is fine outside tests.
+        let _ = self.completed.send(sweeps_run);
     }
 
     /// Read `path` fresh and open it as a new tracked document. A read
@@ -359,12 +381,24 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_a_burst_produces_one_sweep() {
         let sweeper = test_sweeper(Duration::from_millis(500));
+        let mut completed = sweeper.subscribe_completions();
+        let mut written = Vec::with_capacity(50);
         for i in 0..50 {
             let path = sweeper.write(&format!("f{i}.rs"));
-            sweeper.enqueue(&[path]);
+            sweeper.enqueue(std::slice::from_ref(&path));
+            written.push(path);
             tokio::time::advance(Duration::from_millis(10)).await;
         }
         tokio::time::advance(Duration::from_millis(600)).await;
+
+        // Advancing a paused clock moves the clock but does not by itself
+        // guarantee `run`'s spawned task gets polled again; await the
+        // sweep's own completion signal (which pulls the clock forward via
+        // auto-advance as needed) rather than assuming it already ran.
+        tokio::time::timeout(Duration::from_secs(5), completed.changed())
+            .await
+            .expect("a sweep to complete within the timeout")
+            .expect("the sweeper task to still be running");
 
         assert_eq!(
             sweeper.sweeps_run(),
@@ -373,21 +407,42 @@ mod tests {
              check in flight, so a cargo fmt forwarded one path at a time \
              produces fifty cancelled checks and no diagnostics at all"
         );
+
+        let mut swept: Vec<PathBuf> = sweeper
+            .last_kinds()
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
+        swept.sort();
+        written.sort();
+        assert_eq!(
+            swept, written,
+            "a coalesced sweep that dropped paths on the floor would still \
+             pass a bare count of one sweep; every enqueued path must show \
+             up in the set the single sweep covered"
+        );
     }
 
     #[tokio::test(start_paused = true)]
     async fn test_a_path_arriving_during_the_quiet_period_restarts_it() {
         let sweeper = test_sweeper(Duration::from_millis(500));
+        let mut completed = sweeper.subscribe_completions();
         let a = sweeper.write("a.rs");
-        sweeper.enqueue(&[a]);
+        sweeper.enqueue(std::slice::from_ref(&a));
         tokio::time::advance(Duration::from_millis(400)).await;
         let b = sweeper.write("b.rs");
-        sweeper.enqueue(&[b]);
+        sweeper.enqueue(std::slice::from_ref(&b));
         tokio::time::advance(Duration::from_millis(400)).await;
 
         assert_eq!(sweeper.sweeps_run(), 0, "the burst has not settled");
 
         tokio::time::advance(Duration::from_millis(200)).await;
+        // Same reasoning as the burst test: wait for the sweep's own signal
+        // rather than assume the advance above already polled `run`.
+        tokio::time::timeout(Duration::from_secs(5), completed.changed())
+            .await
+            .expect("a sweep to complete within the timeout")
+            .expect("the sweeper task to still be running");
         assert_eq!(sweeper.sweeps_run(), 1);
     }
 
