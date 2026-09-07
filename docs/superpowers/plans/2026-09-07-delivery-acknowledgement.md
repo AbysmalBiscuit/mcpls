@@ -502,6 +502,8 @@ Expected: FAIL on the `report.changed.is_empty()` assertion. `b.rs` arrives with
 
 - [ ] **Step 7: test the real condition instead of the proxy**
 
+The condition the comment states is that the budget is untouched, so the arm has to test that and nothing weaker. `remaining > 0` would say only that the budget is non-empty, which is the same collapse `delivered_any` makes: with `max_total = 2` and a flush carrying one file of one diagnostic and one of five, it truncates the second to a single diagnostic and records the hash of all five, so the other four never come back until that file changes. Testing `remaining == max_total` defers it instead, and the next flush offers two of the five. `visible.len() > self.config.max_total` is redundant once the guard is `remaining == max_total`, because the arm above already established `visible.len() > remaining`.
+
 In `flush`, replace the `!delivered_any` arm of the `budget_omitted` match:
 
 ```rust
@@ -511,13 +513,12 @@ In `flush`, replace the `!delivered_any` arm of the `budget_omitted` match:
                             budget = Some(remaining - visible.len());
                             Some(0)
                         }
-                        // Too big for a whole budget, so no later flush
-                        // does better and withholding it withholds it
-                        // forever. With nothing left to spend, the next
-                        // flush's fresh budget is the better offer.
-                        Some(remaining)
-                            if remaining > 0 && visible.len() > self.config.max_total =>
-                        {
+                        // The budget is untouched and this file still does
+                        // not fit it, so no later flush offers more of it
+                        // and withholding it withholds it forever.
+                        // Truncated to the whole budget is the best any
+                        // flush can do.
+                        Some(remaining) if remaining == self.config.max_total => {
                             let shortfall = visible.len() - remaining;
                             visible.truncate(remaining);
                             budget = Some(0);
@@ -528,6 +529,48 @@ In `flush`, replace the `!delivered_any` arm of the `budget_omitted` match:
 ```
 
 That leaves `delivered_any` read nowhere. Delete both its declaration (`let mut delivered_any = false;`) and its assignment (`delivered_any = true;`).
+
+The clear-then-change test above passes under either guard, so it does not pin the choice. Add one that does, which fails under `remaining > 0` and passes under `remaining == max_total`:
+
+```rust
+    #[test]
+    fn test_a_partly_spent_budget_defers_rather_than_truncating() {
+        let mut delivery = DiagnosticsDelivery::new(DiagnosticsConfig {
+            max_total: 2,
+            ..DiagnosticsConfig::default()
+        });
+        let session = SessionId::from("s".to_string());
+        let one = vec![diagnostic(0, DiagnosticSeverity::ERROR, "boom")];
+        let five: Vec<_> = (1..6)
+            .map(|i| diagnostic(i, DiagnosticSeverity::ERROR, "boom"))
+            .collect();
+
+        let first = delivery.flush(
+            &session,
+            &[
+                entry("a.rs", &one, SeverityFloor::Warning),
+                entry("b.rs", &five, SeverityFloor::Warning),
+            ],
+        );
+        assert_eq!(first.changed.len(), 1, "a.rs fits and is delivered");
+        assert_eq!(first.changed[0].key, "a.rs");
+        assert_eq!(
+            first.omitted, 1,
+            "a.rs spent one of the two, so what is left shows less of b.rs \
+             than a fresh budget would; b.rs waits rather than being cut to a \
+             fifth of itself and recorded as delivered"
+        );
+
+        let second = delivery.flush(&session, &[entry("b.rs", &five, SeverityFloor::Warning)]);
+        assert_eq!(second.changed.len(), 1);
+        assert_eq!(
+            second.changed[0].diagnostics.len(),
+            2,
+            "the whole budget is the most any flush can offer this file"
+        );
+        assert_eq!(second.changed[0].omitted, 3);
+    }
+```
 
 - [ ] **Step 8: run the delivery tests and watch them pass**
 
