@@ -1772,31 +1772,43 @@ mod tests {
         parts
     }
 
-    /// A server whose config enables the footer, with a baseline adopted
-    /// and one error in the cache, so a footer has something to report.
-    async fn test_server_with_footer_and_one_error() -> TestServer {
-        let uri: lsp_types::Uri = if cfg!(windows) {
-            "file:///C:/workspace/broken.rs"
-                .parse()
-                .expect("a valid uri")
+    /// A workspace file URI, spelled the way the running platform spells
+    /// one, for a cache fixture whose file need not exist.
+    fn workspace_uri(name: &str) -> lsp_types::Uri {
+        let uri = if cfg!(windows) {
+            format!("file:///C:/workspace/{name}")
         } else {
-            "file:///workspace/broken.rs".parse().expect("a valid uri")
+            format!("file:///workspace/{name}")
         };
-        let owner = ServerId::from("rust");
-        let diagnostics = DiagnosticsConfig {
+        uri.parse().expect("a valid uri")
+    }
+
+    /// The footer switched on with its wait out of the test's way: what
+    /// these assert is the guard, the record and the note, not the timing,
+    /// which `wait_for_footer_quiet_at` covers directly.
+    fn footer_config() -> DiagnosticsConfig {
+        DiagnosticsConfig {
             footer: true,
-            // Keep the wait out of the test's way: what these assert is the
-            // guard and the record, not the timing, which
-            // `wait_for_footer_quiet_at` covers directly.
             footer_grace_ms: 0,
             footer_quiet_ms: 0,
             footer_wait_ms: 0,
             ..DiagnosticsConfig::default()
-        };
+        }
+    }
+
+    /// A server whose config enables the footer, with a baseline adopted
+    /// and one error in the cache, so a footer has something to report.
+    async fn test_server_with_footer_and_one_error() -> TestServer {
+        server_with_footer_and_one_error(footer_config()).await
+    }
+
+    /// The same over a caller-chosen config, for a test that needs a cap
+    /// the default leaves far out of reach.
+    async fn server_with_footer_and_one_error(diagnostics: DiagnosticsConfig) -> TestServer {
         let parts = test_server_parts_with(diagnostics);
         parts.notification_cache.lock().await.store_diagnostics(
-            &owner,
-            &uri,
+            &ServerId::from("rust"),
+            &workspace_uri("broken.rs"),
             Some(1),
             vec![diagnostic_at("broken")],
         );
@@ -1986,6 +1998,56 @@ mod tests {
         assert!(
             report["changed"].as_array().expect("changed").is_empty(),
             "one report per problem: the footer and the flush share one record"
+        );
+    }
+
+    /// The footer's own note, in both of the shapes it is built in.
+    ///
+    /// It is the only thing telling the agent that a footer is a floor
+    /// rather than the whole answer. An agent that reads one as complete
+    /// stops looking, and whatever landed after the wait is then never
+    /// asked for, so the sentence is pinned whole, and pinned again where
+    /// it follows a note the flush had already written.
+    #[tokio::test]
+    async fn test_a_footer_says_it_is_best_effort() {
+        let parts = test_server_with_footer_and_one_error().await;
+
+        let footer = parts.server.footer_for_write().await.expect("a report");
+
+        assert_eq!(
+            footer.note.as_deref(),
+            Some(
+                "This footer is best effort; anything slower than the wait \
+                 arrives in the next get_new_diagnostics."
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_footer_that_held_a_file_back_says_both_things() {
+        let parts = server_with_footer_and_one_error(DiagnosticsConfig {
+            max_total: 1,
+            ..footer_config()
+        })
+        .await;
+        // A second file the total budget cannot reach, so the flush writes
+        // a note of its own for the footer's to follow.
+        parts.notification_cache.lock().await.store_diagnostics(
+            &ServerId::from("rust"),
+            &workspace_uri("other.rs"),
+            Some(1),
+            vec![diagnostic_at("also broken")],
+        );
+
+        let footer = parts.server.footer_for_write().await.expect("a report");
+
+        assert_eq!(
+            footer.note.as_deref(),
+            Some(
+                "1 file(s) were held back by the diagnostics caps this call; \
+                 call again to see them. This footer is best effort; anything \
+                 slower than the wait arrives in the next get_new_diagnostics."
+            )
         );
     }
 
