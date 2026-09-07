@@ -314,7 +314,7 @@ fn hooks_seen_line(count: u64) -> String {
 /// What the runtime-directory scan found when this project's own socket
 /// answered nobody.
 enum ForeignOwners {
-    /// Nothing else answered either.
+    /// The scan ran and nothing else answered either.
     None,
     /// An owner answered whose root is an ancestor or descendant of the
     /// project directory: the shape a server started one level up, or a
@@ -326,6 +326,11 @@ enum ForeignOwners {
     /// come first out of `read_dir`, an innocent project, for this
     /// project's own silence.
     Unrelated(usize),
+    /// The scan itself could not run, so nothing above is known one way
+    /// or the other. Distinct from `None`, which is an answer the scan
+    /// actually earned; this is the scan reporting that it never got to
+    /// look.
+    ScanFailed(String),
 }
 
 /// The `server sees` line to print when nothing answers this project's own
@@ -346,6 +351,10 @@ fn no_owner_line(foreign: ForeignOwners) -> String {
         ForeignOwners::Unrelated(count) => format!(
             "server sees: no owner for this directory; {count} other mcpls instances are \
              running, none for this directory or a parent of it"
+        ),
+        ForeignOwners::ScanFailed(reason) => format!(
+            "server sees: no owner for this directory; could not scan for other mcpls \
+             instances: {reason}"
         ),
     }
 }
@@ -369,8 +378,12 @@ async fn find_foreign_owner(
     project_dir: &Path,
     prefix: &str,
 ) -> ForeignOwners {
+    let candidates = match foreign_candidates(identity, prefix) {
+        Ok(candidates) => candidates,
+        Err(error) => return ForeignOwners::ScanFailed(error.to_string()),
+    };
     let mut unrelated = 0usize;
-    for candidate in foreign_candidates(identity, prefix).take(MAX_FOREIGN_CANDIDATES) {
+    for candidate in candidates.into_iter().take(MAX_FOREIGN_CANDIDATES) {
         let probe = SocketIdentity {
             socket: candidate,
             lock: PathBuf::new(),
@@ -399,38 +412,50 @@ async fn find_foreign_owner(
 /// The other sockets that might have an owner, alongside `identity`'s own
 /// in the same runtime directory. `prefix` is unused: the directory
 /// itself is already this scan's whole scope on Unix.
+///
+/// A missing runtime directory is not a failure: it means no mcpls has
+/// ever run on this machine since it was last cleared, since the
+/// directory is only created when an owner actually binds. Any other
+/// error (permissions, most plausibly) is genuinely opaque and reported
+/// as one.
 #[cfg(not(windows))]
-fn foreign_candidates(identity: &SocketIdentity, _prefix: &str) -> impl Iterator<Item = PathBuf> {
+fn foreign_candidates(identity: &SocketIdentity, _prefix: &str) -> std::io::Result<Vec<PathBuf>> {
     let own = identity.socket.clone();
-    identity
-        .socket
-        .parent()
-        .and_then(|dir| std::fs::read_dir(dir).ok())
-        .into_iter()
-        .flatten()
+    let Some(dir) = identity.socket.parent() else {
+        return Ok(Vec::new());
+    };
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    Ok(entries
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(move |path| *path != own && path.extension().is_some_and(|ext| ext == "sock"))
+        .filter(|path| *path != own && path.extension().is_some_and(|ext| ext == "sock"))
+        .collect())
 }
 
 /// The other named pipes that might have an owner, read from the
 /// system-wide pipe namespace and filtered to `prefix`, since Windows has
 /// no per-project directory to list instead.
+///
+/// Unlike the Unix directory, this namespace always exists, so any
+/// `read_dir` failure here is genuinely opaque rather than the clean
+/// "nothing has ever run" answer a missing directory means on Unix.
 #[cfg(windows)]
-fn foreign_candidates(identity: &SocketIdentity, prefix: &str) -> impl Iterator<Item = PathBuf> {
+fn foreign_candidates(identity: &SocketIdentity, prefix: &str) -> std::io::Result<Vec<PathBuf>> {
     let own = identity.socket.clone();
-    let prefix = prefix.to_string();
-    std::fs::read_dir(r"\\.\pipe\")
-        .ok()
-        .into_iter()
-        .flatten()
+    let entries = std::fs::read_dir(r"\\.\pipe\")?;
+    Ok(entries
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(move |path| {
+        .filter(|path| {
             *path != own
                 && path
                     .file_name()
                     .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with(prefix.as_str()))
+                    .is_some_and(|name| name.starts_with(prefix))
         })
+        .collect())
 }
 
 /// The doctor's answer when this project's own socket identity cannot be
@@ -1623,6 +1648,54 @@ mod tests {
                 .expect("a server-sees line is always printed"),
             "server sees: no owner; nothing is listening on this project's socket",
             "{out}"
+        );
+    }
+
+    /// A directory the scan cannot read (permissions, most plausibly) is
+    /// not the same fact as an empty one: the scan never got to look, so
+    /// it must say so rather than claiming the clean "nothing is
+    /// listening" it has no evidence for. Unix-only: the permission trick
+    /// this drives has no Windows equivalent, and the Windows pipe
+    /// namespace's failure modes are not reproducible from a test.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_doctor_reports_a_scan_failure_rather_than_a_clean_no_owner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let project = tempfile::tempdir().expect("a temp dir");
+        let socket_dir = tempfile::tempdir().expect("a temp dir");
+        let identity = local_identity_for(project.path(), socket_dir.path());
+
+        let original_mode = std::fs::metadata(socket_dir.path())
+            .expect("stat the directory")
+            .permissions()
+            .mode();
+        std::fs::set_permissions(socket_dir.path(), std::fs::Permissions::from_mode(0o000))
+            .expect("lock the directory down");
+
+        let out = super::doctor_scanning(project.path(), &identity, TEST_PIPE_PREFIX).await;
+
+        // Restore access before any assertion can panic and skip this,
+        // leaving this test's own TempDir unable to clean itself up.
+        std::fs::set_permissions(
+            socket_dir.path(),
+            std::fs::Permissions::from_mode(original_mode),
+        )
+        .expect("restore the directory's permissions");
+
+        let server_sees = out
+            .lines()
+            .find(|line| line.starts_with("server sees: "))
+            .expect("a server-sees line is always printed");
+        assert!(
+            server_sees.contains("could not scan"),
+            "the scan never ran, so the doctor must say so rather than \
+             report a clean negative it has no evidence for: {out}"
+        );
+        assert!(
+            !server_sees.contains("nothing is listening"),
+            "'I could not look' and 'I looked and found nothing' are \
+             different facts: {out}"
         );
     }
 
