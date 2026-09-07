@@ -551,7 +551,11 @@ fn test_completions_survives_a_closed_pipe() {
 /// project directory `main.rs` hands it, so a bug in that seam (passing
 /// `CLAUDE_PROJECT_DIR` through uncanonicalized) is invisible to every unit
 /// test in `hook.rs`, which always passes an absolute `tempfile::tempdir()`
-/// path directly.
+/// path directly. `CLAUDE_PROJECT_DIR` is left unset here, rather than set
+/// to the (already absolute) temp directory, so the process falls back to
+/// `main.rs`'s `PathBuf::from(".")` default: only a relative path run
+/// through canonicalization can tell this test apart from one that merely
+/// checks its own fixture.
 #[test]
 fn test_hook_session_start_emits_absolute_watch_paths() {
     let temp_dir = TempDir::new().unwrap();
@@ -561,10 +565,11 @@ fn test_hook_session_start_emits_absolute_watch_paths() {
     cmd.env_remove("MCPLS_LOG")
         .env_remove("MCPLS_CONFIG")
         .env_remove("MCPLS_TRUST_PROJECT_CONFIG")
-        .env_remove("MCPLS_LOG_JSON");
+        .env_remove("MCPLS_LOG_JSON")
+        .env_remove("CLAUDE_PROJECT_DIR");
     let assert = cmd
         .arg("hook")
-        .env("CLAUDE_PROJECT_DIR", temp_dir.path())
+        .current_dir(temp_dir.path())
         .write_stdin(r#"{"hook_event_name":"SessionStart"}"#)
         .assert()
         .success();
@@ -588,11 +593,10 @@ fn test_hook_session_start_emits_absolute_watch_paths() {
 
 /// A hook invocation must never panic on a closed stdout, the same
 /// guarantee `test_completions_survives_a_closed_pipe` proves for
-/// `completions`: `main.rs`'s hook branch writes with `print!`, which
-/// panics past the `LineWriter`'s buffer, so the project directory here
-/// has enough top-level entries that `SessionStart`'s `watchPaths` JSON is
-/// large enough to force a real write rather than sitting in that buffer
-/// until the ignored exit-time flush.
+/// `completions`: a hook branch that wrote with `print!` would panic past
+/// the `LineWriter`'s buffer, so the project directory here has enough
+/// top-level entries to force a real write rather than one that sits in
+/// that buffer until the ignored exit-time flush.
 #[cfg(unix)]
 #[test]
 fn test_hook_survives_a_closed_pipe() {
