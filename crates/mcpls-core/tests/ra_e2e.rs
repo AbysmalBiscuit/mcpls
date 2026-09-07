@@ -1578,12 +1578,115 @@ fn sc_rename_symbol_apply(client: &mut McpClient, workspace: &Path) -> Result<()
     Ok(())
 }
 
+/// The resync sends `didSave`, so a build error an apply introduces reaches
+/// the agent.
+///
+/// Renaming `tally` to `total` collides with the existing `total`, so rustc
+/// reports E0428 for `src/lib.rs`. rust-analyzer does not check a rename for
+/// conflicts, so the apply lands and the error appears only once a build
+/// runs, which happens only if the resync sent a `didSave`.
+///
+/// The pair is same-signature on purpose. A rename that changed a call
+/// site's arity would produce rust-analyzer's own resident diagnostics,
+/// which arrive on a `didChange` alone, and this sub-case would then pass
+/// with the `didSave` half of the resync entirely broken.
+fn sc_resync_delivers_a_build_error_after_an_apply(
+    client: &mut McpClient,
+    workspace: &Path,
+) -> Result<(), String> {
+    let lib = workspace.join("src/lib.rs");
+    let tally_line = find_line(&lib, "pub fn tally(");
+
+    let resp = client
+        .call_tool(
+            "rename_symbol",
+            &json!({
+                "file_path": lib.to_string_lossy(),
+                "line": tally_line,
+                "character": 8,
+                "new_name": "total",
+                "apply": true,
+            }),
+        )
+        .map_err(|e| format!("call failed: {e}"))?;
+
+    let text = assertions::assert_tool_ok(&resp);
+    let inner: Value = serde_json::from_str(&text).map_err(|e| format!("bad JSON: {e}"))?;
+
+    if inner["applied"] != json!(true) {
+        return Err(format!("expected applied=true, got {inner}"));
+    }
+    let written = inner["files_written"]
+        .as_array()
+        .ok_or_else(|| format!("expected files_written array, got {inner}"))?;
+    if written.len() < 2 {
+        return Err(format!(
+            "the caller in functions.rs must have been rewritten too, so the \
+             resync has more than one document to catch up; got {written:?}"
+        ));
+    }
+
+    // Poll rather than asserting on one call: how long the build takes is
+    // rust-analyzer's business, and how far into the suite this sub-case
+    // runs is the registry's.
+    //
+    // Discriminate on `omitted`, not on `note`'s presence.
+    // `NewDiagnosticsResult::starting_up` sets `note` before `flush` ever
+    // runs, with `omitted == 0`, but `new_diagnostics_payload` also sets
+    // `note` on a real report that held files back. Skipping every report
+    // carrying a `note` would skip real ones. This is the same rule
+    // `sc_get_new_diagnostics` states at `ra_e2e.rs:1445`.
+    let deadline = Instant::now() + Duration::from_millis(settle_deadline_ms());
+    let mut last = Value::Null;
+    loop {
+        let raw = client
+            .call_tool("get_new_diagnostics", &json!({}))
+            .map_err(|e| format!("flush call failed: {e}"))?;
+        let body = assertions::assert_tool_ok(&raw);
+        let report: Value = serde_json::from_str(&body).map_err(|e| format!("bad JSON: {e}"))?;
+        let omitted = report["omitted"].as_u64().unwrap_or(0);
+        let starting_up = report.get("note").is_some() && omitted == 0;
+        if !starting_up {
+            if let Some(hit) = find_rustc_e0428(&report) {
+                if hit["code"] != json!("E0428") || hit["source"] != json!("rustc") {
+                    return Err(format!("matched the wrong diagnostic: {hit}"));
+                }
+                return Ok(());
+            }
+            last = report;
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "no rustc E0428 arrived within the settle deadline. \
+                 rust-analyzer publishes its own resident diagnostics on a \
+                 didChange alone, so this failing while rename_symbol still \
+                 writes means the resync's didSave never reached the server. \
+                 Last report: {last}"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// The first `rustc`-sourced `E0428` anywhere in a flush report, or `None`.
+fn find_rustc_e0428(report: &Value) -> Option<Value> {
+    report["changed"]
+        .as_array()?
+        .iter()
+        .flat_map(|file| file["diagnostics"].as_array().into_iter().flatten())
+        .find(|d| d["source"] == json!("rustc") && d["code"] == json!("E0428"))
+        .cloned()
+}
+
 // ---------------------------------------------------------------------------
 // Suite driver
 // ---------------------------------------------------------------------------
 
 #[test]
 #[ignore = "Requires rust-analyzer in PATH; set MCPLS_SKIP_RA=1 to skip or MCPLS_RUST_ANALYZER=<path> to override"]
+// The sub-case registry grows by one line per stage; the setup and teardown
+// around it stay flat, so length here tracks sub-case count, not complexity.
+#[allow(clippy::too_many_lines)]
 fn ra_e2e_suite() {
     let ra_path = match resolve_rust_analyzer() {
         Resolution::Found(p) => p,
@@ -1655,6 +1758,12 @@ fn ra_e2e_suite() {
         sub_case!(sc_subscribe_unsubscribe_resource),
         sub_case!(sc_subscribe_no_replay_without_cached_diagnostics),
         sub_case!(sc_get_new_diagnostics),
+        // After the dedup sub-case: this one deliberately introduces a
+        // compile error, which would break that sub-case's "a second drain
+        // with no edits between is empty" property. Its own anchors are
+        // symbols nothing else in the suite touches, so whether the rename
+        // sub-case below runs before or after it changes nothing.
+        sub_case!(sc_resync_delivers_a_build_error_after_an_apply),
         // Last: this one writes to the staged workspace, and every anchor
         // above it looks for text this rename moves.
         sub_case!(sc_rename_symbol_apply),
