@@ -2149,7 +2149,7 @@ mod tests {
                     diagnostics_severity: None,
                 }],
                 apply: crate::config::ApplyConfig::default(),
-                diagnostics: crate::config::DiagnosticsConfig::default(),
+                diagnostics: hookless_diagnostics(),
                 project_config_ignored: false,
             };
 
@@ -2192,7 +2192,7 @@ mod tests {
                 },
                 lsp_servers: vec![],
                 apply: crate::config::ApplyConfig::default(),
-                diagnostics: crate::config::DiagnosticsConfig::default(),
+                diagnostics: hookless_diagnostics(),
                 project_config_ignored: false,
             };
 
@@ -2205,6 +2205,24 @@ mod tests {
                     !matches!(err, Error::NoServersAvailable(_)),
                     "serve() must not return NoServersAvailable for empty lsp_servers config"
                 );
+            }
+        }
+
+        /// Diagnostics with the hook socket switched off.
+        ///
+        /// A `serve()` that binds derives its socket from the process
+        /// working directory, which a test runner sets to the package
+        /// directory: several of these tests would then arbitrate one lock
+        /// between themselves, and each run would leave a socket and a lock
+        /// behind in the user's shared runtime directory that nothing ever
+        /// removes. None of them is about hooks.
+        fn hookless_diagnostics() -> crate::config::DiagnosticsConfig {
+            crate::config::DiagnosticsConfig {
+                hooks: crate::config::HooksConfig {
+                    enabled: false,
+                    ..crate::config::HooksConfig::default()
+                },
+                ..crate::config::DiagnosticsConfig::default()
             }
         }
 
@@ -2239,6 +2257,10 @@ mod tests {
             let _guard = CwdGuard::enter(doomed_cwd.path());
             doomed_cwd.close().unwrap();
 
+            // Hooks stay on here, unlike the tests above: with the cwd
+            // removed, deriving the socket identity fails, which is the
+            // path that must warn and carry on rather than fail startup.
+            // Nothing binds, so nothing is left behind either.
             let config = ServerConfig {
                 workspace: WorkspaceConfig {
                     roots: vec![workspace_root],

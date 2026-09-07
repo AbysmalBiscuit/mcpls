@@ -133,6 +133,15 @@ struct E2eConfig {
 #[derive(Serialize, Deserialize)]
 struct DiagnosticsTable {
     settle_quiet_ms: u64,
+    hooks: HooksTable,
+}
+
+/// Hooks off. These suites exercise the MCP and LSP layers, and leaving
+/// hooks on would have every spawned server bind a socket and a lock in the
+/// user's shared runtime directory, which nothing ever removes.
+#[derive(Serialize, Deserialize)]
+struct HooksTable {
+    enabled: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -189,6 +198,7 @@ fn write_config(pyrefly_binary: &Path, workspace_root: &Path, config_path: &Path
         apply: ApplyTable { rename: true },
         diagnostics: DiagnosticsTable {
             settle_quiet_ms: 200,
+            hooks: HooksTable { enabled: false },
         },
     };
     let content = toml::to_string(&cfg).expect("failed to serialize e2e config");

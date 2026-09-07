@@ -6,6 +6,12 @@
 [workspace]
 roots = []
 
+# These tests exercise the MCP layer. Leaving hooks on would have every
+# spawned server bind a socket and a lock in the user's shared runtime
+# directory, which nothing ever removes.
+[diagnostics.hooks]
+enabled = false
+
 [[lsp_servers]]
 language_id = "rust"
 enabled = false
