@@ -590,13 +590,20 @@ impl DocumentTracker {
     /// untracked path to the servers that asked to watch it is the watched
     /// files registry's job, and opening it is the sweep's.
     ///
-    /// The caller must hold `path`'s lock from [`Self::lock_path`].
+    /// The caller must hold `path`'s lock from [`Self::lock_path`]; a debug
+    /// build asserts that some caller does, though not that it is this one.
     ///
     /// # Errors
     ///
     /// Returns an error if the file cannot be read or exceeds the
     /// configured size limit.
     pub async fn resync_from_disk(&self, path: &Path) -> Result<Option<Resync>> {
+        debug_assert!(
+            lock_std(&self.path_locks)
+                .get(path)
+                .is_some_and(|lock| lock.try_lock().is_err()),
+            "resync_from_disk requires the caller to hold path's lock_path guard"
+        );
         let read_at = SystemTime::now();
         if !lock_std(&self.documents).contains_key(path) {
             return Ok(None);
@@ -640,7 +647,9 @@ impl DocumentTracker {
     ///
     /// Dropped when `generation` no longer matches: the process that would
     /// have received it has been respawned, and the fresh one has seen
-    /// nothing.
+    /// nothing. The generation is read only after `documents` is locked --
+    /// see [`Self::forget_server`] and `sync_phase`'s matching check for why
+    /// reading it any earlier would reopen the race those close.
     pub fn mark_change_sent(&self, path: &Path, server: &ServerId, version: i32, generation: u64) {
         let mut documents = lock_std(&self.documents);
         if self.generation(server) != generation {
@@ -654,7 +663,8 @@ impl DocumentTracker {
     /// Record that `server` received the `didSave` for `version`.
     ///
     /// Dropped when `generation` no longer matches, for the same reason as
-    /// [`Self::mark_change_sent`].
+    /// [`Self::mark_change_sent`] -- including reading the generation only
+    /// after `documents` is locked.
     pub fn mark_save_sent(&self, path: &Path, server: &ServerId, version: i32, generation: u64) {
         let mut documents = lock_std(&self.documents);
         if self.generation(server) != generation {
@@ -3091,6 +3101,44 @@ mod tests {
             doc_state.saved_version(&rust),
             None,
             "the process that received that didSave is gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_stale_generation_does_not_mark_a_respawned_servers_change_caught_up() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "fn a() {}").expect("write");
+
+        let tracker = DocumentTracker::new(ResourceLimits::default(), extension_map());
+        let (client, _fake) = fake_client();
+        let rust = ServerId::from("rust");
+        tracker
+            .ensure_open(&path, &rust, &client)
+            .await
+            .expect("open");
+        std::fs::write(&path, "fn a() -> i32 { }").expect("rewrite");
+
+        let stale = tracker.generation_for(&rust);
+        let version = {
+            let _guard = tracker.lock_path(&path).await;
+            tracker
+                .resync_from_disk(&path)
+                .await
+                .expect("resync")
+                .expect("tracked")
+                .version
+        };
+        tracker.forget_server(&rust);
+        tracker.mark_change_sent(&path, &rust, version, stale);
+
+        let doc_state = tracker
+            .snapshot(&path)
+            .expect("the document is still tracked");
+        assert_eq!(
+            doc_state.synced_version(&rust),
+            None,
+            "the process that received that didChange is gone"
         );
     }
 }
