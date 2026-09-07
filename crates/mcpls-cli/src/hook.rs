@@ -281,13 +281,14 @@ async fn doctor_scanning(project_dir: &Path, identity: &SocketIdentity, prefix: 
             ));
             lines.push("owner pid: none".to_string());
         }
-        // A connection was accepted and something came back before the
-        // deadline, but this build could not read it: a version skew is
-        // the likely cause, not a busy owner.
+        // A connection was accepted and the exchange then failed, on the
+        // write, the read, an early hang-up, or the parse. The error
+        // carries which; the line says only what all four share, that
+        // something holds the socket and this build cannot talk to it.
         ProbeOutcome::Unintelligible(error) => {
             lines.push(format!(
-                "server sees: a socket answered but the reply could not be read: {error}; \
-                 a different mcpls version running is the usual cause"
+                "server sees: a socket is live but this build could not read its reply: \
+                 {error}"
             ));
             lines.push("owner pid: none".to_string());
         }
@@ -355,13 +356,20 @@ fn hooks_seen_line(count: u64) -> String {
 /// What the runtime-directory scan found when this project's own socket
 /// answered nobody.
 enum ForeignOwners {
-    /// The scan ran and nothing else answered either.
+    /// The scan ran and no candidate identified itself as an owner.
     None {
         /// Whether the runtime location held more candidates than
         /// [`MAX_FOREIGN_CANDIDATES`] allowed this scan to examine. When
         /// true, "nothing is listening" covers only the candidates this
         /// scan actually reached.
         truncated: bool,
+        /// How many candidates were live but unidentifiable: they
+        /// accepted a connection and then either said nothing before the
+        /// deadline or said something this build could not read. An mcpls
+        /// speaking an older wire shape lands here, and reporting it as
+        /// an absence is how the doctor would come to say nothing is
+        /// running while something is.
+        unidentified: usize,
     },
     /// An owner answered whose root is an ancestor or descendant of the
     /// project directory: the shape a server started one level up, or a
@@ -381,6 +389,10 @@ enum ForeignOwners {
         /// true, "none relate to this project" is not something the scan
         /// established for the candidates past its own limit.
         truncated: bool,
+        /// How many candidates were live but unidentifiable, counted the
+        /// same way as [`ForeignOwners::None::unidentified`]. One of them
+        /// may well be this project's owner on an older wire shape.
+        unidentified: usize,
     },
     /// The scan itself could not run, so nothing above is known one way
     /// or the other. Distinct from `None`, which is an answer the scan
@@ -389,14 +401,36 @@ enum ForeignOwners {
     ScanFailed(String),
 }
 
+impl ForeignOwners {
+    /// How many candidates were live but could not be identified.
+    ///
+    /// Zero for the two outcomes that never probed anything: a scan that
+    /// could not run, and a named owner, which returns the moment it
+    /// answers and so leaves the rest of the candidates unexamined.
+    const fn unidentified(&self) -> usize {
+        match self {
+            Self::None { unidentified, .. } | Self::Unrelated { unidentified, .. } => *unidentified,
+            Self::Related { .. } | Self::ScanFailed(_) => 0,
+        }
+    }
+}
+
 /// The `server sees` line to print when nothing answers this project's own
 /// socket.
+///
+/// Candidates that were live but unidentifiable are reported as their own
+/// clause rather than folded into the counts above it. They are evidence
+/// that something is running, but not evidence of whose it is, and the
+/// lines above only ever count owners that named their own root.
 fn no_owner_line(foreign: ForeignOwners) -> String {
-    match foreign {
-        ForeignOwners::None { truncated: false } => {
-            "server sees: no owner; nothing is listening on this project's socket".to_string()
-        }
-        ForeignOwners::None { truncated: true } => format!(
+    let unidentified = foreign.unidentified();
+    let line = match foreign {
+        ForeignOwners::None {
+            truncated: false, ..
+        } => "server sees: no owner; nothing is listening on this project's socket".to_string(),
+        ForeignOwners::None {
+            truncated: true, ..
+        } => format!(
             "server sees: no owner; checked {MAX_FOREIGN_CANDIDATES} other candidates and \
              none answered, but more may exist beyond the scan's limit"
         ),
@@ -408,12 +442,14 @@ fn no_owner_line(foreign: ForeignOwners) -> String {
         ForeignOwners::Unrelated {
             count: 1,
             truncated: false,
+            ..
         } => "server sees: no owner for this directory; 1 other mcpls instance is \
              running, none for this directory or a parent of it"
             .to_string(),
         ForeignOwners::Unrelated {
             count,
             truncated: false,
+            ..
         } => format!(
             "server sees: no owner for this directory; {count} other mcpls instances are \
              running, none for this directory or a parent of it"
@@ -421,6 +457,7 @@ fn no_owner_line(foreign: ForeignOwners) -> String {
         ForeignOwners::Unrelated {
             count,
             truncated: true,
+            ..
         } => format!(
             "server sees: no owner for this directory; checked {count} other mcpls \
              instances, none for this directory or a parent of it, but more may exist \
@@ -429,6 +466,17 @@ fn no_owner_line(foreign: ForeignOwners) -> String {
         ForeignOwners::ScanFailed(reason) => format!(
             "server sees: no owner for this directory; could not scan for other mcpls \
              instances: {reason}"
+        ),
+    };
+    match unidentified {
+        0 => line,
+        1 => format!(
+            "{line}; 1 other mcpls socket is live but did not answer a status request \
+             this build could read"
+        ),
+        n => format!(
+            "{line}; {n} other mcpls sockets are live but did not answer a status \
+             request this build could read"
         ),
     }
 }
@@ -458,31 +506,48 @@ async fn find_foreign_owner(
     };
     let truncated = candidates.len() > MAX_FOREIGN_CANDIDATES;
     let mut unrelated = 0usize;
-    for candidate in candidates.into_iter().take(MAX_FOREIGN_CANDIDATES) {
-        let probe = SocketIdentity {
-            socket: candidate,
+    let mut unidentified = 0usize;
+    for socket in candidates.into_iter().take(MAX_FOREIGN_CANDIDATES) {
+        let candidate = SocketIdentity {
+            socket,
             lock: PathBuf::new(),
             hash: String::new(),
         };
-        if let Ok(Response::Status {
-            pid,
-            root,
-            owner: true,
-            ..
-        }) = send(&probe, &Request::Status, SOCKET_TIMEOUT).await
-        {
-            if root.starts_with(project_dir) || project_dir.starts_with(&root) {
-                return ForeignOwners::Related { root, pid };
+        match probe(&candidate, &Request::Status, SOCKET_TIMEOUT).await {
+            ProbeOutcome::Answered(Response::Status {
+                pid,
+                root,
+                owner: true,
+                ..
+            }) => {
+                if root.starts_with(project_dir) || project_dir.starts_with(&root) {
+                    return ForeignOwners::Related { root, pid };
+                }
+                unrelated += 1;
             }
-            unrelated += 1;
+            // Accepted the connection and then either said nothing in
+            // time or said something this build could not read. That is
+            // still a process holding the socket, and an mcpls speaking
+            // an older wire shape is the likeliest way to get here, so
+            // counting it as an absence would report the one thing the
+            // scan has evidence against.
+            ProbeOutcome::Busy | ProbeOutcome::Unintelligible(_) => unidentified += 1,
+            // A socket file with nothing behind it, and an answer that
+            // parsed but claimed no ownership. Neither is evidence that
+            // anything is running here.
+            ProbeOutcome::NoOwner | ProbeOutcome::Answered(_) => {}
         }
     }
     if unrelated == 0 {
-        ForeignOwners::None { truncated }
+        ForeignOwners::None {
+            truncated,
+            unidentified,
+        }
     } else {
         ForeignOwners::Unrelated {
             count: unrelated,
             truncated,
+            unidentified,
         }
     }
 }
@@ -1657,6 +1722,29 @@ mod tests {
         super::doctor_scanning(project, &identity, TEST_PIPE_PREFIX).await
     }
 
+    /// Run the doctor for `project` where the runtime directory holds
+    /// `count` other sockets, each with a live owner answering `Status`
+    /// with a wire shape this build cannot read. Stands in for other
+    /// mcpls processes running a previous protocol version.
+    async fn doctor_with_unreadable_foreign_owners(project: &Path, count: usize) -> String {
+        let socket_dir = tempfile::tempdir().expect("a temp dir");
+        let identity = local_identity_for(project, socket_dir.path());
+        let others: Vec<_> = (0..count)
+            .map(|_| tempfile::tempdir().expect("a temp dir"))
+            .collect();
+        let _owners: Vec<_> = others
+            .iter()
+            .map(|other| {
+                let other_identity = local_identity_for(other.path(), socket_dir.path());
+                RecordingOwner::start_answering_status_with_raw_line(
+                    other_identity,
+                    r#"{"op":"status","hash":"abc","socket":"x","pid":1,"owner":true}"#,
+                )
+            })
+            .collect();
+        super::doctor_scanning(project, &identity, TEST_PIPE_PREFIX).await
+    }
+
     /// Run the doctor for `project` where the only reachable socket
     /// answers `Status` with `owner: false`, as a forwarding proxy would.
     async fn doctor_with_non_owner(project: &Path, elsewhere: &Path) -> String {
@@ -1886,6 +1974,80 @@ mod tests {
         );
     }
 
+    /// The scan's whole job is telling "nothing is running" apart from
+    /// "something is running that explains this". A candidate that
+    /// accepts a connection and then answers in a shape this build cannot
+    /// read is running, and an mcpls on a previous protocol version is
+    /// the likeliest way to be one. Counting it as nothing turns the
+    /// scan's most confident sentence into its most wrong one: several
+    /// live processes reported as an empty runtime directory.
+    #[tokio::test]
+    async fn test_doctor_counts_a_live_but_unreadable_socket_as_something_running() {
+        let project = tempfile::tempdir().expect("a temp dir");
+
+        let out = doctor_with_unreadable_foreign_owners(project.path(), 4).await;
+
+        let server_sees = out
+            .lines()
+            .find(|line| line.starts_with("server sees: "))
+            .expect("a server-sees line is always printed");
+        assert!(
+            server_sees.contains(
+                "4 other mcpls sockets are live but did not answer a \
+                 status request this build could read"
+            ),
+            "four processes were listening; the scan probed all four and \
+             could not read any of them, which is a fact it must report \
+             rather than discard: {out}"
+        );
+    }
+
+    /// The singular form of the same clause, which the plural one does
+    /// not cover: a count formatted with the wrong noun reads as a bug in
+    /// the tool rather than the state of the machine.
+    #[tokio::test]
+    async fn test_doctor_reports_a_single_unreadable_socket_in_the_singular() {
+        let project = tempfile::tempdir().expect("a temp dir");
+
+        let out = doctor_with_unreadable_foreign_owners(project.path(), 1).await;
+
+        assert_eq!(
+            out.lines()
+                .find(|line| line.starts_with("server sees: "))
+                .expect("a server-sees line is always printed"),
+            "server sees: no owner; nothing is listening on this project's socket; \
+             1 other mcpls socket is live but did not answer a status request this \
+             build could read",
+            "{out}"
+        );
+    }
+
+    /// An owner that answers this project's own socket with a valid
+    /// response of the wrong kind is neither unreachable nor unreadable,
+    /// and the line saying so was the one user-visible string the
+    /// deletion sweep could remove without failing a test.
+    #[tokio::test]
+    async fn test_doctor_reports_an_answer_that_is_not_a_status() {
+        let project = tempfile::tempdir().expect("a temp dir");
+
+        let out = doctor_with_owner_answering_raw_status(
+            project.path(),
+            r#"{"op":"changed","queued":0}"#,
+        )
+        .await;
+
+        let server_sees = out
+            .lines()
+            .find(|line| line.starts_with("server sees: "))
+            .expect("a server-sees line is always printed");
+        assert!(
+            server_sees.contains("answered, but not with its own status"),
+            "an owner that answered the wrong response is a different \
+             fact from one that could not be read and one that said \
+             nothing: {out}"
+        );
+    }
+
     /// The singular count had a test; the plural sentence did not, and
     /// replacing it entirely leaves every other test green.
     #[tokio::test]
@@ -2079,7 +2241,7 @@ mod tests {
             .find(|line| line.starts_with("server sees: "))
             .expect("a server-sees line is always printed");
         assert!(
-            server_sees.contains("could not be read"),
+            server_sees.contains("could not read its reply"),
             "an owner that answered promptly with something this build \
              cannot parse is not a busy owner: {out}"
         );
@@ -2087,6 +2249,12 @@ mod tests {
             !server_sees.contains("may be busy"),
             "calling a version mismatch 'busy' sends the reader looking \
              for load that does not exist: {out}"
+        );
+        assert!(
+            !server_sees.contains("version"),
+            "the four ways this exchange fails share only that something \
+             holds the socket; naming one of them as the cause states \
+             what the probe did not establish: {out}"
         );
     }
 
