@@ -529,6 +529,70 @@ pub async fn send_many(
     }
 }
 
+/// What probing a socket once found: an answer, nobody home, or somebody
+/// home who did not answer in time.
+///
+/// [`send`] and [`send_many`] collapse the second and third case into one
+/// `Err`, which is right for every hook arm that only cares whether it
+/// got an answer back. `mcpls hook doctor` needs the distinction: a
+/// refused or missing socket has no owner, so looking for one running a
+/// different directory is the right next step, but a socket that
+/// accepted the connection and then went quiet has an owner that is
+/// merely busy, and naming some other project as the reason would be an
+/// accusation with no evidence behind it.
+pub enum ProbeOutcome {
+    /// The peer answered before the deadline.
+    Answered(Response),
+    /// The connection itself could not be made: refused, or the socket
+    /// does not exist. Nobody owns this socket.
+    NoOwner,
+    /// A connection was accepted, but no complete answer arrived before
+    /// the deadline. Something is there.
+    Busy,
+}
+
+/// Probe `identity`'s socket with one `request`.
+///
+/// Distinguishes a refused or missing socket ([`ProbeOutcome::NoOwner`])
+/// from one that accepted the connection but did not answer within
+/// `timeout` ([`ProbeOutcome::Busy`]).
+pub async fn probe(
+    identity: &SocketIdentity,
+    request: &Request,
+    timeout: Duration,
+) -> ProbeOutcome {
+    let deadline = tokio::time::Instant::now() + timeout;
+    // A connection that was never accepted at all (refused, or the
+    // socket does not exist) and a connect that could not even complete
+    // within the deadline both mean nobody was reachable there; neither
+    // says anything about an owner being busy.
+    let Ok(Ok(stream)) = tokio::time::timeout_at(deadline, connect(identity)).await else {
+        return ProbeOutcome::NoOwner;
+    };
+    match tokio::time::timeout_at(deadline, answer_one(stream, request)).await {
+        Ok(Ok(response)) => ProbeOutcome::Answered(response),
+        // The connection was already accepted by this point, so a
+        // failure or a further timeout finishing the exchange means an
+        // owner is there and did not get back to us, not that nobody is
+        // listening.
+        Ok(Err(_)) | Err(_) => ProbeOutcome::Busy,
+    }
+}
+
+/// Write `request` on `stream` and read back one response line.
+async fn answer_one(stream: Box<dyn HookStream>, request: &Request) -> Result<Response> {
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut line = serde_json::to_string(request)?;
+    line.push('\n');
+    write_line(&mut writer, &line).await?;
+    let line = BufReader::new(reader)
+        .lines()
+        .next_line()
+        .await?
+        .ok_or_else(|| Error::Transport("the hook socket closed before answering".to_string()))?;
+    Ok(serde_json::from_str(&line)?)
+}
+
 async fn send_many_inner(identity: &SocketIdentity, requests: &[Request]) -> Result<Vec<Response>> {
     let stream = connect(identity).await?;
     let (reader, mut writer) = tokio::io::split(stream);
