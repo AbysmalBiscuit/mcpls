@@ -305,14 +305,39 @@ mod tests {
         .to_string()
     }
 
-    /// A plausible answer to `request`, using `flush_text` for a `Flush`.
-    fn answer(request: &Request, flush_text: Option<String>) -> Response {
+    /// How `RecordingOwner` answers requests: the `Flush` context text, how
+    /// long to wait before answering one, and whether `Changed` answers an
+    /// error instead of queuing. The delay defaults to zero and the error
+    /// defaults to off; a test exercising either sets it explicitly, so a
+    /// regression that narrows a client's tolerance has something in the
+    /// suite that would notice.
+    #[derive(Clone, Default)]
+    struct OwnerBehavior {
+        flush_text: Option<String>,
+        flush_delay: Duration,
+        changed_errors: bool,
+    }
+
+    /// A plausible answer to `request` under `behavior`.
+    ///
+    /// A real owner answers `Changed` with `Response::Error` once its
+    /// sweeper has stopped (ordinarily: shutdown) rather than silently
+    /// dropping the path, which `behavior.changed_errors` reproduces here.
+    fn answer(request: &Request, behavior: &OwnerBehavior) -> Response {
         match request {
-            Request::Changed { paths, .. } => Response::Changed {
-                queued: paths.len(),
-            },
+            Request::Changed { paths, .. } => {
+                if behavior.changed_errors {
+                    Response::Error {
+                        message: "mcpls is shutting down; these paths were not queued".to_string(),
+                    }
+                } else {
+                    Response::Changed {
+                        queued: paths.len(),
+                    }
+                }
+            }
             Request::Flush { .. } => Response::Flush {
-                context: flush_text,
+                context: behavior.flush_text.clone(),
             },
             Request::EndSession { .. } => Response::EndSession,
             Request::Status => Response::Status {
@@ -346,17 +371,51 @@ mod tests {
 
     impl RecordingOwner {
         /// Bind and start serving, answering every `Flush` with
-        /// [`DEFAULT_FLUSH_TEXT`].
+        /// [`DEFAULT_FLUSH_TEXT`] immediately and every `Changed` with
+        /// `Response::Changed`.
         fn start() -> Self {
             Self::start_with_flush(Some(DEFAULT_FLUSH_TEXT.to_string()))
         }
 
         /// The same, answering every `Flush` with `flush_text` instead.
-        ///
+        fn start_with_flush(flush_text: Option<String>) -> Self {
+            Self::start_with(OwnerBehavior {
+                flush_text,
+                flush_delay: Duration::ZERO,
+                changed_errors: false,
+            })
+        }
+
+        /// The same, waiting `delay` before answering each `Flush`. Used to
+        /// prove a client actually waits out an owner slower than an
+        /// instant in-process reply, rather than merely using whichever
+        /// timeout constant happens to be in scope at its call site.
+        fn start_with_flush_delay(flush_text: Option<String>, delay: Duration) -> Self {
+            Self::start_with(OwnerBehavior {
+                flush_text,
+                flush_delay: delay,
+                changed_errors: false,
+            })
+        }
+
+        /// The same, answering every `Changed` with `Response::Error`
+        /// instead of `Response::Changed`, the shape a real owner sends
+        /// once its sweeper has stopped taking new paths (ordinarily:
+        /// shutdown). `Flush` still answers `flush_text` normally, so a
+        /// `PostToolBatch`'s `changed` erroring must not be allowed to
+        /// swallow its own `flush`'s context.
+        fn start_with_changed_error(flush_text: Option<String>) -> Self {
+            Self::start_with(OwnerBehavior {
+                flush_text,
+                flush_delay: Duration::ZERO,
+                changed_errors: true,
+            })
+        }
+
         /// Not `async`: everything here is a synchronous bind or a plain
         /// `tokio::spawn` call, which needs a runtime running (true of
         /// every `#[tokio::test]` caller) but not an `async` caller.
-        fn start_with_flush(flush_text: Option<String>) -> Self {
+        fn start_with(behavior: OwnerBehavior) -> Self {
             let dir = tempfile::tempdir().expect("a temp dir");
             let identity = temp_identity(dir.path());
 
@@ -374,7 +433,7 @@ mod tests {
                 identity.socket.clone(),
                 Arc::clone(&requests),
                 Arc::clone(&connections),
-                flush_text,
+                behavior,
                 cancel_rx,
             ));
 
@@ -415,7 +474,7 @@ mod tests {
     async fn serve_connection<S>(
         stream: S,
         requests: Arc<Mutex<Vec<Request>>>,
-        flush_text: Option<String>,
+        behavior: OwnerBehavior,
     ) where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
     {
@@ -426,7 +485,10 @@ mod tests {
             let Ok(request) = serde_json::from_str::<Request>(&line) else {
                 return;
             };
-            let response = answer(&request, flush_text.clone());
+            if matches!(request, Request::Flush { .. }) && !behavior.flush_delay.is_zero() {
+                tokio::time::sleep(behavior.flush_delay).await;
+            }
+            let response = answer(&request, &behavior);
             requests.lock().expect("requests lock").push(request);
 
             let Ok(mut out) = serde_json::to_string(&response) else {
@@ -452,14 +514,14 @@ mod tests {
     /// `_socket` is unused here: a `UnixListener` never needs to recreate
     /// itself between clients the way a named pipe does, but the parameter
     /// is kept so both platforms share one call site in
-    /// `RecordingOwner::start_with_flush`.
+    /// `RecordingOwner::start_with`.
     #[cfg(not(windows))]
     async fn accept_loop(
         listener: tokio::net::UnixListener,
         _socket: PathBuf,
         requests: Arc<Mutex<Vec<Request>>>,
         connections: Arc<AtomicUsize>,
-        flush_text: Option<String>,
+        behavior: OwnerBehavior,
         mut cancel: tokio::sync::watch::Receiver<bool>,
     ) {
         loop {
@@ -477,7 +539,7 @@ mod tests {
                     tokio::spawn(serve_connection(
                         stream,
                         Arc::clone(&requests),
-                        flush_text.clone(),
+                        behavior.clone(),
                     ));
                 }
             }
@@ -503,7 +565,7 @@ mod tests {
         socket: PathBuf,
         requests: Arc<Mutex<Vec<Request>>>,
         connections: Arc<AtomicUsize>,
-        flush_text: Option<String>,
+        behavior: OwnerBehavior,
         mut cancel: tokio::sync::watch::Receiver<bool>,
     ) {
         use tokio::net::windows::named_pipe::ServerOptions;
@@ -534,7 +596,7 @@ mod tests {
                     tokio::spawn(serve_connection(
                         current,
                         Arc::clone(&requests),
-                        flush_text.clone(),
+                        behavior.clone(),
                     ));
                 }
             }
@@ -549,6 +611,97 @@ mod tests {
             "a client timeout tighter than the server's own op_deadline_ms \
              default is never right; if the spec's default changes, this \
              constant must change deliberately alongside it"
+        );
+    }
+
+    /// Well past the old, uniform 50ms bound and well inside
+    /// `FLUSH_SOCKET_TIMEOUT`'s 1500ms: a ~15x margin under the timeout
+    /// budget and a 2x margin over the bound a flush-bearing op must no
+    /// longer be held to, so this is not a flake risk the way a
+    /// tight-margin timing test would be.
+    const SLOW_FLUSH_DELAY: Duration = Duration::from_millis(100);
+
+    #[tokio::test]
+    async fn test_a_missing_identity_still_lets_session_start_answer() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
+
+        let out = super::dispatch_payload(
+            &json!({ "hook_event_name": "SessionStart" }).to_string(),
+            dir.path(),
+            None,
+        )
+        .await;
+
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("json");
+        assert!(
+            !parsed["hookSpecificOutput"]["watchPaths"]
+                .as_array()
+                .expect("watchPaths")
+                .is_empty(),
+            "SessionStart never touches the socket, so a missing identity \
+             (an unreachable or over-long project directory) must not \
+             suppress it: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_missing_identity_produces_no_output_for_socket_using_arms() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let out = super::dispatch_payload(
+            &json!({ "hook_event_name": "UserPromptSubmit", "session_id": "s1" }).to_string(),
+            dir.path(),
+            None,
+        )
+        .await;
+        assert_eq!(out, "");
+    }
+
+    #[tokio::test]
+    async fn test_user_prompt_submit_waits_out_a_slow_owner_within_the_flush_timeout() {
+        let recorder = RecordingOwner::start_with_flush_delay(
+            Some(DEFAULT_FLUSH_TEXT.to_string()),
+            SLOW_FLUSH_DELAY,
+        );
+        let out = dispatch_against(
+            &json!({ "hook_event_name": "UserPromptSubmit", "session_id": "s1" }),
+            &recorder,
+        )
+        .await;
+
+        assert_eq!(
+            out,
+            additional_context_output(Some(DEFAULT_FLUSH_TEXT.to_string())),
+            "an owner slower than the old 50ms bound but inside \
+             FLUSH_SOCKET_TIMEOUT must still be waited out, or raising the \
+             timeout had no effect at this call site"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_post_tool_batch_waits_out_a_slow_owner_within_the_flush_timeout() {
+        let recorder = RecordingOwner::start_with_flush_delay(
+            Some(DEFAULT_FLUSH_TEXT.to_string()),
+            SLOW_FLUSH_DELAY,
+        );
+        let file = recorder.project_dir().join("a.rs");
+        std::fs::write(&file, "fn a() {}").expect("write");
+        let out = dispatch_against(
+            &json!({
+                "hook_event_name": "PostToolBatch",
+                "session_id": "s1",
+                "tool_calls": [{ "tool_input": { "file_path": file.display().to_string() } }]
+            }),
+            &recorder,
+        )
+        .await;
+
+        assert_eq!(
+            out,
+            additional_context_output(Some(DEFAULT_FLUSH_TEXT.to_string())),
+            "an owner slower than the old 50ms bound but inside \
+             FLUSH_SOCKET_TIMEOUT must still be waited out, or raising the \
+             timeout had no effect at this call site"
         );
     }
 
@@ -814,6 +967,37 @@ mod tests {
             1,
             "the spec's protocol says PostToolBatch sends changed then flush on \
              one connection, which is what send_many is for"
+        );
+    }
+
+    /// A real owner answers `Changed` with `Response::Error` once its
+    /// sweeper has stopped taking new paths (ordinarily: shutdown), rather
+    /// than silently dropping the path. `PostToolBatch` reads `send_many`'s
+    /// responses by position, not by matching the `changed` half's
+    /// variant, so an error there must not prevent the `flush` half's
+    /// context, arriving over the same connection, from reaching
+    /// `additionalContext`.
+    #[tokio::test]
+    async fn test_a_changed_error_does_not_swallow_the_batch_s_flush() {
+        let recorder =
+            RecordingOwner::start_with_changed_error(Some(DEFAULT_FLUSH_TEXT.to_string()));
+        let file = recorder.project_dir().join("a.rs");
+        std::fs::write(&file, "fn a() {}").expect("write");
+        let out = dispatch_against(
+            &json!({
+                "hook_event_name": "PostToolBatch",
+                "session_id": "s1",
+                "tool_calls": [{ "tool_input": { "file_path": file.display().to_string() } }]
+            }),
+            &recorder,
+        )
+        .await;
+
+        assert_eq!(
+            out,
+            additional_context_output(Some(DEFAULT_FLUSH_TEXT.to_string())),
+            "an error answering changed must not swallow a flush answer \
+             that arrived on the same connection: {out}"
         );
     }
 }
