@@ -35,6 +35,31 @@ pub struct SocketIdentity {
     pub lock: PathBuf,
 }
 
+/// The stable identity hash for `dir`: 16 hex characters derived from its
+/// canonicalized form.
+///
+/// Split out of [`identity_for`] for a caller that only needs the hash and
+/// not a socket to bind, so it is never tripped up by this platform's
+/// socket path length limit, which only matters to an actual `bind()`.
+///
+/// # Errors
+///
+/// Returns an error if `dir` cannot be canonicalized, which means it does
+/// not exist or is not reachable.
+pub fn identity_hash(dir: &Path) -> Result<String> {
+    let canonical = dunce::canonicalize(dir).map_err(|e| Error::FileIo {
+        path: dir.to_path_buf(),
+        source: e,
+    })?;
+    // DefaultHasher is not stable across Rust releases, which does not
+    // matter here: both sides are the same binary in the same process
+    // family, and a hash that changes between mcpls versions only means a
+    // new socket path after an upgrade.
+    let mut hasher = DefaultHasher::new();
+    canonical.hash(&mut hasher);
+    Ok(format!("{:016x}", hasher.finish()))
+}
+
 /// Derive the socket identity for `dir`.
 ///
 /// # Errors
@@ -46,17 +71,7 @@ pub struct SocketIdentity {
 /// no hint the cause is path length, so this is checked here instead, where
 /// the path is built and the failure can name it.
 pub fn identity_for(dir: &Path) -> Result<SocketIdentity> {
-    let canonical = dunce::canonicalize(dir).map_err(|e| Error::FileIo {
-        path: dir.to_path_buf(),
-        source: e,
-    })?;
-    // DefaultHasher is not stable across Rust releases, which does not
-    // matter here: both sides are the same binary in the same process
-    // family, and a hash that changes between mcpls versions only means a
-    // new socket path after an upgrade.
-    let mut hasher = DefaultHasher::new();
-    canonical.hash(&mut hasher);
-    let hash = format!("{:016x}", hasher.finish());
+    let hash = identity_hash(dir)?;
 
     #[cfg(windows)]
     {

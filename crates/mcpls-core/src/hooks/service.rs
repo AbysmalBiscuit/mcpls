@@ -7,6 +7,7 @@
 //! keeps competing for the lock so an owner exiting does not strand it.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures::future::BoxFuture;
@@ -48,6 +49,15 @@ pub struct HookRole {
     /// flip. The role stays behind the mutex; this carries only the fact
     /// that it moved.
     transitions: watch::Sender<u64>,
+    /// How many `Changed`, `Flush`, or `EndSession` requests this process
+    /// has answered while it held the socket.
+    ///
+    /// Never reset on a role transition: a process promoted from `Passive`
+    /// to `Owner` starts counting from zero for the hooks it personally
+    /// answers, which is exactly what `mcpls hook doctor` needs to tell "a
+    /// plugin that has never fired a hook against this process" apart from
+    /// "a server that has been serving them all along".
+    hooks_seen: AtomicU64,
 }
 
 /// A snapshot of [`HookRole`].
@@ -88,7 +98,22 @@ impl HookRole {
         Self {
             role: std::sync::Mutex::new(role),
             transitions: watch::channel(0).0,
+            hooks_seen: AtomicU64::new(0),
         }
+    }
+
+    /// Record one `Changed`, `Flush`, or `EndSession` request this process
+    /// just answered. Not called for `Status`, which is `mcpls hook
+    /// doctor` probing rather than a hook firing, and counting it would
+    /// make every doctor run look like a working install.
+    pub(crate) fn record_hook_request(&self) {
+        self.hooks_seen.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many hook requests this process has answered so far.
+    #[must_use]
+    pub fn hooks_seen(&self) -> u64 {
+        self.hooks_seen.load(Ordering::Relaxed)
     }
 
     /// A cloned snapshot, so no `std::sync::Mutex` guard is held across an
@@ -175,12 +200,14 @@ pub fn build_handler(
     server: Arc<McplsServer>,
     sweeper: Arc<Sweeper>,
     location: HookLocation,
+    role: Arc<HookRole>,
     cancel: watch::Receiver<bool>,
 ) -> impl Fn(Request) -> BoxFuture<'static, Response> + Send + Sync + 'static {
     move |request| {
         let server = Arc::clone(&server);
         let sweeper = Arc::clone(&sweeper);
         let location = location.clone();
+        let role = Arc::clone(&role);
         let cancelled = *cancel.borrow();
         Box::pin(async move {
             match request {
@@ -195,12 +222,14 @@ pub fn build_handler(
                                 .to_string(),
                         };
                     }
+                    role.record_hook_request();
                     // The event kind is discarded: the sweep stats.
                     Response::Changed {
                         queued: sweeper.enqueue(&paths),
                     }
                 }
                 Request::Flush { session } => {
+                    role.record_hook_request();
                     let session = SessionId::from(session);
                     let mut parts: Vec<String> = Vec::new();
                     if let Some(text) = server.flush_for_hook(&session).await {
@@ -214,6 +243,7 @@ pub fn build_handler(
                     }
                 }
                 Request::EndSession { session } => {
+                    role.record_hook_request();
                     server.end_session(&SessionId::from(session)).await;
                     Response::EndSession
                 }
@@ -223,6 +253,7 @@ pub fn build_handler(
                     pid: std::process::id(),
                     owner: true,
                     root: location.root.clone(),
+                    hooks_seen: role.hooks_seen(),
                 },
             }
         })
@@ -260,6 +291,7 @@ pub(crate) async fn hook_owner_task(
             Arc::clone(&server),
             Arc::clone(&sweeper),
             location.clone(),
+            Arc::clone(&role),
             cancel.clone(),
         );
         match listener.serve(handler, op_deadline, cancel.clone()).await {
@@ -386,13 +418,14 @@ mod tests {
             let delivery = Arc::new(Mutex::new(DiagnosticsDelivery::new(
                 DiagnosticsConfig::default(),
             )));
+            let role = Arc::new(HookRole::owner());
             let context = Arc::new(test_context(
                 dir.path(),
                 Arc::clone(&translator),
                 Arc::clone(&notification_cache),
                 Arc::clone(&delivery),
                 DiagnosticsConfig::default(),
-                Arc::new(HookRole::owner()),
+                Arc::clone(&role),
             ));
             let server = Arc::new(McplsServer::from_context(context));
             let sweeper = Arc::new(test_sweeper(dir.path(), translator));
@@ -411,6 +444,7 @@ mod tests {
                         identity: identity.clone(),
                         root: dir.path().to_path_buf(),
                     },
+                    role,
                     cancel_rx.clone(),
                 ),
                 Duration::from_millis(1500),
@@ -998,6 +1032,60 @@ mod tests {
         assert_eq!(root, canonical_root);
     }
 
+    /// `mcpls hook doctor` tells "a server that has never been sent a hook"
+    /// apart from "one that has been serving them all along" by this
+    /// count. `Status` itself, the doctor's own probe, must not inflate it,
+    /// or every doctor run would make an unregistered plugin look wired up.
+    #[tokio::test]
+    async fn test_the_status_response_counts_hook_requests_the_owner_has_answered() {
+        let (dir, identity) = temp_identity();
+        let role = Arc::new(HookRole::owner());
+        let (_tx, cancel) = tokio::sync::watch::channel(false);
+        let (server, sweeper) = takeover_candidate(&dir, Arc::clone(&role));
+        let listener = HookListener::acquire(&identity)
+            .await
+            .expect("acquire")
+            .expect("owner");
+        tokio::spawn(hook_owner_task(
+            listener,
+            HookLocation {
+                identity: identity.clone(),
+                root: dir.path().to_path_buf(),
+            },
+            role,
+            server,
+            sweeper,
+            Duration::from_millis(1500),
+            cancel,
+        ));
+
+        let Response::Status { hooks_seen, .. } = status_from_owner(&identity).await else {
+            panic!("expected a status response");
+        };
+        assert_eq!(
+            hooks_seen, 0,
+            "several Status probes above must not themselves count as hooks"
+        );
+
+        crate::hooks::send(
+            &identity,
+            &Request::EndSession {
+                session: "s1".to_string(),
+            },
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("the owner answers");
+
+        let Response::Status { hooks_seen, .. } = status_from_owner(&identity).await else {
+            panic!("expected a status response");
+        };
+        assert_eq!(
+            hooks_seen, 1,
+            "one real hook request was answered since startup"
+        );
+    }
+
     /// A lock file removed by a temporary-file cleaner is not a competitor,
     /// so the owner wins it back and goes on serving.
     #[tokio::test]
@@ -1127,6 +1215,7 @@ mod tests {
                 identity: harness.identity.clone(),
                 root: harness.dir.path().to_path_buf(),
             },
+            Arc::new(HookRole::owner()),
             cancel_rx,
         );
         cancel_tx.send(true).expect("cancel");

@@ -12,7 +12,7 @@ pub mod service;
 pub mod sweep;
 
 pub use filters::{PathFilter, watch_paths};
-pub use identity::{SocketIdentity, identity_for};
+pub use identity::{SocketIdentity, identity_for, identity_hash};
 pub use listener::{HookListener, LockLoss, ServeExit, send, send_many};
 pub use protocol::{ChangeEvent, Request, Response};
 pub use service::{HookLocation, HookRole, Role, build_handler};

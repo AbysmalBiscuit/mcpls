@@ -218,14 +218,16 @@ fn additional_context_output(context: Option<String>) -> String {
         })
 }
 
-/// How long the doctor waits for a `Status` answer before concluding
-/// nothing owns the socket. Matches the timeout every other socket-using
-/// hook arm uses for a request that carries no context back.
-const DOCTOR_TIMEOUT: Duration = SOCKET_TIMEOUT;
+/// How many candidate sockets or pipes the doctor probes when this
+/// project's own socket answers nobody, so a runtime directory a stale
+/// process left cluttered cannot turn one doctor run into an unbounded
+/// wait for a human sitting at a terminal.
+const MAX_FOREIGN_CANDIDATES: usize = 16;
 
 /// Probe this project's hook socket and describe what it finds: the
 /// socket path, the directory hash each side computes, whether an owner
-/// answers, and whether `mcpls` resolves on `PATH`.
+/// answers and how many hooks it has actually seen, and whether `mcpls`
+/// resolves on `PATH`.
 ///
 /// Every other command in this feature fails silently by design, so a
 /// broken install looks exactly like a quiet workspace. This is the one
@@ -237,36 +239,22 @@ pub async fn doctor(project_dir: &Path, identity: &SocketIdentity) -> String {
         format!("hook sees: {} -> {}", project_dir.display(), identity.hash),
     ];
 
-    let status = send(identity, &Request::Status, DOCTOR_TIMEOUT)
-        .await
-        .ok()
-        .and_then(|response| {
-            if let Response::Status {
-                hash, pid, root, ..
-            } = response
-            {
-                Some((hash, pid, root))
-            } else {
-                None
-            }
-        });
-
-    lines.push(status.as_ref().map_or_else(
-        || "server sees: no owner".to_string(),
-        |(hash, _pid, root)| format!("server sees: {} -> {hash}", root.display()),
-    ));
-
-    if status
-        .as_ref()
-        .is_some_and(|(hash, ..)| *hash != identity.hash)
+    let status = send(identity, &Request::Status, SOCKET_TIMEOUT).await.ok();
+    if let Some(Response::Status {
+        hash,
+        pid,
+        root,
+        hooks_seen,
+        ..
+    }) = status
     {
-        lines.push("the two do not match; hooks will do nothing until they do".to_string());
+        lines.push(format!("server sees: {} -> {hash}", root.display()));
+        lines.push(format!("owner pid: {pid}"));
+        lines.push(hooks_seen_line(hooks_seen));
+    } else {
+        lines.push(no_owner_line(find_foreign_owner(identity).await));
+        lines.push("owner pid: none".to_string());
     }
-
-    lines.push(status.as_ref().map_or_else(
-        || "owner pid: none".to_string(),
-        |(_hash, pid, _root)| format!("owner pid: {pid}"),
-    ));
 
     lines.push(mcpls_on_path().map_or_else(
         || "mcpls on PATH: not found".to_string(),
@@ -274,6 +262,104 @@ pub async fn doctor(project_dir: &Path, identity: &SocketIdentity) -> String {
     ));
 
     lines.join("\n")
+}
+
+/// The `server sees` line for how many `Changed`, `Flush`, or `EndSession`
+/// requests the answering owner has served since it started.
+///
+/// A count of zero is not neutral: it means a live, reachable mcpls that
+/// has never once been asked to do anything, which is what a plugin never
+/// registered with the host looks like. That state must not read as
+/// healthy just because a server happens to be up.
+fn hooks_seen_line(count: u64) -> String {
+    if count == 0 {
+        "hooks seen: none since this owner started; the plugin's hooks may not be \
+         registered with your host"
+            .to_string()
+    } else {
+        format!("hooks seen: {count} request(s) since this owner started")
+    }
+}
+
+/// The `server sees` line to print when nothing answers this project's own
+/// socket: names a foreign owner's directory and pid when one was found,
+/// or says plainly that nothing is listening.
+fn no_owner_line(foreign: Option<(PathBuf, u32)>) -> String {
+    foreign.map_or_else(
+        || "server sees: no owner; nothing is listening on this project's socket".to_string(),
+        |(root, pid)| {
+            format!(
+                "server sees: no owner for this directory; an mcpls is running for {} \
+                 (pid {pid}) instead",
+                root.display()
+            )
+        },
+    )
+}
+
+/// Look for an mcpls answering some other project's socket in the same
+/// runtime location as `identity`'s own, so a doctor run against an
+/// unreachable socket can tell "nothing is running" apart from
+/// "something is running, for a different directory".
+///
+/// Sockets are named by their own directory's hash, which is the entire
+/// reason `identity`'s own probe above can never observe a live owner
+/// whose directory hashed differently: that owner bound a different
+/// socket file, not this one. This is the only way the doctor can learn
+/// about it at all.
+async fn find_foreign_owner(identity: &SocketIdentity) -> Option<(PathBuf, u32)> {
+    for candidate in foreign_candidates(identity).take(MAX_FOREIGN_CANDIDATES) {
+        let probe = SocketIdentity {
+            socket: candidate,
+            lock: PathBuf::new(),
+            hash: String::new(),
+        };
+        if let Ok(Response::Status {
+            pid,
+            root,
+            owner: true,
+            ..
+        }) = send(&probe, &Request::Status, SOCKET_TIMEOUT).await
+        {
+            return Some((root, pid));
+        }
+    }
+    None
+}
+
+/// The other sockets that might have an owner, alongside `identity`'s own
+/// in the same runtime directory.
+#[cfg(not(windows))]
+fn foreign_candidates(identity: &SocketIdentity) -> impl Iterator<Item = PathBuf> {
+    let own = identity.socket.clone();
+    identity
+        .socket
+        .parent()
+        .and_then(|dir| std::fs::read_dir(dir).ok())
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(move |path| *path != own && path.extension().is_some_and(|ext| ext == "sock"))
+}
+
+/// The other named pipes that might have an owner, read from the
+/// system-wide pipe namespace and filtered to this project's naming
+/// convention, since Windows has no per-project directory to list instead.
+#[cfg(windows)]
+fn foreign_candidates(identity: &SocketIdentity) -> impl Iterator<Item = PathBuf> {
+    let own = identity.socket.clone();
+    std::fs::read_dir(r"\\.\pipe\")
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(move |path| {
+            *path != own
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("mcpls-"))
+        })
 }
 
 /// The doctor's answer when this project's own socket identity cannot be
@@ -285,13 +371,14 @@ pub async fn doctor(project_dir: &Path, identity: &SocketIdentity) -> String {
 ///
 /// Kept distinct from "server sees: no owner": that line means a socket
 /// exists and nothing answers it; this means no socket could ever exist
-/// here, which a user needs to be able to tell apart from a server that
-/// simply is not running right now.
+/// here at all, on either side, which a user needs to be able to tell
+/// apart from a server that simply is not running right now.
 pub fn doctor_without_identity(project_dir: &Path, error: &mcpls_core::Error) -> String {
     let lines = [
         format!("socket: none; could not derive an identity for this directory: {error}"),
         format!("hook sees: {} -> unknown", project_dir.display()),
-        "server sees: unknown; no socket exists to probe".to_string(),
+        "server sees: nothing can run here; no socket exists to probe".to_string(),
+        "owner pid: none".to_string(),
         mcpls_on_path().map_or_else(
             || "mcpls on PATH: not found".to_string(),
             |path| format!("mcpls on PATH: {}", path.display()),
@@ -307,13 +394,17 @@ pub fn doctor_without_identity(project_dir: &Path, error: &mcpls_core::Error) ->
 /// path, so a hook environment missing the install directory makes every
 /// hook do nothing, invisibly. Walking `PATH` by hand rather than
 /// shelling out to `which`, which is not installed on every host mcpls
-/// runs on.
+/// runs on. `PATH` entries are not guaranteed absolute themselves (a bare
+/// `bin`, `.`, or an empty entry from `::` all parse), so the winning
+/// candidate is absolutized before it is returned: a relative path here
+/// means nothing to whatever directory a hook later runs in.
 fn mcpls_on_path() -> Option<PathBuf> {
     let exe_name = if cfg!(windows) { "mcpls.exe" } else { "mcpls" };
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
         .map(|dir| dir.join(exe_name))
         .find(|candidate| is_executable_file(candidate))
+        .map(|candidate| std::path::absolute(&candidate).unwrap_or(candidate))
 }
 
 #[cfg(unix)]
@@ -426,11 +517,12 @@ mod tests {
         flush_text: Option<String>,
         flush_delay: Duration,
         changed_errors: bool,
-        /// What `Status` reports as its directory hash and startup root.
-        /// Empty by default, which is fine for every test that never sends
-        /// `Status` against this behavior.
+        /// What `Status` reports as its directory hash, startup root, and
+        /// hook-request count. Empty/zero by default, which is fine for
+        /// every test that never sends `Status` against this behavior.
         status_hash: String,
         status_root: PathBuf,
+        status_hooks_seen: u64,
     }
 
     /// A plausible answer to `request` under `behavior`.
@@ -461,6 +553,7 @@ mod tests {
                 pid: std::process::id(),
                 owner: true,
                 root: behavior.status_root.clone(),
+                hooks_seen: behavior.status_hooks_seen,
             },
         }
     }
@@ -576,17 +669,18 @@ mod tests {
         }
 
         /// An owner bound on `identity`, answering `Status` as though its
-        /// own startup directory were `root` rather than wherever this
-        /// process actually runs.
+        /// own startup directory were `root` and it had already answered
+        /// `hooks_seen` hook requests, rather than wherever this process
+        /// actually runs and however many requests this test harness has
+        /// actually served.
         ///
-        /// Lets `mcpls hook doctor`'s tests put the hook's own hash and the
-        /// reported server hash into agreement or disagreement on demand,
-        /// without needing a second real directory that a running mcpls
-        /// would actually have started in.
-        fn start_reporting_root(identity: SocketIdentity, root: &Path) -> Self {
-            let hash = mcpls_core::hooks::identity_for(root)
-                .expect("identity for the reported root")
-                .hash;
+        /// Uses `identity_hash` rather than `identity_for`, which also
+        /// builds and length-checks a real socket path this call never
+        /// uses: a caller on a host with a long runtime directory would
+        /// otherwise panic here before the test bound anything.
+        fn start_reporting_status(identity: SocketIdentity, root: &Path, hooks_seen: u64) -> Self {
+            let hash = mcpls_core::hooks::identity_hash(root)
+                .expect("identity hash for the reported root");
             let dir = tempfile::tempdir().expect("a temp dir");
             Self::start_on(
                 dir,
@@ -594,6 +688,7 @@ mod tests {
                 OwnerBehavior {
                     status_hash: hash,
                     status_root: root.to_path_buf(),
+                    status_hooks_seen: hooks_seen,
                     ..OwnerBehavior::default()
                 },
             )
@@ -1158,15 +1253,14 @@ mod tests {
     /// and lock moved into `dir` in place of the real runtime directory
     /// `identity_for` would otherwise choose.
     ///
-    /// Only the hash is carried over from the real function: that is the
-    /// value the doctor's "hook sees" line and its mismatch check both
-    /// depend on, and binding a listener on a real per-user runtime
-    /// directory from a test would leave a stray socket behind on the
-    /// host.
+    /// Uses `identity_hash` rather than `identity_for`, which also builds
+    /// and length-checks a real socket path this function never uses: on
+    /// a host with a long runtime directory (the macOS/CI condition
+    /// `doctor_without_identity` exists to degrade gracefully for),
+    /// `identity_for` fails outright, and every one of these tests would
+    /// panic before binding anything.
     fn local_identity_for(project: &Path, dir: &Path) -> SocketIdentity {
-        let hash = mcpls_core::hooks::identity_for(project)
-            .expect("identity")
-            .hash;
+        let hash = mcpls_core::hooks::identity_hash(project).expect("identity hash");
         #[cfg(windows)]
         let socket = PathBuf::from(format!(r"\\.\pipe\mcpls-doctor-{hash}"));
         #[cfg(not(windows))]
@@ -1178,60 +1272,157 @@ mod tests {
         }
     }
 
-    /// Run the doctor for `project`, against an owner that reports `root`
-    /// as its own startup directory, or against no owner at all.
+    /// Run the doctor for `project` against a real owner bound on
+    /// `project`'s own socket, answering as though it had itself started
+    /// in `project` and already served `hooks_seen` hook requests.
     ///
-    /// The owner is a real listener answering a real `Status`, so what
-    /// this exercises is the same probe the installed binary runs.
-    async fn doctor_with(project: &Path, owner_root: Option<&Path>) -> String {
+    /// Returns the identity too, so a test can assert the `socket:` line
+    /// against the exact path this call bound, not merely that the label
+    /// showed up.
+    async fn doctor_with_own_owner(project: &Path, hooks_seen: u64) -> (String, SocketIdentity) {
         let socket_dir = tempfile::tempdir().expect("a temp dir");
         let identity = local_identity_for(project, socket_dir.path());
-        let _owner =
-            owner_root.map(|root| RecordingOwner::start_reporting_root(identity.clone(), root));
+        let _owner = RecordingOwner::start_reporting_status(identity.clone(), project, hooks_seen);
+        let out = super::doctor(project, &identity).await;
+        (out, identity)
+    }
+
+    /// Run the doctor for `project` with nothing bound anywhere it looks.
+    async fn doctor_with_nothing_running(project: &Path) -> (String, SocketIdentity) {
+        let socket_dir = tempfile::tempdir().expect("a temp dir");
+        let identity = local_identity_for(project, socket_dir.path());
+        let out = super::doctor(project, &identity).await;
+        (out, identity)
+    }
+
+    /// Run the doctor for `project` where nothing owns `project`'s own
+    /// socket, but a real owner is bound for `foreign` in the same
+    /// runtime directory the doctor scans.
+    ///
+    /// This is how a server started in the wrong working directory
+    /// actually shows up: a different canonical directory hashes to a
+    /// different socket *file*, never to a different hash answering the
+    /// same one, since the socket's name is that hash.
+    async fn doctor_with_foreign_owner(project: &Path, foreign: &Path) -> String {
+        let socket_dir = tempfile::tempdir().expect("a temp dir");
+        let identity = local_identity_for(project, socket_dir.path());
+        let foreign_identity = local_identity_for(foreign, socket_dir.path());
+        let _owner = RecordingOwner::start_reporting_status(foreign_identity, foreign, 0);
         super::doctor(project, &identity).await
     }
 
+    /// Every line asserted by its exact text and position, not merely by
+    /// label, and the line count pinned too: a deleted line, a bare label
+    /// with its payload dropped, or a value swapped for a look-alike (the
+    /// requesting hash for the owner's own, `project_dir` for the
+    /// owner's `root`) must all fail this, which `out.contains("server
+    /// sees")`-style checks would not have caught.
     #[tokio::test]
-    async fn test_doctor_prints_both_hashes_so_a_mismatch_is_visible() {
+    async fn test_doctor_reports_the_live_owners_root_pid_and_hook_activity() {
+        let project = tempfile::tempdir().expect("a temp dir");
+
+        let (out, identity) = doctor_with_own_owner(project.path(), 3).await;
+        let hash = mcpls_core::hooks::identity_hash(project.path()).expect("hash");
+
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 6, "expected exactly six lines: {out}");
+        assert_eq!(lines[0], format!("socket: {}", identity.socket.display()));
+        assert_eq!(
+            lines[1],
+            format!("hook sees: {} -> {hash}", project.path().display())
+        );
+        assert_eq!(
+            lines[2],
+            format!("server sees: {} -> {hash}", project.path().display())
+        );
+        assert_eq!(lines[3], format!("owner pid: {}", std::process::id()));
+        assert_eq!(
+            lines[4],
+            "hooks seen: 3 request(s) since this owner started"
+        );
+        assert!(lines[5].starts_with("mcpls on PATH: "));
+    }
+
+    #[tokio::test]
+    async fn test_doctor_warns_when_the_live_owner_has_never_seen_a_hook() {
+        let project = tempfile::tempdir().expect("a temp dir");
+
+        let (out, _identity) = doctor_with_own_owner(project.path(), 0).await;
+
+        assert!(
+            out.contains(
+                "hooks seen: none since this owner started; the plugin's hooks \
+                 may not be registered with your host"
+            ),
+            "a live, reachable owner that has never been sent a hook is the \
+             most likely shape of a plugin that was never wired up to the \
+             host, and must not read as a healthy install: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_doctor_reports_no_owner_when_nothing_is_reachable_anywhere() {
+        let project = tempfile::tempdir().expect("a temp dir");
+
+        let (out, identity) = doctor_with_nothing_running(project.path()).await;
+        let hash = mcpls_core::hooks::identity_hash(project.path()).expect("hash");
+
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 5, "expected exactly five lines: {out}");
+        assert_eq!(lines[0], format!("socket: {}", identity.socket.display()));
+        assert_eq!(
+            lines[1],
+            format!("hook sees: {} -> {hash}", project.path().display())
+        );
+        assert_eq!(
+            lines[2],
+            "server sees: no owner; nothing is listening on this project's socket"
+        );
+        assert_eq!(lines[3], "owner pid: none");
+        assert!(lines[4].starts_with("mcpls on PATH: "));
+    }
+
+    #[tokio::test]
+    async fn test_doctor_finds_a_foreign_owner_running_for_a_different_directory() {
         let project = tempfile::tempdir().expect("a temp dir");
         let elsewhere = tempfile::tempdir().expect("a temp dir");
 
-        let out = doctor_with(project.path(), Some(elsewhere.path())).await;
+        let out = doctor_with_foreign_owner(project.path(), elsewhere.path()).await;
 
-        assert!(out.contains("hook sees"));
-        assert!(out.contains("server sees"));
-        assert!(
-            out.contains("do not match"),
-            "a config whose roots point at a subdirectory, a multi-root config, \
-             or a symlinked checkout otherwise produces a permanent silent \
-             no-op with nothing to look at"
+        let server_sees = out
+            .lines()
+            .find(|line| line.starts_with("server sees: "))
+            .expect("a server-sees line is always printed");
+        assert_eq!(
+            server_sees,
+            format!(
+                "server sees: no owner for this directory; an mcpls is running \
+                 for {} (pid {}) instead",
+                elsewhere.path().display(),
+                std::process::id()
+            ),
+            "a server started in a different directory than CLAUDE_PROJECT_DIR \
+             is the failure this command exists to diagnose, and printing \
+             plain 'no owner' here would make it indistinguishable from \
+             nothing running at all: {out}"
         );
-    }
-
-    #[tokio::test]
-    async fn test_doctor_says_nothing_is_wrong_when_the_hashes_agree() {
-        let project = tempfile::tempdir().expect("a temp dir");
-
-        let out = doctor_with(project.path(), Some(project.path())).await;
-
         assert!(
-            !out.contains("do not match"),
-            "the mismatch line is the one thing a reader acts on, so it must not \
-             appear when there is nothing to act on"
+            !server_sees.contains(&project.path().display().to_string()),
+            "the foreign owner's root must not be confused with this \
+             project's own directory: {server_sees}"
         );
-    }
-
-    #[tokio::test]
-    async fn test_doctor_reports_no_owner_when_nothing_is_bound() {
-        let project = tempfile::tempdir().expect("a temp dir");
-        let out = doctor_with(project.path(), None).await;
-        assert!(out.contains("server sees: no owner"));
+        assert!(
+            out.contains("owner pid: none"),
+            "the foreign pid belongs in the server-sees line; owner pid \
+             reports whether THIS project's own socket has an owner, which \
+             it does not: {out}"
+        );
     }
 
     #[tokio::test]
     async fn test_doctor_reports_whether_mcpls_is_on_path() {
         let project = tempfile::tempdir().expect("a temp dir");
-        let out = doctor_with(project.path(), None).await;
+        let (out, _identity) = doctor_with_nothing_running(project.path()).await;
 
         let line = out
             .lines()
@@ -1241,10 +1432,14 @@ mod tests {
                  the install directory makes every hook do nothing, invisibly, \
                  so the doctor must carry one line that answers it",
             );
+        let value = line
+            .strip_prefix("mcpls on PATH: ")
+            .expect("the line was found by this exact prefix above");
         assert!(
-            line.ends_with("not found") || line.contains(std::path::MAIN_SEPARATOR),
-            "the line has to carry the result of the lookup, an absolute path or \
-             a plain 'not found', rather than merely mentioning PATH: {line}"
+            value == "not found" || Path::new(value).is_absolute(),
+            "the line has to carry an absolute path or a plain 'not found'; a \
+             relative PATH entry (a bare 'bin', '.', or an empty ':: ' entry) \
+             means nothing to whatever directory a hook later runs in: {line}"
         );
     }
 
@@ -1256,15 +1451,27 @@ mod tests {
 
         let out = super::doctor_without_identity(project.path(), &error);
 
-        assert!(
-            !out.contains("no owner"),
-            "a directory whose identity can never be derived is a different \
-             failure than a socket nobody answered: {out}"
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 5, "expected exactly five lines: {out}");
+        assert_eq!(
+            lines[0],
+            format!("socket: none; could not derive an identity for this directory: {error}")
         );
-        assert!(
-            out.contains("could not derive an identity"),
-            "the reader needs to know hooks can never work here at all, not \
-             just that nothing answered right now: {out}"
+        assert_eq!(
+            lines[1],
+            format!("hook sees: {} -> unknown", project.path().display())
         );
+        assert_eq!(
+            lines[2], "server sees: nothing can run here; no socket exists to probe",
+            "'unknown' on this line would be the second, contradictory sense \
+             of the word one line above, where the hash genuinely cannot be \
+             computed: {out}"
+        );
+        assert_eq!(
+            lines[3], "owner pid: none",
+            "every doctor state prints an owner pid line, even this one, so \
+             the two commands' output has one consistent shape: {out}"
+        );
+        assert!(lines[4].starts_with("mcpls on PATH: "));
     }
 }
