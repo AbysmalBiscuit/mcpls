@@ -1105,6 +1105,26 @@ mod tests {
         );
     }
 
+    /// Wait until the ownership lock names a file again, which only
+    /// happens once the listener has noticed it vanished, stopped serving,
+    /// and won it back.
+    ///
+    /// The listener re-`stat`s its lock on its own interval, so a test that
+    /// asserted straight after removing the file would usually assert
+    /// before the code it is about had run at all. Bounded, so a
+    /// reacquisition that never comes fails this test rather than hanging
+    /// the run.
+    #[cfg(unix)]
+    async fn wait_for_lock_to_return(identity: &SocketIdentity) {
+        for _ in 0..200 {
+            if identity.lock.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("the owner never won {} back", identity.lock.display());
+    }
+
     /// The listener re-`stat`s its lock on its own interval, so a test that
     /// removes the file has to wait for that tick rather than assume it.
     /// Bounded, and every arm ends in an assertion naming what went wrong.
@@ -1255,6 +1275,11 @@ mod tests {
 
     /// A lock file removed by a temporary-file cleaner is not a competitor,
     /// so the owner wins it back and goes on serving.
+    ///
+    /// Unix-only, like the ownership check it exercises: Windows arbitrates
+    /// on the pipe itself, keeps no lock file, and never produces a
+    /// `LockLoss` at all.
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_an_owner_whose_lock_file_vanishes_reacquires_and_serves_again() {
         let (dir, identity) = temp_identity();
@@ -1281,8 +1306,14 @@ mod tests {
             status_from_owner(&identity).await,
             Response::Status { owner: true, .. }
         ));
+        // Read before the lock goes, because reacquisition promotes and a
+        // role read afterwards therefore always says Owner however the
+        // arm behaved in between.
+        let transitions = role.subscribe_transitions();
+        let before = *transitions.borrow();
 
         std::fs::remove_file(&identity.lock).expect("stand in for a temp-file cleaner");
+        wait_for_lock_to_return(&identity).await;
 
         assert!(
             matches!(
@@ -1293,10 +1324,14 @@ mod tests {
              the rest of the process's life over a file anything may delete"
         );
         assert_eq!(
-            role.get(),
-            Role::Owner,
-            "nothing took this listener's place, so there is nobody to be passive to"
+            *transitions.borrow(),
+            before,
+            "nothing took this listener's place, so it must not pass through \
+             Passive on its way back: while it did, its own writes would \
+             forward to the socket it is itself listening on and its footer \
+             would go silent"
         );
+        assert_eq!(role.get(), Role::Owner);
     }
 
     /// A lock file a competitor took is a different situation: that process
