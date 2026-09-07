@@ -8,6 +8,7 @@
 use std::time::Duration;
 
 use futures::future::BoxFuture;
+use mcpls_core::hooks::listener::ServeExit;
 use mcpls_core::hooks::{HookListener, Request, Response, SocketIdentity, send};
 use tempfile::TempDir;
 
@@ -141,13 +142,40 @@ async fn test_an_owner_stands_down_when_its_lock_file_is_replaced() {
          having been no owner at all, so it must succeed"
     );
 
-    let stood_down = tokio::time::timeout(Duration::from_secs(3), serve_task).await;
-    assert!(
-        stood_down.is_ok(),
-        "the original owner must notice its lock file was replaced and stop \
-         serving, rather than continue believing it owns a session a second \
-         process now also owns"
-    );
+    let exit = tokio::time::timeout(Duration::from_secs(3), serve_task)
+        .await
+        .expect(
+            "the original owner must notice its lock file was replaced and stop \
+             serving, rather than continue believing it owns a session a second \
+             process now also owns",
+        )
+        .expect("the serve task");
+    assert_eq!(exit, ServeExit::LockLost);
+}
+
+#[tokio::test]
+async fn test_serve_reports_cancelled_when_the_cancel_watch_fires() {
+    let (_guard, identity) = temp_identity();
+    let listener = HookListener::acquire(&identity)
+        .await
+        .expect("acquire")
+        .expect("owner");
+    let (cancel_tx, cancel) = tokio::sync::watch::channel(false);
+    let serve_task = tokio::spawn(listener.serve(
+        handler(|_req| Box::pin(async { Response::Flush { context: None } })),
+        Duration::from_millis(1500),
+        cancel,
+    ));
+
+    cancel_tx
+        .send(true)
+        .expect("the cancel watch still has a receiver");
+
+    let exit = tokio::time::timeout(Duration::from_secs(3), serve_task)
+        .await
+        .expect("serve must return promptly once cancelled, not hang")
+        .expect("the serve task");
+    assert_eq!(exit, ServeExit::Cancelled);
 }
 
 #[tokio::test]
