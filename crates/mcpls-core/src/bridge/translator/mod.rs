@@ -185,19 +185,24 @@ enum ResyncStep {
 
 /// What [`Translator::open_untracked_document`] achieved for one path.
 ///
-/// A path no server routes and a path a server routes but could not be
-/// opened are different outcomes: the first is nothing anyone was ever
-/// going to check, the second is a file that should have been checked and
-/// was not, which is what a caller reports as a shortfall.
+/// The three ways of not opening one are kept apart because a caller
+/// reports them differently. Nothing routes the path, so no check was ever
+/// going to run and silence is the honest answer; the caller had no room
+/// for another document, which more room would fix; or the open itself did
+/// not work, which it would not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenOutcome {
     /// The document is tracked and its server was sent a `didOpen`.
     Opened,
-    /// No registered server routes this path's language. Nothing was
-    /// opened, and nothing was told.
+    /// Nothing routes this path's language, and nothing ever will while the
+    /// current configuration stands. Nothing was opened, nothing was told.
     NoRoute,
-    /// A server routes it, but the file could not be opened -- unreadable,
-    /// or past a resource limit.
+    /// A server routes it and the caller said it had no room for another
+    /// document, so the open was not attempted.
+    NoHeadroom,
+    /// A server routes it, but the file was not opened -- unreadable, past
+    /// a resource limit, or routed to a server that has not finished
+    /// starting.
     Failed,
 }
 
@@ -601,6 +606,17 @@ impl Translator {
     /// spent on a document no server holds buys no diagnostics and brings
     /// the next tool call that much closer to the document limit.
     ///
+    /// `has_headroom` says whether the caller can afford one more tracked
+    /// document. It is read after routing rather than before the call, so a
+    /// path nothing routes is never reported against the document limit it
+    /// was not competing for.
+    ///
+    /// A route to a server that is still starting is [`OpenOutcome::Failed`],
+    /// not [`OpenOutcome::NoRoute`]: servers spawn in the background, so a
+    /// file created during startup routes to one that has not registered
+    /// yet, and that file should be checked and was not. Only a language
+    /// with no route at all is silent.
+    ///
     /// The open runs through [`DocumentTracker::ensure_open`], which holds
     /// the path's own lock across the tracker insert and the notify, so a
     /// tool call opening the same path concurrently cannot have its version
@@ -608,10 +624,19 @@ impl Translator {
     ///
     /// `pub(crate)` because the host file-watcher sweep, in
     /// `crate::hooks::sweep`, is what learns a file was created.
-    pub(crate) async fn open_untracked_document(&self, path: &Path) -> OpenOutcome {
-        let Ok((server, client)) = self.get_client_for_file(path, ToolKind::Diagnostics) else {
-            return OpenOutcome::NoRoute;
+    pub(crate) async fn open_untracked_document(
+        &self,
+        path: &Path,
+        has_headroom: bool,
+    ) -> OpenOutcome {
+        let (server, client) = match self.get_client_for_file(path, ToolKind::Diagnostics) {
+            Ok(resolved) => resolved,
+            Err(Error::ServerInitializing { .. }) => return OpenOutcome::Failed,
+            Err(_) => return OpenOutcome::NoRoute,
         };
+        if !has_headroom {
+            return OpenOutcome::NoHeadroom;
+        }
         match self
             .document_tracker
             .ensure_open(path, &server, &client)

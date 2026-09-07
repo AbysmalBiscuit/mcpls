@@ -217,6 +217,12 @@ impl Sweeper {
     /// its check on. Whatever is left -- past the headroom, unopenable, or
     /// routed to no server at all -- is named only to the servers that
     /// registered a watcher glob for it, which costs no tracker slot.
+    ///
+    /// A path just opened is handed to the drain rather than saved directly,
+    /// which costs it a second read of a file the open has already read.
+    /// That buys the drain's restartability: the save stays owed on the
+    /// queue until it lands, so a sweep dropped partway through leaves the
+    /// remaining saves for the next one instead of losing them.
     async fn sweep(&self) {
         let paths: Vec<PathBuf> = lock_std(&self.pending).drain().collect();
         if paths.is_empty() {
@@ -258,17 +264,20 @@ impl Sweeper {
                 watched_only.push(path);
                 continue;
             }
-            if opened >= headroom {
-                over_limit += 1;
-                watched_only.push(path);
-                continue;
-            }
-            match self.translator.open_untracked_document(&path).await {
+            match self
+                .translator
+                .open_untracked_document(&path, opened < headroom)
+                .await
+            {
                 OpenOutcome::Opened => {
                     opened += 1;
                     settle.push(path);
                 }
                 OpenOutcome::NoRoute => watched_only.push(path),
+                OpenOutcome::NoHeadroom => {
+                    over_limit += 1;
+                    watched_only.push(path);
+                }
                 OpenOutcome::Failed => {
                     unopened += 1;
                     watched_only.push(path);
@@ -327,6 +336,7 @@ mod tests {
 
     use super::*;
     use crate::bridge::{ResourceLimits, Translator, TranslatorHarness};
+    use crate::config::{ServerId, ToolRouter};
 
     /// The language and server id every served test uses.
     const SERVER: &str = "rust";
@@ -376,13 +386,39 @@ mod tests {
 
     fn test_sweeper_with_ceiling(quiet_for: Duration, max_documents: usize) -> TestSweeper {
         let dir = tempfile::tempdir().expect("a temp dir");
+        sweeper_over(dir, Translator::new(), quiet_for, max_documents)
+    }
+
+    /// A sweeper whose router names a server that has not registered yet --
+    /// the state mcpls is in while it spawns its servers in the background,
+    /// and the state a file created moments after startup meets.
+    fn initializing_sweeper() -> TestSweeper {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let server = ServerId::from(SERVER);
+        let mut translator = Translator::new()
+            .with_extensions(HashMap::from([("rs".to_string(), SERVER.to_string())]))
+            .with_router(ToolRouter::catch_all([(
+                server.clone(),
+                SERVER.to_string(),
+            )]));
+        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+        translator.set_expected_servers(HashSet::from([server]));
+        sweeper_over(dir, translator, Duration::from_secs(60), usize::MAX)
+    }
+
+    fn sweeper_over(
+        dir: TempDir,
+        translator: Translator,
+        quiet_for: Duration,
+        max_documents: usize,
+    ) -> TestSweeper {
         let filter = PathFilter::new(
             Arc::from(vec![dir.path().to_path_buf()]),
-            Arc::new(HashMap::from([("rs".to_string(), "rust".to_string())])),
+            Arc::new(HashMap::from([("rs".to_string(), SERVER.to_string())])),
             None,
         );
         let sweeper = Arc::new(Sweeper::new(
-            Arc::new(Translator::new()),
+            Arc::new(translator),
             filter,
             quiet_for,
             max_documents,
@@ -640,15 +676,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_a_file_whose_server_is_still_starting_is_not_checked() {
+        let sweeper = initializing_sweeper();
+        let path = sweeper.write("fresh.rs");
+        sweeper.enqueue(std::slice::from_ref(&path));
+        sweeper.sweep_now().await;
+
+        assert_eq!(
+            sweeper.last_shortfall().expect("a shortfall line"),
+            "1 file(s) not checked: they could not be opened",
+            "servers spawn in the background, so a file created moments \
+             after startup routes to one that has not registered yet; \
+             treating that like a language nothing routes leaves the file \
+             unopened, unsaved, and unmentioned"
+        );
+        assert_eq!(sweeper.opened_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_a_file_no_server_routes_is_not_blamed_on_the_ceiling() {
+        // No room for another document at all, so every path this sweep
+        // declines to open would be blamed on the ceiling by an accounting
+        // that decided before it asked whether anything routes them.
+        let sweeper = test_sweeper_with_ceiling(Duration::from_secs(60), 0);
+        let paths: Vec<PathBuf> = (0..3).map(|i| sweeper.write(&format!("f{i}.rs"))).collect();
+        sweeper.enqueue(&paths);
+        sweeper.sweep_now().await;
+
+        assert_eq!(
+            sweeper.last_shortfall(),
+            None,
+            "nothing routes these, so no amount of room would have checked \
+             them: naming them as casualties of the document limit sends a \
+             reader after a limit that was never the problem"
+        );
+    }
+
+    #[tokio::test]
     async fn test_a_path_arriving_during_a_sweep_lands_in_the_next_one() {
         let sweeper = test_sweeper(Duration::from_secs(60));
         let first = sweeper.write("first.rs");
         std::fs::remove_file(&first).expect("remove");
         sweeper.enqueue(std::slice::from_ref(&first));
 
-        // The resync takes each path's own lock. Holding it parks the sweep
-        // partway through, which is the window a hook connection can land a
-        // path in.
+        // The resync takes each path's own lock, so holding it keeps the
+        // sweep from finishing while this test enqueues. An empty pending
+        // set says the sweep has taken its own and is past the point of
+        // picking anything else up, which is the window a hook connection
+        // can land a path in.
         let tracker = Arc::clone(sweeper.translator.document_tracker());
         let held = tracker.lock_path(&first).await;
         let running = tokio::spawn({
