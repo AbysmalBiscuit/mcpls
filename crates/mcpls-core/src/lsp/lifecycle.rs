@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 
 use lsp_types::{
     ClientCapabilities, ClientInfo, GeneralClientCapabilities, InitializeParams, InitializeResult,
@@ -27,6 +28,7 @@ use crate::error::{Error, Result, ServerSpawnFailure};
 use crate::lsp::client::LspClient;
 use crate::lsp::transport::LspTransport;
 use crate::lsp::types::LspNotification;
+use crate::lsp::watched_files::WatchRegistry;
 
 /// Environment variables passed through to a spawned LSP server even though
 /// its environment is otherwise cleared.
@@ -148,6 +150,12 @@ pub struct ServerInitConfig {
     /// The caller is responsible for draining the corresponding receiver and
     /// storing entries in [`crate::bridge::NotificationCache`].
     pub notification_tx: Option<mpsc::Sender<LspNotification>>,
+    /// Where this server's `didChangeWatchedFiles` registrations are stored.
+    ///
+    /// `None` for an embedder that does not want file watching; the two
+    /// capability arms then answer `null` and record nothing, which is what
+    /// they did before this existed.
+    pub watch_registry: Option<Arc<WatchRegistry>>,
 }
 
 /// Result of attempting to spawn multiple LSP servers.
@@ -354,6 +362,8 @@ impl LspServer {
             config.server_config.clone(),
             transport,
             notification_tx,
+            config.watch_registry.clone(),
+            config.server_config.id(),
         );
 
         let (capabilities, position_encoding) = Self::initialize(&client, &config).await?;
@@ -602,6 +612,7 @@ impl LspServer {
     ///         initialization_options: None,
     ///         position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
     ///         notification_tx: None,
+    ///         watch_registry: None,
     ///         applies_edits: false,
     ///     },
     ///     ServerInitConfig {
@@ -610,6 +621,7 @@ impl LspServer {
     ///         initialization_options: None,
     ///         position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
     ///         notification_tx: None,
+    ///         watch_registry: None,
     ///         applies_edits: false,
     ///     },
     /// ];
@@ -730,6 +742,10 @@ fn build_client_capabilities(
         workspace: Some(lsp_types::WorkspaceClientCapabilities {
             workspace_folders: Some(true),
             apply_edit: Some(applies_edits),
+            did_change_watched_files: Some(lsp_types::DidChangeWatchedFilesClientCapabilities {
+                dynamic_registration: Some(true),
+                relative_pattern_support: None,
+            }),
             workspace_edit: Some(lsp_types::WorkspaceEditClientCapabilities {
                 document_changes: Some(true),
                 resource_operations: Some(vec![
@@ -951,18 +967,27 @@ mod tests {
         assert_eq!(workspace.apply_edit, Some(false));
     }
 
+    /// Advertising this is what moves gopls and tsgo out of their do-nothing
+    /// branches: gopls returns early from `registerWatchedDirectoriesLocked`
+    /// without it, and tsgo falls through to a watcher its own comment limits
+    /// to Windows and `FSEvents`. Both abandon their previous behaviour on the
+    /// strength of the advertisement alone, so mcpls must actually send the
+    /// notification, which is why the advertisement and the send belong
+    /// together.
+    /// `relativePatternSupport` stays unclaimed: every watcher then arrives as
+    /// a plain glob string, which is one matching path instead of two.
     #[test]
-    fn test_client_capabilities_do_not_claim_dynamic_file_watching() {
+    #[allow(clippy::expect_used)]
+    fn test_client_capabilities_claim_dynamic_file_watching() {
         let caps = build_client_capabilities(vec![], true);
-        let declared = caps
+        let watched = caps
             .workspace
-            .and_then(|w| w.did_change_watched_files)
-            .and_then(|w| w.dynamic_registration);
-        assert_ne!(
-            declared,
-            Some(true),
-            "advertising this without sending the notification blinds gopls and tsgo"
-        );
+            .expect("workspace capabilities are declared")
+            .did_change_watched_files
+            .expect("didChangeWatchedFiles capabilities are declared");
+
+        assert_eq!(watched.dynamic_registration, Some(true));
+        assert_eq!(watched.relative_pattern_support, None);
     }
 
     /// A server gates server-initiated `$/progress` on this capability, so
@@ -1126,6 +1151,7 @@ mod tests {
             initialization_options: Some(serde_json::json!({"key": "value"})),
             position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
             notification_tx: None,
+            watch_registry: None,
         };
 
         #[allow(clippy::redundant_clone)]
@@ -1143,6 +1169,7 @@ mod tests {
             initialization_options: None,
             position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
             notification_tx: None,
+            watch_registry: None,
         };
 
         let debug_str = format!("{config:?}");
@@ -1187,6 +1214,7 @@ mod tests {
             initialization_options: Some(init_opts),
             position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
             notification_tx: None,
+            watch_registry: None,
         };
 
         assert!(config.initialization_options.is_some());
@@ -1202,6 +1230,7 @@ mod tests {
             initialization_options: None,
             position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
             notification_tx: None,
+            watch_registry: None,
         };
 
         assert!(config.workspace_roots.is_empty());
@@ -1220,6 +1249,7 @@ mod tests {
             initialization_options: None,
             position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
             notification_tx: None,
+            watch_registry: None,
         };
 
         assert_eq!(config.workspace_roots.len(), 3);
@@ -1677,6 +1707,7 @@ mod tests {
             initialization_options: None,
             position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
             notification_tx: None,
+            watch_registry: None,
         }];
 
         let result = LspServer::spawn_batch(&configs).await;
@@ -1716,6 +1747,7 @@ mod tests {
                 initialization_options: None,
                 position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
                 notification_tx: None,
+                watch_registry: None,
             },
             ServerInitConfig {
                 applies_edits: false,
@@ -1737,6 +1769,7 @@ mod tests {
                 initialization_options: None,
                 position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
                 notification_tx: None,
+                watch_registry: None,
             },
             ServerInitConfig {
                 applies_edits: false,
@@ -1758,6 +1791,7 @@ mod tests {
                 initialization_options: None,
                 position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
                 notification_tx: None,
+                watch_registry: None,
             },
         ];
 
@@ -1802,6 +1836,7 @@ mod tests {
                 initialization_options: None,
                 position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
                 notification_tx: None,
+                watch_registry: None,
             },
             ServerInitConfig {
                 applies_edits: false,
@@ -1823,6 +1858,7 @@ mod tests {
                 initialization_options: None,
                 position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
                 notification_tx: None,
+                watch_registry: None,
             },
         ];
 
@@ -1922,6 +1958,7 @@ mod tests {
                 initialization_options: None,
                 position_encodings: vec!["utf-32".to_string(), "utf-8".to_string()],
                 notification_tx: None,
+                watch_registry: None,
             };
 
             let init_task =
@@ -1965,6 +2002,7 @@ mod tests {
                 initialization_options: None,
                 position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
                 notification_tx: None,
+                watch_registry: None,
             };
 
             let init_task =
@@ -2012,6 +2050,7 @@ mod tests {
                 initialization_options: None,
                 position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
                 notification_tx: None,
+                watch_registry: None,
             },
             ServerInitConfig {
                 applies_edits: false,
@@ -2033,6 +2072,7 @@ mod tests {
                 initialization_options: None,
                 position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
                 notification_tx: None,
+                watch_registry: None,
             },
         ];
 

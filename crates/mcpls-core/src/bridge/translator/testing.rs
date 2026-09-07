@@ -22,10 +22,17 @@ use crate::bridge::encoding::PositionEncoding;
 use crate::bridge::state::ResourceLimits;
 use crate::bridge::{DiagnosticInfo, DocumentTracker, lock_std};
 use crate::config::{LspServerConfig, ServerId, ToolRouter};
-use crate::lsp::{LspClient, LspServer, LspTransport};
+use crate::lsp::{LspClient, LspServer, LspTransport, WatchRegistry};
 pub(super) use crate::test_support::read_framed_message;
 
 type JsonValue = serde_json::Value;
+
+/// One notification a [`RecordingServer`] received: its method and params.
+type Received = (String, JsonValue);
+
+/// Where a [`RecordingServer`] sends the log prefix it observed ahead of a
+/// sentinel.
+type SentinelWaiter = Arc<StdMutex<Option<std::sync::mpsc::Sender<Vec<Received>>>>>;
 
 /// A UTF-16 `EncodingCtx`, matching the pre-negotiation behavior: no
 /// disk reads, pure line/column offsetting.
@@ -321,8 +328,8 @@ async fn try_read_frame<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> O
 /// preserves order, and reads back everything logged before the sentinel is
 /// observed -- which, by that ordering, is exactly what was sent before it.
 struct RecordingServer {
-    log: Arc<StdMutex<Vec<String>>>,
-    sentinel_waiter: Arc<StdMutex<Option<std::sync::mpsc::Sender<Vec<String>>>>>,
+    log: Arc<StdMutex<Vec<Received>>>,
+    sentinel_waiter: SentinelWaiter,
     client: LspClient,
     /// The one client returned by [`fake_lsp_client`] that owns the
     /// connection's background task (every other handle, including
@@ -341,8 +348,7 @@ impl RecordingServer {
     /// the client half for the harness to register.
     fn spawn() -> (LspClient, Self) {
         let log = Arc::new(StdMutex::new(Vec::new()));
-        let sentinel_waiter: Arc<StdMutex<Option<std::sync::mpsc::Sender<Vec<String>>>>> =
-            Arc::new(StdMutex::new(None));
+        let sentinel_waiter: SentinelWaiter = Arc::new(StdMutex::new(None));
         let (client_tx, client_rx) = std::sync::mpsc::channel::<LspClient>();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
@@ -373,7 +379,8 @@ impl RecordingServer {
                             }
                             continue;
                         }
-                        lock_std(&log_for_thread).push(method.to_string());
+                        lock_std(&log_for_thread)
+                            .push((method.to_string(), message["params"].clone()));
                     }
                 });
                 let _ = shutdown_rx.await;
@@ -414,6 +421,24 @@ impl RecordingServer {
     }
 
     /// The notification methods received so far, in order.
+    fn notifications(&self) -> Vec<String> {
+        self.received()
+            .into_iter()
+            .map(|(method, _)| method)
+            .collect()
+    }
+
+    /// The params of the last notification received for `method`, or `None`
+    /// if none was.
+    fn last_params_for(&self, method: &str) -> Option<JsonValue> {
+        self.received()
+            .into_iter()
+            .rev()
+            .find(|(received, _)| received == method)
+            .map(|(_, params)| params)
+    }
+
+    /// Every notification received so far, method and params, in order.
     ///
     /// Deterministic rather than timing-based: everything the resync sent
     /// travels through the same client's command channel, in order, ahead
@@ -421,7 +446,7 @@ impl RecordingServer {
     /// observed every earlier notification has already been written and
     /// logged. The 500ms bound only guards against a genuinely hung
     /// transport; it is not part of the normal completion path.
-    fn notifications(&self) -> Vec<String> {
+    fn received(&self) -> Vec<Received> {
         let (tx, rx) = std::sync::mpsc::channel();
         *lock_std(&self.sentinel_waiter) = Some(tx);
         let _ = futures::executor::block_on(
@@ -454,6 +479,9 @@ pub(super) struct TranslatorHarness {
     pub(super) translator: Arc<Translator>,
     dir: TempDir,
     servers: HashMap<String, RecordingServer>,
+    /// The same registry the translator holds, so a test can register a
+    /// watcher the way an inbound `client/registerCapability` would.
+    watch_registry: Arc<WatchRegistry>,
 }
 
 impl TranslatorHarness {
@@ -491,6 +519,7 @@ impl TranslatorHarness {
     ) -> impl Future<Output = Self> {
         let dir = TempDir::new().expect("temp dir");
         let server_id = ServerId::from(language_id);
+        let watch_registry = Arc::new(WatchRegistry::new());
 
         let mut translator = Translator::new()
             .with_extensions(HashMap::from([(
@@ -498,6 +527,7 @@ impl TranslatorHarness {
                 language_id.to_string(),
             )]))
             .with_resource_limits(limits)
+            .with_watch_registry(Arc::clone(&watch_registry))
             .with_router(ToolRouter::catch_all([(
                 server_id.clone(),
                 language_id.to_string(),
@@ -511,6 +541,7 @@ impl TranslatorHarness {
             translator: Arc::new(translator),
             dir,
             servers: HashMap::from([(language_id.to_string(), server)]),
+            watch_registry,
         })
     }
 
@@ -565,6 +596,25 @@ impl TranslatorHarness {
             .get(server)
             .unwrap_or_else(|| panic!("{server} is not registered with this harness"))
             .notifications()
+    }
+
+    /// Register `glob` for `server` under `id`, on the registry the harness
+    /// handed the translator.
+    pub(super) fn register_watcher(&self, server: &str, id: &str, glob: &str) {
+        self.watch_registry.register(
+            &ServerId::from(server),
+            id,
+            &serde_json::json!([{ "globPattern": glob }]),
+        );
+    }
+
+    /// The JSON params of the last `workspace/didChangeWatchedFiles` the
+    /// fake server for `server` received, or `None` if it received none.
+    pub(super) fn last_watched_files_params(&self, server: &str) -> Option<JsonValue> {
+        self.servers
+            .get(server)
+            .unwrap_or_else(|| panic!("{server} is not registered with this harness"))
+            .last_params_for("workspace/didChangeWatchedFiles")
     }
 
     /// Kill `server`'s connection for good, so every notification the
