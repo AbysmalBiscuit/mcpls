@@ -66,8 +66,17 @@ async fn main() {
             }
             Some(HookAction::Doctor) => {
                 // `mcpls hook doctor` reports on the socket and the install.
-                eprintln!("mcpls hook doctor: not implemented");
-                std::process::exit(1);
+                // It reads the same `CLAUDE_PROJECT_DIR` the hook itself
+                // does, canonicalized the same way, so it probes exactly
+                // the socket a real hook invocation would.
+                let raw_project_dir = std::env::var_os("CLAUDE_PROJECT_DIR")
+                    .map_or_else(|| std::path::PathBuf::from("."), std::path::PathBuf::from);
+                let project_dir = dunce::canonicalize(&raw_project_dir).unwrap_or(raw_project_dir);
+                let out = match mcpls_core::hooks::identity_for(&project_dir) {
+                    Ok(identity) => hook::doctor(&project_dir, &identity).await,
+                    Err(error) => hook::doctor_without_identity(&project_dir, &error),
+                };
+                println!("{out}");
             }
         }
         std::process::exit(0);

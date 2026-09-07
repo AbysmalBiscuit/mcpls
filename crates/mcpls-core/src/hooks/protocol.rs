@@ -84,6 +84,10 @@ pub enum Response {
         pid: u32,
         /// Whether the responding process is itself the socket's owner.
         owner: bool,
+        /// The owner's canonicalized startup directory, so `mcpls hook
+        /// doctor` can print what the server sees beside what the hook
+        /// sees.
+        root: PathBuf,
     },
     /// Reports that a request could not be carried out.
     Error {
@@ -223,13 +227,13 @@ mod tests {
 
     #[test]
     fn test_the_status_response_pins_the_wire_shape() {
-        let literal =
-            r#"{"op":"status","hash":"abc123","socket":"mcpls.sock","pid":42,"owner":true}"#;
+        let literal = r#"{"op":"status","hash":"abc123","socket":"mcpls.sock","pid":42,"owner":true,"root":"/work"}"#;
         let value = Response::Status {
             hash: "abc123".to_string(),
             socket: PathBuf::from("mcpls.sock"),
             pid: 42,
             owner: true,
+            root: PathBuf::from("/work"),
         };
         assert_eq!(
             serde_json::to_value(&value).expect("serialize"),
