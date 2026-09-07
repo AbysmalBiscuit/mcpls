@@ -394,7 +394,8 @@ flowchart TB
 - [Configuration Reference](docs/user-guide/configuration.md)
 - [Tools Reference](docs/user-guide/tools-reference.md)
 - [Troubleshooting](docs/user-guide/troubleshooting.md)
-- [Agent Skill](skills/mcpls/) — packaged [Agent Skill](https://agentskills.io/specification) teaching an AI coding agent to install, configure, and run the mcpls CLI
+- [Agent Skill](plugin/skills/mcpls/) — packaged [Agent Skill](https://agentskills.io/specification) teaching an AI coding agent to install, configure, and run the mcpls CLI
+- [Claude Code Plugin](plugin/README.md) — installs the skill above alongside the MCP server registration and the push-diagnostics hooks
 
 ## Development
 
