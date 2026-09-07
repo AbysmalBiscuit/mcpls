@@ -1,6 +1,6 @@
 # Diagnostics injection
 
-Status: stage A shipped; stages B and C designed, not implemented.
+Status: stages A, B and C shipped.
 
 Revised twice after adversarial review, each round verifying claims against the source rather than against the previous draft. The second round found that B3's original wait could not fire for the case it existed to serve, that B1's split between committing a version and sending the notification would desync a server permanently on a cancelled request, that a footer flushing before the baseline landed would flood the session, that stage C's socket arbitration let two instances both believe they owned it, and that the footer's cap was shorter than this repository's own `cargo check`. Those are fixed here. Where a claim now rests on a measurement, the measurement is named so it can be re-run.
 

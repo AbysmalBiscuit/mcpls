@@ -1,0 +1,5 @@
+{
+  "name": "mcpls",
+  "description": "Language server intelligence and push diagnostics through mcpls",
+  "version": "0.1.0"
+}

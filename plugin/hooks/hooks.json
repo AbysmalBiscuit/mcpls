@@ -1,0 +1,9 @@
+{
+  "hooks": {
+    "SessionStart": [{ "hooks": [{ "type": "command", "command": "mcpls hook" }] }],
+    "FileChanged": [{ "hooks": [{ "type": "command", "command": "mcpls hook" }] }],
+    "PostToolBatch": [{ "hooks": [{ "type": "command", "command": "mcpls hook" }] }],
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "mcpls hook" }] }],
+    "SessionEnd": [{ "hooks": [{ "type": "command", "command": "mcpls hook" }] }]
+  }
+}
