@@ -6,10 +6,12 @@
 //! milliseconds, and the first of those gaps arrives before indexing has
 //! begun. Quiet is a count of zero that has held for `quiet_for`.
 //!
-//! A deadline bounds two failure modes neither the count nor the debounce
-//! can see: a notification dropped from a full channel before its pump
-//! existed, and a server that reports no progress at all and so never stops
-//! being busy for the first time.
+//! A deadline bounds a failure mode neither the count nor the debounce can
+//! see on their own: a notification dropped from a full channel before its
+//! pump existed. A server that reports no progress at all is not this case:
+//! restarting the deadline also stamps its first quiet moment, so it settles
+//! on the debounce like any other quiet workspace rather than waiting out
+//! the backstop.
 
 use std::collections::HashSet;
 use std::sync::Mutex;
@@ -34,6 +36,8 @@ struct SettleState {
     quiet_since: Option<Instant>,
     /// When the backstop fires regardless of what the servers have said.
     deadline: Instant,
+    /// How many long-running operations have ever begun.
+    epoch: u64,
 }
 
 impl ServerSettle {
@@ -49,6 +53,7 @@ impl ServerSettle {
                 outstanding: HashSet::new(),
                 quiet_since: None,
                 deadline: Instant::now() + deadline_after,
+                epoch: 0,
             }),
             quiet_for,
             deadline_after,
@@ -62,16 +67,27 @@ impl ServerSettle {
     /// `initialize` handshake would otherwise be spent out of the same
     /// budget. Callers restart the clock once the servers exist, and must do
     /// so unconditionally rather than on the arrival of server traffic: a
-    /// server that never reports progress produces no event to hang this on,
-    /// and the backstop is precisely what covers that case.
+    /// server that never reports progress produces no event to hang this on.
+    ///
+    /// This is also where such a server's quiet debounce gets its start:
+    /// nothing is outstanding yet at this point, so if nothing has been
+    /// stamped either, this counts as the first quiet moment. A server that
+    /// begins reporting progress afterwards clears the stamp the same way
+    /// any other `begin` does.
     pub fn restart_deadline(&self) {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
         state.deadline = Instant::now() + self.deadline_after;
+        if state.outstanding.is_empty() && state.quiet_since.is_none() {
+            state.quiet_since = Some(Instant::now());
+        }
     }
 
     /// Record that `server` started a long-running operation.
+    ///
+    /// Takes no instant: nothing here is time-dependent, since starting
+    /// work only clears the quiet stamp and bumps the epoch.
     pub fn begin(&self, server: &ServerId, token: &serde_json::Value) {
         let Ok(mut state) = self.state.lock() else {
             return;
@@ -80,10 +96,17 @@ impl ServerSettle {
             .outstanding
             .insert((server.clone(), token.to_string()));
         state.quiet_since = None;
+        state.epoch += 1;
     }
 
-    /// Record that `server` finished one.
-    pub fn end(&self, server: &ServerId, token: &serde_json::Value) {
+    /// Record that `server` finished one, as of `now`.
+    ///
+    /// Takes the instant rather than reading the clock, so the footer's
+    /// wait can be driven in a test without sleeping. `end` stamps the wall
+    /// clock, which is why this module's older tests sleep; the footer
+    /// cannot afford that, since its assertions are about which of three
+    /// branches ended the wait.
+    pub fn end_at(&self, server: &ServerId, token: &serde_json::Value, now: Instant) {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
@@ -94,8 +117,44 @@ impl ServerSettle {
             return;
         }
         if state.outstanding.is_empty() {
-            state.quiet_since = Some(Instant::now());
+            state.quiet_since = Some(now);
         }
+    }
+
+    /// Record that `server` finished one.
+    pub fn end(&self, server: &ServerId, token: &serde_json::Value) {
+        self.end_at(server, token, Instant::now());
+    }
+
+    /// How many long-running operations have ever begun.
+    ///
+    /// The footer captures this before its resync and compares afterwards,
+    /// so an index already running when the rename landed does not read as
+    /// the check that rename started.
+    #[must_use]
+    pub fn progress_epoch(&self) -> u64 {
+        self.state.lock().map_or(0, |state| state.epoch)
+    }
+
+    /// Whether nothing has been outstanding for `quiet_for` as of `now`.
+    ///
+    /// Differs from [`Self::should_settle_at`] in two ways, both deliberate.
+    /// There is no deadline: the footer carries its own, much shorter, cap.
+    /// And a workspace that has never reported any progress counts as
+    /// quiet, where the baseline's judgment waits for a first `end`. The
+    /// baseline can afford to wait because it has five minutes and one
+    /// chance to get the workspace's real state; a footer runs after its own
+    /// grace period on every write, and a configured server that reports no
+    /// `$/progress` would otherwise make every footer burn its whole cap.
+    #[must_use]
+    pub fn is_quiet_at(&self, now: Instant, quiet_for: Duration) -> bool {
+        let Ok(state) = self.state.lock() else {
+            return false;
+        };
+        state.outstanding.is_empty()
+            && state
+                .quiet_since
+                .is_none_or(|since| now.duration_since(since) >= quiet_for)
     }
 
     /// Whether the workspace counts as analyzed as of `now`.
@@ -121,6 +180,7 @@ impl ServerSettle {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use std::time::{Duration, Instant};
 
@@ -299,5 +359,83 @@ mod tests {
             settle.should_settle_at(quiet_began + quiet_for * 2),
             "the restart moves the backstop, not the debounce"
         );
+    }
+
+    #[test]
+    fn test_restart_deadline_rescues_a_server_that_never_reports_progress() {
+        let quiet_for = Duration::from_millis(10);
+        let settle = ServerSettle::new(quiet_for, Duration::from_secs(600));
+        settle.restart_deadline();
+        let restarted = Instant::now();
+
+        assert!(
+            settle.should_settle_at(restarted + quiet_for * 2),
+            "a server that never reports progress must settle on the quiet \
+             debounce once the servers are spawned, not wait for the \
+             five-minute backstop"
+        );
+    }
+
+    #[test]
+    fn test_footer_quiet_holds_for_a_workspace_that_never_reported_progress() {
+        let settle = ServerSettle::new(Duration::from_secs(1), Duration::from_secs(600));
+        let now = Instant::now();
+
+        assert!(
+            !settle.should_settle_at(now),
+            "the baseline's judgment waits for a first end, because a workspace \
+             that has said nothing yet may simply not have started"
+        );
+        assert!(
+            settle.is_quiet_at(now, Duration::from_millis(200)),
+            "the footer's does not: it runs after its own grace period, and a \
+             server that reports no progress at all would otherwise burn the \
+             whole cap on every write"
+        );
+    }
+
+    #[test]
+    fn test_footer_quiet_waits_while_work_is_outstanding() {
+        let settle = ServerSettle::new(Duration::from_secs(1), Duration::from_secs(600));
+        let now = Instant::now();
+        settle.begin(&ServerId::from("rust"), &json!("flycheck"));
+
+        assert!(!settle.is_quiet_at(now + Duration::from_secs(30), Duration::from_millis(200)));
+    }
+
+    #[test]
+    fn test_footer_quiet_needs_its_own_debounce_after_the_last_end() {
+        let settle = ServerSettle::new(Duration::from_secs(1), Duration::from_secs(600));
+        let start = Instant::now();
+        let rust = ServerId::from("rust");
+        settle.begin(&rust, &json!("flycheck"));
+        settle.end_at(&rust, &json!("flycheck"), start);
+
+        assert!(!settle.is_quiet_at(
+            start + Duration::from_millis(100),
+            Duration::from_millis(200)
+        ));
+        assert!(settle.is_quiet_at(
+            start + Duration::from_millis(300),
+            Duration::from_millis(200)
+        ));
+    }
+
+    #[test]
+    fn test_the_progress_epoch_moves_only_when_work_begins() {
+        let settle = ServerSettle::new(Duration::from_secs(1), Duration::from_secs(600));
+        let rust = ServerId::from("rust");
+        let before = settle.progress_epoch();
+
+        settle.end_at(&rust, &json!("orphan"), Instant::now());
+        assert_eq!(
+            settle.progress_epoch(),
+            before,
+            "an unmatched end is not new work; the footer uses this to tell an \
+             index already in flight from a check its own save started"
+        );
+
+        settle.begin(&rust, &json!("flycheck"));
+        assert_eq!(settle.progress_epoch(), before + 1);
     }
 }
