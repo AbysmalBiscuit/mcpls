@@ -35,7 +35,7 @@ use crate::bridge::{
     SessionId, Translator, uri_to_path, validate_path_against_roots,
 };
 use crate::config::{DiagnosticsConfig, ServerId, ToolKind};
-use crate::hooks::{self, ChangeEvent, Role};
+use crate::hooks::{self, ChangeEvent, Role, SocketIdentity};
 
 /// MCP server that exposes LSP capabilities as tools.
 #[derive(Clone)]
@@ -43,13 +43,25 @@ pub struct McplsServer {
     context: Arc<BridgeContext>,
 }
 
-/// How long a tool call waits on the hook socket before falling back to
-/// what this process can answer on its own.
+/// How long a fire-and-forget `changed` waits on the hook socket.
 ///
-/// A tool call must never stall behind a socket whose owner has gone: the
-/// connect and the answer together are bounded well below anything an agent
-/// would notice, and every failure is silent.
-const HOOK_FORWARD_TIMEOUT: Duration = Duration::from_millis(50);
+/// Nothing is read back and nothing is lost when it expires -- the owner
+/// picks the same paths up from its next hook -- so this is bounded well
+/// below anything an agent would notice rather than by the owner's own
+/// deadline.
+const HOOK_CHANGED_TIMEOUT: Duration = Duration::from_millis(50);
+
+/// How much longer than the owner's own op deadline a forwarded flush
+/// waits.
+///
+/// The owner answers *at* its deadline rather than before it, letting the
+/// work that overran keep running, so a client waiting exactly that long
+/// times out on the answer it asked for. This covers the connect and the
+/// round trip on top of it. A client bound tighter than the server's own is
+/// never right here: the owner consumes the session's report before it
+/// writes a byte back, so a client that gives up early loses a report
+/// nobody ever sees.
+const HOOK_FLUSH_GRACE: Duration = Duration::from_millis(250);
 
 /// The apply toggle a tool's writes answer to, for the tools that write.
 ///
@@ -240,6 +252,39 @@ impl NewDiagnosticsResult {
             cleared: Vec::new(),
             omitted: 0,
             note: Some("Language servers are still starting up; call again shortly.".to_string()),
+        }
+    }
+
+    /// The owner's already-rendered report, wrapped so a passive instance
+    /// answers the same JSON object every other instance does.
+    ///
+    /// The owner sends text because that is what a hook prints and what the
+    /// socket protocol carries. Returning that string bare would make the
+    /// tool's response type depend on which process won a lock race, and
+    /// flip back mid-session the moment a forward failed.
+    const fn from_owner(context: Option<String>) -> Self {
+        Self {
+            changed: Vec::new(),
+            cleared: Vec::new(),
+            omitted: 0,
+            note: context,
+        }
+    }
+
+    /// The response when the socket's owner could not answer.
+    ///
+    /// Says so rather than reporting an empty diff, which an agent would
+    /// read as a clean workspace.
+    fn owner_unreachable() -> Self {
+        Self {
+            changed: Vec::new(),
+            cleared: Vec::new(),
+            omitted: 0,
+            note: Some(
+                "Another mcpls process owns this project's diagnostics record and could not be \
+                 reached, so nothing is reported this call. Check the mcpls logs."
+                    .to_string(),
+            ),
         }
     }
 }
@@ -742,9 +787,6 @@ impl McplsServer {
             apply,
         }): Parameters<FormatDocumentParams>,
     ) -> Result<String, McpError> {
-        // `FormatDocumentResult` carries no file list: the only file a
-        // format writes is the document it formatted.
-        let formatted = file_path.clone();
         let result = match self
             .context
             .translator
@@ -754,10 +796,7 @@ impl McplsServer {
             Ok(result) => result,
             Err(err) => return Err(McpError::internal_error(err.to_string(), None)),
         };
-        if result.applied {
-            self.forward_apply_targets(std::slice::from_ref(&formatted))
-                .await;
-        }
+        self.forward_apply_targets(&result.files_written).await;
         let footer = self.footer_if_written(result.applied).await;
         to_tool_result(Ok(WithDiagnostics {
             result,
@@ -982,18 +1021,9 @@ impl McplsServer {
     pub(crate) async fn get_new_diagnostics(&self) -> Result<String, McpError> {
         // Ahead of the baseline check: a passive instance's own baseline
         // says nothing about the record it is asking for, which lives in
-        // the owner. Falling through on a send failure answers from this
-        // process's own record, because a socket that has gone away is not
-        // a reason to answer nothing.
+        // the owner.
         if let Role::Passive { identity } = self.context.hooks.get() {
-            let request = hooks::Request::Flush {
-                session: SessionId::from_env_or_process().to_string(),
-            };
-            if let Ok(hooks::Response::Flush { context }) =
-                hooks::send(&identity, &request, HOOK_FORWARD_TIMEOUT).await
-            {
-                return to_tool_result(Ok(context.unwrap_or_default()));
-            }
+            return to_tool_result(Ok(self.flush_from_owner(&identity).await));
         }
 
         let baselined = {
@@ -1055,6 +1085,43 @@ impl McplsServer {
         render_for_hook(&self.flush_now(session).await)
     }
 
+    /// The owner's flush for this session, in the shape every other
+    /// instance answers with.
+    ///
+    /// Never falls back to this process's own record. The owner advances
+    /// the session's delivery record before it writes a byte back, so a
+    /// forward that fails has already consumed a report; answering from the
+    /// local record would hand the agent a different record's diff and
+    /// leave the two permanently disagreeing about what this session has
+    /// been shown. An answer that says the owner could not be reached is
+    /// the smaller failure, and it is the MCP tool rather than a hook, so
+    /// the rule that an edit must never fail on the socket does not apply.
+    async fn flush_from_owner(&self, identity: &SocketIdentity) -> NewDiagnosticsResult {
+        let request = hooks::Request::Flush {
+            session: SessionId::from_env_or_process().to_string(),
+        };
+        let timeout =
+            Duration::from_millis(self.context.diagnostics.hooks.op_deadline_ms) + HOOK_FLUSH_GRACE;
+        match hooks::send(identity, &request, timeout).await {
+            Ok(hooks::Response::Flush { context }) => NewDiagnosticsResult::from_owner(context),
+            Ok(hooks::Response::Error { message }) => {
+                tracing::warn!(%message, "the hook socket's owner refused this session's flush");
+                NewDiagnosticsResult::owner_unreachable()
+            }
+            Ok(other) => {
+                tracing::warn!(
+                    ?other,
+                    "the hook socket's owner answered a flush with something else"
+                );
+                NewDiagnosticsResult::owner_unreachable()
+            }
+            Err(error) => {
+                tracing::warn!(%error, "could not reach the hook socket's owner for this session's flush");
+                NewDiagnosticsResult::owner_unreachable()
+            }
+        }
+    }
+
     /// Drop `session`'s delivery record.
     pub(crate) async fn end_session(&self, session: &SessionId) {
         self.context.delivery.lock().await.end_session(session);
@@ -1079,7 +1146,7 @@ impl McplsServer {
             paths: files_written.iter().map(PathBuf::from).collect(),
             event: ChangeEvent::Change,
         };
-        if let Err(error) = hooks::send(&identity, &request, HOOK_FORWARD_TIMEOUT).await {
+        if let Err(error) = hooks::send(&identity, &request, HOOK_CHANGED_TIMEOUT).await {
             tracing::debug!(%error, "could not forward apply targets to the hook owner");
         }
     }
@@ -1680,6 +1747,105 @@ mod tests {
         );
         parts.delivery.lock().await.set_baseline(HashMap::new());
         parts
+    }
+
+    /// One diagnostic, already converted to the DTO the payload carries,
+    /// so a render test asserts the same values a hook would print.
+    fn rendered_diagnostic(line: u32, severity: DiagnosticSeverity, message: &str) -> Diagnostic {
+        Diagnostic {
+            range: crate::bridge::Range {
+                start: crate::bridge::Position2D { line, character: 3 },
+                end: crate::bridge::Position2D { line, character: 9 },
+            },
+            severity,
+            message: message.to_string(),
+            code: None,
+            source: None,
+        }
+    }
+
+    /// The exact block a hook prints, pinned whole.
+    ///
+    /// Task 20's hook side parses nothing but still injects this verbatim
+    /// into an agent's context, so the header line, the two-space indent,
+    /// the `line:char severity message` order, the truncation line, the
+    /// cleared phrasing and the note's placement are the contract. A
+    /// `contains` assertion would let any of them move.
+    #[test]
+    fn test_the_hook_render_pins_every_line_it_produces() {
+        let report = NewDiagnosticsResult {
+            changed: vec![NewDiagnosticsFile {
+                file_path: "/work/a.rs".to_string(),
+                diagnostics: vec![
+                    rendered_diagnostic(12, DiagnosticSeverity::Error, "mismatched types"),
+                    rendered_diagnostic(40, DiagnosticSeverity::Warning, "unused variable"),
+                ],
+                omitted: 3,
+            }],
+            cleared: vec!["/work/b.rs".to_string()],
+            omitted: 2,
+            note: Some("2 file(s) were held back.".to_string()),
+        };
+
+        assert_eq!(
+            render_for_hook(&report).expect("a report with content renders"),
+            "/work/a.rs:\n  \
+             12:3 error mismatched types\n  \
+             40:3 warning unused variable\n  \
+             (3 more not shown)\n\
+             /work/b.rs: no diagnostics\n\
+             2 file(s) were held back."
+        );
+    }
+
+    /// A flush with nothing to say prints nothing at all: a hook's output is
+    /// injected into the agent's context, and an empty structure there is
+    /// noise the agent has to interpret.
+    #[test]
+    fn test_an_empty_report_renders_as_no_text() {
+        assert!(
+            render_for_hook(&NewDiagnosticsResult {
+                changed: Vec::new(),
+                cleared: Vec::new(),
+                omitted: 0,
+                note: None,
+            })
+            .is_none()
+        );
+    }
+
+    /// A passive instance answers the same JSON object every other instance
+    /// does, whether the forward worked or not. The shape must not depend on
+    /// which process won a lock race.
+    #[test]
+    fn test_a_forwarded_flush_keeps_the_documented_object_shape() {
+        let forwarded =
+            NewDiagnosticsResult::from_owner(Some("a.rs:\n  1:1 error boom".to_string()));
+        let json = serde_json::to_value(&forwarded).expect("serialize");
+        assert_eq!(json["changed"], json!([]));
+        assert_eq!(json["cleared"], json!([]));
+        assert_eq!(json["omitted"], json!(0));
+        assert_eq!(json["note"], json!("a.rs:\n  1:1 error boom"));
+
+        let nothing =
+            serde_json::to_value(NewDiagnosticsResult::from_owner(None)).expect("serialize");
+        assert_eq!(
+            nothing,
+            json!({"changed": [], "cleared": [], "omitted": 0}),
+            "the owner having nothing to report is the documented empty answer, \
+             not an empty string"
+        );
+    }
+
+    /// An unreachable owner says so. Reporting an empty diff instead would
+    /// read as a clean workspace, and the owner has already consumed the
+    /// report that went missing.
+    #[test]
+    fn test_an_unreachable_owner_answers_with_a_note_rather_than_an_empty_diff() {
+        let note = NewDiagnosticsResult::owner_unreachable()
+            .note
+            .expect("a note");
+        assert!(note.contains("could not be reached"), "{note}");
     }
 
     /// A rename result shaped the way `rename_symbol` returns one.

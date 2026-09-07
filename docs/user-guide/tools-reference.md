@@ -625,6 +625,8 @@ Array of text edits to apply formatting:
 ]
 ```
 
+With `apply: true` the response also carries `applied` and `files_written`, the absolute paths whose content actually changed — every one of them is stale in any cache you hold. `files_written` reports the path the applier resolved, which is canonical even when `file_path` was not.
+
 ### Example Use Cases
 
 **Auto-format:**
@@ -962,6 +964,17 @@ While the language servers are still starting up (before mcpls has a stable base
   "cleared": [],
   "omitted": 2,
   "note": "2 file(s) were held back by the diagnostics caps this call; call again to see them."
+}
+```
+
+When several mcpls processes serve one project, one of them owns the project's diagnostics record and the others forward to it, so a session sees one record whichever process it is talking to. A forwarding process answers the same object shape, with the owner's already-rendered report in `note` and `changed`/`cleared` empty; if it cannot reach the owner, `note` says so rather than reporting an empty diff, which would read as a clean workspace:
+
+```json
+{
+  "changed": [],
+  "cleared": [],
+  "omitted": 0,
+  "note": "src/main.rs:\n  12:5 error mismatched types"
 }
 ```
 

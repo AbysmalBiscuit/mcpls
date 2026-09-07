@@ -592,8 +592,30 @@ fn applicable_server_configs(
 ///     std::process::exit(exit_code);
 /// }
 /// ```
-#[allow(clippy::too_many_lines)]
 pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<(), Error> {
+    serve_with_identity(config, transport, None).await
+}
+
+/// [`serve_with`], with the project's hook socket identity supplied rather
+/// than derived from the process working directory.
+///
+/// The identity is where the socket and its ownership lock live, and
+/// deriving it from the cwd means every caller in one checkout competes for
+/// one machine-global lock. A test that wants to observe the socket passes
+/// a temporary identity instead, which is also what keeps a test run from
+/// answering a real agent's hooks. An env override would not do: the
+/// derivation already reads `XDG_RUNTIME_DIR`, and a process-wide variable
+/// races between tests sharing a process.
+///
+/// # Errors
+///
+/// The same as [`serve_with`].
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn serve_with_identity(
+    config: ServerConfig,
+    transport: Transport,
+    identity_override: Option<hooks::SocketIdentity>,
+) -> Result<(), Error> {
     info!("Starting MCPLS server...");
 
     // Registered before any other startup work -- including
@@ -730,10 +752,12 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
 
     // The hook socket is an optimization, not a requirement: a process that
     // cannot derive its own identity still answers every MCP tool, so this
-    // must not turn an unreadable working directory into a startup failure
-    // (see #348, which is why the workspace roots above avoid `current_dir`
-    // when they can).
-    let hook_identity = if config.diagnostics.hooks.enabled {
+    // must not turn an unreadable working directory into a startup failure.
+    let mut hook_identity = if !config.diagnostics.hooks.enabled {
+        None
+    } else if identity_override.is_some() {
+        identity_override
+    } else {
         match std::env::current_dir()
             .map_err(Error::Io)
             .and_then(|dir| hooks::identity_for(&dir))
@@ -747,15 +771,29 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
                 None
             }
         }
-    } else {
-        None
     };
 
     // Acquired before the context is built, so the role is known before the
     // context is frozen into an `Arc`: a process that loses the lock is
     // constructed passive and only ever moves to owner.
+    //
+    // A failure to acquire is not a failure to start, for the same reason a
+    // failure to derive the identity is not. `acquire` creates a runtime
+    // directory, opens and locks a file, unlinks a stale socket and binds,
+    // and on Windows it reports every pipe-creation error but a busy one;
+    // aborting the MCP server over any of those would trade a working
+    // bridge for a missing optimization.
     let ownership = match &hook_identity {
-        Some(identity) => hooks::HookListener::acquire(identity).await?,
+        Some(identity) => match hooks::HookListener::acquire(identity).await {
+            Ok(ownership) => ownership,
+            Err(error) => {
+                warn!(
+                    "the hook ownership lock could not be taken, so no socket is served: {error}"
+                );
+                hook_identity = None;
+                None
+            }
+        },
         None => None,
     };
     let role = match (&hook_identity, &ownership) {
@@ -838,28 +876,33 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
 
     if let (Some(identity), Some(sweeper)) = (hook_identity, sweeper) {
         let op_deadline = Duration::from_millis(config.diagnostics.hooks.op_deadline_ms);
-        match ownership {
-            Some(listener) => {
-                tokio::spawn(hooks::hook_owner_task(
-                    listener,
-                    identity,
-                    Arc::clone(&hook_server),
-                    sweeper,
-                    op_deadline,
-                    cancel_rx.clone(),
-                ));
+        let role = Arc::clone(&context.hooks);
+        let server = Arc::clone(&hook_server);
+        let cancel = cancel_rx.clone();
+        // Wrapped rather than spawned bare: a panic in either task drops the
+        // `HookListener` and so releases the ownership lock, while this
+        // process goes on believing it owns the session. Reporting it is the
+        // only thing that makes that state diagnosable.
+        tokio::spawn(log_hook_task_panic(async move {
+            match ownership {
+                Some(listener) => {
+                    hooks::hook_owner_task(
+                        listener,
+                        identity,
+                        role,
+                        server,
+                        sweeper,
+                        op_deadline,
+                        cancel,
+                    )
+                    .await;
+                }
+                None => {
+                    hooks::hook_takeover_task(identity, role, server, sweeper, op_deadline, cancel)
+                        .await;
+                }
             }
-            None => {
-                tokio::spawn(hooks::hook_takeover_task(
-                    identity,
-                    Arc::clone(&context.hooks),
-                    Arc::clone(&hook_server),
-                    sweeper,
-                    op_deadline,
-                    cancel_rx.clone(),
-                ));
-            }
-        }
+        }));
     }
     info!("MCPLS server initialized successfully");
 
@@ -876,6 +919,18 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
 
     info!("MCPLS server shutting down");
     result
+}
+
+/// Run one of the hook socket tasks, reporting a panic instead of losing
+/// it.
+///
+/// Both tasks own the `HookListener` that proves this process holds the
+/// ownership lock, and unwinding drops it, releasing the lock exactly as if
+/// the process had exited. Nothing else in the process notices.
+async fn log_hook_task_panic<F: Future<Output = ()> + Send + 'static>(task: F) {
+    if let Err(panic) = tokio::spawn(task).await {
+        error!("the hook socket task stopped unexpectedly and hooks are now unserved: {panic}");
+    }
 }
 
 /// Build the translator `serve_with` runs on.
@@ -2427,6 +2482,36 @@ mod tests {
                     .iter()
                     .any(|m| m.contains("Background LSP initialization task failed")),
                 "expected an error! log for the panicking background init task, got: {messages:?}"
+            );
+        }
+
+        /// A panic in a hook socket task drops the `HookListener` and so
+        /// releases the ownership lock, exactly as if the process had
+        /// exited, while the process goes on believing it owns the session.
+        /// Nothing else notices, so the log line is the only thing that
+        /// makes that state diagnosable.
+        #[tokio::test]
+        async fn test_a_panicking_hook_task_is_reported() {
+            use tracing_subscriber::layer::SubscriberExt as _;
+
+            let captured = CapturedMessages::default();
+            let subscriber = tracing_subscriber::registry().with(captured.clone());
+            let guard = tracing::subscriber::set_default(subscriber);
+
+            super::super::log_hook_task_panic(async {
+                panic!("simulated hook socket task panic");
+            })
+            .await;
+
+            drop(guard);
+
+            let messages = captured.0.lock().unwrap().clone();
+            assert!(
+                messages
+                    .iter()
+                    .any(|m| m.contains("hooks are now unserved")),
+                "a hook task that dies silently leaves a project with no owner and \
+                 nothing to look at, got: {messages:?}"
             );
         }
 
