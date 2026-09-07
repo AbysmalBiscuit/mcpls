@@ -60,6 +60,16 @@ pub fn identity_hash(dir: &Path) -> Result<String> {
     Ok(format!("{:016x}", hasher.finish()))
 }
 
+/// The prefix every mcpls socket carries on Windows.
+///
+/// The named pipe namespace is machine-global rather than scoped to a
+/// per-project directory. Exposed so a caller enumerating other owners'
+/// pipes (`mcpls hook doctor`'s scan for one running in a different
+/// directory) filters on the exact prefix this crate binds, rather than a
+/// second copy of the string that could drift from it.
+#[cfg(windows)]
+pub const WINDOWS_PIPE_PREFIX: &str = "mcpls-";
+
 /// Derive the socket identity for `dir`.
 ///
 /// # Errors
@@ -76,7 +86,7 @@ pub fn identity_for(dir: &Path) -> Result<SocketIdentity> {
     #[cfg(windows)]
     {
         Ok(SocketIdentity {
-            socket: PathBuf::from(format!(r"\\.\pipe\mcpls-{hash}")),
+            socket: PathBuf::from(format!(r"\\.\pipe\{WINDOWS_PIPE_PREFIX}{hash}")),
             lock: PathBuf::new(),
             hash,
         })
