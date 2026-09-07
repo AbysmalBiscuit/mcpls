@@ -562,12 +562,9 @@ pub async fn probe(
     timeout: Duration,
 ) -> ProbeOutcome {
     let deadline = tokio::time::Instant::now() + timeout;
-    // A connection that was never accepted at all (refused, or the
-    // socket does not exist) and a connect that could not even complete
-    // within the deadline both mean nobody was reachable there; neither
-    // says anything about an owner being busy.
-    let Ok(Ok(stream)) = tokio::time::timeout_at(deadline, connect(identity)).await else {
-        return ProbeOutcome::NoOwner;
+    let stream = match probe_connect_phase(identity, deadline).await {
+        ConnectPhase::Connected(stream) => stream,
+        ConnectPhase::GaveUp(outcome) => return outcome,
     };
     match tokio::time::timeout_at(deadline, answer_one(stream, request)).await {
         Ok(Ok(response)) => ProbeOutcome::Answered(response),
@@ -576,6 +573,82 @@ pub async fn probe(
         // owner is there and did not get back to us, not that nobody is
         // listening.
         Ok(Err(_)) | Err(_) => ProbeOutcome::Busy,
+    }
+}
+
+/// What [`probe`]'s connect phase found: a stream, or a reason to stop
+/// with no stream at all.
+enum ConnectPhase {
+    Connected(Box<dyn HookStream>),
+    GaveUp(ProbeOutcome),
+}
+
+/// On Unix, [`connect`]'s own error already means exactly "nobody is
+/// there" (a refused or missing socket), so a connect that cannot
+/// complete before `deadline` either way is [`ProbeOutcome::NoOwner`].
+///
+/// Windows has its own path below, because [`connect`]'s retry loop
+/// there can spend the whole deadline waiting on an owner who is right
+/// there, and racing it against an outer timeout would lose the one
+/// fact that tells the two states apart the moment the timeout drops the
+/// future.
+#[cfg(not(windows))]
+async fn probe_connect_phase(
+    identity: &SocketIdentity,
+    deadline: tokio::time::Instant,
+) -> ConnectPhase {
+    match tokio::time::timeout_at(deadline, connect(identity)).await {
+        Ok(Ok(stream)) => ConnectPhase::Connected(stream),
+        Ok(Err(_)) | Err(_) => ConnectPhase::GaveUp(ProbeOutcome::NoOwner),
+    }
+}
+
+/// [`probe`]'s own connect loop, kept separate from [`connect`] rather
+/// than sharing it, so [`send`]/[`send_many`]'s behavior is untouched by
+/// this: a pipe whose single instance is already taken (`ERROR_PIPE_BUSY`)
+/// is retried, exactly like [`connect`], but this loop tracks its own
+/// deadline instead of being raced against one from outside, so it still
+/// knows what it last saw when it gives up rather than losing that fact
+/// to a dropped future.
+#[cfg(windows)]
+async fn probe_connect_phase(
+    identity: &SocketIdentity,
+    deadline: tokio::time::Instant,
+) -> ConnectPhase {
+    use tokio::net::windows::named_pipe::ClientOptions;
+
+    // See `connect`'s own comment for why this is the documented way to
+    // handle `ERROR_PIPE_BUSY` rather than a hard failure.
+    const ERROR_PIPE_BUSY: i32 = 231;
+    loop {
+        match ClientOptions::new().open(&identity.socket) {
+            Ok(client) => return ConnectPhase::Connected(Box::new(client)),
+            Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return ConnectPhase::GaveUp(classify_gave_up_connect(true));
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(_) => return ConnectPhase::GaveUp(classify_gave_up_connect(false)),
+        }
+    }
+}
+
+/// Whether a connect attempt that gave up before succeeding means nobody
+/// was listening, or an owner exists but every instance of the pipe was
+/// already taken.
+///
+/// A pure mapping, kept separate from the retry loop that produces its
+/// input so it has a real unit test on every platform: the only way to
+/// feed it `true` in production is a Windows pipe whose single instance
+/// is busy, which nothing on this platform can produce, but the mapping
+/// itself does not depend on the platform that produced its input.
+#[cfg(any(windows, test))]
+const fn classify_gave_up_connect(saw_pipe_busy: bool) -> ProbeOutcome {
+    if saw_pipe_busy {
+        ProbeOutcome::Busy
+    } else {
+        ProbeOutcome::NoOwner
     }
 }
 
@@ -632,6 +705,15 @@ async fn connect(identity: &SocketIdentity) -> io::Result<Box<dyn HookStream>> {
     // a sleep-and-retry loop as the intended handling for exactly this,
     // rather than treating it as a hard failure. The overall `send`/
     // `send_many` timeout bounds this loop, not a retry count here.
+    //
+    // Collapsing `ERROR_PIPE_BUSY` into a retry, with no trace of it left
+    // once the loop gives up, is correct for this function's only two
+    // callers (`send`/`send_many`), which care about nothing but whether
+    // an answer came back. Do not reuse this loop for `probe`: an owner
+    // holding the pipe's only instance is not the same fact as no owner
+    // at all, and `probe`'s own connect loop below exists specifically
+    // to keep that fact alive past the deadline instead of losing it the
+    // way racing this one against an outer timeout would.
     const ERROR_PIPE_BUSY: i32 = 231;
     loop {
         match ClientOptions::new().open(&identity.socket) {
@@ -794,5 +876,28 @@ mod tests {
         .expect("a transport that always fails must not make serve hang");
 
         assert_eq!(exit, ServeExit::TransportUnrecoverable);
+    }
+}
+
+/// Runs on every platform, unlike the module above: the retry loop that
+/// produces `classify_gave_up_connect`'s input only exists on Windows,
+/// but the mapping itself is a plain function of a `bool`, and pinning it
+/// here is the only verification this behavior can get on a machine that
+/// cannot run the Windows pipe path at all.
+#[cfg(test)]
+mod classify_tests {
+    use super::*;
+
+    #[test]
+    fn test_classify_gave_up_connect_maps_pipe_busy_to_busy() {
+        assert!(matches!(classify_gave_up_connect(true), ProbeOutcome::Busy));
+    }
+
+    #[test]
+    fn test_classify_gave_up_connect_maps_anything_else_to_no_owner() {
+        assert!(matches!(
+            classify_gave_up_connect(false),
+            ProbeOutcome::NoOwner
+        ));
     }
 }
