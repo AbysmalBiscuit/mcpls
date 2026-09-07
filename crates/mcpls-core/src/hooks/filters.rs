@@ -19,6 +19,12 @@ use crate::lsp::WatchRegistry;
 
 /// Directories that hold generated or vendored files, dropped under every
 /// root even when a project's own `.gitignore` does not name them.
+///
+/// These lines are added to each root's matcher before that root's own
+/// `.gitignore`, so a project that genuinely keeps sources under one of
+/// these names can re-admit a specific path with a `.gitignore` negation,
+/// for example `!target/keep.rs`: everything else under `target/` stays
+/// dropped, but that one path is not.
 const BUILT_IN_IGNORES: &[&str] = &["target", "node_modules"];
 
 /// Decides which changed paths are worth waking a language server for.
@@ -80,25 +86,52 @@ impl PathFilter {
 }
 
 /// One root's ignore matcher: the built-in denylist plus that root's own
-/// `.gitignore`, if it has one.
+/// `.gitignore`, if it has one. `admits` and `watch_paths` both build a
+/// matcher through this function rather than each deciding "ignored" its
+/// own way, so the two cannot drift into disagreeing about the same path.
 fn gitignore_for(root: &Path) -> Gitignore {
     let mut builder = GitignoreBuilder::new(root);
     for pattern in BUILT_IN_IGNORES {
         let _ = builder.add_line(None, pattern);
     }
-    let _ = builder.add(root.join(".gitignore"));
+    let gitignore = root.join(".gitignore");
+    if let Some(error) = builder.add(&gitignore) {
+        let missing = error
+            .io_error()
+            .is_some_and(|io_error| io_error.kind() == std::io::ErrorKind::NotFound);
+        if !missing {
+            tracing::warn!(
+                path = %gitignore.display(),
+                %error,
+                "ignoring the project's .gitignore, which could not be read or parsed"
+            );
+        }
+    }
     builder.build().unwrap_or_else(|_| Gitignore::empty())
 }
 
 /// The directories and root-level files a session's watcher should cover.
+///
+/// Filtered through the same matcher `admits` uses, so a build directory
+/// the project's own `.gitignore` does not name is kept off the watcher
+/// exactly as it is kept off the tracker.
 #[must_use]
 pub fn watch_paths(root: &Path) -> Vec<PathBuf> {
+    let ignore = gitignore_for(root);
     WalkBuilder::new(root)
         .max_depth(Some(1))
         .build()
         .filter_map(Result::ok)
+        .filter(|entry| entry.path() != root)
+        .filter(|entry| {
+            let is_dir = entry
+                .file_type()
+                .is_some_and(|file_type| file_type.is_dir());
+            !ignore
+                .matched_path_or_any_parents(entry.path(), is_dir)
+                .is_ignore()
+        })
         .map(ignore::DirEntry::into_path)
-        .filter(|path| path != root)
         .collect()
 }
 
@@ -202,6 +235,25 @@ mod tests {
             "a server that asked for a pattern is the authority on whether that \
              file matters to it"
         );
+    }
+
+    #[test]
+    fn test_watch_paths_drops_the_built_in_floor_with_no_gitignore_present() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        std::fs::create_dir_all(dir.path().join("target/debug")).expect("mkdir");
+        std::fs::create_dir_all(dir.path().join("node_modules")).expect("mkdir");
+        std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
+
+        let paths = watch_paths(dir.path());
+
+        assert!(paths.contains(&dir.path().join("src")));
+        assert!(
+            !paths.contains(&dir.path().join("target")),
+            "watch_paths must apply the same built-in floor admits does, or a \
+             project with no .gitignore hands the host a watcher over its own \
+             build output"
+        );
+        assert!(!paths.contains(&dir.path().join("node_modules")));
     }
 
     #[test]
