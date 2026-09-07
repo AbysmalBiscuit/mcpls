@@ -823,7 +823,8 @@ mod tests {
         use tokio::sync::Mutex;
 
         use crate::bridge::{
-            DiagnosticsDelivery, FloorTable, NotificationCache, ResourceSubscriptions, Translator,
+            DiagnosticsDelivery, FloorTable, NotificationCache, ResourceSubscriptions,
+            ServerSettle, Translator,
         };
         use crate::config::DiagnosticsConfig;
         use crate::mcp::McplsServer;
@@ -836,6 +837,10 @@ mod tests {
             DiagnosticsConfig::default(),
         )));
         let floors = Arc::new(FloorTable::new(&DiagnosticsConfig::default(), &[]));
+        let settle = Arc::new(ServerSettle::new(
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(300),
+        ));
         let server = McplsServer::new(
             translator,
             notification_cache,
@@ -844,6 +849,8 @@ mod tests {
             false,
             delivery,
             floors,
+            DiagnosticsConfig::default(),
+            settle,
         );
         let peer_cell = tokio::sync::OnceCell::new();
 
@@ -1007,7 +1014,11 @@ mod tests {
 
             use tokio::sync::Mutex;
 
-            use crate::bridge::{NotificationCache, ResourceSubscriptions, Translator};
+            use crate::bridge::{
+                DiagnosticsDelivery, FloorTable, NotificationCache, ResourceSubscriptions,
+                ServerSettle, Translator,
+            };
+            use crate::config::DiagnosticsConfig;
             use crate::mcp::McplsServer;
 
             // Hold a listener to make the port unavailable.
@@ -1018,8 +1029,25 @@ mod tests {
             let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
             let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
             let subs = Arc::new(ResourceSubscriptions::new());
-            let server =
-                McplsServer::new(translator, notification_cache, workspace_roots, subs, false);
+            let delivery = Arc::new(Mutex::new(DiagnosticsDelivery::new(
+                DiagnosticsConfig::default(),
+            )));
+            let floors = Arc::new(FloorTable::new(&DiagnosticsConfig::default(), &[]));
+            let settle = Arc::new(ServerSettle::new(
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(300),
+            ));
+            let server = McplsServer::new(
+                translator,
+                notification_cache,
+                workspace_roots,
+                subs,
+                false,
+                delivery,
+                floors,
+                DiagnosticsConfig::default(),
+                settle,
+            );
 
             let cfg = HttpConfig::new(addr, "/mcp");
 
@@ -1041,14 +1069,36 @@ mod tests {
 
             use tokio::sync::Mutex;
 
-            use crate::bridge::{NotificationCache, ResourceSubscriptions, Translator};
+            use crate::bridge::{
+                DiagnosticsDelivery, FloorTable, NotificationCache, ResourceSubscriptions,
+                ServerSettle, Translator,
+            };
+            use crate::config::DiagnosticsConfig;
             use crate::mcp::McplsServer;
 
             let translator = Arc::new(Translator::new());
             let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
             let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
             let subs = Arc::new(ResourceSubscriptions::new());
-            McplsServer::new(translator, notification_cache, workspace_roots, subs, false)
+            let delivery = Arc::new(Mutex::new(DiagnosticsDelivery::new(
+                DiagnosticsConfig::default(),
+            )));
+            let floors = Arc::new(FloorTable::new(&DiagnosticsConfig::default(), &[]));
+            let settle = Arc::new(ServerSettle::new(
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(300),
+            ));
+            McplsServer::new(
+                translator,
+                notification_cache,
+                workspace_roots,
+                subs,
+                false,
+                delivery,
+                floors,
+                DiagnosticsConfig::default(),
+                settle,
+            )
         }
 
         /// Serves the MCP HTTP transport on a fresh loopback port, returning

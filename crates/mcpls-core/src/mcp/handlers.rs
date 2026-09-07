@@ -10,8 +10,10 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::bridge::{
-    DiagnosticsDelivery, FloorTable, NotificationCache, ResourceSubscriptions, Translator,
+    DiagnosticsDelivery, FloorTable, NotificationCache, ResourceSubscriptions, ServerSettle,
+    Translator,
 };
+use crate::config::DiagnosticsConfig;
 
 /// Shared context for all tool handlers.
 ///
@@ -56,11 +58,24 @@ pub struct BridgeContext {
     pub delivery: Arc<Mutex<DiagnosticsDelivery>>,
     /// The severity floor each server answers to, resolved once at startup.
     pub floors: Arc<FloorTable>,
+    /// The diagnostics configuration, fixed at startup.
+    ///
+    /// Held by value: `DiagnosticsConfig` is `Copy` and never changes while
+    /// the process runs, and the footer reads four scalars off it. Carrying
+    /// the whole `ServerConfig` would drag `lsp_servers` and `apply` into a
+    /// struct with no use for either.
+    pub diagnostics: DiagnosticsConfig,
+    /// The same settle tracker the diagnostics pump feeds.
+    ///
+    /// The footer waits on `$/progress` and the pump is what records it, so
+    /// this must be the pump's own `Arc` rather than a fresh tracker.
+    pub settle: Arc<ServerSettle>,
 }
 
 impl BridgeContext {
     /// Create a new bridge context.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub const fn new(
         translator: Arc<Translator>,
         notification_cache: Arc<Mutex<NotificationCache>>,
@@ -69,6 +84,8 @@ impl BridgeContext {
         project_config_ignored: bool,
         delivery: Arc<Mutex<DiagnosticsDelivery>>,
         floors: Arc<FloorTable>,
+        diagnostics: DiagnosticsConfig,
+        settle: Arc<ServerSettle>,
     ) -> Self {
         Self {
             translator,
@@ -78,6 +95,8 @@ impl BridgeContext {
             project_config_ignored,
             delivery,
             floors,
+            diagnostics,
+            settle,
         }
     }
 }
@@ -86,7 +105,6 @@ impl BridgeContext {
 mod tests {
     use super::*;
     use crate::bridge::Translator;
-    use crate::config::DiagnosticsConfig;
 
     #[test]
     fn test_bridge_context_creation() {
@@ -98,6 +116,10 @@ mod tests {
             DiagnosticsConfig::default(),
         )));
         let floors = Arc::new(FloorTable::new(&DiagnosticsConfig::default(), &[]));
+        let settle = Arc::new(ServerSettle::new(
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(300),
+        ));
         let context = BridgeContext::new(
             translator,
             notification_cache,
@@ -106,6 +128,8 @@ mod tests {
             false,
             delivery,
             floors,
+            DiagnosticsConfig::default(),
+            settle,
         );
         assert_eq!(Arc::strong_count(&context.translator), 1);
     }

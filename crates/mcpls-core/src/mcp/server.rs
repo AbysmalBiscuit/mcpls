@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use lsp_types::Uri;
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -29,10 +30,10 @@ use super::tools::{
 use crate::bridge::resources::{make_uri, parse_uri};
 use crate::bridge::{
     Diagnostic, DiagnosticInfo, DiagnosticsDelivery, FileEntry, FloorTable, FlushReport,
-    NotificationCache, PositionEncoding, ResourceSubscriptions, SessionId, Translator, uri_to_path,
-    validate_path_against_roots,
+    NotificationCache, PositionEncoding, ResourceSubscriptions, ServerSettle, SessionId,
+    Translator, uri_to_path, validate_path_against_roots,
 };
-use crate::config::{ServerId, ToolKind};
+use crate::config::{DiagnosticsConfig, ServerId, ToolKind};
 
 /// MCP server that exposes LSP capabilities as tools.
 #[derive(Clone)]
@@ -184,6 +185,15 @@ struct NewDiagnosticsFile {
     omitted: usize,
 }
 
+/// A tool result with the diagnostics that call produced appended.
+#[derive(Debug, serde::Serialize)]
+struct WithDiagnostics<T> {
+    #[serde(flatten)]
+    result: T,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    new_diagnostics: Option<NewDiagnosticsResult>,
+}
+
 /// Response shape for `get_new_diagnostics`.
 #[derive(Debug, Clone, serde::Serialize)]
 struct NewDiagnosticsResult {
@@ -222,6 +232,71 @@ impl NewDiagnosticsResult {
             note: Some("Language servers are still starting up; call again shortly.".to_string()),
         }
     }
+}
+
+/// How long each phase of a footer's wait lasts.
+#[derive(Debug, Clone, Copy)]
+struct FooterTiming {
+    grace: Duration,
+    quiet: Duration,
+    cap: Duration,
+}
+
+impl FooterTiming {
+    const fn from_config(config: &DiagnosticsConfig) -> Self {
+        Self {
+            grace: Duration::from_millis(config.footer_grace_ms),
+            quiet: Duration::from_millis(config.footer_quiet_ms),
+            cap: Duration::from_millis(config.footer_wait_ms),
+        }
+    }
+}
+
+/// How long a footer would wait, given a clock.
+///
+/// Pure so the three branches that can end the wait are each assertable:
+/// the grace period elapsing before anything is consulted, quiet arriving,
+/// and the cap expiring. `at` maps elapsed time to the `Instant` the settle
+/// tracker stamps against.
+///
+/// Sampling starts at `grace` rather than at zero, and that is what covers
+/// the case where the check has not begun yet: flycheck starts about 90 ms
+/// after a `didSave`, and before it does the workspace reads as quiet.
+#[cfg(test)]
+fn wait_for_footer_quiet_at(
+    settle: &ServerSettle,
+    epoch_before: u64,
+    timing: FooterTiming,
+    at: impl Fn(Duration) -> Instant,
+) -> Duration {
+    const STEP: Duration = Duration::from_millis(50);
+    let mut elapsed = timing.grace;
+    while elapsed < timing.cap {
+        if footer_should_stop(settle, epoch_before, at(elapsed), timing.quiet) {
+            return elapsed;
+        }
+        elapsed += STEP;
+    }
+    timing.cap
+}
+
+/// Whether a footer has waited long enough, as of `now`.
+///
+/// Two ways to be done. The workspace is quiet, which is the ordinary one
+/// and the only one that fires before any work has begun. Or work is
+/// outstanding and none of it began since the resync, which means that work
+/// was already running when the edit landed: an index after a `Cargo.toml`
+/// change can run for minutes, and it is not this call's check.
+fn footer_should_stop(
+    settle: &ServerSettle,
+    epoch_before: u64,
+    now: Instant,
+    quiet: Duration,
+) -> bool {
+    if settle.is_quiet_at(now, quiet) {
+        return true;
+    }
+    settle.progress_epoch() == epoch_before
 }
 
 /// Build the `FileEntry` list a flush should see, borrowing straight out of
@@ -303,6 +378,7 @@ impl McplsServer {
     /// diagnostics-baseline background task shares, so that `flush` and
     /// `set_baseline` observe each other's writes.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         translator: Arc<Translator>,
         notification_cache: Arc<Mutex<NotificationCache>>,
@@ -311,6 +387,8 @@ impl McplsServer {
         project_config_ignored: bool,
         delivery: Arc<Mutex<DiagnosticsDelivery>>,
         floors: Arc<FloorTable>,
+        diagnostics: DiagnosticsConfig,
+        settle: Arc<ServerSettle>,
     ) -> Self {
         let context = Arc::new(BridgeContext::new(
             translator,
@@ -320,6 +398,8 @@ impl McplsServer {
             project_config_ignored,
             delivery,
             floors,
+            diagnostics,
+            settle,
         ));
         Self { context }
     }
@@ -490,12 +570,20 @@ impl McplsServer {
             apply,
         }): Parameters<RenameParams>,
     ) -> Result<String, McpError> {
-        to_tool_result(
-            self.context
-                .translator
-                .handle_rename(file_path, line, character, new_name, apply)
-                .await,
-        )
+        let result = match self
+            .context
+            .translator
+            .handle_rename(file_path, line, character, new_name, apply)
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => return Err(McpError::internal_error(err.to_string(), None)),
+        };
+        let footer = self.footer_if_written(result.applied).await;
+        to_tool_result(Ok(WithDiagnostics {
+            result,
+            new_diagnostics: footer,
+        }))
     }
 
     /// Get code completion suggestions.
@@ -563,12 +651,20 @@ impl McplsServer {
             apply,
         }): Parameters<FormatDocumentParams>,
     ) -> Result<String, McpError> {
-        to_tool_result(
-            self.context
-                .translator
-                .handle_format_document(file_path, tab_size, insert_spaces, apply)
-                .await,
-        )
+        let result = match self
+            .context
+            .translator
+            .handle_format_document(file_path, tab_size, insert_spaces, apply)
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => return Err(McpError::internal_error(err.to_string(), None)),
+        };
+        let footer = self.footer_if_written(result.applied).await;
+        to_tool_result(Ok(WithDiagnostics {
+            result,
+            new_diagnostics: footer,
+        }))
     }
 
     /// Search for symbols across the workspace.
@@ -660,21 +756,29 @@ impl McplsServer {
             action_title,
         }): Parameters<ApplyCodeActionParams>,
     ) -> Result<String, McpError> {
-        to_tool_result(
-            self.context
-                .translator
-                .handle_apply_code_action(
-                    file_path,
-                    start_line,
-                    start_character,
-                    end_line,
-                    end_character,
-                    kind_filter,
-                    action_index,
-                    action_title,
-                )
-                .await,
-        )
+        let result = match self
+            .context
+            .translator
+            .handle_apply_code_action(
+                file_path,
+                start_line,
+                start_character,
+                end_line,
+                end_character,
+                kind_filter,
+                action_index,
+                action_title,
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => return Err(McpError::internal_error(err.to_string(), None)),
+        };
+        let footer = self.footer_if_written(result.applied).await;
+        to_tool_result(Ok(WithDiagnostics {
+            result,
+            new_diagnostics: footer,
+        }))
     }
 
     /// Prepare call hierarchy at a position.
@@ -880,6 +984,66 @@ impl McplsServer {
                 )
             }),
         }
+    }
+
+    /// The diagnostics a write tool's own edit produced, or `None` when the
+    /// call wrote nothing.
+    ///
+    /// One method rather than an `if` repeated at three call sites, so a
+    /// fourth write tool cannot be added with the guard forgotten.
+    async fn footer_if_written(&self, applied: bool) -> Option<NewDiagnosticsResult> {
+        if !applied {
+            return None;
+        }
+        self.footer_for_write().await
+    }
+
+    /// The diagnostics a write tool's own edit produced, or `None`.
+    ///
+    /// Silent while no baseline exists. `flush` seeds a session's record
+    /// from the baseline, and `set_baseline` does not rewrite a record that
+    /// already exists, so a footer flushing early would leave that session
+    /// permanently believing the workspace started clean.
+    async fn footer_for_write(&self) -> Option<NewDiagnosticsResult> {
+        if !self.context.diagnostics.footer {
+            return None;
+        }
+        if !self.context.delivery.lock().await.has_baseline() {
+            return None;
+        }
+        let timing = FooterTiming::from_config(&self.context.diagnostics);
+        let epoch_before = self.context.settle.progress_epoch();
+        tokio::time::sleep(timing.grace).await;
+
+        let start = Instant::now();
+        while start.elapsed() < timing.cap {
+            if footer_should_stop(
+                &self.context.settle,
+                epoch_before,
+                Instant::now(),
+                timing.quiet,
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let session = SessionId::process_default();
+        let mut report = self.flush_now(&session).await;
+        report.note = Some(report.note.take().map_or_else(
+            || {
+                "This footer is best effort; anything slower than the wait arrives in the \
+                 next get_new_diagnostics."
+                    .to_string()
+            },
+            |existing| {
+                format!(
+                    "{existing} This footer is best effort; anything slower than the wait \
+                     arrives in the next get_new_diagnostics."
+                )
+            },
+        ));
+        Some(report)
     }
 
     /// Get recent LSP server log messages.
@@ -1243,7 +1407,10 @@ impl ServerHandler for McplsServer {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
+    use crate::bridge::RenameResult;
 
     /// A `DiagnosticsDelivery`/`FloorTable` pair for tests that don't care
     /// about diagnostics config or per-server floors, just a working
@@ -1254,6 +1421,15 @@ mod tests {
             Arc::new(Mutex::new(DiagnosticsDelivery::new(config))),
             Arc::new(FloorTable::new(&config, &[])),
         )
+    }
+
+    /// A settle tracker for tests that need a working `McplsServer::new`
+    /// call but never drive `$/progress` through it.
+    fn test_settle() -> Arc<ServerSettle> {
+        Arc::new(ServerSettle::new(
+            Duration::from_secs(1),
+            Duration::from_secs(300),
+        ))
     }
 
     /// An `McplsServer` together with the `Arc`s it shares, so a test can
@@ -1268,12 +1444,13 @@ mod tests {
         delivery: Arc<Mutex<DiagnosticsDelivery>>,
     }
 
-    fn test_server_parts() -> TestServer {
+    fn test_server_parts_with(diagnostics: DiagnosticsConfig) -> TestServer {
         let translator = Arc::new(Translator::new());
         let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
         let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
         let subscriptions = Arc::new(ResourceSubscriptions::new());
-        let (delivery, floors) = default_delivery_and_floors();
+        let delivery = Arc::new(Mutex::new(DiagnosticsDelivery::new(diagnostics)));
+        let floors = Arc::new(FloorTable::new(&diagnostics, &[]));
         let server = McplsServer::new(
             translator,
             Arc::clone(&notification_cache),
@@ -1282,6 +1459,8 @@ mod tests {
             false,
             Arc::clone(&delivery),
             floors,
+            diagnostics,
+            test_settle(),
         );
         TestServer {
             server,
@@ -1290,12 +1469,266 @@ mod tests {
         }
     }
 
+    fn test_server_parts() -> TestServer {
+        test_server_parts_with(DiagnosticsConfig::default())
+    }
+
     /// The same, with an empty baseline adopted so `has_baseline()` is true
     /// and the flush is not answered with `starting_up()`.
     async fn test_server_with_baseline() -> TestServer {
         let parts = test_server_parts();
         parts.delivery.lock().await.set_baseline(HashMap::new());
         parts
+    }
+
+    /// A server whose config enables the footer, with a baseline adopted
+    /// and one error in the cache, so a footer has something to report.
+    async fn test_server_with_footer_and_one_error() -> TestServer {
+        let uri: lsp_types::Uri = if cfg!(windows) {
+            "file:///C:/workspace/broken.rs"
+                .parse()
+                .expect("a valid uri")
+        } else {
+            "file:///workspace/broken.rs".parse().expect("a valid uri")
+        };
+        let owner = ServerId::from("rust");
+        let diagnostics = DiagnosticsConfig {
+            footer: true,
+            // Keep the wait out of the test's way: what these assert is the
+            // guard and the record, not the timing, which
+            // `wait_for_footer_quiet_at` covers directly.
+            footer_grace_ms: 0,
+            footer_quiet_ms: 0,
+            footer_wait_ms: 0,
+            ..DiagnosticsConfig::default()
+        };
+        let parts = test_server_parts_with(diagnostics);
+        parts.notification_cache.lock().await.store_diagnostics(
+            &owner,
+            &uri,
+            Some(1),
+            vec![diagnostic_at("broken")],
+        );
+        parts.delivery.lock().await.set_baseline(HashMap::new());
+        parts
+    }
+
+    /// A rename result shaped the way `rename_symbol` returns one.
+    fn sample_rename_result() -> RenameResult {
+        RenameResult {
+            changes: Vec::new(),
+            resource_operations: Vec::new(),
+            applied: true,
+            files_written: vec!["/workspace/broken.rs".to_string()],
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_footer_is_silent_before_the_baseline_lands() {
+        let parts = test_server_parts_with(DiagnosticsConfig {
+            footer: true,
+            ..DiagnosticsConfig::default()
+        });
+
+        let footer = parts.server.footer_for_write().await;
+
+        assert!(
+            footer.is_none(),
+            "flush seeds a session record from the baseline, and a record made \
+             before the baseline lands stays empty forever, so the next flush \
+             would report the whole workspace. The settle deadline is 300 \
+             seconds, which puts the first rename of a session squarely inside \
+             this window"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_footer_consumes_what_it_reports() {
+        let parts = test_server_with_footer_and_one_error().await;
+
+        let footer = parts.server.footer_for_write().await.expect("a report");
+        assert_eq!(footer.changed.len(), 1);
+
+        let raw = parts
+            .server
+            .get_new_diagnostics()
+            .await
+            .expect("the flush tool");
+        let report: serde_json::Value = serde_json::from_str(&raw).expect("json");
+        assert!(
+            report["changed"].as_array().expect("changed").is_empty(),
+            "one report per problem: the footer and the flush share one record"
+        );
+    }
+
+    /// The guard the three write tools run the footer behind, both ways.
+    ///
+    /// This is what `if result.applied` buys, so it is asserted against the
+    /// method the call sites use rather than against a serialized struct: a
+    /// serde test proves `skip_serializing_if`, not the guard.
+    #[tokio::test]
+    async fn test_no_footer_when_the_tool_wrote_nothing() {
+        let parts = test_server_with_footer_and_one_error().await;
+
+        assert!(
+            parts.server.footer_if_written(false).await.is_none(),
+            "a rename with apply false changed nothing and has nothing to report"
+        );
+        assert!(
+            parts.server.footer_if_written(true).await.is_some(),
+            "and a call that did write must still get one, or the guard is just \
+             a footer that never fires"
+        );
+    }
+
+    #[test]
+    fn test_the_wrapper_omits_an_absent_footer_from_its_json() {
+        let wrapped = WithDiagnostics {
+            result: sample_rename_result(),
+            new_diagnostics: None,
+        };
+        let json = serde_json::to_string(&wrapped).expect("serialize");
+
+        assert!(!json.contains("new_diagnostics"));
+    }
+
+    #[test]
+    fn test_the_wrapper_flattens_rather_than_nesting() {
+        let wrapped = WithDiagnostics {
+            result: sample_rename_result(),
+            new_diagnostics: None,
+        };
+        let json: serde_json::Value = serde_json::to_value(&wrapped).expect("serialize");
+
+        assert!(
+            json.get("applied").is_some(),
+            "the existing result's fields stay at the top level; a caller \
+             parsing RenameResult must keep parsing it"
+        );
+    }
+
+    /// Branch one: the grace period elapses before quiet is consulted.
+    #[test]
+    fn test_the_footer_wait_never_returns_before_its_grace_period() {
+        let settle = ServerSettle::new(Duration::from_secs(1), Duration::from_secs(600));
+        let start = Instant::now();
+
+        // Nothing has ever begun, so the workspace reads as quiet from the very
+        // first sample.
+        let ended = wait_for_footer_quiet_at(
+            &settle,
+            settle.progress_epoch(),
+            FooterTiming {
+                grace: Duration::from_millis(250),
+                quiet: Duration::from_millis(200),
+                cap: Duration::from_secs(15),
+            },
+            |elapsed| start + elapsed,
+        );
+
+        assert_eq!(
+            ended,
+            Duration::from_millis(250),
+            "rust-analyzer's flycheck begins about 90ms after a didSave, and a \
+             footer that sampled before then would see a quiet workspace and \
+             report the state from before the edit"
+        );
+    }
+
+    /// Branch two: quiet ends the wait early.
+    #[test]
+    fn test_the_footer_wait_ends_on_quiet_rather_than_on_its_cap() {
+        let settle = ServerSettle::new(Duration::from_secs(1), Duration::from_secs(600));
+        let rust = ServerId::from("rust");
+        let start = Instant::now();
+        let epoch_before = settle.progress_epoch();
+        settle.begin(&rust, &json!("flycheck"));
+        settle.end_at(
+            &rust,
+            &json!("flycheck"),
+            start + Duration::from_millis(400),
+        );
+
+        let ended = wait_for_footer_quiet_at(
+            &settle,
+            epoch_before,
+            FooterTiming {
+                grace: Duration::from_millis(250),
+                quiet: Duration::from_millis(200),
+                cap: Duration::from_secs(15),
+            },
+            |elapsed| start + elapsed,
+        );
+
+        assert!(
+            ended < Duration::from_secs(1),
+            "quiet arrived at 600ms, well inside the cap; a test that could only \
+             ever end on the cap would pass against a broken quiet check"
+        );
+        assert!(
+            ended >= Duration::from_millis(600),
+            "and not before the quiet debounce has actually run out"
+        );
+    }
+
+    /// Branch three: the cap ends it when quiet never arrives.
+    #[test]
+    fn test_the_footer_wait_ends_on_its_cap_when_quiet_never_arrives() {
+        let settle = ServerSettle::new(Duration::from_secs(1), Duration::from_secs(600));
+        let rust = ServerId::from("rust");
+        let start = Instant::now();
+        let epoch_before = settle.progress_epoch();
+        settle.begin(&rust, &json!("flycheck"));
+        // No `end_at`: the check is still running when the cap expires.
+
+        let ended = wait_for_footer_quiet_at(
+            &settle,
+            epoch_before,
+            FooterTiming {
+                grace: Duration::from_millis(250),
+                quiet: Duration::from_millis(200),
+                cap: Duration::from_secs(15),
+            },
+            |elapsed| start + elapsed,
+        );
+
+        assert_eq!(
+            ended,
+            Duration::from_secs(15),
+            "the footer is best effort: it reports what has landed rather than \
+             waiting on a build that has not finished"
+        );
+    }
+
+    /// Work that was already running when the edit landed does not eat the cap.
+    #[test]
+    fn test_an_index_already_in_flight_does_not_hold_the_footer() {
+        let settle = ServerSettle::new(Duration::from_secs(1), Duration::from_secs(600));
+        let rust = ServerId::from("rust");
+        let start = Instant::now();
+        settle.begin(&rust, &json!("rustAnalyzer/Indexing"));
+        // Captured after the begin, the way `footer_for_write` captures it
+        // after the resync has already returned.
+        let epoch_before = settle.progress_epoch();
+
+        let ended = wait_for_footer_quiet_at(
+            &settle,
+            epoch_before,
+            FooterTiming {
+                grace: Duration::from_millis(250),
+                quiet: Duration::from_millis(200),
+                cap: Duration::from_secs(15),
+            },
+            |elapsed| start + elapsed,
+        );
+
+        assert_eq!(
+            ended,
+            Duration::from_millis(250),
+            "an index after a Cargo.toml change can run for minutes and is not \
+             this call's check; waiting on it would spend the whole cap on \
+             something this tool call did not cause"
+        );
     }
 
     /// The flush acquires `delivery` before `notification_cache`. With the
@@ -1346,6 +1779,8 @@ mod tests {
             project_config_ignored,
             delivery,
             floors,
+            DiagnosticsConfig::default(),
+            test_settle(),
         )
     }
 
@@ -1832,6 +2267,8 @@ mod tests {
             false,
             Arc::clone(&delivery),
             floors,
+            DiagnosticsConfig::default(),
+            test_settle(),
         );
         (server, notification_cache, delivery)
     }
@@ -2406,6 +2843,8 @@ mod tests {
             false,
             delivery,
             floors,
+            DiagnosticsConfig::default(),
+            test_settle(),
         )
     }
 
