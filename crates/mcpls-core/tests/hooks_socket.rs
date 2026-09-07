@@ -511,7 +511,8 @@ async fn test_send_and_acknowledge_acks_a_tokened_flush_on_the_same_connection()
 /// independently and default to the same 1500 ms, so an owner answering a
 /// flush at its own deadline hands back a report with none of the client's
 /// bound left. An acknowledgement drawing on that remainder would never be
-/// answered, and the owner would offer the same report on every flush after
+/// answered, and on a transport whose write can pend it would never be sent
+/// either, leaving the owner to offer the same report on every flush after
 /// it. Here the owner takes 200 ms per op against a 250 ms client bound: the
 /// flush leaves 50 ms, and the acknowledgement still waits out its own 200 ms.
 #[tokio::test]
@@ -571,7 +572,8 @@ async fn test_an_acknowledgement_outlasts_a_flush_that_spent_the_callers_bound()
         elapsed >= Duration::from_millis(350),
         "the acknowledgement has to wait out the owner's own 200ms, which the \
          caller's bound no longer has room for; returning at about 250ms means \
-         it was cut off and the owner will offer this report again: {elapsed:?}"
+         it was cut off, leaving the commit to whether the write happened to \
+         complete before the deadline was consulted: {elapsed:?}"
     );
     assert!(
         acked.load(std::sync::atomic::Ordering::SeqCst),

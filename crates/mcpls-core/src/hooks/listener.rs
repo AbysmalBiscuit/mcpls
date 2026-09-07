@@ -490,8 +490,8 @@ fn overrun_message(request: &Request, op_deadline: Duration) -> String {
              flush offers it again"
         ),
         Request::Ack { .. } => format!(
-            "op exceeded {ms}ms; the record advances when the work finishes, unless a later \
-             flush replaced this report"
+            "op exceeded {ms}ms; the record advances when the work finishes, unless this \
+             report was superseded or its session ended"
         ),
         Request::EndSession { .. } => {
             format!("op exceeded {ms}ms; the session's record is dropped when the work finishes")
@@ -567,11 +567,16 @@ fn timed_out(timeout: Duration) -> Error {
 /// Its own allowance rather than what is left of the caller's, because an
 /// owner that answers a flush at its own deadline leaves a caller bound to
 /// the same number nothing to spend, and the two are configured
-/// independently and default to the same 1500 ms. A caller in that state
-/// would print a report the owner never commits, and be offered the same
-/// report on every flush after it. The exchange itself is one round trip
-/// on a connection that is already open, so this bounds a peer that has
-/// stopped answering rather than one that is merely slow.
+/// independently and default to the same 1500 ms. What such a caller
+/// certainly loses is the acknowledgement's answer; where the write itself
+/// can pend it loses the acknowledgement, and then the owner never commits
+/// and offers the same report on every flush after it. A commit that lands
+/// only because a write completed on its first poll is not a property to
+/// rest on.
+///
+/// Short, because the exchange is one round trip on a connection that is
+/// already open and its outcome is discarded either way: a longer bound
+/// would only delay a hook that has already printed.
 const ACK_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Send `requests` down one connection and, when the last flush among
@@ -1084,7 +1089,11 @@ mod overrun_tests {
     use crate::hooks::ChangeEvent;
 
     fn message_for(request: &Request) -> String {
-        overrun_message(request, Duration::from_millis(1500))
+        message_for_deadline(request, Duration::from_millis(1500))
+    }
+
+    fn message_for_deadline(request: &Request, deadline: Duration) -> String {
+        overrun_message(request, deadline)
     }
 
     #[test]
@@ -1118,8 +1127,8 @@ mod overrun_tests {
                 session: "s1".to_string(),
                 token: 7,
             }),
-            "op exceeded 1500ms; the record advances when the work finishes, unless a later \
-             flush replaced this report"
+            "op exceeded 1500ms; the record advances when the work finishes, unless this \
+             report was superseded or its session ended"
         );
     }
 
@@ -1136,6 +1145,31 @@ mod overrun_tests {
     #[test]
     fn test_a_status_overrun_promises_nothing_beyond_the_deadline() {
         assert_eq!(message_for(&Request::Status), "op exceeded 1500ms");
+    }
+
+    /// The number is the deadline the owner was configured with, not the
+    /// default it usually holds. Every other test here asks for 1500,
+    /// which is what a frozen literal would answer too, so this is the
+    /// one that tells the value apart from the prose around it.
+    #[test]
+    fn test_an_overrun_names_the_deadline_it_actually_ran_under() {
+        assert_eq!(
+            message_for_deadline(&Request::Status, Duration::from_millis(300)),
+            "op exceeded 300ms",
+            "an owner configured with a 300ms deadline that reports 1500 \
+             sends a reader to the wrong setting"
+        );
+        assert_eq!(
+            message_for_deadline(
+                &Request::Flush {
+                    session: "s1".to_string(),
+                },
+                Duration::from_millis(300),
+            ),
+            "op exceeded 300ms; nothing confirmed this report was delivered, so the next \
+             flush offers it again",
+            "the same holds for a message that carries prose after it"
+        );
     }
 }
 
