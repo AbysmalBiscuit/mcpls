@@ -525,30 +525,39 @@ impl Translator {
 
         // An already-well-formatted file yields no edits, so there is
         // nothing to plan and nothing to write.
-        let applied = if let (Some(applier), false) = (write_permit, edits.is_empty()) {
-            // A `Uri`-keyed `changes` map would trip `clippy::mutable_key_type`
-            // (`Uri` wraps a `Cell`), so the single document is wrapped as
-            // `document_changes` instead; the LSP spec gives it precedence
-            // over `changes` anyway.
-            let plan = EditPlan::from_workspace_edit(WorkspaceEdit {
-                document_changes: Some(LspDocumentChanges::Edits(vec![TextDocumentEdit {
-                    text_document: OptionalVersionedTextDocumentIdentifier {
-                        uri: response_uri,
-                        version: None,
-                    },
-                    edits: edits.into_iter().map(OneOf::Left).collect(),
-                }])),
-                ..WorkspaceEdit::default()
-            })?;
-            let summary = self.apply_locked(&applier, plan, &server_id).await?;
-            changed_the_tree(&summary)
-        } else {
-            false
-        };
+        let (applied, files_written) =
+            if let (Some(applier), false) = (write_permit, edits.is_empty()) {
+                // A `Uri`-keyed `changes` map would trip `clippy::mutable_key_type`
+                // (`Uri` wraps a `Cell`), so the single document is wrapped as
+                // `document_changes` instead; the LSP spec gives it precedence
+                // over `changes` anyway.
+                let plan = EditPlan::from_workspace_edit(WorkspaceEdit {
+                    document_changes: Some(LspDocumentChanges::Edits(vec![TextDocumentEdit {
+                        text_document: OptionalVersionedTextDocumentIdentifier {
+                            uri: response_uri,
+                            version: None,
+                        },
+                        edits: edits.into_iter().map(OneOf::Left).collect(),
+                    }])),
+                    ..WorkspaceEdit::default()
+                })?;
+                let summary = self.apply_locked(&applier, plan, &server_id).await?;
+                (
+                    changed_the_tree(&summary),
+                    summary
+                        .files_changed
+                        .iter()
+                        .map(|change| display_path(&change.path))
+                        .collect(),
+                )
+            } else {
+                (false, Vec::new())
+            };
 
         Ok(FormatDocumentResult {
             edits: result_edits,
             applied,
+            files_written,
         })
     }
 
@@ -1408,6 +1417,90 @@ mod tests {
         assert!(
             error.to_string().contains("apply.format_document"),
             "the error names the config key"
+        );
+    }
+
+    /// A format that writes reports the path the applier resolved, not the
+    /// spelling the caller passed.
+    ///
+    /// The tool accepts a path with `.` components, a symlink, or a relative
+    /// path. A consumer that compares what was written against canonicalized
+    /// workspace roots -- the hook sweep's filter does exactly that -- drops
+    /// every one of those silently, so the file the agent just rewrote is
+    /// never rechecked.
+    #[tokio::test]
+    #[allow(clippy::expect_used)]
+    async fn test_format_with_apply_reports_the_resolved_path_it_wrote() {
+        use std::sync::Arc;
+
+        use tempfile::TempDir;
+        use tokio::io::BufReader;
+        use tokio::time::{Duration, timeout};
+
+        use crate::bridge::apply::Applier;
+        use crate::config::{ApplyConfig, ServerId};
+
+        let dir = TempDir::new().expect("temp dir");
+        let root = dunce::canonicalize(dir.path()).expect("canonicalize");
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            document_formatting_provider: Some(lsp_types::OneOf::Left(true)),
+            ..Default::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
+        let translator = translator.with_applier(Arc::new(Applier::new(
+            vec![root.clone()],
+            ApplyConfig {
+                format_document: true,
+                ..ApplyConfig::default()
+            },
+        )));
+
+        let path = root.join("main.rs");
+        fs::write(&path, "fn main() {}").expect("write fixture");
+        // The same file, spelled the way a caller may well spell it.
+        let indirect = root.join(".").join("main.rs").display().to_string();
+
+        let translator = Arc::new(translator);
+        let handle = {
+            let translator = Arc::clone(&translator);
+            tokio::spawn(async move {
+                translator
+                    .handle_format_document(indirect, 4, true, true)
+                    .await
+            })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let format_request = read_framed_message(&mut wire).await;
+        assert_eq!(format_request["method"], "textDocument/formatting");
+        write_response(
+            &mut server.read_half_stdin,
+            &format_request["id"],
+            serde_json::json!([{
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 12}
+                },
+                "newText": "fn main() {\n}\n"
+            }]),
+        )
+        .await;
+
+        let result = timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handler call should not hang")
+            .expect("task should not panic")
+            .expect("apply is permitted");
+
+        assert!(result.applied);
+        assert_eq!(
+            result.files_written,
+            vec![path.display().to_string()],
+            "a consumer matching this against canonicalized workspace roots drops \
+             anything else"
         );
     }
 

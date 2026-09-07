@@ -10,6 +10,9 @@ use std::hash::{Hash, Hasher};
 
 use crate::config::{DiagnosticsConfig, LspServerConfig, ServerId, SeverityFloor};
 
+/// The session a process serves when the host names none.
+const PROCESS_DEFAULT_SESSION: &str = "local";
+
 /// Identity of one client session.
 ///
 /// Claude Code exports `CLAUDE_CODE_SESSION_ID` into the environment of the
@@ -30,7 +33,8 @@ impl SessionId {
     /// Correct for stdio, where the host spawns one mcpls per client.
     #[must_use]
     pub fn process_default() -> Self {
-        std::env::var("CLAUDE_CODE_SESSION_ID").map_or_else(|_| Self("local".to_string()), Self)
+        std::env::var("CLAUDE_CODE_SESSION_ID")
+            .map_or_else(|_| Self(PROCESS_DEFAULT_SESSION.to_string()), Self)
     }
 
     /// The session id the host exported, or the per-process constant.
@@ -40,12 +44,25 @@ impl SessionId {
     /// same value, so both doors key on one record. Where the variable is
     /// absent, a per-process constant is correct: one process per client is
     /// what stdio means.
+    ///
+    /// An empty value counts as absent. A host that exports the variable
+    /// unset leaves `""`, and keying a record on the empty string would
+    /// give every such process the same record under a name no hook payload
+    /// ever carries.
     #[must_use]
     pub fn from_env_or_process() -> Self {
-        std::env::var("CLAUDE_CODE_SESSION_ID")
-            .ok()
+        Self::from_env_value(std::env::var("CLAUDE_CODE_SESSION_ID").ok())
+    }
+
+    /// [`Self::from_env_or_process`] over an already-read variable.
+    ///
+    /// Split out because `std::env::set_var` is `unsafe` from the 2024
+    /// edition and this workspace denies `unsafe_code`, so the absent and
+    /// empty cases cannot be driven through the real environment at all.
+    fn from_env_value(value: Option<String>) -> Self {
+        value
             .filter(|id| !id.is_empty())
-            .map_or_else(Self::process_default, Self::from)
+            .map_or_else(|| Self(PROCESS_DEFAULT_SESSION.to_string()), Self)
     }
 }
 
@@ -310,6 +327,29 @@ mod tests {
 
     use super::*;
     use crate::config::{DiagnosticsConfig, SeverityFloor};
+
+    #[test]
+    fn test_an_exported_session_id_names_the_record() {
+        assert_eq!(
+            SessionId::from_env_value(Some("abc-123".to_string())),
+            SessionId::from("abc-123".to_string()),
+            "the hook payload carries this same value, and both doors have to \
+             key on one record"
+        );
+    }
+
+    #[test]
+    fn test_an_absent_or_empty_session_id_falls_back_to_the_process_default() {
+        let fallback = SessionId(PROCESS_DEFAULT_SESSION.to_string());
+        assert_eq!(SessionId::from_env_value(None), fallback);
+        assert_eq!(
+            SessionId::from_env_value(Some(String::new())),
+            fallback,
+            "a host that exports the variable unset leaves an empty string, and \
+             keying on it would give every such process one shared record under \
+             a name no hook payload ever carries"
+        );
+    }
 
     fn diagnostic(line: u32, severity: DiagnosticSeverity, message: &str) -> Diagnostic {
         Diagnostic {

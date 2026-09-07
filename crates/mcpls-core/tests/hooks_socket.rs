@@ -150,7 +150,10 @@ async fn test_an_owner_stands_down_when_its_lock_file_is_replaced() {
              process now also owns",
         )
         .expect("the serve task");
-    assert_eq!(exit, ServeExit::LockLost);
+    assert!(
+        matches!(exit, ServeExit::LockLost(_)),
+        "stood down for the wrong reason: {exit:?}"
+    );
 }
 
 #[tokio::test]

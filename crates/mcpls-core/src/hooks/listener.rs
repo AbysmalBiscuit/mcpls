@@ -33,11 +33,16 @@ trait HookStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
 
 impl<T> HookStream for T where T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
 
-/// Why [`HookListener::lock_loss`] reports that the lock is no longer held
-/// reliably.
-#[cfg(not(windows))]
+/// Why a listener can no longer prove it holds the lock it acquired.
+///
+/// The two call for different responses, which is why they are not
+/// flattened into one: `Replaced` means a competitor holds the lock for its
+/// whole life and this process will not win it back, while `Missing` means
+/// nothing has taken this listener's place and the next attempt succeeds.
+/// Never produced on Windows, which has no lock file to lose; the type is
+/// unconditional so [`ServeExit`] has one shape on every platform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LockLoss {
+pub enum LockLoss {
     /// The path now names a different inode: a competitor created its own
     /// lock file there and may now believe it owns this session.
     Replaced,
@@ -84,12 +89,12 @@ pub enum ServeExit {
     /// The `cancel` watch fired, or its sender was dropped.
     Cancelled,
     /// Unix only: the lock file this listener held is no longer the file
-    /// it holds a lock on. The `tracing::warn!` emitted at the point this
-    /// fires names whether the file was replaced (a competitor may now
-    /// believe it owns this session) or simply removed (no competitor has
-    /// appeared, only a missing file). Never returned on Windows, which
-    /// has no lock file to lose.
-    LockLost,
+    /// it holds a lock on. The payload says whether the file was replaced
+    /// (a competitor may now believe it owns this session) or simply
+    /// removed (no competitor has appeared, only a missing file), which is
+    /// what decides whether a caller can expect to win the lock back.
+    /// Never returned on Windows, which has no lock file to lose.
+    LockLost(LockLoss),
     /// The transport hit an error it can never recover from by retrying
     /// (currently: a poisoned Windows pipe-transport lock).
     TransportUnrecoverable,
@@ -380,7 +385,7 @@ impl HookListener {
                                 self.lock_path.display()
                             ),
                         }
-                        return ServeExit::LockLost;
+                        return ServeExit::LockLost(loss);
                     }
                 }
                 accepted = self.transport.accept() => {
