@@ -114,6 +114,16 @@ cargo install --path crates/mcpls-cli
 }
 ```
 
+### File-change diagnostics never fire for files under `target/` or `node_modules/`
+
+**Behavior, not a bug**: the Claude Code file-change hook always treats `target/` and `node_modules/` as build output, at any depth, whether or not your project's `.gitignore` names them. This keeps a `cargo build` or an `npm install` from flooding mcpls with thousands of generated paths.
+
+**Solution**: if you keep real source under one of these names and need a specific file watched anyway, add a negation to your project's `.gitignore`:
+```gitignore
+!target/keep.rs
+```
+Everything else under `target/` stays excluded; only the negated path is watched and diagnosed again.
+
 ### "Failed to start MCP server"
 
 **Problem**: mcpls binary not found or not executable
