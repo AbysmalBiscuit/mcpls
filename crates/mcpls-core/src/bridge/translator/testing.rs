@@ -426,14 +426,13 @@ impl RecordingServer {
             .collect()
     }
 
-    /// The params of the last notification received for `method`, or `None`
-    /// if none was.
-    fn last_params_for(&self, method: &str) -> Option<JsonValue> {
+    /// The params of every notification received for `method`, in order.
+    fn params_for(&self, method: &str) -> Vec<JsonValue> {
         self.received()
             .into_iter()
-            .rev()
-            .find(|(received, _)| received == method)
+            .filter(|(received, _)| received == method)
             .map(|(_, params)| params)
+            .collect()
     }
 
     /// Every notification received so far, method and params, in order.
@@ -625,13 +624,17 @@ impl TranslatorHarness {
         Arc::clone(&self.watch_registry)
     }
 
-    /// The JSON params of the last `workspace/didChangeWatchedFiles` the
-    /// fake server for `server` received, or `None` if it received none.
-    pub(crate) fn last_watched_files_params(&self, server: &str) -> Option<JsonValue> {
+    /// The JSON params of every `workspace/didChangeWatchedFiles` the fake
+    /// server for `server` received, in order.
+    ///
+    /// How many arrived is its own fact: a server told twice under the same
+    /// kind is indistinguishable from one told once by anything that reads
+    /// only the last of them.
+    pub(crate) fn watched_files_params(&self, server: &str) -> Vec<JsonValue> {
         self.servers
             .get(server)
             .unwrap_or_else(|| panic!("{server} is not registered with this harness"))
-            .last_params_for("workspace/didChangeWatchedFiles")
+            .params_for("workspace/didChangeWatchedFiles")
     }
 
     /// Kill `server`'s connection for good, so every notification the
