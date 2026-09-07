@@ -207,6 +207,19 @@ pub enum Error {
         source: std::io::Error,
     },
 
+    /// A derived Unix domain socket path exceeds what `sockaddr_un.sun_path`
+    /// can hold on this platform, which would otherwise fail at `bind()`
+    /// with an OS-level error that gives no hint the cause is path length.
+    #[error("socket path exceeds the {limit}-byte platform limit ({len} bytes): {path:?}")]
+    SocketPathTooLong {
+        /// The socket path that was computed.
+        path: PathBuf,
+        /// Its length in bytes.
+        len: usize,
+        /// The platform's usable limit, in bytes.
+        limit: usize,
+    },
+
     /// Path is outside allowed workspace boundaries.
     #[error("path outside workspace: {0}")]
     PathOutsideWorkspace(PathBuf),
