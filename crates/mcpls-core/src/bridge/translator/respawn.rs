@@ -263,7 +263,11 @@ impl Translator {
         // Cleared before the replacement is spawned, not after: the fresh
         // process registers its own watchers during the `initialize`
         // handshake, and a clear running afterwards would drop those along
-        // with the dead process's.
+        // with the dead process's. Being here also means it runs even when
+        // the spawn below then fails, deliberately unlike the document
+        // tracker's clear further down: a glob belongs to the process that
+        // asked for it, so once that process is gone the glob only produces
+        // notify calls to a connection nobody is reading.
         self.forget_watch_registrations(id);
         let mut new_server = match LspServer::spawn(config).await {
             Ok(server) => {
