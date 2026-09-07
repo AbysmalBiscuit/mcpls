@@ -13,7 +13,6 @@ use std::sync::Arc;
 
 use ignore::WalkBuilder;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
-use lsp_types::FileChangeType;
 
 use crate::lsp::WatchRegistry;
 
@@ -61,6 +60,13 @@ impl PathFilter {
     /// touches the filesystem, so a path reported as a deletion -- nothing
     /// left to stat -- is admitted exactly like one that still exists. A
     /// delete is a change the sweep still has to act on.
+    ///
+    /// The registry is asked whether it watches `path` at all rather than
+    /// whether it watches it under some particular change kind. No kind
+    /// exists yet at this point: the host reports bare paths and the sweep
+    /// decides what each one is afterwards, so a kind named here would be a
+    /// guess, and a guess drops every server whose watcher wants the other
+    /// kinds. Kind filtering belongs to the notification, which knows.
     #[must_use]
     pub fn admits(&self, path: &Path) -> bool {
         let Some(ignore) = self
@@ -78,11 +84,9 @@ impl PathFilter {
         if self.routable_extension(path) {
             return true;
         }
-        self.registry.as_ref().is_some_and(|registry| {
-            !registry
-                .servers_for(path, FileChangeType::CHANGED)
-                .is_empty()
-        })
+        self.registry
+            .as_ref()
+            .is_some_and(|registry| registry.is_watched(path))
     }
 
     /// Whether `path`'s extension is one this filter routes directly to a
@@ -233,24 +237,64 @@ mod tests {
         assert!(!filter_over(dir.path()).admits(&blob));
     }
 
+    /// A filter over `dir` whose registry holds `watchers` for one server,
+    /// in the `registerOptions.watchers` shape a `client/registerCapability`
+    /// carries.
+    fn filter_watching(dir: &Path, watchers: &serde_json::Value) -> PathFilter {
+        let registry = Arc::new(WatchRegistry::new());
+        registry.register(&ServerId::from("weird"), "r1", watchers);
+        PathFilter::new(roots(dir), extensions(), Some(registry))
+    }
+
     #[test]
     fn test_an_unroutable_extension_a_server_registered_for_is_admitted() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let blob = dir.path().join("notes.xyz");
         std::fs::write(&blob, "").expect("write");
-        let registry = Arc::new(WatchRegistry::new());
-        registry.register(
-            &ServerId::from("weird"),
-            "r1",
+
+        let filter = filter_watching(
+            dir.path(),
             &serde_json::json!([{ "globPattern": "**/*.xyz" }]),
         );
-
-        let filter = PathFilter::new(roots(dir.path()), extensions(), Some(registry));
         assert!(
             filter.admits(&blob),
             "a server that asked for a pattern is the authority on whether that \
              file matters to it"
         );
+    }
+
+    /// gopls registers `**/go.work` and `**/go.mod` for creation and
+    /// deletion and for nothing else. Admission runs before anything has
+    /// decided what happened to the path, so a gate that asks about one
+    /// kind answers no here and the path is dropped before the sweep can
+    /// classify it -- the server's own watcher never fires, for either of
+    /// the kinds it asked for.
+    #[test]
+    fn test_a_path_watched_only_for_creation_and_deletion_is_admitted() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let work = dir.path().join("go.work");
+        std::fs::write(&work, "").expect("write");
+
+        let filter = filter_watching(
+            dir.path(),
+            &serde_json::json!([{ "globPattern": "**/go.work", "kind": 5 }]),
+        );
+        assert!(filter.admits(&work));
+    }
+
+    /// A watcher that wants no kind at all wants no events, so the path it
+    /// names is not worth waking anything for.
+    #[test]
+    fn test_a_path_watched_for_no_kind_at_all_is_dropped() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let work = dir.path().join("go.work");
+        std::fs::write(&work, "").expect("write");
+
+        let filter = filter_watching(
+            dir.path(),
+            &serde_json::json!([{ "globPattern": "**/go.work", "kind": 0 }]),
+        );
+        assert!(!filter.admits(&work));
     }
 
     #[test]

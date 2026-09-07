@@ -606,18 +606,30 @@ impl TranslatorHarness {
     }
 
     /// Register `glob` for `server` under `id`, on the registry the harness
-    /// handed the translator.
-    pub(super) fn register_watcher(&self, server: &str, id: &str, glob: &str) {
-        self.watch_registry.register(
-            &ServerId::from(server),
-            id,
-            &serde_json::json!([{ "globPattern": glob }]),
-        );
+    /// handed the translator, for every change kind.
+    pub(crate) fn register_watcher(&self, server: &str, id: &str, glob: &str) {
+        self.register_watchers(server, id, &serde_json::json!([{ "globPattern": glob }]));
+    }
+
+    /// Register `watchers` -- a `registerOptions.watchers` array, the shape
+    /// an inbound `client/registerCapability` carries -- for `server` under
+    /// `id`, for a test that needs a `kind` mask the glob-only form cannot
+    /// express.
+    pub(crate) fn register_watchers(&self, server: &str, id: &str, watchers: &JsonValue) {
+        self.watch_registry
+            .register(&ServerId::from(server), id, watchers);
+    }
+
+    /// The registry the harness handed the translator, for a caller that
+    /// has to build something else -- a `PathFilter` -- against the same
+    /// registrations the translator answers from.
+    pub(crate) fn watch_registry(&self) -> Arc<WatchRegistry> {
+        Arc::clone(&self.watch_registry)
     }
 
     /// The JSON params of the last `workspace/didChangeWatchedFiles` the
     /// fake server for `server` received, or `None` if it received none.
-    pub(super) fn last_watched_files_params(&self, server: &str) -> Option<JsonValue> {
+    pub(crate) fn last_watched_files_params(&self, server: &str) -> Option<JsonValue> {
         self.servers
             .get(server)
             .unwrap_or_else(|| panic!("{server} is not registered with this harness"))
