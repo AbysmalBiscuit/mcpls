@@ -596,6 +596,20 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     serve_with_identity(config, transport, None).await
 }
 
+/// This process's own canonicalized working directory and the socket
+/// identity derived from it, from one canonicalization rather than two, so
+/// a `Status` answer's `root` and `hash` describe the same directory by
+/// construction rather than by coincidence.
+fn canonicalized_cwd_identity() -> Result<(hooks::SocketIdentity, PathBuf), Error> {
+    let dir = std::env::current_dir().map_err(Error::Io)?;
+    let canonical = dunce::canonicalize(&dir).map_err(|e| Error::FileIo {
+        path: dir,
+        source: e,
+    })?;
+    let identity = hooks::identity_for(&canonical)?;
+    Ok((identity, canonical))
+}
+
 /// [`serve_with`], with the project's hook socket identity supplied rather
 /// than derived from the process working directory.
 ///
@@ -753,37 +767,39 @@ pub(crate) async fn serve_with_identity(
     // The hook socket is an optimization, not a requirement: a process that
     // cannot derive its own identity still answers every MCP tool, so this
     // must not turn an unreadable working directory into a startup failure.
-    let mut hook_identity = if !config.diagnostics.hooks.enabled {
-        None
-    } else if identity_override.is_some() {
-        identity_override
+    //
+    // The identity and the root a `Status` answer reports both come from
+    // one canonicalization, not two independent ones: a directory that
+    // canonicalizes for `identity_for` but not for a second, separate call
+    // would otherwise leave `root` silently blank while `hash` is fine.
+    let (mut hook_identity, hook_root) = if config.diagnostics.hooks.enabled {
+        identity_override.map_or_else(
+            || match canonicalized_cwd_identity() {
+                Ok((identity, root)) => (Some(identity), Some(root)),
+                Err(error) => {
+                    warn!(
+                        "hooks are configured on but this project's socket identity could not \
+                         be derived, so no socket is served: {error}"
+                    );
+                    (None, None)
+                }
+            },
+            |identity| {
+                // Test-only path (see this function's doc comment): there
+                // is no real startup directory tied to an injected
+                // identity, so this process's own cwd stands in. Nothing
+                // outside this crate's own tests reads `root` against a
+                // real directory on this path.
+                let root = std::env::current_dir()
+                    .ok()
+                    .and_then(|dir| dunce::canonicalize(&dir).ok())
+                    .unwrap_or_default();
+                (Some(identity), Some(root))
+            },
+        )
     } else {
-        match std::env::current_dir()
-            .map_err(Error::Io)
-            .and_then(|dir| hooks::identity_for(&dir))
-        {
-            Ok(identity) => Some(identity),
-            Err(error) => {
-                warn!(
-                    "hooks are configured on but this project's socket identity could not be \
-                     derived, so no socket is served: {error}"
-                );
-                None
-            }
-        }
+        (None, None)
     };
-
-    // The directory a `Status` answer reports as this owner's root: the
-    // same working directory `identity_for` above hashed, canonicalized
-    // the same way. Only asked for once an identity actually exists,
-    // since a failure here would just repeat the warning already logged
-    // above.
-    let hook_root = hook_identity.is_some().then(|| {
-        std::env::current_dir()
-            .ok()
-            .and_then(|dir| dunce::canonicalize(&dir).ok())
-            .unwrap_or_default()
-    });
 
     // Acquired before the context is built, so the role is known before the
     // context is frozen into an `Arc`: a process that loses the lock is
