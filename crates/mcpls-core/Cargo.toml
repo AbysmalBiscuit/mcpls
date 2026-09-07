@@ -14,6 +14,7 @@ categories = ["development-tools"]
 chrono = { workspace = true }
 dirs = { workspace = true }
 dunce = { workspace = true }
+fs4 = { workspace = true }
 futures = { workspace = true }
 globset = { workspace = true }
 ignore = { workspace = true }

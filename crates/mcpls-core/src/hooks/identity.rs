@@ -17,6 +17,12 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 
+/// The size of `sockaddr_un.sun_path` on this platform, in bytes, including
+/// the terminating null byte a `bind()` call writes into it: 104 on macOS
+/// and the BSDs, 108 on Linux.
+#[cfg(not(windows))]
+const SUN_PATH_LEN: usize = if cfg!(target_os = "macos") { 104 } else { 108 };
+
 /// Where this project's hook socket and its ownership lock live.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SocketIdentity {
@@ -34,7 +40,11 @@ pub struct SocketIdentity {
 /// # Errors
 ///
 /// Returns an error if `dir` cannot be canonicalized, which means it does
-/// not exist or is not reachable.
+/// not exist or is not reachable. On Unix, also returns an error if the
+/// computed socket path would exceed this platform's `sockaddr_un.sun_path`
+/// limit: a longer path fails at `bind()` with an OS-level error that gives
+/// no hint the cause is path length, so this is checked here instead, where
+/// the path is built and the failure can name it.
 pub fn identity_for(dir: &Path) -> Result<SocketIdentity> {
     let canonical = dunce::canonicalize(dir).map_err(|e| Error::FileIo {
         path: dir.to_path_buf(),
@@ -59,12 +69,34 @@ pub fn identity_for(dir: &Path) -> Result<SocketIdentity> {
     #[cfg(not(windows))]
     {
         let dir = runtime_dir();
+        let socket = dir.join(format!("{hash}.sock"));
+        ensure_socket_path_fits(&socket)?;
         Ok(SocketIdentity {
-            socket: dir.join(format!("{hash}.sock")),
             lock: dir.join(format!("{hash}.lock")),
+            socket,
             hash,
         })
     }
+}
+
+/// A macOS-shaped temporary directory plus a long username already leaves
+/// only twenty or thirty bytes of margin against [`SUN_PATH_LEN`], and a
+/// sandboxed or CI environment with a deeper temp path can exceed it
+/// outright. Fails early and names both the limit and the offending path,
+/// rather than leaving that to `bind()`.
+#[cfg(not(windows))]
+fn ensure_socket_path_fits(socket: &Path) -> Result<()> {
+    // One byte is reserved for the null terminator `bind()` writes.
+    let limit = SUN_PATH_LEN - 1;
+    let len = socket.as_os_str().len();
+    if len > limit {
+        return Err(Error::SocketPathTooLong {
+            path: socket.to_path_buf(),
+            len,
+            limit,
+        });
+    }
+    Ok(())
 }
 
 /// Where sockets go on this platform.
@@ -156,6 +188,27 @@ mod tests {
             identity_for(&link).expect("identity").hash,
             "mcpls hashes its own working directory and the hook hashes \
              CLAUDE_PROJECT_DIR; a symlinked checkout must not split them"
+        );
+    }
+
+    /// Unix only: a Windows named pipe path is not `sockaddr_un.sun_path`
+    /// and carries no comparable limit.
+    #[test]
+    #[cfg(unix)]
+    fn test_a_socket_path_over_the_platform_limit_is_rejected() {
+        let long_dir = PathBuf::from("/").join("x".repeat(200));
+        let socket = long_dir.join("0123456789abcdef.sock");
+
+        let err = ensure_socket_path_fits(&socket)
+            .expect_err("the socket path exceeds the platform limit");
+        let message = err.to_string();
+        assert!(
+            message.contains(&(SUN_PATH_LEN - 1).to_string()),
+            "names the limit: {message}"
+        );
+        assert!(
+            message.contains(socket.to_str().expect("a utf8 path")),
+            "names the offending path: {message}"
         );
     }
 }
