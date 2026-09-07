@@ -164,6 +164,35 @@ pub struct DiagnosticsConfig {
     /// newly changed.
     #[serde(default = "default_settle_deadline_ms")]
     pub settle_deadline_ms: u64,
+    /// Whether the tools that write append their new diagnostics to their
+    /// own result.
+    #[serde(default)]
+    pub footer: bool,
+    /// How long a footer waits before it starts looking for quiet.
+    ///
+    /// rust-analyzer's flycheck begins about 90 ms after a `didSave`, and a
+    /// footer that checks before then sees a quiet workspace and reports
+    /// the state from before the edit.
+    #[serde(default = "default_footer_grace_ms")]
+    pub footer_grace_ms: u64,
+    /// How long nothing may be outstanding before a footer calls it done.
+    ///
+    /// Shorter than `settle_quiet_ms`, which exists to bridge the 70 to 100
+    /// millisecond gaps between rust-analyzer's startup phases. A footer
+    /// never sees those; what it bridges is the cancel-and-restart between
+    /// two saves landing back to back.
+    #[serde(default = "default_footer_quiet_ms")]
+    pub footer_quiet_ms: u64,
+    /// How long a footer waits in total before reporting what it has.
+    ///
+    /// Sized against a real build rather than against patience: a no-op
+    /// touch in this repository's largest crate costs about 4.3 seconds of
+    /// `cargo check`, measured, so a five second cap would expire on every
+    /// rename there and report the pre-edit state. The wait is gated on
+    /// progress rather than on a timer, so a fast workspace still returns
+    /// in about a second and the high cap costs it nothing.
+    #[serde(default = "default_footer_wait_ms")]
+    pub footer_wait_ms: u64,
 }
 
 const fn default_severity_floor() -> SeverityFloor {
@@ -195,6 +224,18 @@ const fn default_settle_deadline_ms() -> u64 {
     300_000
 }
 
+const fn default_footer_grace_ms() -> u64 {
+    250
+}
+
+const fn default_footer_quiet_ms() -> u64 {
+    200
+}
+
+const fn default_footer_wait_ms() -> u64 {
+    15_000
+}
+
 impl Default for DiagnosticsConfig {
     fn default() -> Self {
         Self {
@@ -203,6 +244,10 @@ impl Default for DiagnosticsConfig {
             max_total: default_max_total(),
             settle_quiet_ms: default_settle_quiet_ms(),
             settle_deadline_ms: default_settle_deadline_ms(),
+            footer: false,
+            footer_grace_ms: default_footer_grace_ms(),
+            footer_quiet_ms: default_footer_quiet_ms(),
+            footer_wait_ms: default_footer_wait_ms(),
         }
     }
 }
@@ -1071,7 +1116,7 @@ impl Default for ServerConfig {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use std::fs;
 
@@ -1094,6 +1139,15 @@ mod tests {
         assert_eq!(config.lsp_servers[4].language_id, "cpp");
         assert_eq!(config.lsp_servers[5].language_id, "zig");
         assert_eq!(config.workspace.position_encodings, vec!["utf-8", "utf-16"]);
+    }
+
+    #[test]
+    fn test_the_footer_defaults_are_what_the_spec_says() {
+        let config = DiagnosticsConfig::default();
+        assert!(!config.footer);
+        assert_eq!(config.footer_grace_ms, 250);
+        assert_eq!(config.footer_quiet_ms, 200);
+        assert_eq!(config.footer_wait_ms, 15_000);
     }
 
     #[test]
