@@ -112,7 +112,24 @@ impl HookListener {
                     next: std::sync::Mutex::new(Some(server)),
                 }),
             })),
-            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => Ok(None),
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                // Win32's CreateNamedPipe returns ERROR_ACCESS_DENIED both
+                // when another process already holds the first-instance
+                // pipe (routine contention) and when a DACL genuinely
+                // denies creation rights (e.g. a pipe left behind by
+                // another user's session). The two are indistinguishable
+                // from this error alone, and resolving the ambiguity by
+                // probing further (opening the pipe as a client) would
+                // itself race the very contention this is trying to
+                // detect. Treating both as "not the owner" is the safe
+                // default: failing acquisition outright on every such
+                // error would break the ordinary multi-instance takeover
+                // this exists to support whenever the real cause is
+                // routine contention, to avoid silence in the rarer case
+                // where it is a genuine permission problem.
+                tracing::warn!("hook pipe creation denied for {:?}: {e}", identity.socket);
+                Ok(None)
+            }
             Err(e) => Err(e.into()),
         }
     }
@@ -303,9 +320,12 @@ impl HookTransport for UnixTransport {
 }
 
 /// The first pipe instance is created during [`HookListener::acquire`], to
-/// prove exclusivity; every instance after that is created lazily on the
-/// preceding accept, so a client connecting while one instance is in use is
-/// never refused.
+/// prove exclusivity. `accept` pops whichever instance is in `next` and, in
+/// the same synchronous step with no await between the two, creates and
+/// stores its replacement before awaiting `connect` on the popped one: a
+/// ready instance is therefore in `next` at every point either a
+/// concurrent client's `connect` or this future's own cancellation could
+/// observe it, rather than only after the previous connection completed.
 #[cfg(windows)]
 struct PipeTransport {
     path: std::path::PathBuf,
@@ -318,23 +338,27 @@ impl HookTransport for PipeTransport {
         Box::pin(async move {
             use tokio::net::windows::named_pipe::ServerOptions;
 
-            let taken = {
+            // Take the ready instance and create its replacement here,
+            // before awaiting `connect`: both are synchronous, so nothing
+            // -- another accept, or this select! branch losing to
+            // cancellation and dropping this future -- can observe `next`
+            // empty. Creating the replacement only after `connect`
+            // returns would leave a window with no free instance, in
+            // which a second client's own connect gets ERROR_PIPE_BUSY.
+            let server = {
                 let mut next = self
                     .next
                     .lock()
                     .map_err(|_| io::Error::other("hook pipe transport lock poisoned"))?;
-                next.take()
+                let server = match next.take() {
+                    Some(server) => server,
+                    None => ServerOptions::new().create(&self.path)?,
+                };
+                *next = Some(ServerOptions::new().create(&self.path)?);
+                server
             };
-            let server = taken.map_or_else(|| ServerOptions::new().create(&self.path), Ok)?;
+
             server.connect().await?;
-
-            let mut next = self
-                .next
-                .lock()
-                .map_err(|_| io::Error::other("hook pipe transport lock poisoned"))?;
-            *next = Some(ServerOptions::new().create(&self.path)?);
-            drop(next);
-
             Ok(Box::new(server) as Box<dyn HookStream>)
         })
     }
