@@ -173,9 +173,26 @@ impl DiagnosticsDelivery {
             let previous = record.get(entry.key).copied();
 
             match (hash, previous) {
-                (None, Some(_)) => {
+                (None, Some(_)) if entry.floor == SeverityFloor::Off => {
+                    // Muted, not fixed. Dropping the record without
+                    // reporting means the file starts fresh if its floor
+                    // ever rises again, and the agent is not told its
+                    // problems are gone when they were only silenced.
                     record.remove(entry.key);
-                    report.cleared.push(entry.key.to_string());
+                }
+                (None, Some(_)) => {
+                    if budget == Some(0) {
+                        // Leave the record in place so the next flush
+                        // offers this file again, the same deferral a
+                        // changed file gets.
+                        report.omitted += 1;
+                    } else {
+                        if let Some(remaining) = budget.as_mut() {
+                            *remaining -= 1;
+                        }
+                        record.remove(entry.key);
+                        report.cleared.push(entry.key.to_string());
+                    }
                 }
                 (None, None) => {}
                 (Some(current), Some(before)) if current == before => {}
@@ -260,7 +277,7 @@ impl FloorTable {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
@@ -728,5 +745,131 @@ mod tests {
             "the second flush is unchanged because the first one actually delivered \
              the diagnostic, not because it was silently swallowed"
         );
+    }
+
+    #[test]
+    fn test_cleared_files_spend_the_total_budget() {
+        let mut delivery = DiagnosticsDelivery::new(DiagnosticsConfig {
+            max_total: 2,
+            ..DiagnosticsConfig::default()
+        });
+        let session = SessionId::from("s".to_string());
+        let broken = vec![diagnostic(0, DiagnosticSeverity::ERROR, "boom")];
+
+        // Seed all four records two at a time, so each seeding flush fits the
+        // budget of two and every key has a recorded hash to clear against.
+        delivery.flush(
+            &session,
+            &[
+                entry("a", &broken, SeverityFloor::Warning),
+                entry("b", &broken, SeverityFloor::Warning),
+            ],
+        );
+        delivery.flush(
+            &session,
+            &[
+                entry("c", &broken, SeverityFloor::Warning),
+                entry("d", &broken, SeverityFloor::Warning),
+            ],
+        );
+
+        // Now all four are fixed at once, under a budget of two.
+        let report = delivery.flush(
+            &session,
+            &[
+                entry("a", &[], SeverityFloor::Warning),
+                entry("b", &[], SeverityFloor::Warning),
+                entry("c", &[], SeverityFloor::Warning),
+                entry("d", &[], SeverityFloor::Warning),
+            ],
+        );
+
+        assert_eq!(
+            report.cleared,
+            vec!["a".to_string(), "b".to_string()],
+            "max_total is one shared context budget and a cleared line spends \
+             from it like any other; a workspace-wide fix could otherwise emit \
+             up to a thousand of them. The pass is key-ordered, so which two \
+             land is reproducible"
+        );
+        assert_eq!(report.omitted, 2);
+    }
+
+    #[test]
+    fn test_a_deferred_cleared_file_is_offered_again() {
+        let mut delivery = DiagnosticsDelivery::new(DiagnosticsConfig {
+            max_total: 2,
+            ..DiagnosticsConfig::default()
+        });
+        let session = SessionId::from("s".to_string());
+        let broken = vec![diagnostic(0, DiagnosticSeverity::ERROR, "boom")];
+
+        delivery.flush(
+            &session,
+            &[
+                entry("a", &broken, SeverityFloor::Warning),
+                entry("b", &broken, SeverityFloor::Warning),
+            ],
+        );
+        delivery.flush(
+            &session,
+            &[
+                entry("c", &broken, SeverityFloor::Warning),
+                entry("d", &broken, SeverityFloor::Warning),
+            ],
+        );
+
+        let all_clean = [
+            entry("a", &[], SeverityFloor::Warning),
+            entry("b", &[], SeverityFloor::Warning),
+            entry("c", &[], SeverityFloor::Warning),
+            entry("d", &[], SeverityFloor::Warning),
+        ];
+        let first = delivery.flush(&session, &all_clean);
+        let second = delivery.flush(&session, &all_clean);
+
+        let mut seen: Vec<String> = first.cleared;
+        seen.extend(second.cleared);
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string()
+            ],
+            "a deferred cleared file keeps its record entry, which is the same \
+             deferral rule a deferred changed file already follows"
+        );
+    }
+
+    #[test]
+    fn test_a_muted_file_is_dropped_from_the_record_rather_than_reported_fixed() {
+        let mut delivery = DiagnosticsDelivery::new(DiagnosticsConfig::default());
+        let session = SessionId::from("s".to_string());
+        let broken = vec![diagnostic(0, DiagnosticSeverity::ERROR, "boom")];
+
+        let _ = delivery.flush(&session, &[entry("a", &broken, SeverityFloor::Error)]);
+        let report = delivery.flush(&session, &[entry("a", &broken, SeverityFloor::Off)]);
+
+        assert!(
+            report.cleared.is_empty(),
+            "the file still has an error; only the floor changed, and telling the \
+             agent its problems are gone is a lie"
+        );
+        assert!(report.changed.is_empty());
+    }
+
+    #[test]
+    fn test_a_genuinely_fixed_file_is_still_reported_cleared() {
+        let mut delivery = DiagnosticsDelivery::new(DiagnosticsConfig::default());
+        let session = SessionId::from("s".to_string());
+        let broken = vec![diagnostic(0, DiagnosticSeverity::ERROR, "boom")];
+
+        let _ = delivery.flush(&session, &[entry("a", &broken, SeverityFloor::Error)]);
+        let report = delivery.flush(&session, &[entry("a", &[], SeverityFloor::Error)]);
+
+        assert_eq!(report.cleared, vec!["a".to_string()]);
     }
 }
