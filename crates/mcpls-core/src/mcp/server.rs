@@ -1775,6 +1775,92 @@ mod tests {
         );
     }
 
+    /// A footer with a real, non-zero grace does not answer before it
+    /// elapses. `is_quiet_at` reads a workspace that never reported
+    /// `$/progress` as quiet from the very first sample, so with nothing
+    /// gating it but the grace, this proves `footer_for_write` actually
+    /// pays that delay in real time rather than skipping straight to the
+    /// flush. Runs on a paused tokio clock so the assertion is exact and
+    /// the test itself does not sleep.
+    #[tokio::test(start_paused = true)]
+    async fn test_the_footer_actually_waits_out_its_grace_period() {
+        let parts = test_server_parts_with(DiagnosticsConfig {
+            footer: true,
+            footer_grace_ms: 250,
+            footer_quiet_ms: 200,
+            footer_wait_ms: 15_000,
+            ..DiagnosticsConfig::default()
+        });
+        parts.delivery.lock().await.set_baseline(HashMap::new());
+        let server = parts.server;
+
+        let handle = tokio::spawn(async move { server.footer_for_write().await });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        tokio::time::advance(Duration::from_millis(249)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !handle.is_finished(),
+            "nothing ever began, so is_quiet_at would read quiet at any real \
+             instant; only the grace sleep can be holding this open, and it \
+             has not elapsed yet"
+        );
+
+        tokio::time::advance(Duration::from_millis(5)).await;
+        let footer = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("the footer finished once its grace elapsed")
+            .expect("the footer task");
+        assert!(footer.is_some());
+    }
+
+    /// The footer defaults to off, and a disabled footer must never touch
+    /// its timers: with grace and cap both an hour, a regression that
+    /// forgot the `footer` guard would hang this test until it timed out
+    /// instead of merely running slower.
+    #[tokio::test]
+    async fn test_the_footer_is_off_by_default_and_never_waits() {
+        let parts = test_server_parts_with(DiagnosticsConfig {
+            footer_grace_ms: 3_600_000,
+            footer_wait_ms: 3_600_000,
+            ..DiagnosticsConfig::default()
+        });
+        parts.delivery.lock().await.set_baseline(HashMap::new());
+
+        let start = Instant::now();
+        let footer = parts.server.footer_for_write().await;
+
+        assert!(footer.is_none(), "footer defaults to off");
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "a disabled footer must return before ever consulting its timers"
+        );
+    }
+
+    /// With the footer absent, `WithDiagnostics`'s JSON must be exactly what
+    /// the tool returned before this task: `#[serde(flatten)]` inlines the
+    /// result's fields in declaration order and `skip_serializing_if` drops
+    /// `new_diagnostics` entirely, so nothing about the wrapper is visible.
+    #[test]
+    fn test_the_wrapper_matches_the_bare_result_when_the_footer_is_absent() {
+        let bare = serde_json::to_string(&sample_rename_result()).expect("serialize");
+        let wrapped = serde_json::to_string(&WithDiagnostics {
+            result: sample_rename_result(),
+            new_diagnostics: None,
+        })
+        .expect("serialize");
+
+        assert_eq!(
+            bare, wrapped,
+            "a caller of a write tool with the footer off must see byte-identical \
+             output to before this task"
+        );
+    }
+
     /// The flush acquires `delivery` before `notification_cache`. With the
     /// cache lock held from the outside, the flush stalls at a point where it
     /// must already own `delivery`; the opposite acquisition order would leave
