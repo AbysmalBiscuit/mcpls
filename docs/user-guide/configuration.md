@@ -685,7 +685,7 @@ Whether a write tool appends the diagnostics its own edit caused to its result, 
 **Type**: Integer (milliseconds)
 **Default**: `250`
 
-How long a footer waits before it starts looking for quiet. A footer that checks too soon after a write can catch the language servers before they have reacted to it at all, and report the state from before the edit as if it were the result.
+How long a footer waits before it starts looking for quiet. A footer that checks too soon after a write can catch the language servers before they have reacted to it at all, and report the state from before the edit as if it were the result. Bounded by `footer_wait_ms`, which is the whole wait: a grace set above it is spent only up to it.
 
 ### `diagnostics.footer_quiet_ms`
 
@@ -699,7 +699,7 @@ How long nothing may be outstanding before a footer calls it done. Shorter than 
 **Type**: Integer (milliseconds)
 **Default**: `15000`
 
-How long a footer waits in total before reporting whatever it has. Sized against a real build rather than against patience, so it clears comfortably even on a large crate's rebuild; the wait is gated on progress rather than on a timer, so a fast workspace still returns quickly and the high cap costs it nothing.
+How long a footer waits in total before reporting whatever it has, `footer_grace_ms` included rather than on top of it: setting this below the grace shortens the grace to match, so the wait is what this value says it is. Sized against a real build rather than against patience, so it clears comfortably even on a large crate's rebuild; the wait is gated on progress rather than on a timer, so a fast workspace still returns quickly and the high cap costs it nothing.
 
 ## Environment Variables
 
