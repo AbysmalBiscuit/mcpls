@@ -18,7 +18,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
-    /// Sent by the `PostToolUse` hook after an edit tool touches files.
+    /// Sent by the `FileChanged` hook for one path, and by the
+    /// `PostToolBatch` hook for a batch's paths ahead of its `flush`.
     Changed {
         /// The Claude Code session that made the edit.
         session: String,
@@ -27,8 +28,9 @@ pub enum Request {
         /// The kind of change the host observed.
         event: ChangeEvent,
     },
-    /// Sent by the `Stop` hook once a turn's edits are done, asking for the
-    /// diagnostics context to inject before the next turn.
+    /// Sent by the `PostToolBatch` hook after its `changed` events, and by
+    /// the `UserPromptSubmit` hook, asking for the diagnostics context to
+    /// inject before the next turn.
     Flush {
         /// The Claude Code session to flush.
         session: String,
@@ -252,6 +254,45 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Response>(literal).expect("deserialize"),
             value
+        );
+    }
+
+    #[test]
+    fn test_the_status_request_pins_the_wire_shape() {
+        let literal = r#"{"op":"status"}"#;
+        let value = Request::Status;
+        assert_eq!(
+            serde_json::to_value(&value).expect("serialize"),
+            serde_json::from_str::<serde_json::Value>(literal).expect("json")
+        );
+        assert_eq!(
+            serde_json::from_str::<Request>(literal).expect("deserialize"),
+            value
+        );
+    }
+
+    #[test]
+    fn test_a_multiline_string_field_does_not_produce_a_raw_newline() {
+        let value = Response::Error {
+            message: "line one\nline two".to_string(),
+        };
+        let line = serde_json::to_string(&value).expect("serialize");
+        assert!(
+            !line.contains('\n'),
+            "an embedded newline must be escaped, not left raw in the framing"
+        );
+        assert_eq!(
+            serde_json::from_str::<Response>(&line).expect("deserialize"),
+            value
+        );
+    }
+
+    #[test]
+    fn test_an_omitted_context_key_also_deserializes_to_none() {
+        let literal = r#"{"op":"flush"}"#;
+        assert_eq!(
+            serde_json::from_str::<Response>(literal).expect("deserialize"),
+            Response::Flush { context: None }
         );
     }
 }
