@@ -50,8 +50,9 @@ pub struct BridgeContext {
     pub project_config_ignored: bool,
     /// Per-session record of which diagnostics have already been delivered.
     ///
-    /// Locked independently of `notification_cache`; a flush takes the cache
-    /// lock only long enough to copy the snapshot it works from.
+    /// A site that needs both locks takes `delivery` before
+    /// `notification_cache`, never the reverse; a site that needs only one
+    /// takes only that one.
     pub delivery: Arc<Mutex<DiagnosticsDelivery>>,
     /// The severity floor each server answers to, resolved once at startup.
     pub floors: Arc<FloorTable>,

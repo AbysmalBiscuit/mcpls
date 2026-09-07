@@ -251,10 +251,10 @@ fn routable_entries_borrowed<'a>(
 /// What the payload build needs about one cached entry, after the cache
 /// guard is gone.
 ///
-/// Carries `version` as well as the URI and the owner, because
-/// `new_diagnostics_payload` rebuilds a `DiagnosticInfo` from these three
-/// before handing it to `Translator::diagnostics_from_cache_entry`. A pair
-/// of URI and owner alone would silently change what the converter sees.
+/// Carries `version` because `new_diagnostics_payload` rebuilds a
+/// `DiagnosticInfo` from these three fields before handing it to
+/// `Translator::diagnostics_from_cache_entry`, and `DiagnosticInfo` requires
+/// one. The converter itself never reads it.
 #[derive(Debug, Clone)]
 struct DiagnosticSource {
     uri: Uri,
@@ -802,10 +802,11 @@ impl McplsServer {
     /// The caller checks `has_baseline()` first. Both the tool and the
     /// footer must, because `flush` seeds a session's record from the
     /// baseline and `set_baseline` never rewrites one that already exists.
-    // `delivery`'s guard outlives its own last use (the `flush` call) so
-    // that it is still held once `notification_cache`'s guard is taken,
-    // which is what keeps every site honoring the delivery-before-cache
-    // order rather than each choosing its own.
+    // What enforces the delivery-before-cache order is where the two
+    // acquires sit, not how long either guard lives afterward. Clippy's fix
+    // for this lint moves the `delivery` acquire below the cache acquire,
+    // which is the exact reversal that order forbids, so the acquires stay
+    // where they are and the lint is silenced instead.
     #[allow(clippy::significant_drop_tightening)]
     async fn flush_now(&self, session: &SessionId) -> NewDiagnosticsResult {
         let (report, sources) = {
@@ -1991,10 +1992,10 @@ mod tests {
         let baseline_key = {
             let cache = notification_cache.lock().await;
             cache
-                .diagnostics_snapshot()
+                .diagnostics_entries()
                 .into_iter()
                 .find(|(_, info, _)| info.uri == pre_existing_uri)
-                .map(|(key, _, _)| key)
+                .map(|(key, _, _)| key.to_string())
                 .unwrap()
         };
         let baseline_hash = DiagnosticsDelivery::visible_hash(
