@@ -131,8 +131,8 @@ pub struct Translator {
     /// The applier fills this before it writes, so an apply whose caller
     /// stopped awaiting it -- the user pressing Esc, a
     /// `notifications/cancelled`, a client disconnect -- still leaves behind
-    /// the paths that have to be forgotten. Drained by
-    /// [`Self::forget_changed_documents`], which runs after every apply and
+    /// the paths that have to be resynchronized. Drained by
+    /// [`Self::resync_changed_documents`], which runs after every apply and
     /// before every call that opens a document, so no tool call can read a
     /// tracked document a completed write has already invalidated.
     pending_invalidations: InvalidationQueue,
@@ -272,19 +272,20 @@ impl Translator {
     }
 
     /// Write `plan` to disk through `applier`, using the `PositionEncoding`
-    /// negotiated for `server_id`, and forget every document it changed.
+    /// negotiated for `server_id`, and resynchronize every document it
+    /// changed.
     ///
     /// [`Applier::apply`] serializes applies against each other, so a second
     /// apply-enabled call cannot plan against content this one is about to
     /// replace.
     ///
-    /// The forgetting is driven off [`Self::pending_invalidations`] rather
-    /// than off the returned summary, so it covers a run that failed partway
-    /// and rolled back -- a restore that failed leaves the file holding the
-    /// new content, and one that succeeded still moved it out and back --
-    /// and so that a caller who stops awaiting this does not take the list
-    /// of paths with it. The drain before the apply picks up whatever an
-    /// earlier cancelled apply left.
+    /// The resync is driven off [`Self::pending_invalidations`] rather than
+    /// off the returned summary, so it covers a run that failed partway and
+    /// rolled back -- a restore that failed leaves the file holding the new
+    /// content, and one that succeeded still moved it out and back -- and so
+    /// that a caller who stops awaiting this does not take the list of paths
+    /// with it. The drain before the apply picks up whatever an earlier
+    /// cancelled apply left.
     ///
     /// # Errors
     ///
@@ -297,7 +298,7 @@ impl Translator {
         plan: EditPlan,
         server_id: &ServerId,
     ) -> Result<ApplySummary> {
-        self.forget_changed_documents().await;
+        self.resync_changed_documents().await;
         let outcome = applier
             .apply(
                 plan,
@@ -305,61 +306,140 @@ impl Translator {
                 &self.pending_invalidations,
             )
             .await;
-        self.forget_changed_documents().await;
+        self.resync_changed_documents().await;
         outcome
     }
 
-    /// Drop every tracked document whose file an apply rewrote, moved, or
-    /// removed, and send `textDocument/didClose` to each server holding it
-    /// open.
+    /// Resynchronize every document whose file an apply rewrote, moved, or
+    /// removed.
     ///
     /// An apply can write a file the tool call never queried: a rename
-    /// anchored in one file rewrites every file referencing the symbol.
-    /// `DocumentTracker::ensure_open` refreshes only the path a call names,
-    /// and LSP makes the client authoritative for a document it has opened,
-    /// so the server ignores the change on disk. Left alone, both the
-    /// tracker and the server keep serving the pre-apply content forever,
-    /// and a later edit computed against it is spliced into the new text at
-    /// ranges that no longer mean what the server meant. Forgetting the
-    /// document makes the next call on it re-read disk and re-open it.
+    /// anchored in one file rewrites every file referencing the symbol. LSP
+    /// makes the client authoritative for a document it has opened, so a
+    /// server ignores the change on disk until it is told. Telling it means
+    /// two notifications, not one: a `didChange` carrying the new text, and
+    /// a `didSave`, because a server whose diagnostics come from a build
+    /// runs nothing on the change alone.
     ///
-    /// Each path is closed under the same per-path lock `ensure_open` holds
-    /// for its whole duration, and the `didClose` goes out while that lock
-    /// is still held. Without it, a concurrent call for the same path could
-    /// find the entry gone between its disk phase and its commit and fail
-    /// with [`Error::DocumentNotFound`], or open the document again in the
-    /// window between the close and the notify and have this `didClose`
-    /// arrive after its `didOpen`.
+    /// A path leaves the queue only once every server holding it is caught
+    /// up on both. Content matching disk is not the completion test: after
+    /// a drain interrupted between a `didChange` and its `didSave` the
+    /// content matches and the save is still owed. This loop runs inside
+    /// the request future, which is dropped whenever the caller cancels, so
+    /// anything unfinished goes back on the queue for the next drain.
     ///
-    /// This loop runs inside the request future, which is dropped whenever
-    /// the caller cancels, so it must not empty the queue up front: a drop
-    /// between two paths would lose the rest permanently, leaving them
-    /// tracked at pre-apply content with nothing left to notice. The paths
-    /// it has not finished with go back on the queue, and a path is dropped
-    /// from it only once that path's `didClose` has been sent.
-    ///
-    /// A failed notify is logged rather than returned: the bytes are already
-    /// on disk, and the tracker entry is gone either way, so the next call
-    /// still re-opens the document from its current content. A drop between
-    /// the close and the notify is the same case, and leaves the path
-    /// queued, so the next drain finds the document already closed and moves
-    /// on.
-    async fn forget_changed_documents(&self) {
+    /// `pub(crate)` because stage C's sweep, in `crate::hooks::sweep`,
+    /// drives the same drain for paths that arrived from the host's file
+    /// watcher rather than from an apply.
+    pub(crate) async fn resync_changed_documents(&self) {
         let mut drain = PendingDrain {
             queue: &self.pending_invalidations,
             remaining: self.pending_invalidations.take(),
         };
-        // Read without removing: the path leaves `remaining` only after its
-        // notify has gone out, so a drop mid-path re-queues that path too.
         while let Some(path) = drain.remaining.first().cloned() {
-            self.close_one_document(&path).await;
-            drain.remaining.remove(0);
+            if self.resync_one_document(&path).await {
+                drain.remaining.remove(0);
+            } else {
+                // Leave it queued and stop: a server that rejected one
+                // notification will reject the next, and the paths behind
+                // this one are still owed their own drain.
+                break;
+            }
         }
     }
 
-    /// Forget one path and tell every server holding it open.
-    async fn close_one_document(&self, path: &Path) {
+    /// Resynchronize one path. Returns whether it is finished and can leave
+    /// the queue.
+    ///
+    /// `_path_guard` is held for the whole call, across every notify below,
+    /// deliberately: dropping it early would let a concurrent `ensure_open`
+    /// commit a version this resync has already decided against, leaving
+    /// the tracker unable to tell a server it still needs the resync.
+    #[allow(clippy::significant_drop_tightening, clippy::used_underscore_binding)]
+    async fn resync_one_document(&self, path: &Path) -> bool {
         let _path_guard = self.document_tracker.lock_path(path).await;
+
+        if !path.exists() {
+            self.close_one_document_locked(path).await;
+            return true;
+        }
+
+        let resync = match self
+            .document_tracker
+            .resync_from_disk(path, &_path_guard)
+            .await
+        {
+            Ok(Some(resync)) => resync,
+            Ok(None) => return true,
+            Err(error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    %error,
+                    "could not re-read an applied file; leaving it queued"
+                );
+                return false;
+            }
+        };
+
+        for server in &resync.needs_change {
+            let generation = self.document_tracker.generation_for(server);
+            let Some(client) = lock_std(&self.lsp_clients).get(server).cloned() else {
+                continue;
+            };
+            let params = lsp_types::DidChangeTextDocumentParams {
+                text_document: lsp_types::VersionedTextDocumentIdentifier {
+                    uri: resync.uri.clone(),
+                    version: resync.version,
+                },
+                content_changes: vec![lsp_types::TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: resync.text.clone(),
+                }],
+            };
+            if let Err(error) = client.notify("textDocument/didChange", params).await {
+                tracing::warn!(%server, path = %path.display(), %error, "resync didChange failed");
+                return false;
+            }
+            self.document_tracker
+                .mark_change_sent(path, server, resync.version, generation);
+        }
+
+        for server in &resync.needs_save {
+            let generation = self.document_tracker.generation_for(server);
+            let Some(client) = lock_std(&self.lsp_clients).get(server).cloned() else {
+                continue;
+            };
+            let params = lsp_types::DidSaveTextDocumentParams {
+                text_document: lsp_types::TextDocumentIdentifier {
+                    uri: resync.uri.clone(),
+                },
+                text: None,
+            };
+            if let Err(error) = client.notify("textDocument/didSave", params).await {
+                tracing::warn!(%server, path = %path.display(), %error, "resync didSave failed");
+                return false;
+            }
+            self.document_tracker
+                .mark_save_sent(path, server, resync.version, generation);
+        }
+
+        true
+    }
+
+    /// Forget one path and tell every server holding it open, closing it.
+    ///
+    /// Called only for a path absent from disk: `resync_one_document`
+    /// re-syncs everything still there instead. The caller holds `path`'s
+    /// lock for the whole call -- see `resync_one_document`'s own guard --
+    /// so a concurrent call for the same path cannot find the entry gone
+    /// between its disk phase and its commit, or open the document again in
+    /// the window between the close and the notify.
+    ///
+    /// A failed notify is logged rather than returned: the tracker entry is
+    /// gone either way, so the next call still re-opens the document from
+    /// whatever is on disk by then.
+    async fn close_one_document_locked(&self, path: &Path) {
         let Some(state) = self.document_tracker.close(path) else {
             return;
         };
@@ -376,10 +456,27 @@ impl Translator {
                     %server,
                     path = %path.display(),
                     %error,
-                    "could not tell the server that an applied file is closed"
+                    "could not tell the server that a removed file is closed"
                 );
             }
         }
+    }
+
+    /// Put `paths` on the invalidation queue the next resync drains.
+    ///
+    /// The queue is what makes a drain restartable, so a caller that has
+    /// learned a file changed adds to it and then drives
+    /// [`Self::resync_changed_documents`], rather than resyncing one path
+    /// directly and losing the rest if it is cancelled.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no non-test caller lands until the file-watcher sweep does"
+        )
+    )]
+    pub(crate) fn queue_invalidations(&self, paths: &[PathBuf]) {
+        self.pending_invalidations.extend(paths);
     }
 
     /// Mark the set of servers that are expected (configured + applicable)
@@ -621,6 +718,7 @@ mod tests {
 
     use tokio::time::Duration;
 
+    use self::testing::TranslatorHarness;
     use super::*;
     use crate::bridge::state::detect_language;
     use crate::config::{ServerId, ToolKind, ToolRouter};
@@ -862,5 +960,83 @@ mod tests {
 
         let state = translator.document_tracker.close(&path).unwrap();
         assert_eq!(state.language_id(), "rust");
+    }
+
+    #[tokio::test]
+    async fn test_a_rewritten_file_gets_a_change_then_a_save() {
+        let harness = TranslatorHarness::with_one_server("rust").await;
+        let path = harness.write_file("a.rs", "fn a() {}");
+        harness.open(&path, "rust").await;
+        harness.rewrite_file(&path, "fn a() -> i32 { }");
+        harness.queue_invalidation(&path);
+
+        harness.translator.resync_changed_documents().await;
+
+        let sent = harness.notifications_for("rust");
+        assert_eq!(
+            sent.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["textDocument/didChange", "textDocument/didSave"],
+            "the change carries the new text and the save is what starts a build"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_file_the_apply_deleted_is_closed() {
+        let harness = TranslatorHarness::with_one_server("rust").await;
+        let path = harness.write_file("a.rs", "fn a() {}");
+        harness.open(&path, "rust").await;
+        std::fs::remove_file(&path).expect("remove");
+        harness.queue_invalidation(&path);
+
+        harness.translator.resync_changed_documents().await;
+
+        assert_eq!(
+            harness.notifications_for("rust"),
+            vec!["textDocument/didClose"]
+        );
+        assert!(
+            harness
+                .translator
+                .document_tracker()
+                .snapshot(&path)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_an_untracked_path_produces_no_notification() {
+        let harness = TranslatorHarness::with_one_server("rust").await;
+        let path = harness.write_file("a.rs", "fn a() {}");
+        harness.queue_invalidation(&path);
+
+        harness.translator.resync_changed_documents().await;
+
+        assert!(harness.notifications_for("rust").is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_a_second_drain_sends_the_save_a_cancellation_lost() {
+        let harness = TranslatorHarness::with_one_server("rust").await;
+        let path = harness.write_file("a.rs", "fn a() {}");
+        harness.open(&path, "rust").await;
+        harness.rewrite_file(&path, "fn a() -> i32 { }");
+        harness.queue_invalidation(&path);
+
+        // Drop the drain future after its didChange and before its didSave, the
+        // way a cancelled tool call would.
+        harness.fail_notifications_after("rust", 1);
+        harness.translator.resync_changed_documents().await;
+        harness.clear_notifications();
+        harness.allow_notifications("rust");
+
+        harness.translator.resync_changed_documents().await;
+
+        assert!(
+            harness
+                .notifications_for("rust")
+                .contains(&"textDocument/didSave".to_string()),
+            "the content now matches disk, so a comparison alone would call this \
+             finished and the file would never be checked"
+        );
     }
 }

@@ -169,7 +169,7 @@ impl Translator {
         // stopped awaiting it leaves its changed paths queued, and this
         // call must not go on to serve content from a tracked document one
         // of those paths has already invalidated.
-        self.forget_changed_documents().await;
+        self.resync_changed_documents().await;
 
         let path = PathBuf::from(file_path);
         let validated_path = self.validate_path(&path)?;
