@@ -828,6 +828,13 @@ mod tests {
         let first = delivery.flush(&session, &all_clean);
         let second = delivery.flush(&session, &all_clean);
 
+        assert_eq!(
+            (first.cleared.len(), second.cleared.len()),
+            (2, 2),
+            "the budget splits the four across two flushes; clearing all four \
+             in one would satisfy the union below while spending no budget"
+        );
+
         let mut seen: Vec<String> = first.cleared;
         seen.extend(second.cleared);
         seen.sort();
