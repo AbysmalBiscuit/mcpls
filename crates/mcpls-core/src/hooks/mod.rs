@@ -13,7 +13,7 @@ pub mod sweep;
 
 pub use filters::{PathFilter, watch_paths};
 #[cfg(windows)]
-pub use identity::WINDOWS_PIPE_PREFIX;
+pub use identity::windows_pipe_prefix;
 pub use identity::{SocketIdentity, identity_for, identity_hash};
 pub use listener::{
     HookListener, LockLoss, ProbeOutcome, ServeExit, probe, send, send_and_acknowledge, send_many,
