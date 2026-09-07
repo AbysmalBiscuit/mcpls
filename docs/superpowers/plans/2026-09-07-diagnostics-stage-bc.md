@@ -3034,6 +3034,49 @@ EOF
 - Modify: `crates/mcpls-core/src/bridge/settle.rs`
 - Modify: `crates/mcpls-core/src/config/mod.rs` (`DiagnosticsConfig`, the struct at `:134-167` and its `Default` impl running to about `:207`)
 
+### A defect this task must also fix
+
+Task 9 uncovered a defect in the same file, confirmed against the code rather
+than measured, and it defeats the delivery this whole stage exists to provide
+for exactly the servers that are fastest.
+
+`ServerSettle::begin` and `end` are fed from one source only, `$/progress`
+begin and end (`lib.rs:196-197`). `quiet_since` is stamped only inside `end`,
+and `end` returns early unless a matching `begin` was recorded
+(`settle.rs:90-98`). `should_settle_at` is the deadline being reached, or
+`outstanding` being empty with `quiet_since` old enough (`settle.rs:107-113`).
+So for a server that never completes a `$/progress` operation, `quiet_since`
+stays `None` forever and the second disjunct is unreachable. `restart_deadline`
+moves the deadline without stamping `quiet_since` (`settle.rs:67-72`), so a
+spawn does not rescue it either.
+
+`default_settle_deadline_ms` is 300000 (`config/mod.rs:194-196`), and
+`baseline_task` polls until `should_settle` (`lib.rs:1115`), while
+`get_new_diagnostics` returns `starting_up()` until then
+(`mcp/server.rs:738-742`). The consequence: such a server delivers nothing for
+five minutes, and at the deadline the baseline absorbs everything it published
+in that window, so those diagnostics can never be reported as new. pyrefly, ty
+and taplo are all in this class.
+
+`settle.rs:9-12` names this case and treats the deadline as the answer, but
+that deadline is sized for rust-analyzer's indexing, so it hands the
+no-progress server the worst case instead of the best.
+
+Fix it here, because this task already owns the file and is about exactly this
+judgment. Give a server that has produced no progress at all a much shorter
+grace, or stamp `quiet_since` at `restart_deadline` and let `quiet_for` do the
+work. Do not change the five-minute backstop itself: it is correct for the
+server it was sized for, and shortening it would trade this defect for a
+different one.
+
+Write a test that fails without the fix: a settle tracker that never receives
+a `begin` must report settled well before the deadline. Sabotage-check it by
+reverting the fix and confirming it goes red.
+
+`crates/mcpls-core/tests/pyrefly_e2e.rs` sets `settle_deadline_ms = 500` to
+work around this. Once the fix lands, check whether that override is still
+needed and say either way in the commit body.
+
 Read `docs/superpowers/notes/2026-09-07-stage-b-measurements.md`, the "Cargo check timing" section, before setting `footer_wait_ms`. It measured about 4.3 seconds for an edit in `mcpls-core` and about 0.3 seconds for one in `mcpls-cli`, which confirms the spec's 15000. So this task writes the spec's number unchanged; only a later re-measurement that disagrees would change it, and that change would say so in its commit body.
 
 **Interfaces:**
