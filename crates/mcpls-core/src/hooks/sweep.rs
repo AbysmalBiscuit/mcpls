@@ -486,13 +486,22 @@ mod tests {
             self.harness.notifications_for(SERVER)
         }
 
+        /// The single file event of each `didChangeWatchedFiles` the fake
+        /// server received, in order.
+        fn watched_file_events(&self) -> Vec<serde_json::Value> {
+            self.harness
+                .watched_files_params(SERVER)
+                .iter()
+                .map(|params| params["changes"][0].clone())
+                .collect()
+        }
+
         /// The single file event of the last `didChangeWatchedFiles` the
         /// fake server received.
         fn last_watched_file_event(&self) -> serde_json::Value {
-            self.harness
-                .last_watched_files_params(SERVER)
-                .expect("a watched-files notification went out")["changes"][0]
-                .clone()
+            self.watched_file_events()
+                .pop()
+                .expect("a watched-files notification went out")
         }
     }
 
@@ -708,6 +717,13 @@ mod tests {
         assert_eq!(sweeper.enqueue(std::slice::from_ref(&path)), 1);
         sweeper.sweep_now().await;
 
+        assert_eq!(
+            sweeper.watched_file_events().len(),
+            1,
+            "this watcher accepts both of the kinds offered for the path, and \
+             a server that hears about the same file once per kind it would \
+             have taken runs its check twice for one edit"
+        );
         let event = sweeper.last_watched_file_event();
         assert_eq!(
             event["uri"],

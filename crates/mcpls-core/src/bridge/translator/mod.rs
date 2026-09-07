@@ -1519,7 +1519,8 @@ mod tests {
         harness.translator.resync_changed_documents().await;
 
         let params = harness
-            .last_watched_files_params("go")
+            .watched_files_params("go")
+            .pop()
             .expect("a notification went out");
         assert_eq!(
             params["changes"][0]["type"],
