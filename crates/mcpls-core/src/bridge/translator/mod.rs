@@ -36,7 +36,7 @@ mod routing;
 mod symbols;
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
-mod testing;
+pub mod testing;
 
 pub use dto::*;
 pub use routing::validate_path_against_roots;
@@ -181,6 +181,24 @@ enum ResyncStep {
     /// connection, so the drain stops here instead of failing through the
     /// rest of the queue one path at a time.
     NotifyFailed,
+}
+
+/// What [`Translator::open_untracked_document`] achieved for one path.
+///
+/// A path no server routes and a path a server routes but could not be
+/// opened are different outcomes: the first is nothing anyone was ever
+/// going to check, the second is a file that should have been checked and
+/// was not, which is what a caller reports as a shortfall.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenOutcome {
+    /// The document is tracked and its server was sent a `didOpen`.
+    Opened,
+    /// No registered server routes this path's language. Nothing was
+    /// opened, and nothing was told.
+    NoRoute,
+    /// A server routes it, but the file could not be opened -- unreadable,
+    /// or past a resource limit.
+    Failed,
 }
 
 /// Upper bound on how long [`Translator::shutdown_servers`] waits for a
@@ -572,6 +590,43 @@ impl Translator {
     /// directly and losing the rest if it is cancelled.
     pub(crate) fn queue_invalidations(&self, paths: &[PathBuf]) {
         self.pending_invalidations.extend(paths);
+    }
+
+    /// Open a path the tracker has never held and send the server that
+    /// routes its language the `didOpen` every later notification for that
+    /// document builds on.
+    ///
+    /// Routing is resolved before anything is read, so a path no registered
+    /// server handles costs nothing and stays untracked: a tracker slot
+    /// spent on a document no server holds buys no diagnostics and brings
+    /// the next tool call that much closer to the document limit.
+    ///
+    /// The open runs through [`DocumentTracker::ensure_open`], which holds
+    /// the path's own lock across the tracker insert and the notify, so a
+    /// tool call opening the same path concurrently cannot have its version
+    /// reset underneath it.
+    ///
+    /// `pub(crate)` because the host file-watcher sweep, in
+    /// `crate::hooks::sweep`, is what learns a file was created.
+    pub(crate) async fn open_untracked_document(&self, path: &Path) -> OpenOutcome {
+        let Ok((server, client)) = self.get_client_for_file(path, ToolKind::Diagnostics) else {
+            return OpenOutcome::NoRoute;
+        };
+        match self
+            .document_tracker
+            .ensure_open(path, &server, &client)
+            .await
+        {
+            Ok(_) => OpenOutcome::Opened,
+            Err(error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    %error,
+                    "could not open a changed file for its server"
+                );
+                OpenOutcome::Failed
+            }
+        }
     }
 
     /// Mark the set of servers that are expected (configured + applicable)
