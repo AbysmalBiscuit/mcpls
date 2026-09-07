@@ -2613,6 +2613,52 @@ mod tests {
         );
     }
 
+    /// The sampling step, and the overshoot past the cap it buys.
+    ///
+    /// Both are named in `footer_wait_ms`'s own documentation as 50 ms, and
+    /// neither is readable from what the wait returns: the loop reports the
+    /// cap however long its samples were. What it spent is the only place
+    /// the step shows, so that is what this reads.
+    #[tokio::test]
+    async fn test_the_footer_samples_every_fifty_milliseconds() {
+        let settle = ServerSettle::new(Duration::from_secs(1), Duration::from_secs(600));
+        let rust = ServerId::from("rust");
+        let start = Instant::now();
+        let epoch_before = settle.progress_epoch();
+        // No `end_at`: nothing here ever reads as quiet, so the loop samples
+        // until the cap.
+        settle.begin(&rust, &json!("flycheck"));
+        let steps = unread_steps();
+
+        let ended = wait_for_footer_quiet_at(
+            &settle,
+            epoch_before,
+            FooterTiming {
+                grace: Duration::from_millis(100),
+                quiet: Duration::from_millis(200),
+                cap: Duration::from_millis(180),
+            },
+            instant_tick(start, &steps),
+        )
+        .await;
+
+        assert_eq!(ended, Duration::from_millis(180));
+        assert_eq!(
+            steps.borrow()[1..],
+            [Duration::from_millis(50), Duration::from_millis(50)],
+            "everything after the grace is one sampling step, and a shorter \
+             one turns a write's wait into a busier poll of the same tracker"
+        );
+        assert_eq!(
+            steps.borrow().iter().sum::<Duration>(),
+            Duration::from_millis(200),
+            "a sleep already paid cannot be undone, so a wait that never goes \
+             quiet runs to the first sample past the cap: at most one step \
+             beyond it, which is what the user-facing wait is documented to \
+             overshoot by"
+        );
+    }
+
     /// Work that was already running when the edit landed does not eat the cap.
     #[tokio::test]
     async fn test_an_index_already_in_flight_does_not_hold_the_footer() {

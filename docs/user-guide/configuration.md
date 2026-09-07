@@ -699,7 +699,7 @@ How long nothing may be outstanding before a footer calls it done. Shorter than 
 **Type**: Integer (milliseconds)
 **Default**: `15000`
 
-How long a footer waits in total before reporting whatever it has, `footer_grace_ms` included rather than on top of it: setting this below the grace shortens the grace to match, so the wait is what this value says it is. Sized against a real build rather than against patience, so it clears comfortably even on a large crate's rebuild; the wait is gated on progress rather than on a timer, so a fast workspace still returns quickly and the high cap costs it nothing.
+How long a footer waits in total before reporting whatever it has, `footer_grace_ms` included rather than on top of it: setting this below the grace shortens the grace to match. It is a bound rather than an exact duration — a wait that never goes quiet is sampled every 50 ms, and the sample that carries it past this value has already been paid, so the wait can run up to 50 ms beyond it. Sized against a real build rather than against patience, so it clears comfortably even on a large crate's rebuild; the wait is gated on progress rather than on a timer, so a fast workspace still returns quickly and the high cap costs it nothing.
 
 ## Environment Variables
 
