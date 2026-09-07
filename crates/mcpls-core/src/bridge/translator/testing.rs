@@ -324,6 +324,14 @@ struct RecordingServer {
     log: Arc<StdMutex<Vec<String>>>,
     sentinel_waiter: Arc<StdMutex<Option<std::sync::mpsc::Sender<Vec<String>>>>>,
     client: LspClient,
+    /// The one client returned by [`fake_lsp_client`] that owns the
+    /// connection's background task (every other handle, including
+    /// `client` above and the one registered with the `Translator`, is a
+    /// `Clone` that shares the same channel but not that ownership). Held
+    /// here, separate from `client`, so [`Self::kill`] can consume it and
+    /// await the task's own exit -- the only way to know the connection is
+    /// dead for certain rather than probably.
+    owning_client: StdMutex<Option<LspClient>>,
     shutdown: Option<oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -372,20 +380,37 @@ impl RecordingServer {
             });
         });
 
-        let client = client_rx
+        let owning_client = client_rx
             .recv()
             .expect("the fake-server thread to hand back its client");
-        let sentinel_client = client.clone();
+        let sentinel_client = owning_client.clone();
+        let registered_client = owning_client.clone();
         (
-            client,
+            registered_client,
             Self {
                 log,
                 sentinel_waiter,
                 client: sentinel_client,
+                owning_client: StdMutex::new(Some(owning_client)),
                 shutdown: Some(shutdown_tx),
                 thread: Some(thread),
             },
         )
+    }
+
+    /// Kill this server's connection for good: every notification any
+    /// handle to it sends from now on fails.
+    ///
+    /// Consumes the one client that owns the connection's background task
+    /// and awaits that task's exit, so by the time this returns the
+    /// connection is confirmed dead rather than merely asked to die --
+    /// nothing racing a notify against this call can observe the notify
+    /// still succeeding.
+    async fn kill(&self) {
+        let owning = lock_std(&self.owning_client)
+            .take()
+            .expect("kill called twice on the same RecordingServer");
+        let _ = owning.shutdown().await;
     }
 
     /// The notification methods received so far, in order.
@@ -403,7 +428,7 @@ impl RecordingServer {
             self.client.notify(SENTINEL_METHOD, serde_json::Value::Null),
         );
         rx.recv_timeout(Duration::from_millis(500))
-            .unwrap_or_else(|_| lock_std(&self.log).clone())
+            .expect("the fake server never answered the sentinel")
     }
 
     fn clear(&self) {
@@ -542,14 +567,19 @@ impl TranslatorHarness {
             .notifications()
     }
 
-    /// Forget everything recorded so far.
-    #[allow(
-        dead_code,
-        reason = "unused until a test needs to isolate a later drain's own sends"
-    )]
-    pub(super) fn clear_notifications(&self) {
-        for server in self.servers.values() {
-            server.clear();
-        }
+    /// Kill `server`'s connection for good, so every notification the
+    /// translator sends it from now on fails.
+    ///
+    /// Kills the connection up front, before anything is sent, rather than
+    /// reacting to a chosen frame mid-drain: the latter is a race between
+    /// this fake server's own cross-thread round trip and the translator's
+    /// next, purely synchronous enqueue, and the translator always wins it.
+    /// Starting dead sidesteps the race instead of trying to win it.
+    pub(super) async fn kill_transport(&self, server: &str) {
+        self.servers
+            .get(server)
+            .unwrap_or_else(|| panic!("{server} is not registered with this harness"))
+            .kill()
+            .await;
     }
 }
