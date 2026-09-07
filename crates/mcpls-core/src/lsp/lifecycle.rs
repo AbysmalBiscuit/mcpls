@@ -758,9 +758,9 @@ fn build_client_capabilities(
             }),
             ..Default::default()
         }),
-        // Without this, servers must not send `$/progress` at all, which is
-        // how a server that never reports work leaves `ServerSettle` waiting
-        // on its deadline instead of a quiet debounce.
+        // Without this, servers must not send `$/progress` at all, and
+        // `ServerSettle` loses the signal it debounces on: every workspace
+        // would look like one whose servers never report work.
         window: Some(WindowClientCapabilities {
             work_done_progress: Some(true),
             ..Default::default()
