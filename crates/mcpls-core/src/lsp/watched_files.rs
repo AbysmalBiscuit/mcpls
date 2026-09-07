@@ -64,6 +64,26 @@ impl WatchRegistry {
     /// at its base URI would be worse than a log line. A pattern that does
     /// not compile is skipped the same way. Either case leaves the rest of
     /// the array in force.
+    ///
+    /// A registration under an id already in use for this server replaces
+    /// it, except when the new array is empty and a non-empty registration
+    /// already exists for that id: that replacement is ignored, at `warn`.
+    /// LSP's way to say "stop watching" is `client/unregisterCapability`; a
+    /// `registerCapability` carrying no watchers conveys nothing on its own
+    /// and is indistinguishable from a server re-announcing a stale or
+    /// incomplete payload, so honouring it as "watch nothing" would let one
+    /// server's quirk silently kill the whole feature. The two ways this
+    /// can be wrong are not symmetric: ignoring a genuine "watch nothing"
+    /// costs a few notifications the server discards, while honouring a
+    /// spurious one stops file watching dead with no error anywhere. A
+    /// *first* registration for an id that happens to be empty is still
+    /// stored as given -- there is nothing working yet for it to replace.
+    ///
+    /// The lock is held across the check and the insert deliberately:
+    /// dropping it in between would let two concurrent registrations for
+    /// the same id interleave, so each saw a working registration to
+    /// compare against and neither ever wrote.
+    #[allow(clippy::significant_drop_tightening)]
     pub fn register(&self, server: &ServerId, id: &str, watchers: &serde_json::Value) {
         let mut compiled = Vec::new();
         for watcher in watchers.as_array().into_iter().flatten() {
@@ -99,10 +119,21 @@ impl WatchRegistry {
                 kinds,
             });
         }
-        lock_std(&self.by_server)
-            .entry(server.clone())
-            .or_default()
-            .insert(id.to_string(), compiled);
+        let mut by_server = lock_std(&self.by_server);
+        let registrations = by_server.entry(server.clone()).or_default();
+        if compiled.is_empty()
+            && registrations
+                .get(id)
+                .is_some_and(|existing| !existing.is_empty())
+        {
+            tracing::warn!(
+                %server,
+                registration = id,
+                "ignoring an empty watcher registration that would replace a working one"
+            );
+            return;
+        }
+        registrations.insert(id.to_string(), compiled);
     }
 
     /// Drop the registration `id` holds for `server`.
@@ -252,6 +283,26 @@ mod tests {
         assert_eq!(
             registry.servers_for(&abs("go.mod"), lsp_types::FileChangeType::CHANGED),
             vec![go]
+        );
+    }
+
+    #[test]
+    fn test_an_empty_reregistration_does_not_replace_a_working_one() {
+        let registry = WatchRegistry::new();
+        let python = ServerId::from("python");
+        registry.register(
+            &python,
+            "FILEWATCHER",
+            &json!([{ "globPattern": "**/*.py" }]),
+        );
+        registry.register(&python, "FILEWATCHER", &json!([]));
+
+        assert_eq!(
+            registry.servers_for(&abs("main.py"), lsp_types::FileChangeType::CHANGED),
+            vec![python],
+            "a server re-registering the same id with no watchers has no way to \
+             say 'stop watching' -- that is what unregisterCapability is for -- \
+             so the empty payload must not erase the working registration"
         );
     }
 
