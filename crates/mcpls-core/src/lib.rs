@@ -1762,6 +1762,40 @@ mod tests {
         assert_eq!(roots[1], base.join("another path/workspace"));
     }
 
+    /// The one production `ServerInitConfig` literal is what puts the
+    /// registry in front of every spawned server's `registerCapability`
+    /// arm. A `None` here records no glob, so `notify_watched_files` finds
+    /// no server to tell and gopls and tsgo -- which give up their own
+    /// watchers on the strength of the advertisement alone -- see file
+    /// changes never at all, with nothing failing to say so.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_applicable_configs_carry_the_shared_watch_registry() {
+        let mut config: ServerConfig = toml::from_str("").expect("an empty config parses");
+        let mut server = crate::config::LspServerConfig::rust_analyzer();
+        // No markers to look for, so `should_spawn` is true without any
+        // fixture on disk.
+        server.heuristics = None;
+        config.lsp_servers = vec![server];
+
+        let registry = Arc::new(lsp::WatchRegistry::new());
+        let applicable =
+            applicable_server_configs(&config, &[PathBuf::from("/workspace")], None, &registry);
+
+        let spawned = applicable
+            .first()
+            .expect("a server with no heuristics is always applicable");
+        let carried = spawned
+            .watch_registry
+            .as_ref()
+            .expect("the production config carries the registry");
+        assert!(
+            Arc::ptr_eq(carried, &registry),
+            "every server must write the registry the translator reads, not \
+             a registry of its own"
+        );
+    }
+
     #[test]
     #[allow(clippy::expect_used)]
     fn test_serve_translator_carries_the_configured_apply_permissions() {
