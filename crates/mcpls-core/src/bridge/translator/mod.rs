@@ -273,8 +273,9 @@ impl Translator {
     /// told nothing, which is the difference between this and shouting at
     /// everything with a language id.
     ///
-    /// `pub(crate)` because stage C's sweep, in `crate::hooks::sweep`,
-    /// reports untracked changed paths the same way.
+    /// `pub(crate)` rather than private so a caller that learns of a
+    /// changed path from outside an apply -- a host file-watcher sweep --
+    /// can report it the same way.
     pub(crate) async fn notify_watched_files(&self, path: &Path, kind: lsp_types::FileChangeType) {
         let Some(registry) = &self.watch_registry else {
             return;
@@ -1454,8 +1455,11 @@ mod tests {
         );
     }
 
+    /// The registry is what gates the notification, so clearing a server's
+    /// registrations silences it. That a respawn actually does the clearing
+    /// is `respawn`'s own test.
     #[tokio::test]
-    async fn test_a_respawn_clears_that_server_s_registrations() {
+    async fn test_forgetting_a_server_s_registrations_stops_the_notification() {
         let harness = TranslatorHarness::with_one_server("go").await;
         harness.register_watcher("go", "r1", "**/*.go");
         harness

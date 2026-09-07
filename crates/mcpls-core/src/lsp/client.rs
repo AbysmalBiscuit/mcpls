@@ -210,6 +210,13 @@ impl LspClient {
     ///
     /// Notifications received from the LSP server will be parsed and sent
     /// through the provided channel.
+    ///
+    /// `watch_registry` and `server` are constructor parameters rather than
+    /// fields with setters because the message loop that answers
+    /// `client/registerCapability` is spawned right here: a value installed
+    /// on the finished `LspClient` would never reach the already-running
+    /// loop. The `apply_sink` field is the shape a value that *does* change
+    /// over the client's life needs; it is not the shape to copy for these.
     pub(crate) fn from_transport_with_notifications(
         config: LspServerConfig,
         transport: LspTransport,
@@ -918,9 +925,8 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::unnecessary_literal_unwrap)]
     fn test_a_watched_files_registration_reaches_the_registry() {
-        let registry = Some(Arc::new(WatchRegistry::new()));
+        let registry = Arc::new(WatchRegistry::new());
         let go = ServerId::from("go");
         let params = json!({
             "registrations": [{
@@ -933,23 +939,20 @@ mod tests {
         let result = LspClient::server_request_result(
             "client/registerCapability",
             Some(&params),
-            registry.as_ref(),
+            Some(&registry),
             &go,
         );
 
         assert_eq!(result.expect("the arm answers"), Value::Null);
         assert_eq!(
-            registry
-                .expect("the registry is present")
-                .servers_for(&abs("main.go"), lsp_types::FileChangeType::CHANGED),
+            registry.servers_for(&abs("main.go"), lsp_types::FileChangeType::CHANGED),
             vec![go]
         );
     }
 
     #[test]
-    #[allow(clippy::unnecessary_literal_unwrap)]
     fn test_an_unregister_drops_it_again() {
-        let registry = Some(Arc::new(WatchRegistry::new()));
+        let registry = Arc::new(WatchRegistry::new());
         let go = ServerId::from("go");
         let register = json!({
             "registrations": [{
@@ -965,28 +968,26 @@ mod tests {
         let _ = LspClient::server_request_result(
             "client/registerCapability",
             Some(&register),
-            registry.as_ref(),
+            Some(&registry),
             &go,
         );
         let _ = LspClient::server_request_result(
             "client/unregisterCapability",
             Some(&unregister),
-            registry.as_ref(),
+            Some(&registry),
             &go,
         );
 
         assert!(
             registry
-                .expect("the registry is present")
                 .servers_for(&abs("main.go"), lsp_types::FileChangeType::CHANGED)
                 .is_empty()
         );
     }
 
     #[test]
-    #[allow(clippy::unnecessary_literal_unwrap)]
     fn test_a_registration_for_another_method_is_answered_and_ignored() {
-        let registry = Some(Arc::new(WatchRegistry::new()));
+        let registry = Arc::new(WatchRegistry::new());
         let go = ServerId::from("go");
         let params = json!({
             "registrations": [{
@@ -999,7 +1000,7 @@ mod tests {
         let result = LspClient::server_request_result(
             "client/registerCapability",
             Some(&params),
-            registry.as_ref(),
+            Some(&registry),
             &go,
         );
 
@@ -1010,7 +1011,6 @@ mod tests {
         );
         assert!(
             registry
-                .expect("the registry is present")
                 .servers_for(&abs("main.go"), lsp_types::FileChangeType::CHANGED)
                 .is_empty()
         );
@@ -1589,6 +1589,90 @@ mod tests {
         assert_eq!(
             response["id"], 1,
             "the request id must survive the spawn-then-channel-then-transport hop"
+        );
+    }
+
+    /// A registration only reaches the registry if it survives every hop
+    /// between the transport and `server_request_result`: the message loop's
+    /// request arm, the spawned responder, and `server_request_response`.
+    /// The direct-call tests above prove the arm records what it is given
+    /// and say nothing about whether anything ever gives it that.
+    ///
+    /// Built through `from_transport_with_notifications` specifically:
+    /// `from_transport` hardcodes `None` for the registry, so it could not
+    /// fail this test however the plumbing were wired.
+    ///
+    /// Reading the answering frame is what synchronizes: the arm records
+    /// into the registry before it returns the `null` this reads back, so
+    /// by the time the frame arrives the write has happened.
+    #[tokio::test]
+    #[allow(clippy::expect_used)]
+    async fn test_a_registration_reaches_the_registry_through_the_message_loop() {
+        use std::process::Stdio;
+
+        use tokio::io::{AsyncWriteExt, BufReader};
+        use tokio::process::Command;
+
+        let mut write_half = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn cat for the client's outbound half");
+        let write_stdin = write_half.stdin.take().expect("write_half stdin");
+        let write_stdout = write_half.stdout.take().expect("write_half stdout");
+
+        let mut read_half = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn cat for the client's inbound half");
+        let read_stdout = read_half.stdout.take().expect("read_half stdout");
+        let mut read_stdin = read_half.stdin.take().expect("read_half stdin");
+
+        let registry = Arc::new(WatchRegistry::new());
+        let go = ServerId::from("go");
+        let (notification_tx, _notification_rx) = mpsc::channel(1);
+        let _client = LspClient::from_transport_with_notifications(
+            LspServerConfig::rust_analyzer(),
+            LspTransport::new(write_stdin, read_stdout),
+            notification_tx,
+            Some(Arc::clone(&registry)),
+            go.clone(),
+        );
+
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "client/registerCapability",
+            "params": { "registrations": [{
+                "id": "r1",
+                "method": "workspace/didChangeWatchedFiles",
+                "registerOptions": { "watchers": [{ "globPattern": "**/*.go" }] }
+            }]},
+        });
+        let content = serde_json::to_string(&request).expect("serialize request");
+        let header = format!("Content-Length: {}\r\n\r\n", content.len());
+        read_stdin
+            .write_all(header.as_bytes())
+            .await
+            .expect("write header");
+        read_stdin
+            .write_all(content.as_bytes())
+            .await
+            .expect("write body");
+        read_stdin.flush().await.expect("flush request");
+
+        let mut reader = BufReader::new(write_stdout);
+        let response = crate::test_support::read_framed_message(&mut reader).await;
+        assert_eq!(response["id"], 1, "the server's request must be answered");
+
+        assert_eq!(
+            registry.servers_for(&abs("main.go"), lsp_types::FileChangeType::CHANGED),
+            vec![go],
+            "a registry handed to the constructor must reach the arm that \
+             records registrations, not merely type-check on the way"
         );
     }
 
