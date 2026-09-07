@@ -193,6 +193,9 @@ pub struct DiagnosticsConfig {
     /// in about a second and the high cap costs it nothing.
     #[serde(default = "default_footer_wait_ms")]
     pub footer_wait_ms: u64,
+    /// How the Claude Code hooks reach this process.
+    #[serde(default)]
+    pub hooks: HooksConfig,
 }
 
 const fn default_severity_floor() -> SeverityFloor {
@@ -248,6 +251,57 @@ impl Default for DiagnosticsConfig {
             footer_grace_ms: default_footer_grace_ms(),
             footer_quiet_ms: default_footer_quiet_ms(),
             footer_wait_ms: default_footer_wait_ms(),
+            hooks: HooksConfig::default(),
+        }
+    }
+}
+
+/// How the Claude Code hooks reach a running mcpls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HooksConfig {
+    /// Whether the listener binds at all.
+    ///
+    /// Defaults on, because reaching this configuration means installing
+    /// the plugin and installing the plugin is the opt-in. With this off,
+    /// nothing binds and every hook exits 0 without output.
+    #[serde(default = "default_hooks_enabled")]
+    pub enabled: bool,
+    /// How long the pending set must be quiet before the sweep runs.
+    ///
+    /// Every `didSave` restarts rust-analyzer's flycheck and cancels the
+    /// check in flight, so a `cargo fmt` forwarded one path at a time
+    /// produces a run of cancelled checks and no diagnostics at all.
+    #[serde(default = "default_sweep_quiet_ms")]
+    pub sweep_quiet_ms: u64,
+    /// How long an op may take before it answers anyway.
+    ///
+    /// The host's default hook timeout is 600 seconds, so a hook that hangs
+    /// blocks the agent. This bound is the hook's protection, not the
+    /// host's; work already started keeps running and reaches the next
+    /// flush.
+    #[serde(default = "default_op_deadline_ms")]
+    pub op_deadline_ms: u64,
+}
+
+const fn default_hooks_enabled() -> bool {
+    true
+}
+
+const fn default_sweep_quiet_ms() -> u64 {
+    500
+}
+
+const fn default_op_deadline_ms() -> u64 {
+    1_500
+}
+
+impl Default for HooksConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_hooks_enabled(),
+            sweep_quiet_ms: default_sweep_quiet_ms(),
+            op_deadline_ms: default_op_deadline_ms(),
         }
     }
 }
@@ -1148,6 +1202,14 @@ mod tests {
         assert_eq!(config.footer_grace_ms, 250);
         assert_eq!(config.footer_quiet_ms, 200);
         assert_eq!(config.footer_wait_ms, 15_000);
+    }
+
+    #[test]
+    fn test_the_hooks_defaults_are_what_the_spec_says() {
+        let config = HooksConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.sweep_quiet_ms, 500);
+        assert_eq!(config.op_deadline_ms, 1500);
     }
 
     #[test]

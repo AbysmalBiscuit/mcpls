@@ -38,6 +38,7 @@
 pub mod bridge;
 pub mod config;
 pub mod error;
+pub mod hooks;
 pub mod lsp;
 pub mod mcp;
 pub mod transport;
