@@ -270,7 +270,7 @@ async fn doctor_scanning(project_dir: &Path, identity: &SocketIdentity, prefix: 
             lines.push(format!(
                 "server sees: an owner answered with an error: {message}"
             ));
-            lines.push("owner pid: none".to_string());
+            lines.push(OWNER_PID_UNKNOWN.to_string());
         }
         // Some other, unexpected answer to a Status request. An owner
         // exists, evidenced by the answer itself, so this is not a
@@ -279,7 +279,7 @@ async fn doctor_scanning(project_dir: &Path, identity: &SocketIdentity, prefix: 
             lines.push(format!(
                 "server sees: an owner answered, but not with its own status: {other:?}"
             ));
-            lines.push("owner pid: none".to_string());
+            lines.push(OWNER_PID_UNKNOWN.to_string());
         }
         // A connection was accepted and the exchange then failed, on the
         // write, the read, an early hang-up, or the parse. The error
@@ -290,7 +290,7 @@ async fn doctor_scanning(project_dir: &Path, identity: &SocketIdentity, prefix: 
                 "server sees: a socket is live but this build could not read its reply: \
                  {error}"
             ));
-            lines.push("owner pid: none".to_string());
+            lines.push(OWNER_PID_UNKNOWN.to_string());
         }
         // A connection was accepted but nothing came back at all: there
         // is an owner, so naming some other directory as the reason
@@ -300,7 +300,7 @@ async fn doctor_scanning(project_dir: &Path, identity: &SocketIdentity, prefix: 
                 "server sees: a socket answered nothing within {}ms; an owner may be busy",
                 SOCKET_TIMEOUT.as_millis()
             ));
-            lines.push("owner pid: none".to_string());
+            lines.push(OWNER_PID_UNKNOWN.to_string());
         }
         ProbeOutcome::NoOwner => {
             let foreign = find_foreign_owner(identity, project_dir, prefix).await;
@@ -309,10 +309,7 @@ async fn doctor_scanning(project_dir: &Path, identity: &SocketIdentity, prefix: 
         }
     }
 
-    lines.push(mcpls_on_path().map_or_else(
-        || "mcpls on PATH: not found".to_string(),
-        |path| format!("mcpls on PATH: {}", path.display()),
-    ));
+    lines.push(on_path_line(mcpls_on_path().as_deref()));
 
     lines.join("\n")
 }
@@ -375,7 +372,15 @@ enum ForeignOwners {
     /// project directory: the shape a server started one level up, or a
     /// `CLAUDE_PROJECT_DIR` pointing into a subdirectory, actually has.
     /// This is the one case the scan can name with evidence behind it.
-    Related { root: PathBuf, pid: u32 },
+    Related {
+        root: PathBuf,
+        pid: u32,
+        /// How many candidates were live but unidentifiable, counted the
+        /// same way as [`ForeignOwners::None::unidentified`]. Naming an
+        /// owner does not end the scan, so this is the same total the
+        /// other variants carry.
+        unidentified: usize,
+    },
     /// One or more owners answered, but none relate to this project's
     /// directory. Naming one of them would blame whichever happened to
     /// come first out of `read_dir`, an innocent project, for this
@@ -404,13 +409,16 @@ enum ForeignOwners {
 impl ForeignOwners {
     /// How many candidates were live but could not be identified.
     ///
-    /// Zero for the two outcomes that never probed anything: a scan that
-    /// could not run, and a named owner, which returns the moment it
-    /// answers and so leaves the rest of the candidates unexamined.
+    /// Every variant but `ScanFailed` carries a total over the candidates
+    /// the scan set out to probe, because the scan runs to its limit
+    /// whatever it finds along the way. `ScanFailed` never probed
+    /// anything at all.
     const fn unidentified(&self) -> usize {
         match self {
-            Self::None { unidentified, .. } | Self::Unrelated { unidentified, .. } => *unidentified,
-            Self::Related { .. } | Self::ScanFailed(_) => 0,
+            Self::None { unidentified, .. }
+            | Self::Unrelated { unidentified, .. }
+            | Self::Related { unidentified, .. } => *unidentified,
+            Self::ScanFailed(_) => 0,
         }
     }
 }
@@ -432,9 +440,9 @@ fn no_owner_line(foreign: ForeignOwners) -> String {
             truncated: true, ..
         } => format!(
             "server sees: no owner; checked {MAX_FOREIGN_CANDIDATES} other candidates and \
-             none answered, but more may exist beyond the scan's limit"
+             none named an owner, but more may exist beyond the scan's limit"
         ),
-        ForeignOwners::Related { root, pid } => format!(
+        ForeignOwners::Related { root, pid, .. } => format!(
             "server sees: no owner for this directory; an mcpls is running for {} \
              (pid {pid}) instead",
             root.display()
@@ -459,8 +467,8 @@ fn no_owner_line(foreign: ForeignOwners) -> String {
             truncated: true,
             ..
         } => format!(
-            "server sees: no owner for this directory; checked {count} other mcpls \
-             instances, none for this directory or a parent of it, but more may exist \
+            "server sees: no owner for this directory; {count} other mcpls instances are \
+             running, none for this directory or a parent of it, but more may exist \
              beyond the scan's limit"
         ),
         ForeignOwners::ScanFailed(reason) => format!(
@@ -470,14 +478,17 @@ fn no_owner_line(foreign: ForeignOwners) -> String {
     };
     match unidentified {
         0 => line,
-        1 => format!(
-            "{line}; 1 other mcpls socket is live but did not answer a status request \
-             this build could read"
-        ),
-        n => format!(
-            "{line}; {n} other mcpls sockets are live but did not answer a status \
-             request this build could read"
-        ),
+        n => {
+            let subject = if n == 1 {
+                "other mcpls socket is"
+            } else {
+                "other mcpls sockets are"
+            };
+            format!(
+                "{line}; {n} {subject} live but did not answer a status request this \
+                 build could read"
+            )
+        }
     }
 }
 
@@ -486,6 +497,11 @@ fn no_owner_line(foreign: ForeignOwners) -> String {
 /// unreachable socket can tell "nothing is running" apart from
 /// "something is running, for a directory that explains this one's
 /// silence".
+///
+/// Candidates are probed in sorted order, and the candidate cap applies
+/// to that order rather than to whatever the runtime location happened to
+/// list. Two runs against an unchanged machine therefore print the same
+/// answer, including which owner gets named when more than one relates.
 ///
 /// Sockets are named by their own directory's hash, which is the entire
 /// reason `identity`'s own probe above can never observe a live owner
@@ -507,6 +523,13 @@ async fn find_foreign_owner(
     let truncated = candidates.len() > MAX_FOREIGN_CANDIDATES;
     let mut unrelated = 0usize;
     let mut unidentified = 0usize;
+    // Naming an owner does not end the scan. Stopping at the first
+    // related answer would leave the candidates after it unprobed, so the
+    // unidentified count beside the name would be a floor while every
+    // other variant's is a total, and which it was would depend on the
+    // order the runtime directory happened to list its entries in. The
+    // candidate cap is what bounds the wait.
+    let mut related = Option::<(PathBuf, u32)>::None;
     for socket in candidates.into_iter().take(MAX_FOREIGN_CANDIDATES) {
         let candidate = SocketIdentity {
             socket,
@@ -521,9 +544,10 @@ async fn find_foreign_owner(
                 ..
             }) => {
                 if root.starts_with(project_dir) || project_dir.starts_with(&root) {
-                    return ForeignOwners::Related { root, pid };
+                    related.get_or_insert((root, pid));
+                } else {
+                    unrelated += 1;
                 }
-                unrelated += 1;
             }
             // Accepted the connection and then either said nothing in
             // time or said something this build could not read. That is
@@ -538,7 +562,13 @@ async fn find_foreign_owner(
             ProbeOutcome::NoOwner | ProbeOutcome::Answered(_) => {}
         }
     }
-    if unrelated == 0 {
+    if let Some((root, pid)) = related {
+        ForeignOwners::Related {
+            root,
+            pid,
+            unidentified,
+        }
+    } else if unrelated == 0 {
         ForeignOwners::None {
             truncated,
             unidentified,
@@ -572,10 +602,12 @@ fn foreign_candidates(identity: &SocketIdentity, _prefix: &str) -> std::io::Resu
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
-    Ok(entries
+    let mut candidates: Vec<PathBuf> = entries
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .filter(|path| *path != own && path.extension().is_some_and(|ext| ext == "sock"))
-        .collect())
+        .collect();
+    candidates.sort_unstable();
+    Ok(candidates)
 }
 
 /// The other named pipes that might have an owner, read from the
@@ -589,7 +621,7 @@ fn foreign_candidates(identity: &SocketIdentity, _prefix: &str) -> std::io::Resu
 fn foreign_candidates(identity: &SocketIdentity, prefix: &str) -> std::io::Result<Vec<PathBuf>> {
     let own = identity.socket.clone();
     let entries = std::fs::read_dir(r"\\.\pipe\")?;
-    Ok(entries
+    let mut candidates: Vec<PathBuf> = entries
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .filter(|path| {
             *path != own
@@ -598,7 +630,9 @@ fn foreign_candidates(identity: &SocketIdentity, prefix: &str) -> std::io::Resul
                     .and_then(|name| name.to_str())
                     .is_some_and(|name| name.starts_with(prefix))
         })
-        .collect())
+        .collect();
+    candidates.sort_unstable();
+    Ok(candidates)
 }
 
 /// The doctor's answer when this project's own socket identity cannot be
@@ -629,6 +663,25 @@ pub fn doctor_without_identity(project_dir: &Path, error: &mcpls_core::Error) ->
 /// The absolute path to an executable named `mcpls` (`mcpls.exe` on
 /// Windows) on the first `PATH` entry that has one, or `None`.
 ///
+/// What an owner prints for its pid when it exists but did not say which
+/// process it is. Distinct from `none`, which the doctor prints only when
+/// nothing holds the socket at all: the two send a reader to different
+/// places, and one token for both sends half of them to the wrong one.
+const OWNER_PID_UNKNOWN: &str = "owner pid: unknown";
+
+/// The `mcpls on PATH` line for `found`.
+///
+/// Split out of the doctor so both branches can be driven by a test.
+/// The doctor's own call resolves against this process's real `PATH`, so
+/// whether a suite run exercises the found branch, the missing one, or
+/// only one of them is a property of the host rather than of the tests.
+fn on_path_line(found: Option<&Path>) -> String {
+    found.map_or_else(
+        || "mcpls on PATH: not found".to_string(),
+        |path| format!("mcpls on PATH: {}", path.display()),
+    )
+}
+
 /// Hooks invoke `mcpls` by name off `PATH` rather than by an absolute
 /// path, so a hook environment missing the install directory makes every
 /// hook do nothing, invisibly. Walking `PATH` by hand rather than
@@ -1722,6 +1775,47 @@ mod tests {
         super::doctor_scanning(project, &identity, TEST_PIPE_PREFIX).await
     }
 
+    /// Run the doctor for `project` where a real owner is running for
+    /// `related` (an ancestor or descendant of `project`) alongside
+    /// `unreadable` other owners answering a wire shape this build cannot
+    /// read.
+    ///
+    /// The socket names are chosen so the related owner sorts first among
+    /// the candidates. The scan probes in sorted order, so a scan that
+    /// stopped at the first related answer would reach none of the
+    /// unreadable ones, and the count beside the name would be zero.
+    async fn doctor_with_related_owner_among_unreadable_ones(
+        project: &Path,
+        related: &Path,
+        unreadable: usize,
+    ) -> String {
+        let socket_dir = tempfile::tempdir().expect("a temp dir");
+        let identity = local_identity_for(project, socket_dir.path());
+        let related_identity = SocketIdentity {
+            socket: socket_dir.path().join("aaa-related.sock"),
+            ..local_identity_for(related, socket_dir.path())
+        };
+        let _related = RecordingOwner::start_reporting_status(related_identity, related, 0);
+        let others: Vec<_> = (0..unreadable)
+            .map(|_| tempfile::tempdir().expect("a temp dir"))
+            .collect();
+        let _owners: Vec<_> = others
+            .iter()
+            .enumerate()
+            .map(|(i, other)| {
+                let other_identity = SocketIdentity {
+                    socket: socket_dir.path().join(format!("zzz-unreadable-{i}.sock")),
+                    ..local_identity_for(other.path(), socket_dir.path())
+                };
+                RecordingOwner::start_answering_status_with_raw_line(
+                    other_identity,
+                    r#"{"op":"status","hash":"abc","socket":"x","pid":1,"owner":true}"#,
+                )
+            })
+            .collect();
+        super::doctor_scanning(project, &identity, TEST_PIPE_PREFIX).await
+    }
+
     /// Run the doctor for `project` where the runtime directory holds
     /// `count` other sockets, each with a live owner answering `Status`
     /// with a wire shape this build cannot read. Stands in for other
@@ -2002,6 +2096,123 @@ mod tests {
         );
     }
 
+    /// Naming an owner is the scan's most specific claim, and it is the
+    /// one variant that could have been built without ever finishing the
+    /// scan. If it were, the live-but-unreadable candidates listed after
+    /// the named one would vanish, and whether they did would depend on
+    /// the order the runtime directory happened to return its entries in:
+    /// the same answer, from the same machine, differing run to run.
+    #[tokio::test]
+    async fn test_doctor_counts_unreadable_sockets_even_when_it_names_an_owner() {
+        let parent = tempfile::tempdir().expect("a temp dir");
+        let project = parent.path().join("child");
+        std::fs::create_dir(&project).expect("create the child directory");
+
+        let out = doctor_with_related_owner_among_unreadable_ones(&project, parent.path(), 3).await;
+
+        let server_sees = out
+            .lines()
+            .find(|line| line.starts_with("server sees: "))
+            .expect("a server-sees line is always printed");
+        assert!(
+            server_sees.contains(&format!(
+                "an mcpls is running for {}",
+                parent.path().display()
+            )),
+            "the related owner is still the headline: {out}"
+        );
+        assert!(
+            server_sees.contains(
+                "3 other mcpls sockets are live but did not answer a status request \
+                 this build could read"
+            ),
+            "three other sockets were live and unreadable, and the scan \
+             probed all of them before answering: {out}"
+        );
+    }
+
+    /// `none` is the doctor's token for nothing holding the socket. Every
+    /// arm reached by an accepted connection has an owner that simply did
+    /// not name its process, which sends a reader somewhere else entirely.
+    #[tokio::test]
+    async fn test_doctor_says_the_pid_is_unknown_when_an_owner_exists() {
+        let project = tempfile::tempdir().expect("a temp dir");
+
+        let unreadable = doctor_with_owner_answering_raw_status(
+            project.path(),
+            r#"{"op":"status","hash":"abc","socket":"x","pid":1,"owner":true}"#,
+        )
+        .await;
+        let wrong_shape = doctor_with_owner_answering_raw_status(
+            project.path(),
+            r#"{"op":"changed","queued":0}"#,
+        )
+        .await;
+        let errored = doctor_with_owner_answering_error(project.path(), "not right now").await;
+
+        for out in [&unreadable, &wrong_shape, &errored] {
+            assert_eq!(
+                out.lines()
+                    .find(|line| line.starts_with("owner pid: "))
+                    .expect("an owner pid line is always printed"),
+                "owner pid: unknown",
+                "something answered on this socket, so there is an owner; \
+                 saying `none` here means the same word carries both \
+                 'nobody is there' and 'somebody is there but did not say \
+                 who': {out}"
+            );
+        }
+    }
+
+    /// The scan's cap means it may not reach every candidate, so which
+    /// ones it reaches decides the answer. Left in `read_dir` order that
+    /// is the filesystem's choice, and two runs against an unchanged
+    /// machine could print different things. Deleting the sort cannot be
+    /// caught by a doctor-level test: it makes the answer arbitrary
+    /// rather than wrong, so a test asserting one answer merely becomes
+    /// flaky. This asserts the order itself.
+    #[cfg(unix)]
+    #[test]
+    fn test_the_candidate_scan_returns_a_stable_order() {
+        let socket_dir = tempfile::tempdir().expect("a temp dir");
+        for name in ["m.sock", "a.sock", "z.sock", "b.sock"] {
+            std::fs::write(socket_dir.path().join(name), b"").expect("write");
+        }
+        let identity = SocketIdentity {
+            socket: socket_dir.path().join("own.sock"),
+            lock: socket_dir.path().join("own.lock"),
+            hash: "own".to_string(),
+        };
+
+        let candidates = super::foreign_candidates(&identity, TEST_PIPE_PREFIX).expect("the scan");
+
+        let names: Vec<_> = candidates
+            .iter()
+            .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
+            .collect();
+        assert_eq!(
+            names,
+            ["a.sock", "b.sock", "m.sock", "z.sock"],
+            "{candidates:?}"
+        );
+    }
+
+    /// Whether a suite run exercises the found branch, the missing one,
+    /// or only one of them is otherwise a property of the host's `PATH`.
+    #[test]
+    fn test_the_path_line_reports_both_outcomes() {
+        assert_eq!(
+            super::on_path_line(Some(Path::new("/usr/local/bin/mcpls"))),
+            "mcpls on PATH: /usr/local/bin/mcpls"
+        );
+        assert_eq!(
+            super::on_path_line(None),
+            "mcpls on PATH: not found",
+            "hooks invoke mcpls by name, so this line is the whole warning \
+             that every hook is silently doing nothing"
+        );
+    }
+
     /// The singular form of the same clause, which the plural one does
     /// not cover: a count formatted with the wrong noun reads as a bug in
     /// the tool rather than the state of the machine.
@@ -2088,12 +2299,13 @@ mod tests {
                 .find(|line| line.starts_with("server sees: "))
                 .expect("a server-sees line is always printed"),
             format!(
-                "server sees: no owner for this directory; checked {MAX_FOREIGN_CANDIDATES} \
-                 other mcpls instances, none for this directory or a parent of it, but more \
-                 may exist beyond the scan's limit"
+                "server sees: no owner for this directory; {MAX_FOREIGN_CANDIDATES} \
+                 other mcpls instances are running, none for this directory or a parent \
+                 of it, but more may exist beyond the scan's limit"
             ),
             "with more candidates than the scan examines, it must not assert \
-             an absence it never established: {out}"
+             an absence it never established; and the count is how many \
+             answered, never how many were looked at: {out}"
         );
     }
 
@@ -2121,7 +2333,7 @@ mod tests {
                 .expect("a server-sees line is always printed"),
             format!(
                 "server sees: no owner; checked {MAX_FOREIGN_CANDIDATES} other candidates \
-                 and none answered, but more may exist beyond the scan's limit"
+                 and none named an owner, but more may exist beyond the scan's limit"
             ),
             "with more stale candidates than the scan examines, it must not \
              claim the clean 'nothing is listening' it never established: {out}"
@@ -2173,8 +2385,10 @@ mod tests {
             out.lines()
                 .find(|line| line.starts_with("owner pid: "))
                 .expect("an owner pid line is always printed"),
-            "owner pid: none",
-            "{out}"
+            "owner pid: unknown",
+            "a busy owner is an owner: it accepted the connection and then \
+             did not say which process it is, which is not the same fact \
+             as nothing holding the socket at all: {out}"
         );
     }
 
@@ -2353,9 +2567,9 @@ mod tests {
         relative
     }
 
-    /// This is the exact bug finding 3 named: `resolve_on_path` found the
-    /// binary but returned the relative `PATH` entry it found it under
-    /// verbatim. Deleting the absolutizing `.map` from `resolve_on_path`
+    /// A `PATH` entry may be relative, and a relative path means nothing
+    /// to whatever directory a hook later runs in. Deleting the
+    /// absolutizing `.map` from `resolve_on_path`
     /// must fail this without depending on the ambient `PATH`, which is
     /// why the entry here is built from the real current directory
     /// instead of assumed to already be relative.
