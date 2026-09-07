@@ -28,13 +28,18 @@ pub use state::{
     DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE, DocumentState, DocumentTracker, ResourceLimits,
     path_to_uri, uri_to_path,
 };
-pub(crate) use translator::validate_path_against_roots;
+/// The fake-server harness the translator's own tests drive, re-exported so
+/// a test in another module can assert on what actually reached a server
+/// rather than building a second fake of its own.
+#[cfg(test)]
+pub(crate) use translator::testing::TranslatorHarness;
 pub use translator::{
     Completion, CompletionsResult, DefinitionResult, Diagnostic, DiagnosticSeverity,
     DiagnosticsResult, DocumentChanges, DocumentSymbolsResult, FormatDocumentResult, HoverResult,
     Location, Position2D, Range, ReferencesResult, RenameResult, ResourceOperation, Symbol,
     TextEdit, Translator,
 };
+pub(crate) use translator::{OpenOutcome, validate_path_against_roots};
 
 /// Lock a `std::sync::Mutex`, recovering the guard if a previous holder
 /// panicked while holding it.

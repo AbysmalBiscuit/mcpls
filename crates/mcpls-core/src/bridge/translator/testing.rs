@@ -474,9 +474,9 @@ impl Drop for RecordingServer {
 
 /// A `Translator` with one fake LSP server, a temp workspace, and a record
 /// of every notification the fake server received.
-pub(super) struct TranslatorHarness {
+pub struct TranslatorHarness {
     /// The translator under test, shared so a test can call it directly.
-    pub(super) translator: Arc<Translator>,
+    pub translator: Arc<Translator>,
     dir: TempDir,
     servers: HashMap<String, RecordingServer>,
     /// The same registry the translator holds, so a test can register a
@@ -506,14 +506,14 @@ impl TranslatorHarness {
     /// site awaits it anyway for symmetry with the rest of the harness's
     /// async surface, so this returns an already-ready future instead of
     /// forcing callers to special-case it.
-    pub(super) fn with_one_server(language_id: &str) -> impl Future<Output = Self> {
+    pub fn with_one_server(language_id: &str) -> impl Future<Output = Self> {
         Self::with_one_server_and_limits(language_id, ResourceLimits::default())
     }
 
     /// As [`Self::with_one_server`], with a caller-chosen [`ResourceLimits`]
     /// -- for tests that need a resync's disk read to fail on purpose (e.g.
     /// a `max_file_size` a rewrite exceeds).
-    pub(super) fn with_one_server_and_limits(
+    pub fn with_one_server_and_limits(
         language_id: &str,
         limits: ResourceLimits,
     ) -> impl Future<Output = Self> {
@@ -545,9 +545,16 @@ impl TranslatorHarness {
         })
     }
 
+    /// The temp workspace every path this harness hands out lives under,
+    /// for a caller that has to configure something else against the same
+    /// roots the translator was given.
+    pub fn root(&self) -> &Path {
+        self.dir.path()
+    }
+
     /// Write `contents` to `relative` under the temp workspace and return
     /// the absolute path.
-    pub(super) fn write_file(&self, relative: &str, contents: &str) -> PathBuf {
+    pub fn write_file(&self, relative: &str, contents: &str) -> PathBuf {
         let path = self.dir.path().join(relative);
         std::fs::write(&path, contents).expect("write the fixture");
         path
@@ -564,7 +571,7 @@ impl TranslatorHarness {
     /// Clears `server`'s recorded notifications afterward: opening sends its
     /// own `didOpen`, which is setup for a test, not the behavior under
     /// test.
-    pub(super) async fn open(&self, path: &Path, server: &str) {
+    pub async fn open(&self, path: &Path, server: &str) {
         let server_id = ServerId::from(server);
         let client = lock_std(&self.translator.lsp_clients)
             .get(&server_id)
@@ -591,7 +598,7 @@ impl TranslatorHarness {
     }
 
     /// The LSP method names `server` received, in order.
-    pub(super) fn notifications_for(&self, server: &str) -> Vec<String> {
+    pub fn notifications_for(&self, server: &str) -> Vec<String> {
         self.servers
             .get(server)
             .unwrap_or_else(|| panic!("{server} is not registered with this harness"))

@@ -10,7 +10,7 @@
 //! connection that reported them.
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -19,7 +19,7 @@ use lsp_types::FileChangeType;
 use tokio::sync::watch;
 use tokio::time::Instant;
 
-use crate::bridge::{DocumentTracker, Translator, lock_std};
+use crate::bridge::{OpenOutcome, Translator, lock_std};
 use crate::hooks::filters::PathFilter;
 
 /// What a stat says a pending path actually is.
@@ -34,7 +34,7 @@ pub enum SweepKind {
     Deleted,
     /// Present, and the tracker has never held it.
     Created,
-    /// Present, and either tracked or seen before.
+    /// Present, and the tracker already holds it.
     Changed,
 }
 
@@ -45,13 +45,12 @@ pub struct Sweeper {
     quiet_for: Duration,
     max_documents: usize,
     /// Paths admitted since the last sweep, deduplicated.
+    ///
+    /// Holds one entry per distinct admitted path between two sweeps, and a
+    /// sweep empties it, so its size follows how much the host actually
+    /// changed rather than how many events it sent: an unlink and an add
+    /// for the same save are one entry.
     pending: StdMutex<HashSet<PathBuf>>,
-    /// The subset of `pending` that was absent from disk the moment it
-    /// arrived -- what a host's `unlink` looks like. A path in here is never
-    /// opened as a new document even if it turns out to exist by sweep time:
-    /// the host's own view is that this path already existed and is now
-    /// gone, which is a change to resync, not a document to create.
-    arrived_absent: StdMutex<HashSet<PathBuf>>,
     /// When the most recent path arrived; `None` before the first one ever
     /// does.
     last_arrival: StdMutex<Option<Instant>>,
@@ -91,7 +90,6 @@ impl Sweeper {
             quiet_for,
             max_documents,
             pending: StdMutex::new(HashSet::new()),
-            arrived_absent: StdMutex::new(HashSet::new()),
             last_arrival: StdMutex::new(None),
             sweeps_run: AtomicUsize::new(0),
             last_kinds: StdMutex::new(Vec::new()),
@@ -102,6 +100,12 @@ impl Sweeper {
     }
 
     /// Queue paths. Returns how many survived the filters.
+    ///
+    /// Answers from the path and the configured roots alone -- no
+    /// filesystem call, no lock held longer than an insert -- because this
+    /// runs on the hook connection, which has a deadline to answer within.
+    /// What each path actually is gets decided at sweep time, off that
+    /// connection.
     pub fn enqueue(&self, paths: &[PathBuf]) -> usize {
         let mut admitted = 0;
         for path in paths {
@@ -110,11 +114,6 @@ impl Sweeper {
             }
             admitted += 1;
             lock_std(&self.pending).insert(path.clone());
-            if path.try_exists().unwrap_or(false) {
-                lock_std(&self.arrived_absent).remove(path);
-            } else {
-                lock_std(&self.arrived_absent).insert(path.clone());
-            }
         }
         if admitted > 0 {
             *lock_std(&self.last_arrival) = Some(Instant::now());
@@ -209,18 +208,23 @@ impl Sweeper {
 
     /// Take the whole pending set and act on it.
     ///
-    /// Tracked and deleted paths (and any that arrived while absent, even if
-    /// they exist again by now) are handed to `translator`'s own drain,
-    /// which stats each one, closes the ones that are truly gone, resyncs
-    /// the rest, and notifies the servers watching them. Paths untracked and
-    /// never reported absent are opened as new documents, up to the
-    /// remaining headroom, or just watched-files-notified past it.
+    /// A path the tracker has never held is opened first, up to the
+    /// remaining headroom, so its server gets the `didOpen` every later
+    /// notification for that document builds on. Opened paths then join the
+    /// tracked and the deleted ones in `translator`'s own drain, which stats
+    /// each one, closes the ones that are truly gone, resyncs the rest, and
+    /// sends the `didSave` a server whose diagnostics come from a build runs
+    /// its check on. Whatever is left -- past the headroom, unopenable, or
+    /// routed to no server at all -- is named only to the servers that
+    /// registered a watcher glob for it, which costs no tracker slot.
     async fn sweep(&self) {
         let paths: Vec<PathBuf> = lock_std(&self.pending).drain().collect();
         if paths.is_empty() {
             return;
         }
-        let arrived_absent: HashSet<PathBuf> = lock_std(&self.arrived_absent).drain().collect();
+        // Cleared before the work rather than only overwritten after it: a
+        // read landing mid-sweep must not be answered with the previous
+        // sweep's line.
         *lock_std(&self.last_shortfall) = None;
 
         let tracker = self.translator.document_tracker();
@@ -232,49 +236,56 @@ impl Sweeper {
             if !path.try_exists().unwrap_or(false) {
                 kinds.push((path.clone(), SweepKind::Deleted));
                 settle.push(path);
-            } else if tracker.is_open(&path) || arrived_absent.contains(&path) {
+            } else if tracker.is_open(&path) {
                 kinds.push((path.clone(), SweepKind::Changed));
                 settle.push(path);
             } else {
+                kinds.push((path.clone(), SweepKind::Created));
                 untracked.push(path);
+            }
+        }
+
+        let headroom = self
+            .max_documents
+            .saturating_sub(tracker.open_paths().len());
+        let mut opened = 0;
+        let mut over_limit = 0;
+        let mut unopened = 0;
+        let mut watched_only = Vec::new();
+
+        for path in untracked {
+            if !self.filter.routable_extension(&path) {
+                watched_only.push(path);
+                continue;
+            }
+            if opened >= headroom {
+                over_limit += 1;
+                watched_only.push(path);
+                continue;
+            }
+            match self.translator.open_untracked_document(&path).await {
+                OpenOutcome::Opened => {
+                    opened += 1;
+                    settle.push(path);
+                }
+                OpenOutcome::NoRoute => watched_only.push(path),
+                OpenOutcome::Failed => {
+                    unopened += 1;
+                    watched_only.push(path);
+                }
             }
         }
 
         self.translator.queue_invalidations(&settle);
         self.translator.resync_changed_documents().await;
 
-        let headroom = self
-            .max_documents
-            .saturating_sub(tracker.open_paths().len());
-        let mut opened = 0;
-        let mut skipped = 0;
-
-        for path in untracked {
-            let routable = self.filter.routable_extension(&path);
-            let within_headroom = opened < headroom;
-            let created = routable && within_headroom && Self::try_open(tracker, &path);
-
-            if created {
-                opened += 1;
-                kinds.push((path.clone(), SweepKind::Created));
-            } else {
-                if routable && !within_headroom {
-                    skipped += 1;
-                }
-                kinds.push((path.clone(), SweepKind::Changed));
-            }
+        for path in watched_only {
             self.translator
                 .notify_watched_files(&path, FileChangeType::CHANGED)
                 .await;
         }
 
-        if skipped > 0 {
-            *lock_std(&self.last_shortfall) = Some(format!(
-                "{skipped} file(s) not checked: the document limit of {} was reached",
-                self.max_documents
-            ));
-        }
-
+        *lock_std(&self.last_shortfall) = Self::shortfall(over_limit, unopened, self.max_documents);
         *lock_std(&self.last_kinds) = kinds;
         self.last_opened_count.store(opened, Ordering::Relaxed);
         let sweeps_run = self.sweeps_run.fetch_add(1, Ordering::Relaxed) + 1;
@@ -283,38 +294,26 @@ impl Sweeper {
         let _ = self.completed.send(sweeps_run);
     }
 
-    /// Read `path` fresh and open it as a new tracked document. A read
-    /// failure or a limit rejection is logged and treated as not opened,
-    /// leaving the caller to fall back to a plain watched-files notify.
+    /// The line naming the files a sweep left unchecked, or `None` when it
+    /// checked everything it took on.
     ///
-    /// Reads synchronously rather than through `tokio::fs`: the sweep runs
-    /// off the request path, so briefly blocking its own task costs nothing
-    /// a caller is waiting on, and it keeps this step on the same virtual
-    /// clock as the rest of the sweep under a paused-time test instead of
-    /// handing off to the runtime's separate blocking-thread pool.
-    fn try_open(tracker: &DocumentTracker, path: &Path) -> bool {
-        let content = match std::fs::read_to_string(path) {
-            Ok(content) => content,
-            Err(error) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    %error,
-                    "could not read a changed file the sweep found"
-                );
-                return false;
-            }
-        };
-        match tracker.open(path.to_path_buf(), content) {
-            Ok(_) => true,
-            Err(error) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    %error,
-                    "could not open a changed file the sweep found"
-                );
-                false
-            }
+    /// Both reasons are reported, and separately: a run of files declined
+    /// for the document limit is answered by raising the limit, while one
+    /// that could not be opened at all is not, and a single count would
+    /// send a reader after the wrong one.
+    fn shortfall(over_limit: usize, unopened: usize, max_documents: usize) -> Option<String> {
+        let mut reasons = Vec::new();
+        if over_limit > 0 {
+            reasons.push(format!(
+                "{over_limit} file(s) not checked: the document limit of {max_documents} was reached"
+            ));
         }
+        if unopened > 0 {
+            reasons.push(format!(
+                "{unopened} file(s) not checked: they could not be opened"
+            ));
+        }
+        (!reasons.is_empty()).then(|| reasons.join("; "))
     }
 }
 
@@ -322,19 +321,26 @@ impl Sweeper {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use std::collections::HashMap;
+    use std::path::Path;
 
     use tempfile::TempDir;
 
     use super::*;
-    use crate::bridge::Translator;
+    use crate::bridge::{ResourceLimits, Translator, TranslatorHarness};
+
+    /// The language and server id every served test uses.
+    const SERVER: &str = "rust";
 
     /// A `Sweeper` over a temporary workspace, with its `run` loop already
     /// spawned so the debounce tests can drive it with `tokio::time`.
     ///
-    /// The translator has no registered servers. Nothing here asserts on
-    /// what reaches a server: these tests are about which paths the sweep
-    /// picks up, what it decides each one is, and where it stops. The
-    /// notifications are covered by Tasks 4 and 7 against a fake server.
+    /// The translator has no registered servers, so nothing the sweep would
+    /// send reaches anyone: these tests are about which paths the sweep
+    /// picks up, what it decides each one is, and where it stops.
+    /// [`ServedSweeper`] is what a test asserting on notifications uses.
+    /// Keeping the two apart also keeps the debounce tests free of the
+    /// real disk and pipe I/O an open performs, which a paused clock can
+    /// auto-advance straight past.
     struct TestSweeper {
         sweeper: Arc<Sweeper>,
         dir: TempDir,
@@ -388,6 +394,84 @@ mod tests {
             dir,
             _cancel: cancel_tx,
         }
+    }
+
+    /// A `Sweeper` over a workspace with one fake `rust` server recording
+    /// every notification it receives, so a test can assert on what the
+    /// sweep sent and not only on what it decided.
+    ///
+    /// `run` is not spawned here: every test that uses this drives
+    /// `sweep_now` itself, and a background loop that could also sweep
+    /// would make what the server received depend on which of the two got
+    /// there first.
+    struct ServedSweeper {
+        sweeper: Arc<Sweeper>,
+        harness: TranslatorHarness,
+    }
+
+    impl std::ops::Deref for ServedSweeper {
+        type Target = Sweeper;
+        fn deref(&self) -> &Self::Target {
+            &self.sweeper
+        }
+    }
+
+    impl ServedSweeper {
+        /// An absolute path under the workspace, with `contents` at it.
+        fn write(&self, rel: &str, contents: &str) -> PathBuf {
+            self.harness.write_file(rel, contents)
+        }
+
+        /// Track `path` and let its server see the `didOpen` -- the state a
+        /// file the agent has already asked a tool about is in.
+        ///
+        /// The notifications recorded so far are dropped, so a later
+        /// assertion sees what the sweep sent rather than this setup.
+        async fn open(&self, path: &Path) {
+            self.harness.open(path, SERVER).await;
+        }
+
+        /// The LSP methods the fake server received, in order.
+        fn notifications(&self) -> Vec<String> {
+            self.harness.notifications_for(SERVER)
+        }
+    }
+
+    async fn served_sweeper(max_documents: usize) -> ServedSweeper {
+        served_sweeper_with_limits(max_documents, ResourceLimits::default()).await
+    }
+
+    async fn served_sweeper_with_limits(
+        max_documents: usize,
+        limits: ResourceLimits,
+    ) -> ServedSweeper {
+        let harness = TranslatorHarness::with_one_server_and_limits(SERVER, limits).await;
+        let filter = PathFilter::new(
+            Arc::from(vec![harness.root().to_path_buf()]),
+            Arc::new(HashMap::from([("rs".to_string(), SERVER.to_string())])),
+            None,
+        );
+        let sweeper = Arc::new(Sweeper::new(
+            Arc::clone(&harness.translator),
+            filter,
+            Duration::from_millis(500),
+            max_documents,
+        ));
+        ServedSweeper { sweeper, harness }
+    }
+
+    /// Poll `ready` until it holds, letting other tasks run in between.
+    ///
+    /// Bounded, so a condition that will never hold fails this test instead
+    /// of hanging the run.
+    async fn wait_until(ready: impl Fn() -> bool + Send + Sync) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !ready() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the condition to hold within the timeout");
     }
 
     #[tokio::test(start_paused = true)]
@@ -446,7 +530,17 @@ mod tests {
         sweeper.enqueue(std::slice::from_ref(&b));
         tokio::time::advance(Duration::from_millis(400)).await;
 
-        assert_eq!(sweeper.sweeps_run(), 0, "the burst has not settled");
+        // A bare read here would also pass against a sweeper that was never
+        // spawned. Blocking on the completion signal instead makes the
+        // runtime run the timer up to 1 ms short of when the restarted
+        // quiet period expires, so this asserts the sweeper looked and
+        // declined rather than merely that nothing was noticed.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(99), completed.changed())
+                .await
+                .is_err(),
+            "the burst has not settled"
+        );
 
         tokio::time::advance(Duration::from_millis(200)).await;
         // Same reasoning as the burst test: wait for the sweep's own signal
@@ -471,17 +565,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_an_atomic_save_is_swept_as_a_change_not_a_delete() {
-        let sweeper = test_sweeper(Duration::from_millis(10));
-        let path = sweeper.write("saved.rs");
+        let sweeper = served_sweeper(usize::MAX).await;
+        let path = sweeper.write("saved.rs", "fn main() {}");
+        sweeper.open(&path).await;
 
-        // The host sends unlink and then add for a temp-file-and-rename save,
-        // and the hook process arrives after both. Reproduce that: the file is
-        // gone when the unlink is queued and back by the time the sweep stats
-        // it, which is the whole point of stating rather than trusting the
-        // event kind.
-        std::fs::remove_file(&path).expect("unlink");
+        // A save through a temporary file and a rename emits unlink and then
+        // add, and the hook process for each connects after both have already
+        // happened: the file is on disk at both enqueues, and only the stat
+        // at sweep time can say what it really is.
         sweeper.enqueue(std::slice::from_ref(&path));
-        std::fs::write(&path, "").expect("the rename puts it back");
+        std::fs::write(&path, "fn main() { todo!() }").expect("the rename puts it back");
+        sweeper.enqueue(std::slice::from_ref(&path));
 
         sweeper.sweep_now().await;
 
@@ -489,15 +583,106 @@ mod tests {
             sweeper.last_kinds(),
             vec![(path, SweepKind::Changed)],
             "acting on the host's unlink would close a live document and tell \
-             every watching server the file was deleted"
+             every watching server the file was deleted, and the two events \
+             for one save are one change, not two"
+        );
+        assert_eq!(
+            sweeper.notifications(),
+            vec!["textDocument/didChange", "textDocument/didSave"],
+            "the server is told the new content and that it was saved -- and \
+             never that the document closed"
         );
     }
 
     #[tokio::test]
+    async fn test_a_created_file_is_opened_and_saved_on_its_server() {
+        let sweeper = served_sweeper(usize::MAX).await;
+        let path = sweeper.write("fresh.rs", "fn main() {}");
+        sweeper.enqueue(std::slice::from_ref(&path));
+        sweeper.sweep_now().await;
+
+        assert_eq!(
+            sweeper.notifications(),
+            vec!["textDocument/didOpen", "textDocument/didSave"],
+            "a file no server has seen has to be opened before any later \
+             notification can name it, and the didSave is what makes a server \
+             whose diagnostics come from a build run one: a sweep that took \
+             the tracker slot and sent neither would cost the next tool call \
+             a document and produce no diagnostics at all"
+        );
+        assert_eq!(sweeper.last_kinds(), vec![(path, SweepKind::Created)]);
+        assert_eq!(sweeper.opened_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_a_file_the_sweep_cannot_open_is_reported_as_not_checked() {
+        let sweeper = served_sweeper_with_limits(
+            usize::MAX,
+            ResourceLimits {
+                max_documents: 0,
+                max_file_size: 8,
+            },
+        )
+        .await;
+        let path = sweeper.write("oversized.rs", "fn main() { todo!() }");
+        sweeper.enqueue(std::slice::from_ref(&path));
+        sweeper.sweep_now().await;
+
+        assert_eq!(
+            sweeper.last_shortfall().expect("a shortfall line"),
+            "1 file(s) not checked: they could not be opened",
+            "a file the sweep gave up on inside the headroom is as unchecked \
+             as one it never reached, and reported separately because \
+             raising the document limit would not have helped this one"
+        );
+        assert_eq!(sweeper.opened_count(), 0);
+        assert!(sweeper.notifications().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_a_path_arriving_during_a_sweep_lands_in_the_next_one() {
+        let sweeper = test_sweeper(Duration::from_secs(60));
+        let first = sweeper.write("first.rs");
+        std::fs::remove_file(&first).expect("remove");
+        sweeper.enqueue(std::slice::from_ref(&first));
+
+        // The resync takes each path's own lock. Holding it parks the sweep
+        // partway through, which is the window a hook connection can land a
+        // path in.
+        let tracker = Arc::clone(sweeper.translator.document_tracker());
+        let held = tracker.lock_path(&first).await;
+        let running = tokio::spawn({
+            let sweeper = Arc::clone(&sweeper.sweeper);
+            async move { sweeper.sweep_now().await }
+        });
+        wait_until(|| sweeper.pending_len() == 0).await;
+
+        let second = sweeper.write("second.rs");
+        sweeper.enqueue(std::slice::from_ref(&second));
+        drop(held);
+        running.await.expect("the sweep task");
+
+        assert_eq!(
+            sweeper.last_kinds(),
+            vec![(first, SweepKind::Deleted)],
+            "a sweep acts on the set it drained and nothing that arrived after"
+        );
+        assert_eq!(
+            sweeper.pending_len(),
+            1,
+            "a path that arrives mid-sweep has to survive to the next one: \
+             dropping it means the file the agent just wrote is never checked"
+        );
+
+        sweeper.sweep_now().await;
+        assert_eq!(sweeper.last_kinds(), vec![(second, SweepKind::Created)]);
+    }
+
+    #[tokio::test]
     async fn test_the_sweep_stops_short_of_the_document_ceiling() {
-        let sweeper = test_sweeper_with_ceiling(Duration::from_millis(10), 3);
+        let sweeper = served_sweeper(3).await;
         let paths: Vec<PathBuf> = (0..10)
-            .map(|i| sweeper.write(&format!("f{i}.rs")))
+            .map(|i| sweeper.write(&format!("f{i}.rs"), "fn main() {}"))
             .collect();
         sweeper.enqueue(&paths);
         sweeper.sweep_now().await;
