@@ -185,6 +185,18 @@ impl Sweeper {
         self.last_opened_count.load(Ordering::Relaxed)
     }
 
+    /// Set what the last sweep could not check, and why. Test-only.
+    #[cfg(test)]
+    pub(crate) fn set_shortfall_for_test(&self, shortfall: &str) {
+        *lock_std(&self.last_shortfall) = Some(shortfall.to_string());
+    }
+
+    /// How many paths are waiting for the next sweep. Test-only.
+    #[cfg(test)]
+    pub(crate) fn pending_len(&self) -> usize {
+        lock_std(&self.pending).len()
+    }
+
     /// A receiver that changes once the next sweep completes.
     ///
     /// Subscribe before triggering the activity under test, then await

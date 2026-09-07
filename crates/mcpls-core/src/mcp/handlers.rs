@@ -14,6 +14,7 @@ use crate::bridge::{
     Translator,
 };
 use crate::config::DiagnosticsConfig;
+use crate::hooks::HookRole;
 
 /// Shared context for all tool handlers.
 ///
@@ -70,13 +71,24 @@ pub struct BridgeContext {
     /// The footer waits on `$/progress` and the pump is what records it, so
     /// this must be the pump's own `Arc` rather than a fresh tracker.
     pub settle: Arc<ServerSettle>,
+    /// This process's relationship to the project's hook socket.
+    ///
+    /// Shared with the takeover task, which is what makes its
+    /// `promote_to_owner` visible to a tool call. Read by binding
+    /// `hooks.get()` to a value: the inner lock is a `std::sync::Mutex` and
+    /// no guard may cross an await point.
+    ///
+    /// [`BridgeContext::new`] sets `Disabled`, which is what every caller
+    /// but `serve_with` wants; `serve_with` decides the role before the
+    /// context is frozen into an `Arc` and overwrites this field.
+    pub hooks: Arc<HookRole>,
 }
 
 impl BridgeContext {
     /// Create a new bridge context.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
-    pub const fn new(
+    pub fn new(
         translator: Arc<Translator>,
         notification_cache: Arc<Mutex<NotificationCache>>,
         workspace_roots: Arc<[PathBuf]>,
@@ -97,6 +109,7 @@ impl BridgeContext {
             floors,
             diagnostics,
             settle,
+            hooks: Arc::new(HookRole::disabled()),
         }
     }
 }
