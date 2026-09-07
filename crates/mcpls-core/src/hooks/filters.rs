@@ -67,13 +67,24 @@ impl PathFilter {
     /// decides what each one is afterwards, so a kind named here would be a
     /// guess, and a guess drops every server whose watcher wants the other
     /// kinds. Kind filtering belongs to the notification, which knows.
+    ///
+    /// When several configured roots contain `path` -- one nested inside
+    /// another, which is how a monorepo with a vendored subproject is
+    /// configured -- the deepest of them decides. It is the one whose
+    /// `.gitignore` was written about this file: an outer root's `vendor/`
+    /// line says nothing about what the subproject keeps, and letting it
+    /// answer would drop every path under a nested root the user configured
+    /// on purpose. The order the roots were configured in never enters into
+    /// it.
     #[must_use]
     pub fn admits(&self, path: &Path) -> bool {
         let Some(ignore) = self
             .roots
             .iter()
             .zip(&self.ignores)
-            .find_map(|(root, ignore)| path.starts_with(root).then_some(ignore))
+            .filter(|(root, _)| path.starts_with(root))
+            .max_by_key(|(root, _)| root.components().count())
+            .map(|(_, ignore)| ignore)
         else {
             return false;
         };
@@ -181,6 +192,70 @@ mod tests {
     /// case: only the registry-override test passes one.
     fn filter_over(dir: &Path) -> PathFilter {
         PathFilter::new(roots(dir), extensions(), None)
+    }
+
+    /// A monorepo holding two subprojects, each configured as a root of its
+    /// own alongside the repository root and each keeping its own
+    /// `.gitignore`. The outer `.gitignore` excludes `vendor/` and says
+    /// nothing about `sub/`.
+    ///
+    /// The two subprojects are the two ways an outer root and a nested one
+    /// can disagree: `vendor/tool` is a root the outer `.gitignore`
+    /// excludes wholesale, and `sub` is a root that excludes a file the
+    /// outer `.gitignore` would have admitted.
+    fn nested_roots(dir: &Path) -> Vec<PathBuf> {
+        let vendored = dir.join("vendor/tool");
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(vendored.join("src")).expect("mkdir");
+        std::fs::create_dir_all(sub.join("src")).expect("mkdir");
+        std::fs::write(dir.join(".gitignore"), "vendor/\n").expect("write");
+        std::fs::write(sub.join(".gitignore"), "generated.rs\n").expect("write");
+        vec![dir.to_path_buf(), vendored, sub]
+    }
+
+    /// Both orders of the same roots, so a test can assert an answer does
+    /// not depend on which order they were configured in.
+    fn both_orders(dir: &Path) -> [PathFilter; 2] {
+        let roots = nested_roots(dir);
+        let reversed: Vec<PathBuf> = roots.iter().rev().cloned().collect();
+        [
+            PathFilter::new(Arc::from(roots), extensions(), None),
+            PathFilter::new(Arc::from(reversed), extensions(), None),
+        ]
+    }
+
+    #[test]
+    fn test_a_nested_root_inside_an_ignored_subtree_is_admitted() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let source = dir.path().join("vendor/tool/src/a.rs");
+
+        for filter in both_orders(dir.path()) {
+            std::fs::write(&source, "").expect("write");
+            assert!(
+                filter.admits(&source),
+                "the outer root's vendor/ line says nothing about a subproject \
+                 configured as a root in its own right, and an answer that \
+                 changes when the roots are listed the other way round is not \
+                 an answer about the file"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_nested_root_governs_its_own_contents() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let generated = dir.path().join("sub/src/generated.rs");
+
+        for filter in both_orders(dir.path()) {
+            std::fs::write(&generated, "").expect("write");
+            assert!(
+                !filter.admits(&generated),
+                "the deepest root containing a file is the one whose .gitignore \
+                 was written about it; the repository root, which knows nothing \
+                 of this file, must not be able to re-admit what the subproject \
+                 itself excluded"
+            );
+        }
     }
 
     #[test]
