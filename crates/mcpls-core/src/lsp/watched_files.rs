@@ -175,6 +175,24 @@ impl WatchRegistry {
         lock_std(&self.by_server).remove(server);
     }
 
+    /// Whether any server asked to hear about `path` under any change kind.
+    ///
+    /// The question a caller asks when nothing has yet established what
+    /// happened to the path. Claude Code's hooks report paths and the sweep
+    /// classifies them later, so the admission gate runs before any kind
+    /// exists; asking `servers_for` about a guessed kind there drops the
+    /// path of a server that registered `**/go.work` for creation and
+    /// deletion only, and the sweep never sees it. A watcher whose mask
+    /// wants no kind at all matches nothing here either.
+    #[must_use]
+    pub fn is_watched(&self, path: &Path) -> bool {
+        lock_std(&self.by_server)
+            .values()
+            .flat_map(HashMap::values)
+            .flatten()
+            .any(|watcher| watcher.kinds & ALL_KINDS != 0 && watcher.glob.is_match(path))
+    }
+
     /// Servers that asked to hear about `path` changing this way, sorted so
     /// the notification order is reproducible.
     #[must_use]
@@ -267,6 +285,37 @@ mod tests {
             registry.servers_for(&abs("main.go"), lsp_types::FileChangeType::DELETED),
             vec![go]
         );
+    }
+
+    #[test]
+    fn test_a_watcher_that_omits_a_kind_still_counts_as_watching_the_path() {
+        let registry = WatchRegistry::new();
+        // 1 = Created, 2 = Changed, 4 = Deleted. 5 is create and delete,
+        // which is what gopls registers for `go.work` and `go.mod`.
+        registry.register(
+            &ServerId::from("go"),
+            "r1",
+            &json!([{ "globPattern": "**/go.work", "kind": 5 }]),
+        );
+
+        assert!(
+            registry.is_watched(&abs("go.work")),
+            "the caller has not decided what happened to this path yet, so a \
+             gate that answered no here would drop it before anything could"
+        );
+        assert!(!registry.is_watched(&abs("go.mod")));
+    }
+
+    #[test]
+    fn test_a_watcher_wanting_no_kind_watches_nothing() {
+        let registry = WatchRegistry::new();
+        registry.register(
+            &ServerId::from("go"),
+            "r1",
+            &json!([{ "globPattern": "**/go.work", "kind": 0 }]),
+        );
+
+        assert!(!registry.is_watched(&abs("go.work")));
     }
 
     #[test]

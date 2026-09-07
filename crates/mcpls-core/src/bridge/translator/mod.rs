@@ -290,37 +290,56 @@ impl Translator {
     }
 
     /// Tell every server that registered a matching glob that `path`
-    /// changed this way.
+    /// changed, naming to each the first of `kinds` that server's own
+    /// watcher accepts.
     ///
     /// Sent per server rather than broadcast: a server that did not ask is
     /// told nothing, which is the difference between this and shouting at
-    /// everything with a language id.
+    /// everything with a language id. Each server is told once, under one
+    /// kind, however many of `kinds` its watchers would take.
+    ///
+    /// A caller that knows exactly what happened passes one kind. A caller
+    /// that has narrowed it to two -- the sweep, for a path present on disk
+    /// that the tracker has never held -- passes both, most preferred
+    /// first, so a server that registered for only one of them still hears
+    /// about the file instead of being dropped by the caller's guess.
     ///
     /// `pub(crate)` rather than private so a caller that learns of a
     /// changed path from outside an apply -- a host file-watcher sweep --
     /// can report it the same way.
-    pub(crate) async fn notify_watched_files(&self, path: &Path, kind: lsp_types::FileChangeType) {
+    pub(crate) async fn notify_watched_files(
+        &self,
+        path: &Path,
+        kinds: &[lsp_types::FileChangeType],
+    ) {
         let Some(registry) = &self.watch_registry else {
             return;
         };
         let Ok(uri) = crate::bridge::path_to_uri(path) else {
             return;
         };
-        for server in registry.servers_for(path, kind) {
-            let Some(client) = lock_std(&self.lsp_clients).get(&server).cloned() else {
-                continue;
-            };
-            let params = lsp_types::DidChangeWatchedFilesParams {
-                changes: vec![lsp_types::FileEvent {
-                    uri: uri.clone(),
-                    typ: kind,
-                }],
-            };
-            if let Err(error) = client
-                .notify("workspace/didChangeWatchedFiles", params)
-                .await
-            {
-                tracing::warn!(%server, path = %path.display(), %error, "watched files notify failed");
+        let mut told: Vec<ServerId> = Vec::new();
+        for &kind in kinds {
+            for server in registry.servers_for(path, kind) {
+                if told.contains(&server) {
+                    continue;
+                }
+                told.push(server.clone());
+                let Some(client) = lock_std(&self.lsp_clients).get(&server).cloned() else {
+                    continue;
+                };
+                let params = lsp_types::DidChangeWatchedFilesParams {
+                    changes: vec![lsp_types::FileEvent {
+                        uri: uri.clone(),
+                        typ: kind,
+                    }],
+                };
+                if let Err(error) = client
+                    .notify("workspace/didChangeWatchedFiles", params)
+                    .await
+                {
+                    tracing::warn!(%server, path = %path.display(), %error, "watched files notify failed");
+                }
             }
         }
     }
@@ -464,7 +483,7 @@ impl Translator {
         match path.try_exists() {
             Ok(false) => {
                 self.close_one_document_locked(path).await;
-                self.notify_watched_files(path, lsp_types::FileChangeType::DELETED)
+                self.notify_watched_files(path, &[lsp_types::FileChangeType::DELETED])
                     .await;
                 return ResyncStep::Done;
             }
@@ -490,7 +509,7 @@ impl Translator {
         {
             Ok(Some(resync)) => resync,
             Ok(None) => {
-                self.notify_watched_files(path, lsp_types::FileChangeType::CHANGED)
+                self.notify_watched_files(path, &[lsp_types::FileChangeType::CHANGED])
                     .await;
                 return ResyncStep::Done;
             }
@@ -547,7 +566,7 @@ impl Translator {
                 .mark_save_sent(path, server, resync.version, generation);
         }
 
-        self.notify_watched_files(path, lsp_types::FileChangeType::CHANGED)
+        self.notify_watched_files(path, &[lsp_types::FileChangeType::CHANGED])
             .await;
         ResyncStep::Done
     }

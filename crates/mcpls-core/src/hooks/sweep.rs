@@ -38,6 +38,28 @@ pub enum SweepKind {
     Changed,
 }
 
+impl SweepKind {
+    /// The change kinds a watching server may be told this path underwent,
+    /// most preferred first.
+    ///
+    /// `Deleted` and `Changed` are each one definite kind: the path is gone,
+    /// or the tracker was already holding it and so it existed before.
+    /// `Created` is two facts short of that. It says the tracker has never
+    /// held the path, which is equally what a file the host has just made
+    /// and a file mcpls simply never opens as a document -- a `go.work`
+    /// edited in place -- look like, and nothing mcpls keeps tells them
+    /// apart. Naming one guessed kind to everybody silently drops every
+    /// server whose watcher registered for the other, so both are offered
+    /// and each server hears the one it asked for.
+    const fn watched_file_kinds(self) -> &'static [FileChangeType] {
+        match self {
+            Self::Deleted => &[FileChangeType::DELETED],
+            Self::Changed => &[FileChangeType::CHANGED],
+            Self::Created => &[FileChangeType::CHANGED, FileChangeType::CREATED],
+        }
+    }
+}
+
 /// Collects changed paths and acts on them once the burst settles.
 pub struct Sweeper {
     translator: Arc<Translator>,
@@ -239,15 +261,20 @@ impl Sweeper {
         let mut untracked = Vec::new();
 
         for path in paths {
-            if !path.try_exists().unwrap_or(false) {
-                kinds.push((path.clone(), SweepKind::Deleted));
-                settle.push(path);
-            } else if tracker.is_open(&path) {
-                kinds.push((path.clone(), SweepKind::Changed));
-                settle.push(path);
+            let kind = if path.try_exists().unwrap_or(false) {
+                if tracker.is_open(&path) {
+                    SweepKind::Changed
+                } else {
+                    SweepKind::Created
+                }
             } else {
-                kinds.push((path.clone(), SweepKind::Created));
-                untracked.push(path);
+                SweepKind::Deleted
+            };
+            kinds.push((path.clone(), kind));
+            if kind == SweepKind::Created {
+                untracked.push((path, kind));
+            } else {
+                settle.push(path);
             }
         }
 
@@ -259,9 +286,9 @@ impl Sweeper {
         let mut unopened = 0;
         let mut watched_only = Vec::new();
 
-        for path in untracked {
+        for (path, kind) in untracked {
             if !self.filter.routable_extension(&path) {
-                watched_only.push(path);
+                watched_only.push((path, kind));
                 continue;
             }
             match self
@@ -273,14 +300,14 @@ impl Sweeper {
                     opened += 1;
                     settle.push(path);
                 }
-                OpenOutcome::NoRoute => watched_only.push(path),
+                OpenOutcome::NoRoute => watched_only.push((path, kind)),
                 OpenOutcome::NoHeadroom => {
                     over_limit += 1;
-                    watched_only.push(path);
+                    watched_only.push((path, kind));
                 }
                 OpenOutcome::Failed => {
                     unopened += 1;
-                    watched_only.push(path);
+                    watched_only.push((path, kind));
                 }
             }
         }
@@ -288,9 +315,9 @@ impl Sweeper {
         self.translator.queue_invalidations(&settle);
         self.translator.resync_changed_documents().await;
 
-        for path in watched_only {
+        for (path, kind) in watched_only {
             self.translator
-                .notify_watched_files(&path, FileChangeType::CHANGED)
+                .notify_watched_files(&path, kind.watched_file_kinds())
                 .await;
         }
 
@@ -471,6 +498,15 @@ mod tests {
         fn notifications(&self) -> Vec<String> {
             self.harness.notifications_for(SERVER)
         }
+
+        /// The single file event of the last `didChangeWatchedFiles` the
+        /// fake server received.
+        fn last_watched_file_event(&self) -> serde_json::Value {
+            self.harness
+                .last_watched_files_params(SERVER)
+                .expect("a watched-files notification went out")["changes"][0]
+                .clone()
+        }
     }
 
     async fn served_sweeper(max_documents: usize) -> ServedSweeper {
@@ -492,6 +528,29 @@ mod tests {
             filter,
             Duration::from_millis(500),
             max_documents,
+        ));
+        ServedSweeper { sweeper, harness }
+    }
+
+    /// A served sweeper whose filter reads the same watch registry the
+    /// translator answers from, and whose server has registered `watchers`.
+    ///
+    /// Both ends have to see the registration: the filter is what admits a
+    /// path no extension routes, and the translator is what decides which
+    /// servers hear about it.
+    async fn sweeper_watching(watchers: &serde_json::Value) -> ServedSweeper {
+        let harness = TranslatorHarness::with_one_server(SERVER).await;
+        harness.register_watchers(SERVER, "r1", watchers);
+        let filter = PathFilter::new(
+            Arc::from(vec![harness.root().to_path_buf()]),
+            Arc::new(HashMap::from([("rs".to_string(), SERVER.to_string())])),
+            Some(harness.watch_registry()),
+        );
+        let sweeper = Arc::new(Sweeper::new(
+            Arc::clone(&harness.translator),
+            filter,
+            Duration::from_millis(500),
+            usize::MAX,
         ));
         ServedSweeper { sweeper, harness }
     }
@@ -648,6 +707,61 @@ mod tests {
         );
         assert_eq!(sweeper.last_kinds(), vec![(path, SweepKind::Created)]);
         assert_eq!(sweeper.opened_count(), 1);
+    }
+
+    /// The whole delivery path for a file mcpls never opens as a document:
+    /// a `Cargo.toml`, a `go.work`, a `.proto`. Nothing routes its
+    /// extension, so it costs no tracker slot and gets no `didOpen`, and
+    /// the one thing that ever reaches its server is this notification.
+    #[tokio::test]
+    async fn test_a_watched_file_no_extension_routes_is_named_to_its_server() {
+        let sweeper = sweeper_watching(&serde_json::json!([{ "globPattern": "**/go.work" }])).await;
+        let path = sweeper.write("go.work", "go 1.22\n");
+
+        assert_eq!(sweeper.enqueue(std::slice::from_ref(&path)), 1);
+        sweeper.sweep_now().await;
+
+        let event = sweeper.last_watched_file_event();
+        assert_eq!(
+            event["uri"],
+            serde_json::json!(
+                crate::bridge::path_to_uri(&path)
+                    .expect("a uri for the fixture")
+                    .as_str()
+            )
+        );
+        assert_eq!(
+            event["type"],
+            serde_json::json!(2),
+            "a server whose watcher takes every kind hears the likelier of the \
+             two this path could be"
+        );
+        assert!(
+            !sweeper
+                .notifications()
+                .contains(&"textDocument/didOpen".to_string()),
+            "opening it would spend a tracker slot on a file no server routes"
+        );
+    }
+
+    /// gopls watches `go.work` for creation and deletion and for nothing
+    /// else. The sweep cannot tell a file it has never held from one just
+    /// made, so naming a single guessed kind to everybody leaves this
+    /// server hearing nothing at all.
+    #[tokio::test]
+    async fn test_a_watcher_that_wants_only_creations_hears_about_one() {
+        let sweeper =
+            sweeper_watching(&serde_json::json!([{ "globPattern": "**/go.work", "kind": 5 }]))
+                .await;
+        let path = sweeper.write("go.work", "go 1.22\n");
+
+        assert_eq!(sweeper.enqueue(std::slice::from_ref(&path)), 1);
+        sweeper.sweep_now().await;
+
+        assert_eq!(
+            sweeper.last_watched_file_event()["type"],
+            serde_json::json!(1)
+        );
     }
 
     #[tokio::test]
