@@ -408,8 +408,13 @@ impl Resync {
 impl DocumentTracker {
     /// Re-read `path` from disk and report what its servers still need.
     /// `Ok(None)` when the path is not tracked.
-    /// The caller must hold this path's lock from `lock_path`.
-    pub async fn resync_from_disk(&self, path: &Path) -> Result<Option<Resync>>;
+    /// The guard parameter is how the caller proves it holds this path's
+    /// lock: a `PathLockGuard` cannot exist without having awaited it.
+    pub async fn resync_from_disk(
+        &self,
+        path: &Path,
+        _guard: &PathLockGuard<'_>,
+    ) -> Result<Option<Resync>>;
 
     /// Record that `server` received the `didChange` for `version`.
     pub fn mark_change_sent(&self, path: &Path, server: &ServerId, version: i32, generation: u64);
@@ -625,7 +630,16 @@ impl DocumentTracker {
     ///
     /// Returns an error if the file cannot be read or exceeds the
     /// configured size limit.
-    pub async fn resync_from_disk(&self, path: &Path) -> Result<Option<Resync>> {
+    pub async fn resync_from_disk(
+        &self,
+        path: &Path,
+        _guard: &PathLockGuard<'_>,
+    ) -> Result<Option<Resync>> {
+        debug_assert_eq!(
+            _guard.path(),
+            path,
+            "resync_from_disk's guard must be the lock for this path"
+        );
         let read_at = SystemTime::now();
         if !lock_std(&self.documents).contains_key(path) {
             return Ok(None);
@@ -742,7 +756,7 @@ EOF
 - Test: `crates/mcpls-core/src/bridge/translator/mod.rs` test module at `:618`
 
 **Interfaces:**
-- Consumes: `DocumentTracker::resync_from_disk -> Result<Option<Resync>>`, `Resync { uri, version, text, needs_change, needs_save }`, `DocumentTracker::mark_change_sent`, `mark_save_sent`, `generation_for`, `snapshot` from Task 3. `Resync::is_settled` is not consumed here: the drain decides from the two notify loops rather than re-reading the struct, and only Task 3's own test calls it.
+- Consumes: `DocumentTracker::resync_from_disk(&self, path: &Path, _guard: &PathLockGuard<'_>) -> Result<Option<Resync>>`, whose guard parameter is satisfied by the `_path_guard` this task already takes, `Resync { uri, version, text, needs_change, needs_save }`, `DocumentTracker::mark_change_sent`, `mark_save_sent`, `generation_for`, `snapshot` from Task 3. `Resync::is_settled` is not consumed here: the drain decides from the two notify loops rather than re-reading the struct, and only Task 3's own test calls it.
 - Produces:
   - `Translator::resync_changed_documents(&self)`, `pub(crate)`, replacing `forget_changed_documents`
   - `Translator::queue_invalidations(&self, paths: &[PathBuf])`, `pub(crate)`
@@ -940,7 +954,11 @@ Replace both `forget_changed_documents` calls in `apply_locked` (`:300` and `:30
             return true;
         }
 
-        let resync = match self.document_tracker.resync_from_disk(path).await {
+        let resync = match self
+            .document_tracker
+            .resync_from_disk(path, &_path_guard)
+            .await
+        {
             Ok(Some(resync)) => resync,
             Ok(None) => return true,
             Err(error) => {
