@@ -134,6 +134,13 @@ impl HookListener {
         }
     }
 
+    /// The shortest an `accept` backoff ever waits, and what it resets to
+    /// after a success.
+    const ACCEPT_BACKOFF_FLOOR: Duration = Duration::from_millis(10);
+    /// The longest an `accept` backoff ever waits, however many consecutive
+    /// errors precede it.
+    const ACCEPT_BACKOFF_CEILING: Duration = Duration::from_millis(500);
+
     /// Serve connections until `cancel` fires, answering every op within
     /// `op_deadline` whether or not the handler has finished.
     ///
@@ -143,6 +150,19 @@ impl HookListener {
     /// task. Rewriting this to a plain `timeout` around the handler's
     /// future would cancel that work at the deadline instead, silently
     /// dropping every sweep that ran long.
+    ///
+    /// A persistent `accept` error (an fd-exhausted process is the
+    /// realistic case, since mcpls also spawns language servers) backs off
+    /// exponentially between [`Self::ACCEPT_BACKOFF_FLOOR`] and
+    /// [`Self::ACCEPT_BACKOFF_CEILING`] rather than retrying immediately,
+    /// so it cannot spin a core or flood the log while the condition
+    /// lasts. It never gives up and returns early: this socket is
+    /// best-effort infrastructure whose every failure mode downstream
+    /// already degrades to "no diagnostics this turn" rather than an
+    /// error a caller must handle, so exiting the accept loop over a
+    /// transient condition would trade a recoverable, momentary
+    /// degradation for a permanent one lasting the rest of the process's
+    /// life.
     pub async fn serve<H>(
         self,
         handler: H,
@@ -152,6 +172,7 @@ impl HookListener {
         H: Fn(Request) -> BoxFuture<'static, Response> + Send + Sync + 'static,
     {
         let handler = Arc::new(handler);
+        let mut accept_backoff = Self::ACCEPT_BACKOFF_FLOOR;
         loop {
             tokio::select! {
                 result = cancel.changed() => {
@@ -163,11 +184,21 @@ impl HookListener {
                 accepted = self.transport.accept() => {
                     match accepted {
                         Ok(stream) => {
+                            accept_backoff = Self::ACCEPT_BACKOFF_FLOOR;
                             let handler = Arc::clone(&handler);
                             tokio::spawn(serve_connection(stream, handler, op_deadline));
                         }
                         Err(e) => {
                             tracing::warn!("hook socket accept failed: {e}");
+                            tokio::select! {
+                                () = tokio::time::sleep(accept_backoff) => {}
+                                result = cancel.changed() => {
+                                    if result.is_err() || *cancel.borrow() {
+                                        return;
+                                    }
+                                }
+                            }
+                            accept_backoff = (accept_backoff * 2).min(Self::ACCEPT_BACKOFF_CEILING);
                         }
                     }
                 }
