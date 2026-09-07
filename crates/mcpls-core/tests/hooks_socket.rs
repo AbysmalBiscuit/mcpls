@@ -107,6 +107,49 @@ async fn test_a_stale_socket_file_does_not_block_acquisition() {
     );
 }
 
+/// A temp-file cleaner deleting the lock file out from under a live owner
+/// is not something the newcomer's side can ever detect: it opens a
+/// genuinely fresh inode at the path and genuinely locks it, which is
+/// indistinguishable, from its own point of view, from there having been
+/// no owner at all. The owner is the side that has to notice, by
+/// re-`stat`ing the path it locked and comparing it against the handle it
+/// still holds.
+#[tokio::test]
+#[cfg(unix)]
+async fn test_an_owner_stands_down_when_its_lock_file_is_replaced() {
+    let (_guard, identity) = temp_identity();
+    let owner = HookListener::acquire(&identity)
+        .await
+        .expect("acquire")
+        .expect("owner");
+    let (_tx, cancel) = tokio::sync::watch::channel(false);
+    let serve_task = tokio::spawn(owner.serve(
+        handler(|_req| Box::pin(async { Response::Flush { context: None } })),
+        Duration::from_millis(1500),
+        cancel,
+    ));
+
+    // Stand in for an age-based tmp-file cleaner: the path is gone, but the
+    // inode the owner locked is still alive and still locked.
+    std::fs::remove_file(&identity.lock).expect("remove the lock file out from under the owner");
+
+    let challenger = HookListener::acquire(&identity).await.expect("acquire");
+    assert!(
+        challenger.is_some(),
+        "the newcomer opens a genuinely fresh inode at the path and genuinely \
+         locks it; from its own side this is indistinguishable from there \
+         having been no owner at all, so it must succeed"
+    );
+
+    let stood_down = tokio::time::timeout(Duration::from_secs(3), serve_task).await;
+    assert!(
+        stood_down.is_ok(),
+        "the original owner must notice its lock file was replaced and stop \
+         serving, rather than continue believing it owns a session a second \
+         process now also owns"
+    );
+}
+
 #[tokio::test]
 async fn test_exactly_one_of_many_racing_acquirers_wins() {
     let (_guard, identity) = temp_identity();

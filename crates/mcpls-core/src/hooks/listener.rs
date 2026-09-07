@@ -50,10 +50,13 @@ impl<T> HookStream for T where T: tokio::io::AsyncRead + tokio::io::AsyncWrite +
 pub struct HookListener {
     transport: Box<dyn HookTransport>,
     /// Held for as long as `Self` lives; dropping it (including on process
-    /// exit) releases ownership. Never unlocked explicitly, and never read:
-    /// its only job is to stay open.
+    /// exit) releases ownership. Never unlocked explicitly.
     #[cfg(not(windows))]
-    _lock: std::fs::File,
+    lock: std::fs::File,
+    /// `identity.lock`'s path, kept so [`Self::still_owns_lock`] can
+    /// re-`stat` it against `lock`'s own `fstat`.
+    #[cfg(not(windows))]
+    lock_path: std::path::PathBuf,
 }
 
 impl HookListener {
@@ -93,8 +96,40 @@ impl HookListener {
         let listener = tokio::net::UnixListener::bind(&identity.socket)?;
         Ok(Some(Self {
             transport: Box::new(UnixTransport { listener }),
-            _lock: lock,
+            lock,
+            lock_path: identity.lock.clone(),
         }))
+    }
+
+    /// How often [`Self::serve`] re-`stat`s its own lock file to notice a
+    /// replacement (see [`Self::still_owns_lock`]). Unconditional (rather
+    /// than Unix-only, like the check itself) because [`Self::serve`]
+    /// constructs its ownership-check timer on every platform and gates
+    /// the check at runtime instead, so the timer's type does not depend
+    /// on `cfg`.
+    const OWNERSHIP_CHECK_INTERVAL: Duration = Duration::from_millis(200);
+
+    /// Whether `identity.lock` still names the inode this listener holds a
+    /// lock on.
+    ///
+    /// This is the owner-side half of detecting an externally deleted lock
+    /// file (see [`Self::lock_file`]'s doc comment for why the newcomer's
+    /// side cannot detect it at all). Compares `lock`'s own `fstat`
+    /// against a fresh `stat` of the path it was opened from: if a cleaner
+    /// deleted and something else recreated that path, the two now name
+    /// different inodes, even though `lock` itself is still open and
+    /// still locked -- an `fstat` on an open handle keeps working after
+    /// its path is unlinked, it just stops matching anything reachable by
+    /// name.
+    #[cfg(not(windows))]
+    fn still_owns_lock(&self) -> bool {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let Ok(locked) = self.lock.metadata() else {
+            return false;
+        };
+        std::fs::metadata(&self.lock_path)
+            .is_ok_and(|current| current.ino() == locked.ino() && current.dev() == locked.dev())
     }
 
     /// The most attempts [`Self::lock_file`] makes before giving up on a
@@ -105,21 +140,27 @@ impl HookListener {
     /// Open, create if needed, and exclusively lock `identity.lock`.
     ///
     /// Returns `Ok(None)` when someone else already holds it and `Ok(Some)`
-    /// when this call now owns it. Nothing in mcpls ever deletes this file,
-    /// so the create/unlink/bind race that motivates comparing identity
-    /// after a rename does not arise from mcpls's own code. But nothing
-    /// stops an external cleaner (an age-based `systemd-tmpfiles` policy
-    /// over `/tmp/mcpls-<user>` is the realistic case) from deleting it
-    /// while an owner still holds a lock on the now-unlinked inode. A
-    /// newcomer that opens the path afterward creates a fresh inode there
-    /// and locks *that* uncontended -- exclusive at the inode level, but
-    /// no longer exclusive at the path, since the original owner is still
-    /// holding a lock nobody else can see. Comparing this handle's `fstat`
-    /// against a fresh `stat` of the path, taken after the lock succeeds,
-    /// catches that: a mismatch means the path was replaced while this
-    /// call was opening or locking it, so this handle no longer protects
-    /// anything and the attempt retries against whatever is at the path
-    /// now, up to [`Self::LOCK_FILE_MAX_ATTEMPTS`] times.
+    /// when this call now owns it.
+    ///
+    /// This closes only the narrow race where the path is replaced
+    /// *during this call*, between its own `open` and `try_lock_exclusive`
+    /// succeeding: comparing this handle's `fstat` against a fresh `stat`
+    /// of the path catches that, and retries against whatever is at the
+    /// path now, up to [`Self::LOCK_FILE_MAX_ATTEMPTS`] times. It says
+    /// nothing about a replacement that happens at any later point, once
+    /// a lock is already held stably -- an external cleaner (an age-based
+    /// `systemd-tmpfiles` policy over `/tmp/mcpls-<user>` is the realistic
+    /// case) can delete the file at any moment after this call has
+    /// already returned, and a newcomer that then opens the path creates
+    /// a fresh inode and locks it uncontended: exclusive at the inode
+    /// level, but no longer exclusive at the path, since this call cannot
+    /// see a replacement that happens after it. Nothing on the newcomer's
+    /// side can close that, because a replaced path is indistinguishable
+    /// from a clean start from the newcomer's own point of view.
+    /// [`Self::serve`] instead re-`stat`s the path periodically from the
+    /// side that actually knows something was taken from it (see
+    /// [`Self::still_owns_lock`]) and stands down when it no longer
+    /// matches.
     ///
     /// Windows has no equivalent: there is no lock *file* whose path an
     /// external cleaner could sever from the handle holding it, since
@@ -131,8 +172,13 @@ impl HookListener {
 
         use fs4::fs_std::FileExt as _;
 
-        if let Some(parent) = identity.socket.parent() {
-            std::fs::create_dir_all(parent)?;
+        // `socket` and `lock` are always siblings in identities `identity_for`
+        // produces, but nothing enforces that, so both parents are created
+        // rather than assuming either one covers the other.
+        for path in [&identity.socket, &identity.lock] {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
         }
 
         for _ in 0..Self::LOCK_FILE_MAX_ATTEMPTS {
@@ -229,6 +275,13 @@ impl HookListener {
     /// transient condition would trade a recoverable, momentary
     /// degradation for a permanent one lasting the rest of the process's
     /// life.
+    ///
+    /// On Unix, also stands down if [`Self::still_owns_lock`] reports the
+    /// lock file no longer names the inode this listener holds: something
+    /// external took it while this process was still serving, and
+    /// continuing would risk a second process believing it owns the same
+    /// session. See [`Self::lock_file`]'s doc comment for why this has to
+    /// be checked from here rather than at acquisition.
     pub async fn serve<H>(
         self,
         handler: H,
@@ -239,11 +292,31 @@ impl HookListener {
     {
         let handler = Arc::new(handler);
         let mut accept_backoff = Self::ACCEPT_BACKOFF_FLOOR;
+        // Unconditionally constructed so its type does not depend on
+        // platform, and gated off on Windows (where there is no lock file
+        // to lose) with the `if` precondition below rather than `cfg`.
+        let has_lock_file = cfg!(not(windows));
+        let mut ownership_check = tokio::time::interval(Self::OWNERSHIP_CHECK_INTERVAL);
+        ownership_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         loop {
             tokio::select! {
                 result = cancel.changed() => {
                     // Err means the sender was dropped; treat as cancellation.
                     if result.is_err() || *cancel.borrow() {
+                        return;
+                    }
+                }
+                _ = ownership_check.tick(), if has_lock_file => {
+                    #[cfg(not(windows))]
+                    if !self.still_owns_lock() {
+                        tracing::warn!(
+                            "the lock at {} no longer names the inode this listener \
+                             holds; something else now owns it, so this listener is \
+                             standing down rather than risk two owners of the same \
+                             session",
+                            self.lock_path.display()
+                        );
                         return;
                     }
                 }
