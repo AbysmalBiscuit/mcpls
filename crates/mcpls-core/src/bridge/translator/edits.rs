@@ -2024,9 +2024,10 @@ mod tests {
 
     /// An apply whose caller stopped awaiting it -- Esc in the MCP client, a
     /// `notifications/cancelled`, a disconnect -- completes its write on a
-    /// blocking thread but never reaches the close. The paths it queued must
-    /// be acted on by the next call, and before that call reads anything, or
-    /// the whole point of closing the document is lost to one keystroke.
+    /// blocking thread but never reaches the resync. The paths it queued
+    /// must be acted on by the next call, and before that call reads
+    /// anything, or the whole point of resynchronizing the document is lost
+    /// to one keystroke.
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn test_a_queued_invalidation_is_drained_before_the_next_call_opens_a_document() {
@@ -2101,15 +2102,21 @@ mod tests {
             })
         };
 
-        let closed = read_framed_message(&mut wire).await;
+        let changed = read_framed_message(&mut wire).await;
         assert_eq!(
-            closed["method"], "textDocument/didClose",
-            "the queued path must be closed before the next call opens anything"
+            changed["method"], "textDocument/didChange",
+            "the queued path must be resynchronized before the next call opens anything"
         );
-        assert_eq!(closed["params"]["textDocument"]["uri"], stale_uri.as_str());
+        assert_eq!(changed["params"]["textDocument"]["uri"], stale_uri.as_str());
+
+        let saved = read_framed_message(&mut wire).await;
+        assert_eq!(
+            saved["method"], "textDocument/didSave",
+            "the change alone does not start a build; the save does"
+        );
         assert!(
-            !translator.is_document_open(&stale_canonical),
-            "the queued path is no longer tracked"
+            translator.is_document_open(&stale_canonical),
+            "the queued path stays tracked, now at its resynchronized content"
         );
 
         assert_eq!(
@@ -2158,7 +2165,7 @@ mod tests {
         let second = dir.path().join("second.rs");
         let mut wire = BufReader::new(&mut server.write_stdout);
 
-        // Both are open in the server, which is what makes closing them
+        // Both are open in the server, which is what makes resyncing them
         // observable on the wire.
         let mut canonical = Vec::new();
         for path in [&first, &second] {
@@ -2199,14 +2206,15 @@ mod tests {
         translator.pending_invalidations.extend(&canonical);
         let drain = {
             let translator = Arc::clone(&translator);
-            tokio::spawn(async move { translator.forget_changed_documents().await })
+            tokio::spawn(async move { translator.resync_changed_documents().await })
         };
 
-        // The first path is dealt with; the drain is now parked on the
-        // second path's lock.
-        let closed = read_framed_message(&mut wire).await;
-        assert_eq!(closed["method"], "textDocument/didClose");
-        assert!(!translator.is_document_open(&canonical[0]));
+        // The first path is dealt with -- its content on disk never changed,
+        // so a save is still owed but no change is -- and the drain is now
+        // parked on the second path's lock.
+        let saved = read_framed_message(&mut wire).await;
+        assert_eq!(saved["method"], "textDocument/didSave");
+        assert!(translator.is_document_open(&canonical[0]));
 
         drain.abort();
         assert!(
@@ -2229,10 +2237,11 @@ mod tests {
     /// An apply writes files the call never queried -- a rename anchored in
     /// one file rewrites every file referencing the symbol. Those files stay
     /// open in the routed server at their pre-apply content unless mcpls
-    /// closes them, and the next edit against that content corrupts them.
+    /// resynchronizes them, and the next edit against that content corrupts
+    /// them.
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    async fn test_apply_closes_a_written_document_the_call_never_queried() {
+    async fn test_apply_resyncs_a_written_document_the_call_never_queried() {
         use std::sync::Arc;
 
         use tokio::io::BufReader;
@@ -2328,12 +2337,18 @@ mod tests {
         )
         .await;
 
-        let closed = read_framed_message(&mut wire).await;
+        let changed = read_framed_message(&mut wire).await;
         assert_eq!(
-            closed["method"], "textDocument/didClose",
+            changed["method"], "textDocument/didChange",
             "the server must be told the file it still holds open was rewritten"
         );
-        assert_eq!(closed["params"]["textDocument"]["uri"], other_uri.as_str());
+        assert_eq!(changed["params"]["textDocument"]["uri"], other_uri.as_str());
+
+        let saved = read_framed_message(&mut wire).await;
+        assert_eq!(
+            saved["method"], "textDocument/didSave",
+            "the change alone does not start a build; the save does"
+        );
 
         let result = timeout(Duration::from_secs(5), handle)
             .await
@@ -2346,8 +2361,8 @@ mod tests {
             "fn renamed() {}\n"
         );
         assert!(
-            !translator.is_document_open(&other_canonical),
-            "a written document must not stay tracked at its pre-apply content"
+            translator.is_document_open(&other_canonical),
+            "a written document stays tracked, now at its resynchronized content"
         );
     }
 
