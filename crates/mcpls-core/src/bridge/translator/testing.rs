@@ -102,11 +102,11 @@ pub(super) fn diag_info(diagnostics: Vec<lsp_types::Diagnostic>) -> DiagnosticIn
     }
 }
 
-pub(super) struct FakeServer {
+pub struct FakeServer {
     _write_half: Child,
     _read_half: Child,
-    pub(super) read_half_stdin: ChildStdin,
-    pub(super) write_stdout: ChildStdout,
+    pub(crate) read_half_stdin: ChildStdin,
+    pub(crate) write_stdout: ChildStdout,
 }
 
 pub(super) fn fake_lsp_client() -> (LspClient, FakeServer) {
@@ -146,9 +146,7 @@ pub(super) fn fake_lsp_client() -> (LspClient, FakeServer) {
 /// notifications mcpls interleaves with its replies -- an apply emits a
 /// `textDocument/didClose` for every file it rewrote before the request
 /// that triggered it is answered.
-pub(super) async fn read_framed_reply<R: tokio::io::AsyncBufRead + Unpin>(
-    reader: &mut R,
-) -> JsonValue {
+pub async fn read_framed_reply<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> JsonValue {
     loop {
         let message = read_framed_message(reader).await;
         if !message["id"].is_null() {
@@ -168,7 +166,7 @@ async fn write_frame(stdin: &mut ChildStdin, message: &JsonValue) {
 }
 
 /// Writes a framed JSON-RPC success response, as a real LSP server would.
-pub(super) async fn write_response(stdin: &mut ChildStdin, id: &JsonValue, result: JsonValue) {
+pub async fn write_response(stdin: &mut ChildStdin, id: &JsonValue, result: JsonValue) {
     write_frame(
         stdin,
         &serde_json::json!({
@@ -225,7 +223,7 @@ pub(super) async fn write_error_response(
 /// Builds a single-server translator routed to `server_id` for every tool,
 /// with a registered `LspServer` fixture carrying `capabilities` (default
 /// capabilities advertise nothing).
-pub(super) fn translator_with_capabilities(
+pub fn translator_with_capabilities(
     dir: &TempDir,
     server_id: &ServerId,
     capabilities: lsp_types::ServerCapabilities,

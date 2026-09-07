@@ -1691,7 +1691,12 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::bridge::RenameResult;
+    use crate::bridge::apply::Applier;
+    use crate::bridge::{
+        FakeServer, RenameResult, read_framed_reply, translator_with_capabilities, write_response,
+    };
+    use crate::config::ApplyConfig;
+    use crate::hooks::{HookRole, SocketIdentity};
 
     /// A `DiagnosticsDelivery`/`FloorTable` pair for tests that don't care
     /// about diagnostics config or per-server floors, just a working
@@ -1997,6 +2002,355 @@ mod tests {
             "and a call that did write must still get one, or the guard is just \
              a footer that never fires"
         );
+    }
+
+    /// The three tools that can write to the working tree.
+    ///
+    /// Each of them forwards what it wrote to the socket owner and appends
+    /// the diagnostics its own edit produced, on two adjacent lines of its
+    /// own. Driving all three from one place is what keeps a fourth write
+    /// tool, or a refactor of one of these, from quietly losing either.
+    #[derive(Clone, Copy, Debug)]
+    enum WriteTool {
+        Rename,
+        Format,
+        CodeAction,
+    }
+
+    const WRITE_TOOLS: [WriteTool; 3] =
+        [WriteTool::Rename, WriteTool::Format, WriteTool::CodeAction];
+
+    impl WriteTool {
+        /// What its language server has to advertise for the call to get as
+        /// far as a request.
+        fn capabilities(self) -> lsp_types::ServerCapabilities {
+            match self {
+                Self::Rename => lsp_types::ServerCapabilities {
+                    rename_provider: Some(lsp_types::OneOf::Left(true)),
+                    ..Default::default()
+                },
+                Self::Format => lsp_types::ServerCapabilities {
+                    document_formatting_provider: Some(lsp_types::OneOf::Left(true)),
+                    ..Default::default()
+                },
+                Self::CodeAction => lsp_types::ServerCapabilities {
+                    code_action_provider: Some(lsp_types::CodeActionProviderCapability::Simple(
+                        true,
+                    )),
+                    ..Default::default()
+                },
+            }
+        }
+
+        /// The apply key the deployment has to permit for the write to
+        /// happen rather than be described.
+        fn apply_config(self) -> ApplyConfig {
+            match self {
+                Self::Rename => ApplyConfig {
+                    rename: true,
+                    ..ApplyConfig::default()
+                },
+                Self::Format => ApplyConfig {
+                    format_document: true,
+                    ..ApplyConfig::default()
+                },
+                Self::CodeAction => ApplyConfig {
+                    code_actions: true,
+                    ..ApplyConfig::default()
+                },
+            }
+        }
+
+        /// The reply to this tool's own request, carrying an edit that
+        /// rewrites `old` to `new` on the fixture's first line.
+        fn reply_rewriting(self, uri: &Uri) -> serde_json::Value {
+            let edits = json!([{
+                "range": {
+                    "start": { "line": 0, "character": 3 },
+                    "end": { "line": 0, "character": 6 },
+                },
+                "newText": "new",
+            }]);
+            match self {
+                Self::Rename => json!({ "changes": { uri.as_str(): edits } }),
+                Self::Format => edits,
+                Self::CodeAction => json!([{
+                    "title": "Rewrite it",
+                    "edit": { "changes": { uri.as_str(): edits } },
+                }]),
+            }
+        }
+
+        /// Call the tool over `path` with `apply` on, and return its raw
+        /// JSON result.
+        async fn call_applying(self, server: &McplsServer, path: &str) -> String {
+            let result = match self {
+                Self::Rename => {
+                    server
+                        .rename_symbol(Parameters(RenameParams {
+                            position: PositionParams {
+                                file_path: path.to_string(),
+                                line: 1,
+                                character: 4,
+                            },
+                            new_name: "new".to_string(),
+                            apply: true,
+                        }))
+                        .await
+                }
+                Self::Format => {
+                    server
+                        .format_document(Parameters(FormatDocumentParams {
+                            file_path: path.to_string(),
+                            tab_size: 4,
+                            insert_spaces: true,
+                            apply: true,
+                        }))
+                        .await
+                }
+                Self::CodeAction => {
+                    server
+                        .apply_code_action(Parameters(ApplyCodeActionParams {
+                            file_path: path.to_string(),
+                            range: RangeParams {
+                                start_line: 1,
+                                start_character: 1,
+                                end_line: 1,
+                                end_character: 5,
+                            },
+                            kind_filter: None,
+                            action_index: Some(0),
+                            action_title: None,
+                        }))
+                        .await
+                }
+            };
+            result.unwrap_or_else(|error| panic!("{self:?} must apply its edit: {error}"))
+        }
+    }
+
+    /// An `McplsServer` whose translator is routed to a fake language
+    /// server that advertises what `tool` needs and is permitted to write
+    /// what `tool` writes, over a workspace holding one `main.rs`.
+    struct WriteFixture {
+        server: McplsServer,
+        fake: FakeServer,
+        /// The fixture file, canonicalized, which is the spelling the
+        /// applier reports and the URI is built from.
+        path: PathBuf,
+        uri: Uri,
+        _dir: tempfile::TempDir,
+    }
+
+    impl WriteFixture {
+        fn new(tool: WriteTool, diagnostics: DiagnosticsConfig, hooks: Arc<HookRole>) -> Self {
+            let dir = tempfile::tempdir().expect("a temp dir");
+            let (translator, fake) =
+                translator_with_capabilities(&dir, &ServerId::from("rust"), tool.capabilities());
+            let translator = Arc::new(translator.with_applier(Arc::new(Applier::new(
+                vec![dir.path().to_path_buf()],
+                tool.apply_config(),
+            ))));
+
+            let path = dir.path().join("main.rs");
+            std::fs::write(&path, "fn old() {}\n").expect("write the fixture");
+            let path = path.canonicalize().expect("the fixture exists");
+            let uri = crate::bridge::path_to_uri(&path).expect("a uri for the fixture");
+
+            let mut context = BridgeContext::new(
+                translator,
+                Arc::new(Mutex::new(NotificationCache::new())),
+                Arc::from(vec![dir.path().to_path_buf()]),
+                Arc::new(ResourceSubscriptions::new()),
+                false,
+                Arc::new(Mutex::new(DiagnosticsDelivery::new(diagnostics))),
+                Arc::new(FloorTable::new(&diagnostics, &[])),
+                diagnostics,
+                test_settle(),
+            );
+            context.hooks = hooks;
+            let context = Arc::new(context);
+
+            Self {
+                server: McplsServer::from_context(context),
+                fake,
+                path,
+                uri,
+                _dir: dir,
+            }
+        }
+
+        /// Adopt an empty baseline and record one error against the fixture
+        /// file, so a footer has both a record to diff against and
+        /// something to report.
+        async fn with_one_error(self) -> Self {
+            self.server
+                .context
+                .notification_cache
+                .lock()
+                .await
+                .store_diagnostics(
+                    &ServerId::from("rust"),
+                    &self.uri,
+                    Some(1),
+                    vec![diagnostic_at("broken")],
+                );
+            self.server
+                .context
+                .delivery
+                .lock()
+                .await
+                .set_baseline(HashMap::new());
+            self
+        }
+
+        /// Drive `tool` to completion against the fake server, answering the
+        /// one request it sends, and return its raw JSON result.
+        async fn apply(&mut self, tool: WriteTool) -> String {
+            let server = self.server.clone();
+            let path = self.path.display().to_string();
+            let reply = tool.reply_rewriting(&self.uri);
+            let fake = &mut self.fake;
+            let (result, ()) = tokio::join!(tool.call_applying(&server, &path), async move {
+                let mut wire = tokio::io::BufReader::new(&mut fake.write_stdout);
+                let request = read_framed_reply(&mut wire).await;
+                write_response(&mut fake.read_half_stdin, &request["id"], reply).await;
+            });
+            result
+        }
+    }
+
+    /// Every write tool appends the diagnostics its own edit produced.
+    ///
+    /// Asserted through the tool's own JSON rather than through
+    /// `footer_if_written`, which is separately covered: what is under test
+    /// here is that each call site still calls it, and a call site that
+    /// stopped would return a result with no `new_diagnostics` key at all.
+    #[tokio::test]
+    async fn test_every_write_tool_appends_its_own_diagnostics() {
+        for tool in WRITE_TOOLS {
+            let mut fixture = WriteFixture::new(
+                tool,
+                DiagnosticsConfig {
+                    footer: true,
+                    footer_grace_ms: 0,
+                    footer_quiet_ms: 0,
+                    footer_wait_ms: 0,
+                    ..DiagnosticsConfig::default()
+                },
+                Arc::new(HookRole::disabled()),
+            )
+            .with_one_error()
+            .await;
+            let expected = fixture.path.display().to_string();
+
+            let result: serde_json::Value =
+                serde_json::from_str(&fixture.apply(tool).await).expect("json");
+
+            assert_eq!(
+                result["new_diagnostics"]["changed"][0]["file_path"],
+                json!(expected),
+                "{tool:?} answered without the diagnostics its own write \
+                 produced, so the agent has to ask for them in a second call \
+                 and pays a turn for it: {result}"
+            );
+        }
+    }
+
+    /// Every write tool tells the socket's owner what it wrote.
+    ///
+    /// A passive instance's own language servers are warm but nobody feeds
+    /// them, so without this the owner's servers never learn the file
+    /// changed and every symptom reads as a slow language server.
+    #[tokio::test]
+    async fn test_every_write_tool_reports_its_writes_to_the_socket_owner() {
+        for tool in WRITE_TOOLS {
+            let owner = RecordingOwner::listening().await;
+            let mut fixture = WriteFixture::new(
+                tool,
+                DiagnosticsConfig::default(),
+                Arc::new(HookRole::passive(owner.identity.clone())),
+            );
+            let expected = fixture.path.clone();
+
+            fixture.apply(tool).await;
+
+            assert_eq!(
+                *owner.forwarded.lock().await,
+                vec![expected],
+                "{tool:?} wrote through a passive instance, whose servers no \
+                 flush ever reads"
+            );
+        }
+    }
+
+    /// An owner listening on its own temporary socket, recording the paths
+    /// every `Changed` request names.
+    struct RecordingOwner {
+        /// What a passive instance forwards to.
+        identity: SocketIdentity,
+        /// The paths every `Changed` request named, in arrival order.
+        forwarded: Arc<Mutex<Vec<PathBuf>>>,
+        /// Dropping this cancels the listener, so it is held for as long as
+        /// the owner is expected to answer.
+        _cancel: tokio::sync::watch::Sender<bool>,
+        /// The socket and its lock live in here.
+        _dir: tempfile::TempDir,
+    }
+
+    impl RecordingOwner {
+        async fn listening() -> Self {
+            let dir = tempfile::tempdir().expect("a temp dir");
+            let hash = format!("{:016x}", unique_suffix());
+            #[cfg(windows)]
+            let socket = PathBuf::from(format!(r"\\.\pipe\mcpls-forward-{hash}"));
+            #[cfg(not(windows))]
+            let socket = dir.path().join(format!("{hash}.sock"));
+            let identity = SocketIdentity {
+                socket,
+                lock: dir.path().join(format!("{hash}.lock")),
+                hash,
+            };
+
+            let forwarded = Arc::new(Mutex::new(Vec::new()));
+            let recorder = Arc::clone(&forwarded);
+            let listener = hooks::HookListener::acquire(&identity)
+                .await
+                .expect("acquire")
+                .expect("nothing else owns a socket in a fresh temp dir");
+            let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+            tokio::spawn(listener.serve(
+                move |request: hooks::Request| {
+                    let recorder = Arc::clone(&recorder);
+                    Box::pin(async move {
+                        if let hooks::Request::Changed { paths, .. } = request {
+                            recorder.lock().await.extend(paths);
+                        }
+                        hooks::Response::Changed { queued: 0 }
+                    }) as futures::future::BoxFuture<'static, hooks::Response>
+                },
+                Duration::from_secs(5),
+                cancel_rx,
+            ));
+
+            Self {
+                identity,
+                forwarded,
+                _cancel: cancel_tx,
+                _dir: dir,
+            }
+        }
+    }
+
+    /// A suffix no other socket in this test run carries. The Windows pipe
+    /// namespace is machine-global, so a name derived from the process
+    /// alone would collide with the next owner this test starts.
+    fn unique_suffix() -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::thread::current().id().hash(&mut hasher);
+        std::time::SystemTime::now().hash(&mut hasher);
+        hasher.finish()
     }
 
     #[test]

@@ -28,11 +28,14 @@ pub use state::{
     DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE, DocumentState, DocumentTracker, ResourceLimits,
     path_to_uri, uri_to_path,
 };
-/// The fake-server harness the translator's own tests drive, re-exported so
-/// a test in another module can assert on what actually reached a server
-/// rather than building a second fake of its own.
+/// The fake servers the translator's own tests drive, and the framing
+/// helpers that answer them, re-exported so a test in another module can
+/// assert on what actually reached a server -- or drive a whole tool call
+/// through one -- rather than building a second fake of its own.
 #[cfg(test)]
-pub(crate) use translator::testing::TranslatorHarness;
+pub(crate) use translator::testing::{
+    FakeServer, TranslatorHarness, read_framed_reply, translator_with_capabilities, write_response,
+};
 pub use translator::{
     Completion, CompletionsResult, DefinitionResult, Diagnostic, DiagnosticSeverity,
     DiagnosticsResult, DocumentChanges, DocumentSymbolsResult, FormatDocumentResult, HoverResult,
