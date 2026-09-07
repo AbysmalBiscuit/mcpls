@@ -372,6 +372,30 @@ mod tests {
         assert!(!filter.admits(&work));
     }
 
+    /// The two facts a `.gitignore` negation under a built-in ignore buys,
+    /// which are not one fact: the negated file is admitted, so mcpls
+    /// checks it whenever it hears about it, and its directory is still
+    /// kept off the host's watcher, so nothing outside the session's own
+    /// tool calls ever tells mcpls it changed. A negation cannot re-include
+    /// a file whose parent directory is excluded, and the watcher is handed
+    /// directories.
+    #[test]
+    fn test_a_negated_path_is_admitted_and_still_not_watched() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        std::fs::create_dir_all(dir.path().join("target")).expect("mkdir");
+        let kept = dir.path().join("target/keep.rs");
+        std::fs::write(&kept, "").expect("write");
+        std::fs::write(dir.path().join(".gitignore"), "!target/keep.rs\n").expect("write");
+
+        assert!(filter_over(dir.path()).admits(&kept));
+        assert!(
+            !watch_paths(dir.path()).contains(&dir.path().join("target")),
+            "the troubleshooting guide tells a user what this workaround does \
+             and does not buy them, and it can only be true while these two \
+             answers stay apart"
+        );
+    }
+
     #[test]
     fn test_watch_paths_drops_the_built_in_floor_with_no_gitignore_present() {
         let dir = tempfile::tempdir().expect("a temp dir");

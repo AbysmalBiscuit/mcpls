@@ -118,11 +118,13 @@ cargo install --path crates/mcpls-cli
 
 **Behavior, not a bug**: the Claude Code file-change hook always treats `target/` and `node_modules/` as build output, at any depth, whether or not your project's `.gitignore` names them. This keeps a `cargo build` or an `npm install` from flooding mcpls with thousands of generated paths.
 
-**Solution**: if you keep real source under one of these names and need a specific file watched anyway, add a negation to your project's `.gitignore`:
+**Partial workaround**: if you keep real source under one of these names, add a negation to your project's `.gitignore`:
 ```gitignore
 !target/keep.rs
 ```
-Everything else under `target/` stays excluded; only the negated path is watched and diagnosed again.
+Everything else under `target/` stays excluded, and mcpls diagnoses the negated path whenever it hears about it: when you edit the file through one of mcpls's own write tools, and when a tool call the agent made reports it. That covers edits made inside the session.
+
+The negation does not put the file back under the session's file watcher, so an edit made outside the session — by a build script, or by another editor — is still not seen. The watch list the `SessionStart` hook hands Claude Code names the project's top-level entries, `target/` is excluded there as a directory, and `.gitignore` rules cannot re-include a file whose parent directory is excluded. To have such a file watched, keep it outside `target/` and `node_modules/`.
 
 ### "Failed to start MCP server"
 
