@@ -187,7 +187,7 @@ Only some servers need this. Ten were checked against their own source at the co
 | typescript-language-server | yes, through tsserver | no |
 | vtsls | yes, through tsserver | no |
 | lua-language-server | yes | no |
-| pyrefly | no | yes |
+| pyrefly | no | for currency, not delivery |
 | ty | no | yes |
 | taplo | no | ignores the notification |
 | marksman | no | ignores the notification |
@@ -197,7 +197,7 @@ Only some servers need this. Ten were checked against their own source at the co
 - **typescript-language-server** gates client watching on `tsserver.useClientFileWatcher`, which defaults to false (`src/lsp-server.ts:183`, `docs/configuration.md:109`), and falls back to tsserver's own watching when the client cannot oblige.
 - **vtsls** has no `didChangeWatchedFiles` registration or handler anywhere in its packages, so client watching cannot reach it; tsserver watches.
 - **lua-language-server** watches through `bee.filewatch` (`script/filewatch.lua`) and never handles the notification.
-- **pyrefly** registers `FileSystemWatcher` patterns with the client (`pyrefly/lib/lsp/non_wasm/server.rs:5811`); the `notify`-based watcher elsewhere in that codebase belongs to the CLI `check` command. **ty** gates registration on the same client capability (`crates/ty_server/src/session.rs:955-975`, inside ruff's checkout rather than ty's).
+- **pyrefly** registers `FileSystemWatcher` patterns with the client (`pyrefly/lib/lsp/non_wasm/server.rs:5811`); the `notify`-based watcher elsewhere in that codebase belongs to the CLI `check` command. Measured against pyrefly 1.2.0, it acts on the notification but publishes only for documents it holds open, so watching buys it analysis currency for open documents rather than diagnostic delivery for unopened ones: `docs/superpowers/notes/2026-09-07-stage-b-measurements.md`, "Pyrefly on an unopened file". **ty** gates registration on the same client capability (`crates/ty_server/src/session.rs:955-975`, inside ruff's checkout rather than ty's).
 - **taplo** and **marksman** handle no watched-files notification at all. Nothing here changes that, and nothing can.
 
 So the payoff is gopls at default settings, tsgo on Linux, pyrefly, and ty. That is narrower than it first looked and still worth building, since two of the four are the fork owner's likely second and third languages.
