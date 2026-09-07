@@ -418,7 +418,7 @@ impl Translator {
     /// the request future, which is dropped whenever the caller cancels, so
     /// anything unfinished goes back on the queue for the next drain.
     ///
-    /// `pub(crate)` because stage C's sweep, in `crate::hooks::sweep`,
+    /// `pub(crate)` because the hook sweep, in `crate::hooks::sweep`,
     /// drives the same drain for paths that arrived from the host's file
     /// watcher rather than from an apply.
     pub(crate) async fn resync_changed_documents(&self) {

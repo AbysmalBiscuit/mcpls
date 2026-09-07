@@ -113,8 +113,8 @@ pub fn lsp317_target() {
     let _ = (p, s);
 }
 
-/// One half of a deliberate rename collision, used by the stage B resync
-/// e2e. Renaming `tally` to `total` makes rustc report E0428 for this file.
+/// One half of a deliberate rename collision, used by the resync e2e.
+/// Renaming `tally` to `total` makes rustc report E0428 for this file.
 pub fn tally(a: i32, b: i32) -> i32 {
     a + b
 }
