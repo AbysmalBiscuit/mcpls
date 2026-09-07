@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 use mcpls_core::hooks::{
-    ChangeEvent, ProbeOutcome, Request, Response, SocketIdentity, probe, send, send_many,
-    watch_paths,
+    ChangeEvent, ProbeOutcome, Request, Response, SocketIdentity, probe, send,
+    send_and_acknowledge, watch_paths,
 };
 use serde::Deserialize;
 
@@ -27,7 +27,9 @@ const SOCKET_TIMEOUT: Duration = Duration::from_millis(50);
 /// tighter than the server's own deadline for finishing that work is never
 /// right, since it only cuts off answers from an owner that is going to
 /// reply anyway. A missing owner still fails fast, because the connect
-/// itself fails immediately rather than waiting out this bound.
+/// itself fails immediately rather than waiting out this bound. The
+/// acknowledgement that follows a flush answer shares this bound and never
+/// turns a report already in hand into an error.
 const FLUSH_SOCKET_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// The hook payload Claude Code writes to stdin, keeping only the fields
@@ -147,7 +149,7 @@ async fn run(stdin: &str, project_dir: &Path, identity: Option<&SocketIdentity>)
                     session: payload.session_id,
                 },
             ];
-            let responses = send_many(identity, &requests, FLUSH_SOCKET_TIMEOUT).await?;
+            let responses = send_and_acknowledge(identity, &requests, FLUSH_SOCKET_TIMEOUT).await?;
             let context = responses.into_iter().nth(1).and_then(flush_context);
             Ok(additional_context_output(context))
         }
@@ -156,15 +158,16 @@ async fn run(stdin: &str, project_dir: &Path, identity: Option<&SocketIdentity>)
             let Some(identity) = identity else {
                 return Ok(String::new());
             };
-            let response = send(
+            let responses = send_and_acknowledge(
                 identity,
-                &Request::Flush {
+                &[Request::Flush {
                     session: payload.session_id,
-                },
+                }],
                 FLUSH_SOCKET_TIMEOUT,
             )
             .await?;
-            Ok(additional_context_output(flush_context(response)))
+            let context = responses.into_iter().next().and_then(flush_context);
+            Ok(additional_context_output(context))
         }
 
         "SessionEnd" => {
@@ -193,7 +196,7 @@ async fn run(stdin: &str, project_dir: &Path, identity: Option<&SocketIdentity>)
 
 /// The context a `Flush` response carries, or `None` for any other answer.
 fn flush_context(response: Response) -> Option<String> {
-    if let Response::Flush { context } = response {
+    if let Response::Flush { context, .. } = response {
         context
     } else {
         None
@@ -838,6 +841,7 @@ mod tests {
         match request {
             Request::Changed { .. } => "changed",
             Request::Flush { .. } => "flush",
+            Request::Ack { .. } => "ack",
             Request::EndSession { .. } => "end_session",
             Request::Status => "status",
         }
@@ -850,7 +854,13 @@ mod tests {
     /// defaults to off; a test exercising either sets it explicitly, so a
     /// regression that narrows a client's tolerance has something in the
     /// suite that would notice.
+    ///
+    /// The flags are independent switches over one owner, not states of a
+    /// machine: a test sets whichever ones its scenario needs and leaves
+    /// the rest at their defaults, so folding them into an enum would
+    /// enumerate combinations no reader has a name for.
     #[derive(Clone)]
+    #[allow(clippy::struct_excessive_bools)]
     struct OwnerBehavior {
         flush_text: Option<String>,
         flush_delay: Duration,
@@ -884,6 +894,11 @@ mod tests {
         /// represent (a previous version missing a field this build now
         /// requires). `None` by default.
         status_raw_line: Option<String>,
+        /// Whether the connection is closed right after a `Flush` is
+        /// answered, before any acknowledgement can be read. `false` by
+        /// default; one test sets it to prove a report already in hand is
+        /// printed regardless of what the acknowledgement meets.
+        hang_up_after_flush: bool,
     }
 
     impl Default for OwnerBehavior {
@@ -899,6 +914,7 @@ mod tests {
                 silent: false,
                 status_error: None,
                 status_raw_line: None,
+                hang_up_after_flush: false,
             }
         }
     }
@@ -923,7 +939,9 @@ mod tests {
             }
             Request::Flush { .. } => Response::Flush {
                 context: behavior.flush_text.clone(),
+                token: behavior.flush_text.as_ref().map(|_| 1),
             },
+            Request::Ack { .. } => Response::Ack,
             Request::EndSession { .. } => Response::EndSession,
             Request::Status => behavior.status_error.as_ref().map_or_else(
                 || Response::Status {
@@ -999,6 +1017,16 @@ mod tests {
             Self::start_with(OwnerBehavior {
                 flush_text,
                 changed_errors: true,
+                ..OwnerBehavior::default()
+            })
+        }
+
+        /// The same, closing the connection the moment a `Flush` has been
+        /// answered.
+        fn start_hanging_up_after_flush(flush_text: Option<String>) -> Self {
+            Self::start_with(OwnerBehavior {
+                flush_text,
+                hang_up_after_flush: true,
                 ..OwnerBehavior::default()
             })
         }
@@ -1195,6 +1223,8 @@ mod tests {
                 tokio::time::sleep(behavior.flush_delay).await;
             }
 
+            let hang_up = behavior.hang_up_after_flush && matches!(request, Request::Flush { .. });
+
             // A raw line bypasses `Response`'s own serialization entirely,
             // for a test standing in for a wire shape this build's
             // `Response` cannot represent at all (a previous version
@@ -1217,6 +1247,9 @@ mod tests {
                 return;
             }
             if writer.flush().await.is_err() {
+                return;
+            }
+            if hang_up {
                 return;
             }
         }
@@ -1572,7 +1605,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_user_prompt_submit_flushes_and_injects_context() {
+    async fn test_user_prompt_submit_flushes_and_acknowledges() {
         let recorder = RecordingOwner::start();
         let out = dispatch_against(
             &json!({ "hook_event_name": "UserPromptSubmit", "session_id": "s1" }),
@@ -1581,11 +1614,29 @@ mod tests {
         .await;
 
         let requests = recorder.requests();
-        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            recorder.ops(),
+            vec!["flush".to_string(), "ack".to_string()],
+            "a flush with content is acknowledged once its answer is in hand: {requests:?}"
+        );
         let Request::Flush { session } = &requests[0] else {
             panic!("expected a flush request: {:?}", requests[0]);
         };
         assert_eq!(session.as_str(), "s1");
+        let Request::Ack { session, token } = &requests[1] else {
+            panic!("expected an ack request: {:?}", requests[1]);
+        };
+        assert_eq!(session.as_str(), "s1");
+        assert_eq!(
+            *token, 1,
+            "the acknowledgement names the token the answer carried, so the \
+             owner commits that report and not a later one"
+        );
+        assert_eq!(
+            recorder.connections(),
+            1,
+            "the acknowledgement rides the flush's own connection"
+        );
 
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("json");
         assert_eq!(
@@ -1643,9 +1694,13 @@ mod tests {
 
         let requests = recorder.requests();
         assert_eq!(
-            requests.len(),
-            2,
-            "expected a changed request followed by a flush request: {requests:?}"
+            recorder.ops(),
+            vec![
+                "changed".to_string(),
+                "flush".to_string(),
+                "ack".to_string()
+            ],
+            "a changed, the flush, then the acknowledgement: {requests:?}"
         );
         let Request::Changed {
             session: changed_session,
@@ -1683,8 +1738,10 @@ mod tests {
         assert_eq!(
             recorder.connections(),
             1,
-            "the spec's protocol says PostToolBatch sends changed then flush on \
-             one connection, which is what send_many is for"
+            "changed, flush and the acknowledgement travel on one connection: a \
+             second connect would be a second chance to find the pipe busy on \
+             Windows, and the owner commits nothing until the acknowledgement \
+             arrives"
         );
     }
 
@@ -1716,6 +1773,46 @@ mod tests {
             additional_context_output(Some(DEFAULT_FLUSH_TEXT.to_string())),
             "an error answering changed must not swallow a flush answer \
              that arrived on the same connection: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_flush_with_nothing_to_report_is_not_acknowledged() {
+        let recorder = RecordingOwner::start_with_flush(None);
+        let out = dispatch_against(
+            &json!({ "hook_event_name": "UserPromptSubmit", "session_id": "s1" }),
+            &recorder,
+        )
+        .await;
+
+        assert_eq!(out, "");
+        assert_eq!(
+            recorder.ops(),
+            vec!["flush".to_string()],
+            "an answer with no token implies no record change, so there is \
+             nothing to acknowledge"
+        );
+    }
+
+    /// The report is in hand before the acknowledgement is sent, and the
+    /// acknowledgement's fate does not gate the print. An owner that hangs
+    /// up on it offers the report again next time; losing the report here
+    /// would be the one outcome the acknowledgement exists to rule out.
+    #[tokio::test]
+    async fn test_a_refused_acknowledgement_still_injects_the_context() {
+        let recorder =
+            RecordingOwner::start_hanging_up_after_flush(Some(DEFAULT_FLUSH_TEXT.to_string()));
+        let out = dispatch_against(
+            &json!({ "hook_event_name": "UserPromptSubmit", "session_id": "s1" }),
+            &recorder,
+        )
+        .await;
+
+        assert_eq!(
+            out,
+            additional_context_output(Some(DEFAULT_FLUSH_TEXT.to_string())),
+            "the flush answer was read before the owner hung up, so it is \
+             printed: {out}"
         );
     }
 

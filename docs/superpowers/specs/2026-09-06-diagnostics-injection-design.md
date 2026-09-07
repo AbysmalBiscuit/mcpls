@@ -316,10 +316,11 @@ Newline-delimited JSON. A connection carries one or more requests and closes whe
 ```
 {"op":"changed","session":"<id>","paths":["/abs/src/x.rs"],"event":"change"}
 {"op":"flush","session":"<id>"}
+{"op":"ack","session":"<id>","token":<n>}
 {"op":"status"}
 ```
 
-`changed` runs the filters below and **enqueues** the surviving paths for the sweep; it does not resync inline and it does not flush. `flush` drains the delivery record and does not resync. `PostToolBatch` sends `changed` then `flush` on one connection. `status` serves `doctor`.
+`changed` runs the filters below and **enqueues** the surviving paths for the sweep; it does not resync inline and it does not flush. `flush` stages the session's report and answers it with a token; the record advances only when an `ack` carrying that token arrives, which the hook sends on the same connection once the answer is in hand. A report nobody acknowledges is offered again by the next `flush`, so a hook that gives up on its deadline, or is killed before it prints, costs a repeat rather than a loss. An answer with nothing to commit carries no token and gets no `ack`. The MCP tool and the footer advance the record in the flush itself: their transport is the session's own, and losing it ends the session. `flush` does not resync. `PostToolBatch` sends `changed` then `flush` on one connection. `status` serves `doctor`.
 
 The consequence is worth stating plainly, because it is surprising: a `PostToolBatch` pair never reports the batch it belongs to. The sweep has not run yet when the `flush` arrives. Those results land in the next flush, which for an agent working in a loop is the very next tool batch or prompt. Making `changed` synchronous instead would put the debounce inside a 1500 ms deadline it cannot fit, and would defeat the burst coalescing that exists so a `cargo fmt` does not produce fifty cancelled checks.
 

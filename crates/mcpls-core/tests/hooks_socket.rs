@@ -5,6 +5,7 @@
 //! racing, a stale file, a lock outliving a socket.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::BoxFuture;
@@ -125,7 +126,14 @@ async fn test_an_owner_stands_down_when_its_lock_file_is_replaced() {
         .expect("owner");
     let (_tx, cancel) = tokio::sync::watch::channel(false);
     let serve_task = tokio::spawn(owner.serve(
-        handler(|_req| Box::pin(async { Response::Flush { context: None } })),
+        handler(|_req| {
+            Box::pin(async {
+                Response::Flush {
+                    context: None,
+                    token: None,
+                }
+            })
+        }),
         Duration::from_millis(1500),
         cancel,
     ));
@@ -165,7 +173,14 @@ async fn test_serve_reports_cancelled_when_the_cancel_watch_fires() {
         .expect("owner");
     let (cancel_tx, cancel) = tokio::sync::watch::channel(false);
     let serve_task = tokio::spawn(listener.serve(
-        handler(|_req| Box::pin(async { Response::Flush { context: None } })),
+        handler(|_req| {
+            Box::pin(async {
+                Response::Flush {
+                    context: None,
+                    token: None,
+                }
+            })
+        }),
         Duration::from_millis(1500),
         cancel,
     ));
@@ -226,6 +241,7 @@ async fn test_a_request_reaches_the_owner_and_is_answered() {
             Box::pin(async {
                 Response::Flush {
                     context: Some("hello".to_string()),
+                    token: None,
                 }
             })
         }),
@@ -246,7 +262,8 @@ async fn test_a_request_reaches_the_owner_and_is_answered() {
     assert_eq!(
         response,
         Response::Flush {
-            context: Some("hello".to_string())
+            context: Some("hello".to_string()),
+            token: None
         }
     );
 }
@@ -271,7 +288,10 @@ async fn test_an_op_answers_within_its_deadline_while_its_work_runs_on() {
         handler(|_req| {
             Box::pin(async {
                 tokio::time::sleep(Duration::from_secs(30)).await;
-                Response::Flush { context: None }
+                Response::Flush {
+                    context: None,
+                    token: None,
+                }
             })
         }),
         Duration::from_millis(200),
@@ -288,11 +308,18 @@ async fn test_an_op_answers_within_its_deadline_while_its_work_runs_on() {
     )
     .await;
 
+    let Ok(Response::Error { message }) = response else {
+        panic!(
+            "a hook that hangs blocks the agent, and the host's own timeout is \
+             600 seconds, so the bound has to be ours and it has to answer \
+             rather than drop the connection; got {response:?}"
+        );
+    };
     assert!(
-        matches!(response, Ok(Response::Error { .. })),
-        "a hook that hangs blocks the agent, and the host's own timeout is \
-         600 seconds, so the bound has to be ours and it has to answer \
-         rather than drop the connection; got {response:?}"
+        message.contains("the next flush offers it again"),
+        "a flush that outran its deadline was never acknowledged, so what \
+         its work stages is offered again; the message has to say that and \
+         not promise something else: {message}"
     );
     assert!(
         started.elapsed() < Duration::from_secs(2),
@@ -322,7 +349,10 @@ async fn test_overrunning_work_completes_after_its_deadline_answered() {
             Box::pin(async move {
                 tokio::time::sleep(Duration::from_millis(400)).await;
                 let _ = done_tx.send(()).await;
-                Response::Flush { context: None }
+                Response::Flush {
+                    context: None,
+                    token: None,
+                }
             })
         }),
         Duration::from_millis(100),
@@ -368,6 +398,7 @@ async fn test_two_requests_share_one_connection() {
                 } else {
                     Response::Flush {
                         context: Some("drained".to_string()),
+                        token: None,
                     }
                 }
             })
@@ -398,11 +429,78 @@ async fn test_two_requests_share_one_connection() {
         vec![
             Response::Changed { queued: 1 },
             Response::Flush {
-                context: Some("drained".to_string())
+                context: Some("drained".to_string()),
+                token: None
             },
         ],
         "the spec's PostToolBatch sends changed then flush on one \
          connection, and the answers come back in the order they were sent"
+    );
+}
+
+#[tokio::test]
+async fn test_send_and_acknowledge_acks_a_tokened_flush_on_the_same_connection() {
+    let (_guard, identity) = temp_identity();
+    let listener = HookListener::acquire(&identity)
+        .await
+        .expect("acquire")
+        .expect("owner");
+    let (_tx, cancel) = tokio::sync::watch::channel(false);
+    let seen: Arc<std::sync::Mutex<Vec<Request>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&seen);
+    tokio::spawn(listener.serve(
+        handler(move |req| {
+            recorder.lock().expect("seen").push(req.clone());
+            Box::pin(async move {
+                match req {
+                    Request::Flush { .. } => Response::Flush {
+                        context: Some("2 errors in a.rs".to_string()),
+                        token: Some(7),
+                    },
+                    Request::Ack { .. } => Response::Ack,
+                    _ => Response::Error {
+                        message: "unexpected".to_string(),
+                    },
+                }
+            })
+        }),
+        Duration::from_millis(1500),
+        cancel,
+    ));
+
+    let answers = mcpls_core::hooks::send_and_acknowledge(
+        &identity,
+        &[Request::Flush {
+            session: "s1".to_string(),
+        }],
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("the owner answers");
+
+    assert_eq!(
+        answers,
+        vec![Response::Flush {
+            context: Some("2 errors in a.rs".to_string()),
+            token: Some(7),
+        }],
+        "the caller gets the flush answers and nothing else; the \
+         acknowledgement's own answer is consumed on its behalf"
+    );
+    let seen = seen.lock().expect("seen").clone();
+    assert_eq!(
+        seen,
+        vec![
+            Request::Flush {
+                session: "s1".to_string(),
+            },
+            Request::Ack {
+                session: "s1".to_string(),
+                token: 7,
+            },
+        ],
+        "the acknowledgement names the session and the token the answer \
+         carried, and follows the flush on the connection it came in on"
     );
 }
 
