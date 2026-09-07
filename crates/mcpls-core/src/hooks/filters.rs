@@ -70,25 +70,44 @@ impl PathFilter {
     ///
     /// When several configured roots contain `path` -- one nested inside
     /// another, which is how a monorepo with a vendored subproject is
-    /// configured -- the deepest of them decides. It is the one whose
-    /// `.gitignore` was written about this file: an outer root's `vendor/`
-    /// line says nothing about what the subproject keeps, and letting it
-    /// answer would drop every path under a nested root the user configured
-    /// on purpose. The order the roots were configured in never enters into
-    /// it.
+    /// configured -- every one of them is asked, and the path is dropped as
+    /// soon as any of them ignores it. A repository root writes `dist/` or
+    /// `*.log` once at the top and means it everywhere below, which is what
+    /// git does with the same file.
+    ///
+    /// The one rule that does not get to answer is an outer one excluding
+    /// the deepest containing root itself: configuring that root is the
+    /// statement that its contents are wanted, so a `vendor/` line above it
+    /// cannot drop everything inside it. That outer root is then skipped
+    /// entirely for this path, and the roots below it still answer for
+    /// themselves.
+    ///
+    /// Being a fold over a set, the order the roots were configured in
+    /// never enters into it.
     #[must_use]
     pub fn admits(&self, path: &Path) -> bool {
-        let Some(ignore) = self
+        let containing: Vec<(&PathBuf, &Gitignore)> = self
             .roots
             .iter()
             .zip(&self.ignores)
             .filter(|(root, _)| path.starts_with(root))
+            .collect();
+        let Some(deepest) = containing
+            .iter()
             .max_by_key(|(root, _)| root.components().count())
-            .map(|(_, ignore)| ignore)
+            .map(|(root, _)| *root)
         else {
             return false;
         };
-        if ignore.matched_path_or_any_parents(path, false).is_ignore() {
+        let ignored = containing.iter().any(|(root, ignore)| {
+            let excludes_the_deepest_root = *root != deepest
+                && ignore
+                    .matched_path_or_any_parents(deepest, true)
+                    .is_ignore();
+            !excludes_the_deepest_root
+                && ignore.matched_path_or_any_parents(path, false).is_ignore()
+        });
+        if ignored {
             return false;
         }
 
@@ -254,6 +273,38 @@ mod tests {
                  was written about it; the repository root, which knows nothing \
                  of this file, must not be able to re-admit what the subproject \
                  itself excluded"
+            );
+        }
+    }
+
+    /// A repository root that writes its build directory into its own
+    /// `.gitignore` once, and a subproject configured as a root of its own
+    /// which does not repeat the rule -- how a JS or Python monorepo is
+    /// actually laid out, `dist/` being neither `target/` nor
+    /// `node_modules/` and so outside [`BUILT_IN_IGNORES`].
+    fn monorepo_sharing_one_build_rule(dir: &Path) -> Vec<PathBuf> {
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(sub.join("dist")).expect("mkdir");
+        std::fs::write(dir.join(".gitignore"), "dist/\n").expect("write");
+        vec![dir.to_path_buf(), sub]
+    }
+
+    #[test]
+    fn test_an_outer_build_rule_reaches_under_a_nested_root() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let roots = monorepo_sharing_one_build_rule(dir.path());
+        let bundle = dir.path().join("sub/dist/bundle.rs");
+        std::fs::write(&bundle, "").expect("write");
+        let reversed: Vec<PathBuf> = roots.iter().rev().cloned().collect();
+
+        for roots in [roots, reversed] {
+            let filter = PathFilter::new(Arc::from(roots), extensions(), None);
+            assert!(
+                !filter.admits(&bundle),
+                "a repository root's build rule is written once and meant for \
+                 everything below it, and a subproject configured as a root \
+                 does not switch it off: an npm build under one would \
+                 otherwise fill the tracker to its ceiling"
             );
         }
     }
