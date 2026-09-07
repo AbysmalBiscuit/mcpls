@@ -32,32 +32,10 @@ use crate::hooks::filters::PathFilter;
 pub enum SweepKind {
     /// Absent from disk.
     Deleted,
-    /// Present, and the tracker has never held it.
+    /// Present, and the tracker is not holding it.
     Created,
     /// Present, and the tracker already holds it.
     Changed,
-}
-
-impl SweepKind {
-    /// The change kinds a watching server may be told this path underwent,
-    /// most preferred first.
-    ///
-    /// `Deleted` and `Changed` are each one definite kind: the path is gone,
-    /// or the tracker was already holding it and so it existed before.
-    /// `Created` is two facts short of that. It says the tracker has never
-    /// held the path, which is equally what a file the host has just made
-    /// and a file mcpls simply never opens as a document -- a `go.work`
-    /// edited in place -- look like, and nothing mcpls keeps tells them
-    /// apart. Naming one guessed kind to everybody silently drops every
-    /// server whose watcher registered for the other, so both are offered
-    /// and each server hears the one it asked for.
-    const fn watched_file_kinds(self) -> &'static [FileChangeType] {
-        match self {
-            Self::Deleted => &[FileChangeType::DELETED],
-            Self::Changed => &[FileChangeType::CHANGED],
-            Self::Created => &[FileChangeType::CHANGED, FileChangeType::CREATED],
-        }
-    }
 }
 
 /// Collects changed paths and acts on them once the burst settles.
@@ -272,7 +250,7 @@ impl Sweeper {
             };
             kinds.push((path.clone(), kind));
             if kind == SweepKind::Created {
-                untracked.push((path, kind));
+                untracked.push(path);
             } else {
                 settle.push(path);
             }
@@ -286,9 +264,9 @@ impl Sweeper {
         let mut unopened = 0;
         let mut watched_only = Vec::new();
 
-        for (path, kind) in untracked {
+        for path in untracked {
             if !self.filter.routable_extension(&path) {
-                watched_only.push((path, kind));
+                watched_only.push(path);
                 continue;
             }
             match self
@@ -300,14 +278,14 @@ impl Sweeper {
                     opened += 1;
                     settle.push(path);
                 }
-                OpenOutcome::NoRoute => watched_only.push((path, kind)),
+                OpenOutcome::NoRoute => watched_only.push(path),
                 OpenOutcome::NoHeadroom => {
                     over_limit += 1;
-                    watched_only.push((path, kind));
+                    watched_only.push(path);
                 }
                 OpenOutcome::Failed => {
                     unopened += 1;
-                    watched_only.push((path, kind));
+                    watched_only.push(path);
                 }
             }
         }
@@ -315,9 +293,18 @@ impl Sweeper {
         self.translator.queue_invalidations(&settle);
         self.translator.resync_changed_documents().await;
 
-        for (path, kind) in watched_only {
+        // Everything here is a path present on disk that the tracker is not
+        // holding right now, which is equally what a file the host has just
+        // made and a file mcpls never opens as a document -- a `go.work`
+        // edited in place -- look like, and nothing mcpls keeps tells the two
+        // apart. Naming one guessed kind to everybody silently drops every
+        // server whose watcher registered for the other, so both go out and
+        // each server hears the one it asked for. `CHANGED` comes first
+        // because it is what every server used to be told, and preferring it
+        // keeps every delivery that already worked.
+        for path in watched_only {
             self.translator
-                .notify_watched_files(&path, kind.watched_file_kinds())
+                .notify_watched_files(&path, &[FileChangeType::CHANGED, FileChangeType::CREATED])
                 .await;
         }
 
