@@ -363,13 +363,15 @@ Paths arriving from tool inputs are bounded by what the agent actually edited, s
 
 | Event | mcpls does | Injects context |
 |---|---|---|
-| `SessionStart` | returns `watchPaths` | no |
+| `SessionStart` | returns `watchPaths`; warns the user about scan errors | no |
 | `FileChanged` | `changed` for one path | no |
 | `PostToolBatch` | `changed` for the batch's paths, then `flush` | yes |
 | `UserPromptSubmit` | `flush` | yes |
 | `SessionEnd` | drops the session record | no |
 
-`SessionStart` no longer snapshots the baseline: A2 gates that on servers settling, which is a signal mcpls owns and the hook cannot observe. This also removes a race, since the hook and the MCP server start concurrently and the hook can reach a socket that is not yet bound.
+Structured output includes the triggering event in `hookSpecificOutput.hookEventName`. `SessionStart` retains partial watch paths on traversal or ignore-rule errors and adds a non-blocking `systemMessage`. The doctor reports a fresh local scan, including empty versus incomplete results; neither surface claims the host registered the paths. Hidden top-level entries remain excluded.
+
+`SessionStart` does not snapshot the baseline: A2 gates that on servers settling, which is a signal mcpls owns and the hook cannot observe. This also removes a race, since the hook and the MCP server start concurrently and the hook can reach a socket that is not yet bound.
 
 `Stop` is deliberately absent. Its output schema states that `additionalContext` is non-error feedback delivered to the model and the conversation continues so the model can act on it, so a `Stop` flush would turn every new warning into a keep-working signal and produce a warnings-driven auto-continue loop. The next `UserPromptSubmit` flush delivers the same diagnostics anyway.
 
@@ -384,11 +386,11 @@ sweep_quiet_ms = 500
 op_deadline_ms = 1500
 ```
 
-Defaulting on is safe here in a way it is not for the footer, because reaching this configuration at all means installing the plugin, and installing the plugin is the opt-in. With `enabled = false` the listener never binds and every hook exits 0 without output. There is no separate socket switch and no configurable socket path: the hook process does not read mcpls's config, since `MCPLS_CONFIG` lives in the MCP server's environment rather than the hook's, so a path it could not discover would be unusable.
+Installing the plugin opts into its hooks. With `enabled = false` the listener never binds, so socket-dependent hooks receive no diagnostics. `SessionStart` still performs its local scan. There is no configurable socket path: the hook process does not read mcpls's config, since `MCPLS_CONFIG` lives in the MCP server's environment rather than the hook's.
 
-### Failure is silent
+### Socket failure is silent
 
-No socket, a connect timeout of 50 ms, a malformed response, or any other fault: the hook exits 0 having printed nothing. An edit must never fail because diagnostics were unavailable.
+Socket and payload failures leave the hook successful and silent. `SessionStart` scan failures instead produce a non-blocking warning. Owner overruns use the configured deadline in a generic response stating that work continues in the background; hook clients discard that response. It promises neither successful completion nor delivery on a later flush.
 
 ### CLI and plugin layout
 
@@ -419,7 +421,7 @@ The watcher filters get unit tests: a `target/` artifact dropped, a gitignored f
 
 Every test that builds a path for one of these must build it with a drive letter on Windows, the way `mcp/server.rs:1736` already does. `Url::from_file_path` fails without one, and a test that silently skips its own assertion proves nothing on the platform this fork is installed on.
 
-Windows named pipes have no CI coverage, but Windows is a supported target, so the listener sits behind a small trait with the logic tested once and the transport verified by hand.
+Windows CI compiles and executes the unit and integration suites and runs native Clippy. Real named-pipe tests cover ownership, concurrent requests, saturated-pipe classification, and isolated namespace scans. These do not establish live plugin wiring or cross-user access control; execution evidence and remaining gates are recorded in the [follow-up validation note](../notes/2026-09-08-diagnostics-followup-validation.md).
 
 **What no test in this repository can prove.** Whether Claude Code actually invokes `mcpls hook`, whether `mcpls` is on the hook process's `PATH`, and whether the two directory hashes agree on a given machine are all properties of a live host session. The tests above cover the socket, the protocol, and the filters; they say nothing about the wiring. `mcpls hook doctor` against a real session is the gate, and stage C is not done until it has been run. This is stated rather than papered over with a test that would only prove the mock agrees with itself.
 

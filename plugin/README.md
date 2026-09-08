@@ -14,7 +14,7 @@ claude --plugin-dir /path/to/mcpls/plugin
 
 ## Check that it's working
 
-Every hook failure in this system is silent by design: a hook that cannot reach mcpls exits cleanly and prints nothing, because an edit must never fail just because diagnostics were unavailable. That means a broken install looks exactly like a quiet workspace. Before doing anything else, run:
+Payload and socket failures exit cleanly without output, so a broken connection can look like a quiet workspace. `SessionStart` reports watch-path scan failures through a non-blocking user warning. To inspect the connection and scan, run:
 
 ```fish
 mcpls hook doctor
@@ -28,7 +28,8 @@ hook sees: /home/lev/project -> 39df698ef1ac4f49
 server sees: /home/lev/project -> 39df698ef1ac4f49
 owner pid: 2816002
 hooks seen: 3 request(s) since this owner started
-mcpls on PATH: /home/lev/.cargo/bin/mcpls
+mcpls on PATH: /home/lev/.cargo/bin/mcpls; launch not checked
+watch scan: selected 4 top-level path(s); hidden and ignored entries excluded; host registration unverified
 ```
 
 Line by line:
@@ -46,7 +47,10 @@ Line by line:
   When an owner does answer but the exchange itself fails, the line reports the specific fault instead: an owner answering with an error message, answering with something other than its own status, a socket that accepted the connection but whose reply this build could not parse, or a socket that answered nothing within the probe window. Each of those pairs with `owner pid: unknown` below. The doctor names no cause for any of them, because an accepted connection and a failed exchange are the whole of what it established; what it prints instead is the answer or the error itself, and that is the thing to act on.
 - **`owner pid:`** the process id holding the socket, `none` if nothing does, or `unknown` if an owner exists but the exchange did not get far enough to learn its pid (see the fault messages above). When it does print a pid, confirm it names a live `mcpls` process; a pid that no longer exists or belongs to something else means the socket is orphaned: delete the socket file at the path in `socket:` above (a Windows named pipe clears on its own once nothing holds it) so a new mcpls can bind it.
 - **`hooks seen:`** how many `Changed`, `Flush`, or `EndSession` requests this owner has served since it started; a `Status` probe, including the doctor's own, is never counted. Zero is not by itself a fault: `SessionStart` never touches the socket, so an owner that just started, or just took over from a previous one, looks identical to one that has never received a hook. The line's own wording says what to do about a zero.
-- **`mcpls on PATH:`** the absolute path doctor found by searching `PATH` for `mcpls`, or `not found`. Hooks invoke `mcpls` by name, not by path, so `not found` means every hook silently does nothing. Fix the `PATH` the hook process inherits, not just your interactive shell's.
+- **`mcpls on PATH:`** the absolute path of a candidate found on `PATH`, or `not found`. The doctor does not execute it: a text file named `mcpls.exe` on Windows is still a candidate, not a verified installation. Hooks invoke `mcpls` by name, so check the `PATH` the hook process inherits, not just your interactive shell's.
+- **`watch scan:`** what a fresh local scan can select for `SessionStart`. An empty successful scan says `no eligible top-level paths`; traversal or ignore-rule failures say `incomplete` and include their causes. A selected path does not prove the host registered it or can read its descendants. Hidden top-level files and directories, including `.github`, are excluded along with ignored entries. After fixing scan errors, restart the session to register a fresh watch list.
+
+An operation that exceeds the owner's response deadline keeps running in the background. Hook clients remain silent on that response; the deadline does not establish whether the work will succeed or whether a later report will contain diagnostics. The doctor reports a deadline response if it receives one during its probe window.
 
 If mcpls cannot derive a socket identity for the project directory at all (an unreachable path, or a runtime directory deep enough that the resulting socket path exceeds the platform's length limit), the doctor prints a different shape entirely:
 
@@ -55,7 +59,8 @@ socket: none; could not derive an identity for this directory: socket path excee
 hook sees: /home/lev/project -> unknown
 server sees: nothing can run here; no socket exists to probe
 owner pid: none
-mcpls on PATH: /home/lev/.cargo/bin/mcpls
+mcpls on PATH: /home/lev/.cargo/bin/mcpls; launch not checked
+watch scan: selected 4 top-level path(s); hidden and ignored entries excluded; host registration unverified
 ```
 
 This is a different failure from a missing owner: there, a socket exists and nothing answers it; here, no socket could ever exist for this directory on either side. Fix the reported reason, for example moving the project or `XDG_RUNTIME_DIR` to a shorter path, then run the doctor again.
