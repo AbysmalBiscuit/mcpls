@@ -111,7 +111,7 @@ pub enum Response {
         /// that is actually wired up to a host.
         hooks_seen: u64,
     },
-    /// Reports that a request could not be carried out.
+    /// Reports a failure or a response deadline exceeded while work continues.
     Error {
         /// A human-readable description of what went wrong.
         message: String,

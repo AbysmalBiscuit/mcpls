@@ -77,6 +77,52 @@ async fn test_one_listener_acquires_and_a_second_defers() {
 }
 
 #[tokio::test]
+async fn test_two_concurrent_clients_reach_one_owner_before_either_finishes() {
+    let (_guard, identity) = temp_identity();
+    let listener = HookListener::acquire(&identity).await.unwrap().unwrap();
+    let both = Arc::new(tokio::sync::Barrier::new(2));
+    let (cancel, rx) = tokio::sync::watch::channel(false);
+    let owner = tokio::spawn(listener.serve(
+        handler(move |request| {
+            let both = Arc::clone(&both);
+            Box::pin(async move {
+                both.wait().await;
+                let Request::Flush { session } = request else {
+                    panic!("expected flush")
+                };
+                Response::Flush {
+                    context: Some(session),
+                    token: None,
+                }
+            })
+        }),
+        Duration::from_secs(1),
+        rx,
+    ));
+    let first = Request::Flush {
+        session: "first".into(),
+    };
+    let second = Request::Flush {
+        session: "second".into(),
+    };
+    let (a, b) = tokio::join!(
+        send(&identity, &first, Duration::from_millis(1500)),
+        send(&identity, &second, Duration::from_millis(1500)),
+    );
+    for (response, expected) in [(a, "first"), (b, "second")] {
+        assert_eq!(
+            response.unwrap(),
+            Response::Flush {
+                context: Some(expected.into()),
+                token: None
+            }
+        );
+    }
+    cancel.send(true).unwrap();
+    owner.await.unwrap();
+}
+
+#[tokio::test]
 async fn test_a_second_listener_acquires_after_the_owner_drops() {
     let (_guard, identity) = temp_identity();
     let first = HookListener::acquire(&identity)
@@ -204,14 +250,7 @@ async fn test_exactly_one_of_many_racing_acquirers_wins() {
         let identity = identity.clone();
         set.spawn(async move { HookListener::acquire(&identity).await.expect("acquire") });
     }
-    // Every acquired listener is kept, not just counted, until every racer
-    // has reported in: dropping the winner as soon as it is known would
-    // release its lock while stragglers are still attempting theirs, and a
-    // straggler that then acquires the now-free lock is a second success
-    // that never overlapped the first. Holding every winner open for the
-    // whole race is what makes "how many attempts overlapped a held lock"
-    // the thing being measured, rather than "how many attempts landed
-    // after some earlier one let go."
+    // Retain the winner until every contender has attempted acquisition.
     let mut acquired = Vec::new();
     while let Some(result) = set.join_next().await {
         acquired.push(result.expect("the task"));
@@ -315,11 +354,9 @@ async fn test_an_op_answers_within_its_deadline_while_its_work_runs_on() {
              rather than drop the connection; got {response:?}"
         );
     };
-    assert!(
-        message.contains("the next flush offers it again"),
-        "a flush that outran its deadline was never acknowledged, so what \
-         its work stages is offered again; the message has to say that and \
-         not promise something else: {message}"
+    assert_eq!(
+        message,
+        "op exceeded 200ms; work continues in the background"
     );
     assert!(
         started.elapsed() < Duration::from_secs(2),
@@ -327,12 +364,7 @@ async fn test_an_op_answers_within_its_deadline_while_its_work_runs_on() {
     );
 }
 
-/// The deadline bounds the answer, not the work: a handler that outruns it
-/// keeps running and its result reaches the next flush. A plain `timeout`
-/// around the handler's future would cancel it here instead, and no
-/// client-visible behaviour would change -- this is what actually tells
-/// the two implementations apart, since the previous test only checks that
-/// an answer arrives on time, which both would satisfy.
+/// Detached handler work survives the response deadline.
 #[tokio::test]
 async fn test_overrunning_work_completes_after_its_deadline_answered() {
     let (_guard, identity) = temp_identity();
@@ -504,17 +536,7 @@ async fn test_send_and_acknowledge_acks_a_tokened_flush_on_the_same_connection()
     );
 }
 
-/// A flush that spends the caller's whole bound still leaves its
-/// acknowledgement time to land.
-///
-/// The hook's client bound and the owner's op deadline are configured
-/// independently and default to the same 1500 ms, so an owner answering a
-/// flush at its own deadline hands back a report with none of the client's
-/// bound left. An acknowledgement drawing on that remainder would never be
-/// answered, and on a transport whose write can pend it would never be sent
-/// either, leaving the owner to offer the same report on every flush after
-/// it. Here the owner takes 200 ms per op against a 250 ms client bound: the
-/// flush leaves 50 ms, and the acknowledgement still waits out its own 200 ms.
+/// The acknowledgement gets its own allowance after a slow flush consumes the caller's.
 #[tokio::test]
 async fn test_an_acknowledgement_outlasts_a_flush_that_spent_the_callers_bound() {
     let (_guard, identity) = temp_identity();
