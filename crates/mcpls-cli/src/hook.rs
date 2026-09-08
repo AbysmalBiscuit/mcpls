@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Result;
+use mcpls_core::hooks::filters::WatchPaths;
 use mcpls_core::hooks::{
     ChangeEvent, ProbeOutcome, Request, Response, SocketIdentity, probe, send,
     send_and_acknowledge, watch_paths,
@@ -21,16 +22,7 @@ use serde::Deserialize;
 /// carry no context back and are never worth stalling an edit for.
 const SOCKET_TIMEOUT: Duration = Duration::from_millis(50);
 
-/// How long a hook waits for an answer that can carry `additionalContext`:
-/// `UserPromptSubmit`'s `Flush`, and the `Flush` half of a `PostToolBatch`.
-/// Tracks the spec's `op_deadline_ms` default of 1500: a client timeout
-/// tighter than the server's own deadline for finishing that work is never
-/// right, since it only cuts off answers from an owner that is going to
-/// reply anyway. A missing owner still fails fast, because the connect
-/// itself fails immediately rather than waiting out this bound. This bound
-/// covers the flush alone: an owner answering at its own deadline would
-/// leave nothing of it for the acknowledgement that follows, so that
-/// acknowledgement runs under an allowance of its own.
+/// Bounds the request batch that supplies context; acknowledgement has a separate allowance.
 const FLUSH_SOCKET_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// The hook payload Claude Code writes to stdin, keeping only the fields
@@ -62,35 +54,13 @@ struct ToolInput {
     file_path: Option<PathBuf>,
 }
 
-/// Await `body`, and swallow whatever it does wrong.
-///
-/// An edit must never fail because diagnostics were unavailable, so there
-/// is exactly one exit code and it is zero. The cost is that a broken
-/// installation is invisible, which is what `mcpls hook doctor` exists to
-/// answer. This covers an `Err` from `body`; nothing on this path panics
-/// today, so there is no `catch_unwind` here, but a caller relying on this
-/// wrapper for panic safety would be relying on something it does not do.
-///
-/// Takes a future rather than a closure: everything it wraps goes through
-/// `hooks::send`, which is `async`, and a synchronous `FnOnce` could not
-/// contain the await, so the one-wrapper guarantee would not hold.
+/// Convert returned errors to an empty answer; panics are not caught.
 async fn silently<T: Default>(body: impl Future<Output = Result<T>>) -> T {
     body.await.unwrap_or_default()
 }
 
-/// Read one hook payload from `stdin` and return the hook JSON to print,
-/// dispatching on the payload's own `hook_event_name` against the socket
-/// `identity` names.
-///
-/// `identity` is `None` when the caller could not derive one (an
-/// unreachable or over-long project directory): `SessionStart` still
-/// answers, since it never touches the socket, and every other arm
-/// degrades to the empty string exactly as it would against an
-/// unreachable socket.
-///
-/// Every fault, a missing identity, a missing socket, a connect timeout, a
-/// malformed response, a payload that will not parse, produces the empty
-/// string.
+/// Return hook JSON, or an empty answer on payload or socket failure.
+/// `SessionStart` works without an identity and reports local watch-scan failures.
 pub async fn dispatch_payload(
     stdin: &str,
     project_dir: &Path,
@@ -103,11 +73,7 @@ async fn run(stdin: &str, project_dir: &Path, identity: Option<&SocketIdentity>)
     let payload: HookPayload = serde_json::from_str(stdin)?;
 
     match payload.hook_event_name.as_str() {
-        // `SessionStart` fires while the host is still spawning the MCP
-        // server, so the socket may not be bound yet. Computing the watch
-        // set locally, rather than asking over the socket, is what keeps
-        // this hook from either leaving the session with no coverage or an
-        // unbounded watcher over target/. It never touches `identity`.
+        // The owner may still be starting, so watch-path selection is local.
         "SessionStart" => Ok(session_start_output(&watch_paths(project_dir))),
 
         "FileChanged" => {
@@ -152,7 +118,7 @@ async fn run(stdin: &str, project_dir: &Path, identity: Option<&SocketIdentity>)
             ];
             let responses = send_and_acknowledge(identity, &requests, FLUSH_SOCKET_TIMEOUT).await?;
             let context = responses.into_iter().nth(1).and_then(flush_context);
-            Ok(additional_context_output(context))
+            Ok(additional_context_output("PostToolBatch", context))
         }
 
         "UserPromptSubmit" => {
@@ -168,7 +134,7 @@ async fn run(stdin: &str, project_dir: &Path, identity: Option<&SocketIdentity>)
             )
             .await?;
             let context = responses.into_iter().next().and_then(flush_context);
-            Ok(additional_context_output(context))
+            Ok(additional_context_output("UserPromptSubmit", context))
         }
 
         "SessionEnd" => {
@@ -186,11 +152,7 @@ async fn run(stdin: &str, project_dir: &Path, identity: Option<&SocketIdentity>)
             Ok(String::new())
         }
 
-        // `Stop` is deliberately absent. Its `additionalContext` is
-        // documented as non-error feedback after which the conversation
-        // continues so the model can act on it, so flushing there would
-        // turn every new warning into a keep-working signal. The next
-        // `UserPromptSubmit` delivers the same diagnostics anyway.
+        // Stop context resumes the conversation; flush at the next prompt instead.
         _ => Ok(String::new()),
     }
 }
@@ -205,21 +167,53 @@ fn flush_context(response: Response) -> Option<String> {
 }
 
 /// The `SessionStart` hook's JSON, naming the directories to watch.
-fn session_start_output(paths: &[PathBuf]) -> String {
-    let watch_paths: Vec<String> = paths
+fn session_start_output(scan: &WatchPaths) -> String {
+    let watch_paths: Vec<String> = scan
+        .paths
         .iter()
         .map(|path| path.display().to_string())
         .collect();
-    serde_json::json!({ "hookSpecificOutput": { "watchPaths": watch_paths } }).to_string()
+    let mut output = serde_json::json!({ "hookSpecificOutput": {
+        "hookEventName": "SessionStart", "watchPaths": watch_paths
+    }});
+    if !scan.errors.is_empty() {
+        output["systemMessage"] = serde_json::json!(format!(
+            "mcpls: watch-path scan incomplete; external edits may be missed. {}. \
+             Fix the reported scan errors and restart the session; inspect with mcpls hook doctor.",
+            scan.errors.join("; ")
+        ));
+    }
+    output.to_string()
+}
+
+fn watch_scan_line(project_dir: &Path) -> String {
+    let scan = watch_paths(project_dir);
+    let status = if !scan.errors.is_empty() {
+        format!(
+            "incomplete; selected {} top-level path(s); {}",
+            scan.paths.len(),
+            scan.errors.join("; ")
+        )
+    } else if scan.paths.is_empty() {
+        "no eligible top-level paths".to_string()
+    } else {
+        format!("selected {} top-level path(s)", scan.paths.len())
+    };
+    format!(
+        "watch scan: {status}; hidden and ignored entries excluded; host registration unverified"
+    )
 }
 
 /// The hook JSON carrying diagnostics context, or the empty string when
 /// there is nothing to report.
-fn additional_context_output(context: Option<String>) -> String {
+fn additional_context_output(event: &str, context: Option<String>) -> String {
     context
         .filter(|text| !text.is_empty())
         .map_or_else(String::new, |text| {
-            serde_json::json!({ "hookSpecificOutput": { "additionalContext": text } }).to_string()
+            serde_json::json!({ "hookSpecificOutput": {
+                "hookEventName": event, "additionalContext": text
+            } })
+            .to_string()
         })
 }
 
@@ -234,10 +228,8 @@ const MAX_FOREIGN_CANDIDATES: usize = 16;
 /// answers and how many hooks it has actually seen, and whether `mcpls`
 /// resolves on `PATH`.
 ///
-/// Every other command in this feature fails silently by design, so a
-/// broken install looks exactly like a quiet workspace. This is the one
-/// command allowed to print on failure, because breaking that silence is
-/// its entire purpose.
+/// Socket failures are silent in hooks; this command reports their cause.
+/// `SessionStart` separately warns when its watch-path scan is incomplete.
 pub async fn doctor(project_dir: &Path, identity: &SocketIdentity) -> String {
     doctor_scanning(project_dir, identity, &foreign_scan_prefix()).await
 }
@@ -257,12 +249,7 @@ async fn doctor_scanning(project_dir: &Path, identity: &SocketIdentity, prefix: 
     ];
 
     match probe(identity, &Request::Status, SOCKET_TIMEOUT).await {
-        // `owner: true` is required here for the same reason the foreign
-        // scan requires it: a status answered by anything that is not the
-        // socket's own owner describes some other process's session, and
-        // printing its root and pid as this project's would send a reader
-        // after the wrong process. A `false` falls through to the
-        // unexpected-answer arm below.
+        // Only the socket's owner can identify this project's service.
         ProbeOutcome::Answered(Response::Status {
             hash,
             pid,
@@ -321,6 +308,7 @@ async fn doctor_scanning(project_dir: &Path, identity: &SocketIdentity, prefix: 
     }
 
     lines.push(on_path_line(mcpls_on_path().as_deref()));
+    lines.push(watch_scan_line(project_dir));
 
     lines.join("\n")
 }
@@ -702,6 +690,7 @@ pub fn doctor_without_identity(project_dir: &Path, error: &mcpls_core::Error) ->
         "server sees: nothing can run here; no socket exists to probe".to_string(),
         "owner pid: none".to_string(),
         on_path_line(mcpls_on_path().as_deref()),
+        watch_scan_line(project_dir),
     ];
     lines.join("\n")
 }
@@ -721,7 +710,7 @@ const OWNER_PID_UNKNOWN: &str = "owner pid: unknown";
 fn on_path_line(found: Option<&Path>) -> String {
     found.map_or_else(
         || "mcpls on PATH: not found".to_string(),
-        |path| format!("mcpls on PATH: {}", path.display()),
+        |path| format!("mcpls on PATH: {}; launch not checked", path.display()),
     )
 }
 
@@ -1339,14 +1328,7 @@ mod tests {
                     if connected.is_err() {
                         return;
                     }
-                    // The replacement instance is created *before* the
-                    // connected one is moved out and handed off, mirroring
-                    // `crates/mcpls-core/src/hooks/listener.rs`'s
-                    // `PipeTransport::accept`: a client arriving between
-                    // this instance no longer listening and a replacement
-                    // existing would get `ERROR_FILE_NOT_FOUND` rather than
-                    // the `ERROR_PIPE_BUSY` a real client's connect loop
-                    // retries on.
+                    // Keep an instance available during handoff to avoid FILE_NOT_FOUND.
                     let Ok(next) = ServerOptions::new().create(&socket) else {
                         return;
                     };
@@ -1430,7 +1412,7 @@ mod tests {
 
         assert_eq!(
             out,
-            additional_context_output(Some(DEFAULT_FLUSH_TEXT.to_string())),
+            additional_context_output("UserPromptSubmit", Some(DEFAULT_FLUSH_TEXT.to_string())),
             "an owner slower than the old 50ms bound but inside \
              FLUSH_SOCKET_TIMEOUT must still be waited out, or raising the \
              timeout had no effect at this call site"
@@ -1457,7 +1439,7 @@ mod tests {
 
         assert_eq!(
             out,
-            additional_context_output(Some(DEFAULT_FLUSH_TEXT.to_string())),
+            additional_context_output("PostToolBatch", Some(DEFAULT_FLUSH_TEXT.to_string())),
             "an owner slower than the old 50ms bound but inside \
              FLUSH_SOCKET_TIMEOUT must still be waited out, or raising the \
              timeout had no effect at this call site"
@@ -1778,7 +1760,7 @@ mod tests {
 
         assert_eq!(
             out,
-            additional_context_output(Some(DEFAULT_FLUSH_TEXT.to_string())),
+            additional_context_output("PostToolBatch", Some(DEFAULT_FLUSH_TEXT.to_string())),
             "an error answering changed must not swallow a flush answer \
              that arrived on the same connection: {out}"
         );
@@ -1818,7 +1800,7 @@ mod tests {
 
         assert_eq!(
             out,
-            additional_context_output(Some(DEFAULT_FLUSH_TEXT.to_string())),
+            additional_context_output("UserPromptSubmit", Some(DEFAULT_FLUSH_TEXT.to_string())),
             "the flush answer was read before the owner hung up, so it is \
              printed: {out}"
         );
@@ -2049,7 +2031,11 @@ mod tests {
         let hash = mcpls_core::hooks::identity_hash(project.path()).expect("hash");
 
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 6, "expected exactly six lines: {out}");
+        assert_eq!(lines.len(), 7, "expected exactly seven lines: {out}");
+        assert_eq!(
+            lines[6],
+            "watch scan: no eligible top-level paths; hidden and ignored entries excluded; host registration unverified"
+        );
         assert_eq!(lines[0], format!("socket: {}", identity.socket.display()));
         assert_eq!(
             lines[1],
@@ -2089,7 +2075,11 @@ mod tests {
         .await;
 
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 5, "expected exactly five lines: {out}");
+        assert_eq!(lines.len(), 6, "expected exactly six lines: {out}");
+        assert_eq!(
+            lines[5],
+            "watch scan: no eligible top-level paths; hidden and ignored entries excluded; host registration unverified"
+        );
         assert_eq!(
             lines[2],
             format!(
@@ -2148,7 +2138,11 @@ mod tests {
         let hash = mcpls_core::hooks::identity_hash(project.path()).expect("hash");
 
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 5, "expected exactly five lines: {out}");
+        assert_eq!(lines.len(), 6, "expected exactly six lines: {out}");
+        assert_eq!(
+            lines[5],
+            "watch scan: no eligible top-level paths; hidden and ignored entries excluded; host registration unverified"
+        );
         assert_eq!(lines[0], format!("socket: {}", identity.socket.display()));
         assert_eq!(
             lines[1],
@@ -2477,13 +2471,74 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_pipe_scan_is_sorted_and_confined_to_its_fixture() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let identity = local_identity_for(dir.path(), dir.path());
+        let paths: Vec<_> = ["m", "a", "z", "b"]
+            .iter()
+            .map(|name| test_socket(dir.path(), name))
+            .collect();
+        let _pipes: Vec<_> = paths.iter().map(|path| bind_owner(path)).collect();
+        let _foreign = bind_owner(&test_socket(other.path(), "a"));
+        let _own = bind_owner(&identity.socket);
+        let mut expected = paths;
+        expected.sort();
+        for _ in 0..2 {
+            assert_eq!(
+                super::foreign_candidates(&identity, &test_pipe_prefix(dir.path())).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_doctor_reports_a_saturated_pipe_as_busy_then_recovers() {
+        use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+        let dir = tempfile::tempdir().unwrap();
+        let identity = local_identity_for(dir.path(), dir.path());
+        let server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .max_instances(1)
+            .create(&identity.socket)
+            .unwrap();
+        let client = ClientOptions::new().open(&identity.socket).unwrap();
+        server.connect().await.unwrap();
+        let prefix = test_pipe_prefix(dir.path());
+        let out = super::doctor_scanning(dir.path(), &identity, &prefix).await;
+        assert!(
+            out.contains(
+                "server sees: a socket answered nothing within 50ms; an owner may be busy"
+            ),
+            "{out}"
+        );
+        assert!(out.contains("owner pid: unknown"), "{out}");
+        assert!(!out.contains("server sees: no owner"), "{out}");
+        drop(client);
+        drop(server);
+        tokio::task::yield_now().await;
+        let _owner = RecordingOwner::start_reporting_status(identity.clone(), dir.path(), 1);
+        let out = super::doctor_scanning(dir.path(), &identity, &prefix).await;
+        assert!(
+            out.contains(&format!("owner pid: {}", std::process::id())),
+            "{out}"
+        );
+        assert!(
+            out.contains("hooks seen: 1 request(s) since this owner started"),
+            "{out}"
+        );
+    }
+
     /// Whether a suite run exercises the found branch, the missing one,
     /// or only one of them is otherwise a property of the host's `PATH`.
     #[test]
     fn test_the_path_line_reports_both_outcomes() {
         assert_eq!(
             super::on_path_line(Some(Path::new("/usr/local/bin/mcpls"))),
-            "mcpls on PATH: /usr/local/bin/mcpls"
+            "mcpls on PATH: /usr/local/bin/mcpls; launch not checked"
         );
         assert_eq!(
             super::on_path_line(None),
@@ -2955,7 +3010,11 @@ mod tests {
         let out = super::doctor_without_identity(project.path(), &error);
 
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 5, "expected exactly five lines: {out}");
+        assert_eq!(lines.len(), 6, "expected exactly six lines: {out}");
+        assert_eq!(
+            lines[5],
+            "watch scan: no eligible top-level paths; hidden and ignored entries excluded; host registration unverified"
+        );
         assert_eq!(
             lines[0],
             format!("socket: none; could not derive an identity for this directory: {error}")
