@@ -71,10 +71,14 @@ jobs:
         run: cargo +nightly fmt --all -- --check
 
   clippy:
-    name: Lint (clippy)
+    name: Lint (clippy) (${{ matrix.os }})
     needs: detect-changes
     if: needs.detect-changes.outputs.run-full-ci == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     timeout-minutes: 10
     permissions:
       contents: read

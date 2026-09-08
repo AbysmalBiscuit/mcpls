@@ -1751,7 +1751,7 @@ mod tests {
                 Component::Prefix(p) => Some(p.as_os_str().to_owned()),
                 _ => None,
             })
-            .expect("temp dir path should have a Windows drive prefix");
+            .unwrap();
         let mut root = drive_prefix;
         root.push("workspace");
         let root = PathBuf::from(root);

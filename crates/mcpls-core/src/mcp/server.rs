@@ -2221,7 +2221,7 @@ mod tests {
 
             let path = dir.path().join("main.rs");
             std::fs::write(&path, "fn old() {}\n").expect("write the fixture");
-            let path = path.canonicalize().expect("the fixture exists");
+            let path = dunce::canonicalize(path).expect("the fixture exists");
             let uri = crate::bridge::path_to_uri(&path).expect("a uri for the fixture");
 
             let mut context = BridgeContext::new(
