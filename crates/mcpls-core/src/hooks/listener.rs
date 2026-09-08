@@ -446,14 +446,18 @@ where
     while let Ok(Some(line)) = lines.next_line().await {
         let response = match serde_json::from_str::<Request>(&line) {
             Ok(request) => {
-                let overrun = overrun_message(&request, op_deadline);
                 let work = tokio::spawn(handler(request));
                 match tokio::time::timeout(op_deadline, work).await {
                     Ok(Ok(response)) => response,
                     Ok(Err(_join_error)) => Response::Error {
                         message: "the handler panicked".to_string(),
                     },
-                    Err(_elapsed) => Response::Error { message: overrun },
+                    Err(_elapsed) => Response::Error {
+                        message: format!(
+                            "op exceeded {}ms; work continues in the background",
+                            op_deadline.as_millis()
+                        ),
+                    },
                 }
             }
             Err(e) => Response::Error {
@@ -468,35 +472,6 @@ where
         if write_line(&mut writer, &line).await.is_err() {
             return;
         }
-    }
-}
-
-/// What a client is told when its op outran the deadline: what the work
-/// it did not wait for does once it finishes, which differs per op.
-///
-/// A `flush` that outruns the deadline stages a report nobody
-/// acknowledges, so the record does not move and the next `flush` offers
-/// the same report; saying so is what lets a client treat the error as a
-/// deferral rather than a loss.
-fn overrun_message(request: &Request, op_deadline: Duration) -> String {
-    let ms = op_deadline.as_millis();
-    match request {
-        Request::Changed { .. } => format!(
-            "op exceeded {ms}ms; the paths are queued when the work finishes and their \
-             diagnostics reach a later flush"
-        ),
-        Request::Flush { .. } => format!(
-            "op exceeded {ms}ms; nothing confirmed this report was delivered, so the next \
-             flush offers it again"
-        ),
-        Request::Ack { .. } => format!(
-            "op exceeded {ms}ms; the record advances when the work finishes, unless this \
-             report was superseded or its session ended"
-        ),
-        Request::EndSession { .. } => {
-            format!("op exceeded {ms}ms; the session's record is dropped when the work finishes")
-        }
-        Request::Status => format!("op exceeded {ms}ms"),
     }
 }
 
@@ -576,7 +551,7 @@ fn timed_out(timeout: Duration) -> Error {
 ///
 /// Short, because the exchange is one round trip on a connection that is
 /// already open and its outcome is discarded either way: a longer bound
-/// would only delay a hook that has already printed.
+/// would only delay a hook whose report is already in hand.
 const ACK_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Send `requests` down one connection and, when the last flush among
@@ -962,8 +937,7 @@ fn is_pipe_transport_poisoned(e: &io::Error) -> bool {
 /// is ever wrong, the failure mode is a `connect` stalling until the
 /// popped instance happens to receive a client, rather than the clean
 /// `ERROR_PIPE_BUSY` refusal this design otherwise produces -- a stall is
-/// harder to diagnose than a refusal. This has not been verified against
-/// real concurrent clients on Windows.
+/// harder to diagnose than a refusal.
 #[cfg(windows)]
 struct PipeTransport {
     path: std::path::PathBuf,
@@ -1075,101 +1049,6 @@ mod classify_tests {
             classify_gave_up_connect(false),
             ProbeOutcome::NoOwner
         ));
-    }
-}
-
-/// Each overrun message is the only thing a client ever learns about work
-/// its deadline cut off, so what every one of them promises is pinned
-/// whole here rather than by substring: a message that named the wrong
-/// consequence would read as authoritative and send the reader looking
-/// for a report that is not coming, or stop them looking for one that is.
-#[cfg(test)]
-mod overrun_tests {
-    use super::*;
-    use crate::hooks::ChangeEvent;
-
-    fn message_for(request: &Request) -> String {
-        message_for_deadline(request, Duration::from_millis(1500))
-    }
-
-    fn message_for_deadline(request: &Request, deadline: Duration) -> String {
-        overrun_message(request, deadline)
-    }
-
-    #[test]
-    fn test_a_changed_overrun_says_its_paths_reach_a_later_flush() {
-        assert_eq!(
-            message_for(&Request::Changed {
-                session: "s1".to_string(),
-                paths: Vec::new(),
-                event: ChangeEvent::Change,
-            }),
-            "op exceeded 1500ms; the paths are queued when the work finishes and their \
-             diagnostics reach a later flush"
-        );
-    }
-
-    #[test]
-    fn test_a_flush_overrun_says_the_report_is_offered_again() {
-        assert_eq!(
-            message_for(&Request::Flush {
-                session: "s1".to_string(),
-            }),
-            "op exceeded 1500ms; nothing confirmed this report was delivered, so the next \
-             flush offers it again"
-        );
-    }
-
-    #[test]
-    fn test_an_ack_overrun_does_not_promise_an_advance_commit_may_refuse() {
-        assert_eq!(
-            message_for(&Request::Ack {
-                session: "s1".to_string(),
-                token: 7,
-            }),
-            "op exceeded 1500ms; the record advances when the work finishes, unless this \
-             report was superseded or its session ended"
-        );
-    }
-
-    #[test]
-    fn test_an_end_session_overrun_says_the_record_is_still_dropped() {
-        assert_eq!(
-            message_for(&Request::EndSession {
-                session: "s1".to_string(),
-            }),
-            "op exceeded 1500ms; the session's record is dropped when the work finishes"
-        );
-    }
-
-    #[test]
-    fn test_a_status_overrun_promises_nothing_beyond_the_deadline() {
-        assert_eq!(message_for(&Request::Status), "op exceeded 1500ms");
-    }
-
-    /// The number is the deadline the owner was configured with, not the
-    /// default it usually holds. Every other test here asks for 1500,
-    /// which is what a frozen literal would answer too, so this is the
-    /// one that tells the value apart from the prose around it.
-    #[test]
-    fn test_an_overrun_names_the_deadline_it_actually_ran_under() {
-        assert_eq!(
-            message_for_deadline(&Request::Status, Duration::from_millis(300)),
-            "op exceeded 300ms",
-            "an owner configured with a 300ms deadline that reports 1500 \
-             sends a reader to the wrong setting"
-        );
-        assert_eq!(
-            message_for_deadline(
-                &Request::Flush {
-                    session: "s1".to_string(),
-                },
-                Duration::from_millis(300),
-            ),
-            "op exceeded 300ms; nothing confirmed this report was delivered, so the next \
-             flush offers it again",
-            "the same holds for a message that carries prose after it"
-        );
     }
 }
 
