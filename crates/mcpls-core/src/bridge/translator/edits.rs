@@ -1929,7 +1929,7 @@ mod tests {
             result.applied,
             "the inbound edit wrote bytes, so the action applied"
         );
-        let written = path.canonicalize().expect("the fixture file exists");
+        let written = dunce::canonicalize(&path).expect("the fixture file exists");
         assert_eq!(result.files_written, vec![written.display().to_string()]);
         assert_eq!(result.executed_command.as_deref(), Some("test.extract"));
         assert_eq!(
@@ -2015,7 +2015,7 @@ mod tests {
         let written: Vec<String> = [&first, &second]
             .iter()
             .map(|path| {
-                path.canonicalize()
+                dunce::canonicalize(path)
                     .expect("the fixture file exists")
                     .display()
                     .to_string()
@@ -2520,9 +2520,11 @@ mod tests {
             .expect("the handler must not hang")
             .expect("the handler task must not panic")
             .expect_err("the command failed");
-        let written = path.canonicalize().expect("the fixture file exists");
+        let written = dunce::canonicalize(&path).expect("the fixture file exists");
         assert!(
-            error.to_string().contains(&written.display().to_string()),
+            error
+                .to_string()
+                .contains(&format!("{:?}", written.display().to_string())),
             "the error must name the file the failed command already wrote: {error}"
         );
         assert_eq!(

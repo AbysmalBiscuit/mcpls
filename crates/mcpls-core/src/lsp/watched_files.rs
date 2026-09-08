@@ -322,7 +322,8 @@ mod tests {
     fn test_a_star_does_not_cross_a_directory_separator() {
         let registry = WatchRegistry::new();
         let go = ServerId::from("go");
-        registry.register(&go, "r1", &json!([{ "globPattern": "/work/*.go" }]));
+        let glob = abs("*.go").to_string_lossy().replace('\\', "/");
+        registry.register(&go, "r1", &json!([{ "globPattern": glob }]));
 
         assert_eq!(
             registry.servers_for(&abs("main.go"), lsp_types::FileChangeType::CHANGED),

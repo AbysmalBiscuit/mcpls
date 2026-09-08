@@ -335,7 +335,8 @@ mod tests {
     use super::{EditPlan, Operation};
 
     fn uri(path: &str) -> Uri {
-        Uri::from_str(&format!("file://{path}")).expect("valid uri")
+        let drive = if cfg!(windows) { "/C:" } else { "" };
+        Uri::from_str(&format!("file://{drive}{path}")).expect("valid uri")
     }
 
     fn edit(start_line: u32, end_line: u32, text: &str) -> TextEdit {
@@ -391,7 +392,7 @@ mod tests {
         let Operation::Edit { uri: target, .. } = &plan.operations()[0] else {
             panic!("expected an edit operation");
         };
-        assert_eq!(target.as_str(), "file:///w/modern.rs");
+        assert_eq!(target, &uri("/w/modern.rs"));
     }
 
     #[test]
