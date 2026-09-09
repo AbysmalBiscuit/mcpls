@@ -18,6 +18,10 @@ programs = ["git"]
 args = ["worktree", "remove"]
 reason = "Use devkit's issue binary to remove worktrees: issue end [branch-name]"
 
+[harness.commands.sudo]
+programs = ["sudo"]
+reason = "Never run sudo"
+
 [tasks.build]
 description = "Build the workspace"
 run = ["cargo", "build", "--workspace", "--locked"]
@@ -30,7 +34,14 @@ guard = true
 
 [tasks.check]
 description = "Check all workspace targets and features"
-run = ["cargo", "check", "--workspace", "--all-targets", "--all-features", "--locked"]
+run = [
+    "cargo",
+    "check",
+    "--workspace",
+    "--all-targets",
+    "--all-features",
+    "--locked",
+]
 guard = true
 
 [tasks.test]
@@ -55,11 +66,19 @@ guard = true
 
 [tasks.lint]
 description = "Run clippy with warnings denied"
-run = ["cargo", "clippy", "--workspace", "--all-targets", "--all-features", "--locked", "--", "-D", "warnings"]
+run = [
+    "cargo",
+    "clippy",
+    "--workspace",
+    "--all-targets",
+    "--all-features",
+    "--locked",
+    "--",
+    "-D",
+    "warnings",
+]
 guard = true
-
-[tasks.lint.env]
-RUSTC_WRAPPER = ""
+env = { RUSTC_WRAPPER = "" }
 
 [tasks.docs]
 description = "Build workspace API documentation"
@@ -73,4 +92,9 @@ guard = true
 
 [tasks.verify]
 description = "Check formatting, lint, and run tests including documentation tests"
-steps = [{ task = "fmt-check" }, { task = "lint" }, { task = "test" }, { task = "test-doc" }]
+steps = [
+    { task = "fmt-check" },
+    { task = "lint" },
+    { task = "test" },
+    { task = "test-doc" },
+]
