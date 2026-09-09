@@ -186,6 +186,7 @@ impl WatchRegistry {
     /// wants no kind at all matches nothing here either.
     #[must_use]
     pub fn is_watched(&self, path: &Path) -> bool {
+        let path = dunce::simplified(path);
         lock_std(&self.by_server)
             .values()
             .flat_map(HashMap::values)
@@ -197,6 +198,7 @@ impl WatchRegistry {
     /// the notification order is reproducible.
     #[must_use]
     pub fn servers_for(&self, path: &Path, kind: lsp_types::FileChangeType) -> Vec<ServerId> {
+        let path = dunce::simplified(path);
         let mut matched: Vec<ServerId> = {
             let registrations = lock_std(&self.by_server);
             registrations
@@ -246,6 +248,33 @@ mod tests {
         );
         assert_eq!(
             registry.servers_for(&abs("main.py"), lsp_types::FileChangeType::CHANGED),
+            vec![python]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_absolute_glob_matches_a_canonical_windows_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("a.py");
+        std::fs::write(&file, "value = 1\n").expect("write fixture");
+        let workspace_root = dunce::canonicalize(dir.path()).expect("workspace root");
+        let root = url::Url::from_directory_path(&workspace_root)
+            .expect("root URI")
+            .to_file_path()
+            .expect("server root path");
+        let canonical = file.canonicalize().expect("canonical fixture path");
+        let registry = WatchRegistry::new();
+        let python = ServerId::from("python");
+        registry.register(
+            &python,
+            "FILEWATCHER",
+            &json!([{ "globPattern": root.join("**/*.py") }]),
+        );
+
+        assert!(registry.is_watched(&canonical));
+        assert_eq!(
+            registry.servers_for(&canonical, lsp_types::FileChangeType::CHANGED),
             vec![python]
         );
     }
