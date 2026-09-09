@@ -33,6 +33,7 @@ mod mcp_client;
 #[path = "common/ra_probe.rs"]
 mod ra_probe;
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -204,6 +205,7 @@ struct LspServerConfig {
     language_id: String,
     command: String,
     args: Vec<String>,
+    env: BTreeMap<String, String>,
     file_patterns: Vec<String>,
 }
 
@@ -217,6 +219,12 @@ fn write_config(ra_binary: &Path, workspace_root: &Path, config_path: &Path) {
             language_id: "rust".to_owned(),
             command: ra_binary.to_string_lossy().into_owned(),
             args: vec![],
+            // Compiler wrappers need the invoking user's identity and runtime directory
+            // to connect to their existing daemon from the sanitized LSP environment.
+            env: ["USER", "LOGNAME", "XDG_RUNTIME_DIR"]
+                .into_iter()
+                .filter_map(|key| std::env::var(key).ok().map(|value| (key.to_owned(), value)))
+                .collect(),
             file_patterns: vec!["**/*.rs".to_owned()],
         }],
         // Only `rename` is on: the earlier read-only sub-cases must keep
@@ -271,7 +279,7 @@ fn ra_index_timeout_secs() -> u64 {
         .map_or(default_timeout, |t| t.max(5))
 }
 
-/// Poll `get_hover` on the `add` function until rust-analyzer returns content.
+/// Poll `get_hover` on a function until rust-analyzer returns its signature.
 ///
 /// Timeout controlled by `MCPLS_RA_INDEX_TIMEOUT_SECS` (default 60, minimum 5).
 ///
@@ -279,14 +287,15 @@ fn ra_index_timeout_secs() -> u64 {
 /// (only `window/logMessage`, `window/showMessage`, and `publishDiagnostics` are
 /// stored).  The readiness gate therefore uses hover-probe as the primary oracle.
 /// See M-r1 in the architect handoff for the follow-up to add `$/progress` capture.
-fn wait_until_ready(client: &mut McpClient, lib_rs: &Path) {
+fn wait_until_ready(client: &mut McpClient, file: &Path, function: &str) {
     let timeout_secs = ra_index_timeout_secs();
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    let lib_path = lib_rs.to_string_lossy().into_owned();
-    let add_line = find_line(lib_rs, "pub fn add(");
+    let file_path = file.to_string_lossy().into_owned();
+    let function_line = find_line(file, &format!("pub fn {function}("));
+    let signature = format!("fn {function}");
 
     println!("[ra_e2e] waiting for rust-analyzer to index (timeout {timeout_secs}s)…");
-    println!("[ra_e2e] hover probe: file={lib_path} line={add_line}");
+    println!("[ra_e2e] hover probe: file={file_path} line={function_line}");
 
     // Require 3 consecutive successful hover responses to guard against transient
     // successes during RA's intermediate indexing phases (observed on Windows CI).
@@ -294,12 +303,12 @@ fn wait_until_ready(client: &mut McpClient, lib_rs: &Path) {
     let mut consecutive = 0u32;
     let mut last_print = Instant::now();
     loop {
-        // Hover over `add` — the 'a' of "add" is at column 8 (1-based).
+        // Fixture function names start at column 8 (1-based).
         let resp = client.call_tool(
             "get_hover",
             &json!({
-                "file_path": lib_path,
-                "line": add_line,
+                "file_path": file_path,
+                "line": function_line,
                 "character": 8,
             }),
         );
@@ -308,8 +317,7 @@ fn wait_until_ready(client: &mut McpClient, lib_rs: &Path) {
             Ok(r) => {
                 let is_err = r["result"]["isError"].as_bool().unwrap_or(false);
                 let text = assertions::content_text(r);
-                // Require both "fn add" and "i32" to confirm type-checking is done.
-                if text.contains("fn add") && text.contains("i32") {
+                if text.contains(&signature) && text.contains("i32") {
                     consecutive += 1;
                     if consecutive >= required_consecutive {
                         println!("[ra_e2e] rust-analyzer is ready");
@@ -1592,9 +1600,8 @@ fn sc_rename_symbol_apply(client: &mut McpClient, workspace: &Path) -> Result<()
 /// the agent.
 ///
 /// Renaming `tally` to `total` collides with the existing `total`, so rustc
-/// reports E0428 for `src/lib.rs`. rust-analyzer does not check a rename for
-/// conflicts, so the apply lands and the error appears only once a build
-/// runs, which happens only if the resync sent a `didSave`.
+/// reports E0428 for `src/lib.rs`. Both rewritten files are open documents,
+/// so the resync sends their new contents and requests a build with `didSave`.
 ///
 /// The pair is same-signature on purpose. A rename that changed a call
 /// site's arity would produce rust-analyzer's own resident diagnostics,
@@ -1606,6 +1613,7 @@ fn sc_resync_delivers_a_build_error_after_an_apply(
 ) -> Result<(), String> {
     let lib = workspace.join("src/lib.rs");
     let tally_line = find_line(&lib, "pub fn tally(");
+    wait_until_ready(client, &workspace.join("src/functions.rs"), "tally_twice");
 
     let resp = client
         .call_tool(
@@ -1667,10 +1675,7 @@ fn sc_resync_delivers_a_build_error_after_an_apply(
         }
         if Instant::now() >= deadline {
             return Err(format!(
-                "no rustc E0428 arrived within the settle deadline. \
-                 rust-analyzer publishes its own resident diagnostics on a \
-                 didChange alone, so this failing while rename_symbol still \
-                 writes means the resync's didSave never reached the server. \
+                "no rustc E0428 arrived after applying the rename within the settle deadline. \
                  Last report: {last}"
             ));
         }
@@ -1739,7 +1744,7 @@ fn ra_e2e_suite() {
 
     // Wait for rust-analyzer to index.
     let lib_rs = workspace.join("src/lib.rs");
-    wait_until_ready(&mut client, &lib_rs);
+    wait_until_ready(&mut client, &lib_rs, "add");
 
     // Sub-case registry.
     let sub_cases: &[SubCase] = &[

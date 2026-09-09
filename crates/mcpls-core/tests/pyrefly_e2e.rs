@@ -299,6 +299,35 @@ macro_rules! sub_case {
 // Sub-cases
 // ---------------------------------------------------------------------------
 
+fn open_document(
+    client: &mut McpClient,
+    file: &Path,
+    anchor: &str,
+    character: u32,
+) -> Result<(), String> {
+    let open_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let outcome = client.call_tool(
+            "get_hover",
+            &json!({
+                "file_path": file.to_string_lossy(),
+                "line": find_line(file, anchor),
+                "character": character,
+            }),
+        );
+        match outcome {
+            Ok(_) => return Ok(()),
+            Err(e)
+                if Instant::now() < open_deadline
+                    && e.to_string().contains("LSP server error: -32800 -") =>
+            {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            Err(e) => return Err(format!("opening {} failed: {e}", file.display())),
+        }
+    }
+}
+
 /// A watched-files notification reaches pyrefly and changes its analysis of
 /// a document it holds open.
 ///
@@ -318,32 +347,13 @@ fn sc_watched_files_reaches_pyrefly(
     client: &mut McpClient,
     workspace: &Path,
 ) -> Result<(), String> {
-    // Open b.py through a read tool, so pyrefly holds a document for it.
-    //
-    // Freshly spawned, pyrefly cancels a hover landing while it is still
-    // re-checking the workspace it just opened the document into, so the
-    // first attempt is retried rather than treated as a real failure.
     let b = workspace.join("b.py");
-    let open_deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let outcome = client.call_tool(
-            "get_hover",
-            &json!({
-                "file_path": b.to_string_lossy(),
-                "line": find_line(&b, "RESULT = greet"),
-                "character": 9,
-            }),
-        );
-        match outcome {
-            Ok(_) => break,
-            Err(_) if Instant::now() < open_deadline => {
-                std::thread::sleep(Duration::from_millis(500));
-            }
-            Err(e) => return Err(format!("opening b.py failed: {e}")),
-        }
+    let c = workspace.join("c.py");
+    for (file, anchor, character) in [(&b, "RESULT = greet", 9), (&c, "USED = helper", 8)] {
+        open_document(client, file, anchor, character)?;
     }
 
-    // Drain whatever the baseline and that open produced, so the assertion
+    // Drain the baseline and document opens so the assertion
     // below is about what this apply caused.
     let _ = client
         .call_tool("get_new_diagnostics", &json!({}))
@@ -354,7 +364,6 @@ fn sc_watched_files_reaches_pyrefly(
     // still adjacent to the token, resolves to no local symbol at all and
     // pyrefly answers "third-party symbols cannot be renamed" instead of
     // the intended local one.
-    let c = workspace.join("c.py");
     let resp = client
         .call_tool(
             "rename_symbol",
