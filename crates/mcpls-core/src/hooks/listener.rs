@@ -315,8 +315,8 @@ impl HookListener {
     ///
     /// A persistent `accept` error (an fd-exhausted process is the
     /// realistic case, since mcpls also spawns language servers) backs off
-    /// exponentially between [`Self::ACCEPT_BACKOFF_FLOOR`] and
-    /// [`Self::ACCEPT_BACKOFF_CEILING`] rather than retrying immediately,
+    /// exponentially between `Self::ACCEPT_BACKOFF_FLOOR` and
+    /// `Self::ACCEPT_BACKOFF_CEILING` rather than retrying immediately,
     /// so it cannot spin a core or flood the log while the condition
     /// lasts, and warns once per run of failures rather than on every one
     /// of them. It otherwise never gives up and returns early: this
@@ -329,11 +329,11 @@ impl HookListener {
     /// which cannot recover by retrying at all: that stands down rather
     /// than retrying forever into a condition that can never clear.
     ///
-    /// On Unix, also stands down if [`Self::lock_loss`] reports the lock
+    /// On Unix, also stands down if `Self::lock_loss` reports the lock
     /// file no longer names the inode this listener holds: something
     /// external took it while this process was still serving, and
     /// continuing would risk a second process believing it owns the same
-    /// session. See [`Self::lock_file`]'s doc comment for why this has to
+    /// session. See `Self::lock_file`'s doc comment for why this has to
     /// be checked from here rather than at acquisition. This includes the
     /// case where nothing has actually taken the lock's place -- the file
     /// was simply removed -- because this listener can no longer prove it
@@ -588,7 +588,7 @@ const ACK_TIMEOUT: Duration = Duration::from_millis(250);
 /// never hears it offers the same report again next time; withholding the
 /// report over a failed acknowledgement would be the one outcome the
 /// acknowledgement exists to rule out. The acknowledgement runs under
-/// [`ACK_TIMEOUT`], its own allowance, rather than under what `timeout`
+/// `ACK_TIMEOUT`, its own allowance, rather than under what `timeout`
 /// has left, and its outcome is discarded either way.
 ///
 /// It is sent before the caller prints, not after. The host reads a

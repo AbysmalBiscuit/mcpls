@@ -591,7 +591,7 @@ impl DocumentTracker {
     /// files registry's job, and opening it is the sweep's.
     ///
     /// The caller must hold `path`'s lock: `_guard` is that lock's proof of
-    /// possession, obtained from [`Self::lock_path`], rather than a
+    /// possession, obtained from `Self::lock_path`, rather than a
     /// documented-only precondition. A debug build asserts that `_guard` is
     /// the lock for `path` specifically, catching a guard for the wrong
     /// path being passed through.
