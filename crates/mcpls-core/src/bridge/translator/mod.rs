@@ -1443,6 +1443,7 @@ mod tests {
             .mode();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000))
             .expect("lock the directory down");
+        let inaccessible = std::fs::metadata(&path).is_err();
 
         harness.translator.resync_changed_documents().await;
 
@@ -1450,6 +1451,13 @@ mod tests {
         // leaving the harness's own `TempDir` unable to clean itself up.
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(original_mode))
             .expect("restore the directory's permissions");
+
+        if !inaccessible {
+            eprintln!(
+                "permission fixture unavailable: runner can stat through a mode-000 directory"
+            );
+            return;
+        }
 
         assert!(
             harness.notifications_for("rust").is_empty(),

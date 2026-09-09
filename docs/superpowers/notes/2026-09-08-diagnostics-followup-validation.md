@@ -1,5 +1,7 @@
 # Diagnostics recovery validation
 
+This is the 2026-09-08 recovery snapshot. See the [independent Linux validation](2026-09-09-diagnostics-validation.md) for subsequent findings, reruns, and limits on the evidence available on the validation machine.
+
 Snapshot: 2026-09-08. The functional follow-up is restored in `/home/lev/Git/lev/mcpls_worktrees/diagnostics-recovery`, branch `diagnostics-recovery`, based on `5f6fcc1137824f372f6290860cfbf81b8aba9936`. Devkit `issue setup` created this persistent worktree. At initial validation, nothing was committed, merged, pushed, or installed into the daily-driver plugin. Lev subsequently authorized committing and pushing the recovery branch.
 
 ## Review this recovery

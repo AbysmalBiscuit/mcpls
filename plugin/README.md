@@ -29,7 +29,7 @@ server sees: /home/lev/project -> 39df698ef1ac4f49
 owner pid: 2816002
 hooks seen: 3 request(s) since this owner started
 mcpls on PATH: /home/lev/.cargo/bin/mcpls; launch not checked
-watch scan: selected 4 top-level path(s); hidden and ignored entries excluded; host registration unverified
+watch scan: selected 4 top-level path(s); hidden entries excluded by default; ignore rules applied; host registration unverified
 ```
 
 Line by line:
@@ -48,7 +48,7 @@ Line by line:
 - **`owner pid:`** the process id holding the socket, `none` if nothing does, or `unknown` if an owner exists but the exchange did not get far enough to learn its pid (see the fault messages above). When it does print a pid, confirm it names a live `mcpls` process; a pid that no longer exists or belongs to something else means the socket is orphaned: delete the socket file at the path in `socket:` above (a Windows named pipe clears on its own once nothing holds it) so a new mcpls can bind it.
 - **`hooks seen:`** how many `Changed`, `Flush`, or `EndSession` requests this owner has served since it started; a `Status` probe, including the doctor's own, is never counted. Zero is not by itself a fault: `SessionStart` never touches the socket, so an owner that just started, or just took over from a previous one, looks identical to one that has never received a hook. The line's own wording says what to do about a zero.
 - **`mcpls on PATH:`** the absolute path of a candidate found on `PATH`, or `not found`. The doctor does not execute it: a text file named `mcpls.exe` on Windows is still a candidate, not a verified installation. Hooks invoke `mcpls` by name, so check the `PATH` the hook process inherits, not just your interactive shell's.
-- **`watch scan:`** what a fresh local scan can select for `SessionStart`. An empty successful scan says `no eligible top-level paths`; traversal or ignore-rule failures say `incomplete` and include their causes. A selected path does not prove the host registered it or can read its descendants. Hidden top-level files and directories, including `.github`, are excluded along with ignored entries. After fixing scan errors, restart the session to register a fresh watch list.
+- **`watch scan:`** what a fresh local scan can select for `SessionStart`. An empty successful scan says `no eligible top-level paths`; traversal or ignore-rule failures say `incomplete` and include their causes. A selected path does not prove the host registered it or can read its descendants. Hidden top-level files and directories, including `.github`, are excluded by default. Explicit allow rules in ignore files can include them; for example, `!.github/` in a Git repository's `.gitignore` includes `.github` in the watch scan. After fixing scan errors, restart the session to register a fresh watch list.
 
 An operation that exceeds the owner's response deadline keeps running in the background. Hook clients remain silent on that response; the deadline does not establish whether the work will succeed or whether a later report will contain diagnostics. The doctor reports a deadline response if it receives one during its probe window.
 
@@ -60,7 +60,7 @@ hook sees: /home/lev/project -> unknown
 server sees: nothing can run here; no socket exists to probe
 owner pid: none
 mcpls on PATH: /home/lev/.cargo/bin/mcpls; launch not checked
-watch scan: selected 4 top-level path(s); hidden and ignored entries excluded; host registration unverified
+watch scan: selected 4 top-level path(s); hidden entries excluded by default; ignore rules applied; host registration unverified
 ```
 
 This is a different failure from a missing owner: there, a socket exists and nothing answers it; here, no socket could ever exist for this directory on either side. Fix the reported reason, for example moving the project or `XDG_RUNTIME_DIR` to a shorter path, then run the doctor again.
@@ -75,7 +75,7 @@ The `[diagnostics.hooks]` table controls the hook listener:
 | `sweep_quiet_ms` | `500` | How long pending file changes must sit quiet before diagnostics are gathered and delivered. |
 | `op_deadline_ms` | `1500` | How long a hook operation may run before it answers anyway, so a slow op can't block the agent. |
 
-Setting `enabled = false` turns the listener off entirely: mcpls binds no socket, and every `mcpls hook` invocation exits having done nothing. Use it to run mcpls without push diagnostics, for example while diagnosing whether a problem is in the hook path or elsewhere.
+Setting `enabled = false` disables the hook listener, so mcpls binds no socket and socket-dependent hooks receive no diagnostics. `SessionStart` still performs its local watch scan. Use this setting to run mcpls without push diagnostics, for example while diagnosing whether a problem is in the hook path or elsewhere.
 
 ## What's included
 

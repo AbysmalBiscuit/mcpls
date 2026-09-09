@@ -169,13 +169,15 @@ fn read_gitignore(root: &Path) -> (Gitignore, Vec<String>) {
 /// Selected watch paths and failures encountered while inspecting the root.
 #[derive(Debug)]
 pub struct WatchPaths {
-    /// Non-hidden, non-ignored top-level entries found by the scan.
+    /// Top-level entries admitted by the scan and ignore rules.
     pub paths: Vec<PathBuf>,
     /// Traversal or ignore-rule failures; selected paths may be incomplete.
     pub errors: Vec<String>,
 }
 
-/// Scan top-level entries using the path filter's ignore rules, excluding hidden entries.
+/// Scan top-level entries using ignore rules; hidden entries are excluded by default.
+///
+/// Explicit allow rules can include hidden entries.
 /// This does not verify that a host registered the paths or can watch their descendants.
 #[must_use]
 pub fn watch_paths(root: &Path) -> WatchPaths {

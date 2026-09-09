@@ -565,8 +565,9 @@ fn test_hook_session_start_emits_absolute_watch_paths() {
 }
 
 fn session_start(project: &std::path::Path) -> serde_json::Value {
-    let output = assert_cmd::Command::cargo_bin("mcpls")
-        .unwrap()
+    let mut cmd = Command::cargo_bin("mcpls").unwrap();
+    clear_ambient_env(&mut cmd);
+    let output = assert_cmd::Command::from_std(cmd)
         .env("CLAUDE_PROJECT_DIR", project)
         .arg("hook")
         .write_stdin(r#"{"hook_event_name":"SessionStart"}"#)
@@ -580,8 +581,8 @@ fn session_start(project: &std::path::Path) -> serde_json::Value {
 
 fn doctor_output(project: &std::path::Path) -> String {
     let runtime = TempDir::new().unwrap();
-    let output = Command::cargo_bin("mcpls")
-        .unwrap()
+    let mut cmd = Command::cargo_bin("mcpls").unwrap();
+    let output = clear_ambient_env(&mut cmd)
         .env("CLAUDE_PROJECT_DIR", project)
         .env("XDG_RUNTIME_DIR", runtime.path())
         .env(
@@ -610,8 +611,8 @@ fn test_doctor_does_not_claim_a_path_candidate_can_launch() {
         use std::os::unix::fs::PermissionsExt as _;
         fs::set_permissions(&candidate, fs::Permissions::from_mode(0o755)).unwrap();
     }
-    let output = Command::cargo_bin("mcpls")
-        .unwrap()
+    let mut cmd = Command::cargo_bin("mcpls").unwrap();
+    let output = clear_ambient_env(&mut cmd)
         .env("CLAUDE_PROJECT_DIR", project.path())
         .env("XDG_RUNTIME_DIR", bin.path())
         .env("USERNAME", bin.path().file_name().unwrap())
@@ -700,7 +701,18 @@ fn test_watch_scan_rejects_a_file_as_project_root() {
             .unwrap()
             .contains("watch-path scan incomplete")
     );
-    assert!(doctor_output(&file).contains("watch scan: incomplete"));
+    assert!(
+        output["systemMessage"]
+            .as_str()
+            .unwrap()
+            .contains("project root is not a directory")
+    );
+    let doctor = doctor_output(&file);
+    assert!(doctor.contains("watch scan: incomplete"), "{doctor}");
+    assert!(
+        doctor.contains("project root is not a directory"),
+        "{doctor}"
+    );
 }
 
 #[test]
@@ -716,7 +728,29 @@ fn test_watch_scan_describes_hidden_only_tree_as_filtered() {
     assert!(output.get("systemMessage").is_none());
     let doctor = doctor_output(project.path());
     assert!(
-        doctor.contains("hidden and ignored entries excluded"),
+        doctor.contains("hidden entries excluded by default; ignore rules applied"),
+        "{doctor}"
+    );
+}
+
+#[test]
+fn test_watch_scan_reports_explicitly_allowed_hidden_paths_through_cli() {
+    let project = TempDir::new().unwrap();
+    fs::create_dir(project.path().join(".git")).unwrap();
+    fs::create_dir(project.path().join(".github")).unwrap();
+    fs::write(project.path().join(".gitignore"), "!.github/\n").unwrap();
+
+    let output = session_start(project.path());
+    let root = dunce::canonicalize(project.path()).unwrap();
+    assert_eq!(
+        output["hookSpecificOutput"]["watchPaths"],
+        serde_json::json!([root.join(".github")])
+    );
+    assert!(output.get("systemMessage").is_none());
+    let doctor = doctor_output(project.path());
+    assert!(doctor.contains("selected 1 top-level path(s)"), "{doctor}");
+    assert!(
+        doctor.contains("hidden entries excluded by default"),
         "{doctor}"
     );
 }
@@ -751,8 +785,8 @@ fn test_watch_scan_reports_unreadable_root_through_cli() {
 #[test]
 fn test_doctor_identity_uses_current_user_without_xdg_runtime_dir() {
     let project = TempDir::new().unwrap();
-    let output = Command::cargo_bin("mcpls")
-        .unwrap()
+    let mut cmd = Command::cargo_bin("mcpls").unwrap();
+    let output = clear_ambient_env(&mut cmd)
         .env("CLAUDE_PROJECT_DIR", project.path())
         .env_remove("XDG_RUNTIME_DIR")
         .env("USER", "mcpls-followup-user")
@@ -773,8 +807,8 @@ fn test_doctor_identity_uses_current_user_without_xdg_runtime_dir() {
 fn test_doctor_identity_rejects_socket_path_that_cannot_bind() {
     let project = TempDir::new().unwrap();
     let runtime = project.path().join("x".repeat(120));
-    let output = Command::cargo_bin("mcpls")
-        .unwrap()
+    let mut cmd = Command::cargo_bin("mcpls").unwrap();
+    let output = clear_ambient_env(&mut cmd)
         .env("CLAUDE_PROJECT_DIR", project.path())
         .env("XDG_RUNTIME_DIR", &runtime)
         .args(["hook", "doctor"])
@@ -821,8 +855,9 @@ async fn test_hook_context_outputs_name_the_triggering_event_through_cli() {
     ));
     tokio::task::spawn_blocking(move || {
         for event in ["UserPromptSubmit", "PostToolBatch"] {
-            let output = assert_cmd::Command::cargo_bin("mcpls")
-                .unwrap()
+            let mut cmd = Command::cargo_bin("mcpls").unwrap();
+            clear_ambient_env(&mut cmd);
+            let output = assert_cmd::Command::from_std(cmd)
                 .env("CLAUDE_PROJECT_DIR", project.path())
                 .env("XDG_RUNTIME_DIR", runtime.path())
                 .arg("hook")

@@ -23,6 +23,7 @@ use serde::Deserialize;
 const SOCKET_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// Bounds the request batch that supplies context; acknowledgement has a separate allowance.
+/// A shorter bound would cut off work still inside the owner's default operation deadline.
 const FLUSH_SOCKET_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// The hook payload Claude Code writes to stdin, keeping only the fields
@@ -200,7 +201,7 @@ fn watch_scan_line(project_dir: &Path) -> String {
         format!("selected {} top-level path(s)", scan.paths.len())
     };
     format!(
-        "watch scan: {status}; hidden and ignored entries excluded; host registration unverified"
+        "watch scan: {status}; hidden entries excluded by default; ignore rules applied; host registration unverified"
     )
 }
 
@@ -2034,7 +2035,7 @@ mod tests {
         assert_eq!(lines.len(), 7, "expected exactly seven lines: {out}");
         assert_eq!(
             lines[6],
-            "watch scan: no eligible top-level paths; hidden and ignored entries excluded; host registration unverified"
+            "watch scan: no eligible top-level paths; hidden entries excluded by default; ignore rules applied; host registration unverified"
         );
         assert_eq!(lines[0], format!("socket: {}", identity.socket.display()));
         assert_eq!(
@@ -2078,7 +2079,7 @@ mod tests {
         assert_eq!(lines.len(), 6, "expected exactly six lines: {out}");
         assert_eq!(
             lines[5],
-            "watch scan: no eligible top-level paths; hidden and ignored entries excluded; host registration unverified"
+            "watch scan: no eligible top-level paths; hidden entries excluded by default; ignore rules applied; host registration unverified"
         );
         assert_eq!(
             lines[2],
@@ -2141,7 +2142,7 @@ mod tests {
         assert_eq!(lines.len(), 6, "expected exactly six lines: {out}");
         assert_eq!(
             lines[5],
-            "watch scan: no eligible top-level paths; hidden and ignored entries excluded; host registration unverified"
+            "watch scan: no eligible top-level paths; hidden entries excluded by default; ignore rules applied; host registration unverified"
         );
         assert_eq!(lines[0], format!("socket: {}", identity.socket.display()));
         assert_eq!(
@@ -2855,6 +2856,7 @@ mod tests {
         std::fs::set_permissions(socket_dir.path(), std::fs::Permissions::from_mode(0o000))
             .expect("lock the directory down");
 
+        let inaccessible = std::fs::read_dir(socket_dir.path()).is_err();
         let out = super::doctor_scanning(
             project.path(),
             &identity,
@@ -2869,6 +2871,11 @@ mod tests {
             std::fs::Permissions::from_mode(original_mode),
         )
         .expect("restore the directory's permissions");
+
+        if !inaccessible {
+            eprintln!("permission fixture unavailable: runner can read a mode-000 directory");
+            return;
+        }
 
         let server_sees = out
             .lines()
@@ -3013,7 +3020,7 @@ mod tests {
         assert_eq!(lines.len(), 6, "expected exactly six lines: {out}");
         assert_eq!(
             lines[5],
-            "watch scan: no eligible top-level paths; hidden and ignored entries excluded; host registration unverified"
+            "watch scan: no eligible top-level paths; hidden entries excluded by default; ignore rules applied; host registration unverified"
         );
         assert_eq!(
             lines[0],
