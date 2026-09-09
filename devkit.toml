@@ -58,6 +58,9 @@ description = "Run clippy with warnings denied"
 run = ["cargo", "clippy", "--workspace", "--all-targets", "--all-features", "--locked", "--", "-D", "warnings"]
 guard = true
 
+[tasks.lint.env]
+RUSTC_WRAPPER = ""
+
 [tasks.docs]
 description = "Build workspace API documentation"
 run = ["cargo", "doc", "--workspace", "--no-deps", "--all-features", "--locked"]
