@@ -1007,6 +1007,7 @@ mod tests {
 
         #[cfg(unix)]
         #[tokio::test]
+        #[allow(clippy::expect_used)]
         async fn test_serve_http_on_repeat_signal_ends_active_drain() {
             use std::io::ErrorKind;
             use std::time::Duration;
