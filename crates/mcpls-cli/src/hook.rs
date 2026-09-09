@@ -1824,18 +1824,23 @@ mod tests {
         );
     }
 
-    /// The prefix these tests' own pipes carry on Windows, distinct from
-    /// `mcpls_core::hooks::windows_pipe_prefix`: the pipe namespace is
-    /// machine-global, so a scan filtered on the real prefix would
-    /// enumerate an actual mcpls running on the developer's own machine,
-    /// not only the one a test bound itself. Every doctor call in this
-    /// module goes through `doctor_scanning` with this prefix rather than
-    /// the public `doctor`, so the scan can never see past this suite's
-    /// own pipes on Windows.
-    #[cfg(windows)]
-    const TEST_PIPE_PREFIX: &str = "mcpls-doctor-test-";
-    #[cfg(not(windows))]
-    const TEST_PIPE_PREFIX: &str = "";
+    fn test_pipe_prefix(dir: &Path) -> String {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        dir.hash(&mut hasher);
+        format!("mcpls-doctor-test-{:016x}-", hasher.finish())
+    }
+
+    fn test_socket(dir: &Path, name: &str) -> PathBuf {
+        #[cfg(windows)]
+        {
+            PathBuf::from(format!(r"\\.\pipe\{}{name}", test_pipe_prefix(dir)))
+        }
+        #[cfg(not(windows))]
+        {
+            dir.join(name)
+        }
+    }
 
     /// The identity `identity_for(project)` would derive, with its socket
     /// and lock moved into `dir` in place of the real runtime directory
@@ -1849,10 +1854,7 @@ mod tests {
     /// panic before binding anything.
     fn local_identity_for(project: &Path, dir: &Path) -> SocketIdentity {
         let hash = mcpls_core::hooks::identity_hash(project).expect("identity hash");
-        #[cfg(windows)]
-        let socket = PathBuf::from(format!(r"\\.\pipe\{TEST_PIPE_PREFIX}{hash}"));
-        #[cfg(not(windows))]
-        let socket = dir.join(format!("{hash}.sock"));
+        let socket = test_socket(dir, &format!("{hash}.sock"));
         SocketIdentity {
             lock: dir.join(format!("{hash}.lock")),
             socket,
@@ -1871,7 +1873,8 @@ mod tests {
         let socket_dir = tempfile::tempdir().expect("a temp dir");
         let identity = local_identity_for(project, socket_dir.path());
         let _owner = RecordingOwner::start_reporting_status(identity.clone(), project, hooks_seen);
-        let out = super::doctor_scanning(project, &identity, TEST_PIPE_PREFIX).await;
+        let out =
+            super::doctor_scanning(project, &identity, &test_pipe_prefix(socket_dir.path())).await;
         (out, identity)
     }
 
@@ -1879,7 +1882,8 @@ mod tests {
     async fn doctor_with_nothing_running(project: &Path) -> (String, SocketIdentity) {
         let socket_dir = tempfile::tempdir().expect("a temp dir");
         let identity = local_identity_for(project, socket_dir.path());
-        let out = super::doctor_scanning(project, &identity, TEST_PIPE_PREFIX).await;
+        let out =
+            super::doctor_scanning(project, &identity, &test_pipe_prefix(socket_dir.path())).await;
         (out, identity)
     }
 
@@ -1896,7 +1900,7 @@ mod tests {
         let identity = local_identity_for(project, socket_dir.path());
         let foreign_identity = local_identity_for(foreign, socket_dir.path());
         let _owner = RecordingOwner::start_reporting_status(foreign_identity, foreign, 0);
-        super::doctor_scanning(project, &identity, TEST_PIPE_PREFIX).await
+        super::doctor_scanning(project, &identity, &test_pipe_prefix(socket_dir.path())).await
     }
 
     /// Run the doctor for `project` against several real, unrelated
@@ -1912,7 +1916,7 @@ mod tests {
                 RecordingOwner::start_reporting_status(other_identity, other, 0)
             })
             .collect();
-        super::doctor_scanning(project, &identity, TEST_PIPE_PREFIX).await
+        super::doctor_scanning(project, &identity, &test_pipe_prefix(socket_dir.path())).await
     }
 
     /// Run the doctor for `project` where a real owner is running for
@@ -1932,7 +1936,7 @@ mod tests {
         let socket_dir = tempfile::tempdir().expect("a temp dir");
         let identity = local_identity_for(project, socket_dir.path());
         let related_identity = SocketIdentity {
-            socket: socket_dir.path().join("aaa-related.sock"),
+            socket: test_socket(socket_dir.path(), "aaa-related.sock"),
             ..local_identity_for(related, socket_dir.path())
         };
         let _related = RecordingOwner::start_reporting_status(related_identity, related, 0);
@@ -1944,7 +1948,7 @@ mod tests {
             .enumerate()
             .map(|(i, other)| {
                 let other_identity = SocketIdentity {
-                    socket: socket_dir.path().join(format!("zzz-unreadable-{i}.sock")),
+                    socket: test_socket(socket_dir.path(), &format!("zzz-unreadable-{i}.sock")),
                     ..local_identity_for(other.path(), socket_dir.path())
                 };
                 RecordingOwner::start_answering_status_with_raw_line(
@@ -1953,7 +1957,7 @@ mod tests {
                 )
             })
             .collect();
-        super::doctor_scanning(project, &identity, TEST_PIPE_PREFIX).await
+        super::doctor_scanning(project, &identity, &test_pipe_prefix(socket_dir.path())).await
     }
 
     /// Run the doctor for `project` where the runtime directory holds
@@ -1976,7 +1980,7 @@ mod tests {
                 )
             })
             .collect();
-        super::doctor_scanning(project, &identity, TEST_PIPE_PREFIX).await
+        super::doctor_scanning(project, &identity, &test_pipe_prefix(socket_dir.path())).await
     }
 
     /// Run the doctor for `project` where the only reachable socket
@@ -1986,7 +1990,7 @@ mod tests {
         let identity = local_identity_for(project, socket_dir.path());
         let elsewhere_identity = local_identity_for(elsewhere, socket_dir.path());
         let _owner = RecordingOwner::start_reporting_non_owner(elsewhere_identity, elsewhere);
-        super::doctor_scanning(project, &identity, TEST_PIPE_PREFIX).await
+        super::doctor_scanning(project, &identity, &test_pipe_prefix(socket_dir.path())).await
     }
 
     /// Run the doctor for `project` against a real owner that accepts the
@@ -1996,7 +2000,7 @@ mod tests {
         let socket_dir = tempfile::tempdir().expect("a temp dir");
         let identity = local_identity_for(project, socket_dir.path());
         let _owner = RecordingOwner::start_silent(identity.clone());
-        super::doctor_scanning(project, &identity, TEST_PIPE_PREFIX).await
+        super::doctor_scanning(project, &identity, &test_pipe_prefix(socket_dir.path())).await
     }
 
     /// The same, with a second, real, related owner also present in the
@@ -2009,7 +2013,7 @@ mod tests {
         let _busy = RecordingOwner::start_silent(identity.clone());
         let related_identity = local_identity_for(related, socket_dir.path());
         let _related = RecordingOwner::start_reporting_status(related_identity, related, 0);
-        super::doctor_scanning(project, &identity, TEST_PIPE_PREFIX).await
+        super::doctor_scanning(project, &identity, &test_pipe_prefix(socket_dir.path())).await
     }
 
     /// Run the doctor for `project` against a real owner that answers
@@ -2018,7 +2022,7 @@ mod tests {
         let socket_dir = tempfile::tempdir().expect("a temp dir");
         let identity = local_identity_for(project, socket_dir.path());
         let _owner = RecordingOwner::start_answering_status_with_error(identity.clone(), message);
-        super::doctor_scanning(project, &identity, TEST_PIPE_PREFIX).await
+        super::doctor_scanning(project, &identity, &test_pipe_prefix(socket_dir.path())).await
     }
 
     /// Run the doctor for `project` against a real owner that answers
@@ -2028,7 +2032,7 @@ mod tests {
         let identity = local_identity_for(project, socket_dir.path());
         let _owner =
             RecordingOwner::start_answering_status_with_raw_line(identity.clone(), raw_line);
-        super::doctor_scanning(project, &identity, TEST_PIPE_PREFIX).await
+        super::doctor_scanning(project, &identity, &test_pipe_prefix(socket_dir.path())).await
     }
 
     /// Every line asserted by its exact text and position, not merely by
@@ -2077,7 +2081,12 @@ mod tests {
         let identity = local_identity_for(project.path(), socket_dir.path());
         let _proxy = RecordingOwner::start_reporting_non_owner(identity.clone(), other.path());
 
-        let out = super::doctor_scanning(project.path(), &identity, TEST_PIPE_PREFIX).await;
+        let out = super::doctor_scanning(
+            project.path(),
+            &identity,
+            &test_pipe_prefix(socket_dir.path()),
+        )
+        .await;
 
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 5, "expected exactly five lines: {out}");
@@ -2163,7 +2172,9 @@ mod tests {
         let never_created = project.path().join("does-not-exist-mcpls-dir");
         let identity = local_identity_for(project.path(), &never_created);
 
-        let out = super::doctor_scanning(project.path(), &identity, TEST_PIPE_PREFIX).await;
+        let out =
+            super::doctor_scanning(project.path(), &identity, &test_pipe_prefix(&never_created))
+                .await;
 
         assert_eq!(
             out.lines()
@@ -2320,17 +2331,18 @@ mod tests {
         let socket_dir = tempfile::tempdir().expect("a temp dir");
         let identity = local_identity_for(&project, socket_dir.path());
         let first = SocketIdentity {
-            socket: socket_dir.path().join("aaa-first.sock"),
+            socket: test_socket(socket_dir.path(), "aaa-first.sock"),
             ..local_identity_for(parent.path(), socket_dir.path())
         };
         let second = SocketIdentity {
-            socket: socket_dir.path().join("bbb-second.sock"),
+            socket: test_socket(socket_dir.path(), "bbb-second.sock"),
             ..local_identity_for(&child, socket_dir.path())
         };
         let _first = RecordingOwner::start_reporting_status(first, parent.path(), 0);
         let _second = RecordingOwner::start_reporting_status(second, &child, 0);
 
-        let out = super::doctor_scanning(&project, &identity, TEST_PIPE_PREFIX).await;
+        let out =
+            super::doctor_scanning(&project, &identity, &test_pipe_prefix(socket_dir.path())).await;
 
         let server_sees = out
             .lines()
@@ -2362,18 +2374,30 @@ mod tests {
         let socket_dir = tempfile::tempdir().expect("a temp dir");
         let identity = local_identity_for(&project, socket_dir.path());
         let related = SocketIdentity {
-            socket: socket_dir.path().join("aaa-related.sock"),
+            socket: test_socket(socket_dir.path(), "aaa-related.sock"),
             ..local_identity_for(parent.path(), socket_dir.path())
         };
         let _related = RecordingOwner::start_reporting_status(related, parent.path(), 0);
         // Sorted after the related owner, so the cap cuts these rather
         // than the answer the line is built from.
+        #[cfg(not(windows))]
         for i in 0..MAX_FOREIGN_CANDIDATES + 4 {
             std::fs::write(socket_dir.path().join(format!("zzz-stale-{i}.sock")), b"")
                 .expect("write");
         }
+        #[cfg(windows)]
+        let _others: Vec<_> = (0..MAX_FOREIGN_CANDIDATES + 4)
+            .map(|i| {
+                let other = SocketIdentity {
+                    socket: test_socket(socket_dir.path(), &format!("zzz-non-owner-{i}.sock")),
+                    ..identity.clone()
+                };
+                RecordingOwner::start_reporting_non_owner(other, parent.path())
+            })
+            .collect();
 
-        let out = super::doctor_scanning(&project, &identity, TEST_PIPE_PREFIX).await;
+        let out =
+            super::doctor_scanning(&project, &identity, &test_pipe_prefix(socket_dir.path())).await;
 
         let server_sees = out
             .lines()
@@ -2439,7 +2463,8 @@ mod tests {
             hash: "own".to_string(),
         };
 
-        let candidates = super::foreign_candidates(&identity, TEST_PIPE_PREFIX).expect("the scan");
+        let candidates = super::foreign_candidates(&identity, &test_pipe_prefix(socket_dir.path()))
+            .expect("the scan");
 
         let names: Vec<_> = candidates
             .iter()
@@ -2579,14 +2604,27 @@ mod tests {
         let project = tempfile::tempdir().expect("a temp dir");
         let socket_dir = tempfile::tempdir().expect("a temp dir");
         let identity = local_identity_for(project.path(), socket_dir.path());
-        // Stale candidate files, none of them a real listener: nothing
-        // answers, but there are more of them than the scan's own cap,
-        // so it cannot have examined all of them.
+        #[cfg(not(windows))]
         for i in 0..MAX_FOREIGN_CANDIDATES + 4 {
             std::fs::write(socket_dir.path().join(format!("stale-{i}.sock")), b"").expect("write");
         }
+        #[cfg(windows)]
+        let _others: Vec<_> = (0..MAX_FOREIGN_CANDIDATES + 4)
+            .map(|i| {
+                let other = SocketIdentity {
+                    socket: test_socket(socket_dir.path(), &format!("non-owner-{i}.sock")),
+                    ..identity.clone()
+                };
+                RecordingOwner::start_reporting_non_owner(other, project.path())
+            })
+            .collect();
 
-        let out = super::doctor_scanning(project.path(), &identity, TEST_PIPE_PREFIX).await;
+        let out = super::doctor_scanning(
+            project.path(),
+            &identity,
+            &test_pipe_prefix(socket_dir.path()),
+        )
+        .await;
 
         assert_eq!(
             out.lines()
@@ -2762,7 +2800,12 @@ mod tests {
         std::fs::set_permissions(socket_dir.path(), std::fs::Permissions::from_mode(0o000))
             .expect("lock the directory down");
 
-        let out = super::doctor_scanning(project.path(), &identity, TEST_PIPE_PREFIX).await;
+        let out = super::doctor_scanning(
+            project.path(),
+            &identity,
+            &test_pipe_prefix(socket_dir.path()),
+        )
+        .await;
 
         // Restore access before any assertion can panic and skip this,
         // leaving this test's own TempDir unable to clean itself up.
@@ -2874,7 +2917,8 @@ mod tests {
 
     #[test]
     fn test_resolve_on_path_absolutizes_a_relative_path_entry() {
-        let dir = tempfile::tempdir().expect("a temp dir");
+        let cwd = std::env::current_dir().expect("cwd");
+        let dir = tempfile::tempdir_in(&cwd).expect("a temp dir on the same volume as cwd");
         let exe_name = if cfg!(windows) { "mcpls.exe" } else { "mcpls" };
         let exe_path = dir.path().join(exe_name);
         std::fs::write(&exe_path, "").expect("write");
@@ -2885,7 +2929,6 @@ mod tests {
                 .expect("chmod");
         }
 
-        let cwd = std::env::current_dir().expect("cwd");
         let relative = relative_from(&cwd, dir.path());
         assert!(
             relative.is_relative(),
