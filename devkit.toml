@@ -4,6 +4,9 @@
 worktree_root = "../mcpls_worktrees/"
 baseline_ref = "origin/main"
 
+[tracker]
+kind = "github"
+
 [harness]
 enforce_writes = true
 enforce_commands = true
