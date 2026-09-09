@@ -75,8 +75,9 @@ fn resolve_pyrefly() -> Resolution {
 
 fn find_in_path(name: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
+    let executable = format!("{name}{}", std::env::consts::EXE_SUFFIX);
     for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join(name);
+        let candidate = dir.join(&executable);
         if candidate.is_file() {
             return Some(candidate);
         }
