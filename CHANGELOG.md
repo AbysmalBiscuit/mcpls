@@ -30,6 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Omit null LSP parameters so shutdown and exit messages are accepted by tsgo; keep empty-object parameters intact. ([bug-ops/mcpls#404](https://github.com/bug-ops/mcpls/pull/404))
+
 - Log transient LSP errors at warning level while retrying and at error level only when the request fails. ([bug-ops/mcpls#401](https://github.com/bug-ops/mcpls/pull/401))
 
 - Retry ContentModified responses for safe read methods and advertise the same retry allowlist during LSP initialization. ([bug-ops/mcpls#390](https://github.com/bug-ops/mcpls/pull/390))
