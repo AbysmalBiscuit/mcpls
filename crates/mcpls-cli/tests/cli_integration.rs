@@ -135,10 +135,7 @@ fn test_config_with_empty_file() {
     clear_ambient_env(&mut cmd)
         .arg("--config")
         .arg(&config_path)
-        // An empty file parses to an all-default config, so this reaches
-        // `serve_with`, which binds the real hook socket at
-        // `identity_for`'s runtime directory unless redirected here, before
-        // failing fast on the stdio transport having no client attached.
+        // Default config starts hook service, so isolate its runtime directory.
         .env("XDG_RUNTIME_DIR", temp_dir.path())
         .assert()
         .failure();
@@ -163,18 +160,10 @@ fn test_trust_project_config_env_false_does_not_grant_trust() {
         .env_remove("MCPLS_TRUST_PROJECT_CONFIG");
     let output = cmd
         .current_dir(temp_dir.path())
-        // This path proceeds all the way to `serve_with`, which binds the
-        // real hook socket at `identity_for`'s runtime directory unless
-        // redirected here; the untrusted-ignore assertion below does not
-        // depend on where that socket lands.
+        // Isolate the hook socket when startup proceeds past config loading.
         .env("XDG_RUNTIME_DIR", temp_dir.path())
         .env("MCPLS_TRUST_PROJECT_CONFIG", "false")
-        // Generous bound: the untrusted path is expected to block on stdio
-        // (proving it never bailed out on the broken TOML), so this timeout
-        // always elapses by design. It only needs to be long enough that a
-        // loaded CI runner doesn't get the process killed before mcpls even
-        // finishes logging the ignore-warning, which would false-fail this
-        // test rather than exercise the actual behavior under test.
+        // Allow startup to log before killing the process blocked on stdio.
         .timeout(Duration::from_secs(5))
         .output()
         .unwrap();
@@ -283,16 +272,7 @@ fn test_trust_project_config_env_true_grants_trust() {
         .stderr(predicate::str::contains("failed to load configuration"));
 }
 
-/// `MCPLS_CONFIG` must stay trusted -- and be the file actually consulted --
-/// even when a `./mcpls.toml` also exists in the CWD, regardless of the CWD
-/// file's own trust state. Runs with `--trust-project-config` set (so the
-/// CWD file is itself trusted) specifically to rule out a reordering bug
-/// where a trusted CWD file gets checked/loaded before `MCPLS_CONFIG`: if
-/// that ordering regressed, the invalid-TOML CWD file would be parsed first
-/// and fail with a TOML-parse error, never reaching the `MCPLS_CONFIG`
-/// check. Asserting the "configuration file not found" error for the
-/// `MCPLS_CONFIG` path (not a TOML-parse error) proves `MCPLS_CONFIG` is
-/// still checked first.
+/// A missing `MCPLS_CONFIG` file takes precedence over malformed trusted CWD config.
 #[test]
 fn test_mcpls_config_env_wins_over_cwd_file_even_when_trusted() {
     let temp_dir = TempDir::new().unwrap();
@@ -328,18 +308,7 @@ fn test_config_file_with_spaces_in_path() {
         .failure();
 }
 
-/// #279: `--log-json` was parsed by clap but never passed to
-/// `logging::init`, so the flag had no observable effect. A nonexistent
-/// `--config` path is used to force a fast, deterministic failure right
-/// after the "starting mcpls" line is logged (see `main.rs`), without
-/// needing a timeout+kill for a process that would otherwise block on
-/// stdio. `tracing_subscriber`'s JSON formatter always quotes the event's
-/// `message` field as `"message":"..."`, which the default compact
-/// formatter never produces (it renders unquoted `starting mcpls
-/// version=...`), so this substring is a reliable discriminator between the
-/// two formats without pulling in `serde_json` just for tests. Also asserts
-/// on the fatal-error line (`main`'s `tracing::error!` on `run()` failure)
-/// to guard the crash path staying JSON too, not just the startup line.
+/// A missing config makes startup and fatal-error logging observable without a timeout.
 #[test]
 fn test_log_json_flag_emits_json_formatted_logs() {
     let mut cmd = Command::cargo_bin("mcpls").unwrap();
@@ -526,10 +495,7 @@ fn test_completions_survives_a_closed_pipe() {
     use std::process::Stdio;
 
     for shell in ["bash", "elvish", "fish", "nushell", "powershell", "zsh"] {
-        // A pipe whose read end is already gone, so the very first write
-        // fails. Handing the child a live pipe and closing the read end here
-        // instead would race: the whole script fits in the kernel's pipe
-        // buffer, so a child that wins gets no error at all.
+        // Close the reader before spawning mcpls so its first write must fail.
         let mut departed_reader = Command::new("true").stdin(Stdio::piped()).spawn().unwrap();
         let closed_pipe = departed_reader.stdin.take().unwrap();
         departed_reader.wait().unwrap();
@@ -558,17 +524,7 @@ fn test_completions_survives_a_closed_pipe() {
     }
 }
 
-/// `SessionStart`'s watch paths must be absolute: the host consumes them
-/// with no obligation to resolve them against the hook process's own
-/// working directory. `mcpls hook`'s dispatcher only ever sees whatever
-/// project directory `main.rs` hands it, so a bug in that seam (passing
-/// `CLAUDE_PROJECT_DIR` through uncanonicalized) is invisible to every unit
-/// test in `hook.rs`, which always passes an absolute `tempfile::tempdir()`
-/// path directly. `CLAUDE_PROJECT_DIR` is left unset here, rather than set
-/// to the (already absolute) temp directory, so the process falls back to
-/// `main.rs`'s `PathBuf::from(".")` default: only a relative path run
-/// through canonicalization can tell this test apart from one that merely
-/// checks its own fixture.
+/// Unset `CLAUDE_PROJECT_DIR` exercises canonicalization of the relative CWD fallback.
 #[test]
 fn test_hook_session_start_emits_absolute_watch_paths() {
     let temp_dir = TempDir::new().unwrap();
@@ -590,6 +546,10 @@ fn test_hook_session_start_emits_absolute_watch_paths() {
     let output = assert.get_output();
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        parsed["hookSpecificOutput"]["hookEventName"],
+        "SessionStart"
+    );
     let paths = parsed["hookSpecificOutput"]["watchPaths"]
         .as_array()
         .unwrap();
@@ -602,6 +562,326 @@ fn test_hook_session_start_emits_absolute_watch_paths() {
              process's own working directory: {path}"
         );
     }
+}
+
+fn session_start(project: &std::path::Path) -> serde_json::Value {
+    let mut cmd = Command::cargo_bin("mcpls").unwrap();
+    clear_ambient_env(&mut cmd);
+    let output = assert_cmd::Command::from_std(cmd)
+        .env("CLAUDE_PROJECT_DIR", project)
+        .arg("hook")
+        .write_stdin(r#"{"hook_event_name":"SessionStart"}"#)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    serde_json::from_slice(&output).unwrap()
+}
+
+fn doctor_output(project: &std::path::Path) -> String {
+    let runtime = TempDir::new().unwrap();
+    let mut cmd = Command::cargo_bin("mcpls").unwrap();
+    let output = clear_ambient_env(&mut cmd)
+        .env("CLAUDE_PROJECT_DIR", project)
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env(
+            "USERNAME",
+            format!(
+                "mcpls-test-{}",
+                runtime.path().file_name().unwrap().to_string_lossy()
+            ),
+        )
+        .args(["hook", "doctor"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout).unwrap()
+}
+
+#[test]
+fn test_doctor_does_not_claim_a_path_candidate_can_launch() {
+    let project = TempDir::new().unwrap();
+    let bin = TempDir::new().unwrap();
+    let name = if cfg!(windows) { "mcpls.exe" } else { "mcpls" };
+    let candidate = bin.path().join(name);
+    fs::write(&candidate, "not an executable").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&candidate, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let mut cmd = Command::cargo_bin("mcpls").unwrap();
+    let output = clear_ambient_env(&mut cmd)
+        .env("CLAUDE_PROJECT_DIR", project.path())
+        .env("XDG_RUNTIME_DIR", bin.path())
+        .env("USERNAME", bin.path().file_name().unwrap())
+        .env("PATH", bin.path())
+        .args(["hook", "doctor"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(
+        stdout
+            .lines()
+            .find(|line| line.starts_with("mcpls on PATH:")),
+        Some(format!("mcpls on PATH: {}; launch not checked", candidate.display()).as_str())
+    );
+}
+
+#[test]
+fn test_watch_scan_distinguishes_missing_and_empty_roots_through_cli() {
+    let project = TempDir::new().unwrap();
+    let empty = session_start(project.path());
+    assert_eq!(
+        empty,
+        serde_json::json!({"hookSpecificOutput": {
+            "hookEventName": "SessionStart", "watchPaths": []
+        }})
+    );
+    assert!(doctor_output(project.path()).contains("watch scan: no eligible top-level paths"));
+
+    let missing = project.path().join("missing");
+    let failed = session_start(&missing);
+    assert_eq!(
+        failed["hookSpecificOutput"]["watchPaths"],
+        serde_json::json!([])
+    );
+    assert!(
+        failed["systemMessage"]
+            .as_str()
+            .unwrap()
+            .contains("watch-path scan incomplete")
+    );
+    assert!(
+        failed["systemMessage"]
+            .as_str()
+            .unwrap()
+            .contains("missing")
+    );
+    let doctor = doctor_output(&missing);
+    assert!(doctor.contains("watch scan: incomplete"), "{doctor}");
+    assert!(!doctor.contains("watch scan: no eligible"), "{doctor}");
+}
+
+#[test]
+fn test_watch_scan_reports_ignore_errors_without_losing_valid_paths() {
+    let project = TempDir::new().unwrap();
+    fs::create_dir(project.path().join("src")).unwrap();
+    fs::create_dir(project.path().join("target")).unwrap();
+    fs::create_dir(project.path().join(".gitignore")).unwrap();
+    let output = session_start(project.path());
+    let root = dunce::canonicalize(project.path()).unwrap();
+    assert_eq!(
+        output["hookSpecificOutput"]["watchPaths"],
+        serde_json::json!([root.join("src")])
+    );
+    assert!(
+        output["systemMessage"]
+            .as_str()
+            .unwrap()
+            .contains(".gitignore")
+    );
+    assert!(
+        doctor_output(project.path())
+            .contains("watch scan: incomplete; selected 1 top-level path(s)")
+    );
+}
+
+#[test]
+fn test_watch_scan_rejects_a_file_as_project_root() {
+    let project = TempDir::new().unwrap();
+    let file = project.path().join("file");
+    fs::write(&file, "").unwrap();
+    let output = session_start(&file);
+    assert!(
+        output["systemMessage"]
+            .as_str()
+            .unwrap()
+            .contains("watch-path scan incomplete")
+    );
+    assert!(
+        output["systemMessage"]
+            .as_str()
+            .unwrap()
+            .contains("project root is not a directory")
+    );
+    let doctor = doctor_output(&file);
+    assert!(doctor.contains("watch scan: incomplete"), "{doctor}");
+    assert!(
+        doctor.contains("project root is not a directory"),
+        "{doctor}"
+    );
+}
+
+#[test]
+fn test_watch_scan_describes_hidden_only_tree_as_filtered() {
+    let project = TempDir::new().unwrap();
+    fs::create_dir(project.path().join(".github")).unwrap();
+    fs::create_dir(project.path().join(".git")).unwrap();
+    let output = session_start(project.path());
+    assert_eq!(
+        output["hookSpecificOutput"]["watchPaths"],
+        serde_json::json!([])
+    );
+    assert!(output.get("systemMessage").is_none());
+    let doctor = doctor_output(project.path());
+    assert!(
+        doctor.contains("hidden entries excluded by default; ignore rules applied"),
+        "{doctor}"
+    );
+}
+
+#[test]
+fn test_watch_scan_reports_explicitly_allowed_hidden_paths_through_cli() {
+    let project = TempDir::new().unwrap();
+    fs::create_dir(project.path().join(".git")).unwrap();
+    fs::create_dir(project.path().join(".github")).unwrap();
+    fs::write(project.path().join(".gitignore"), "!.github/\n").unwrap();
+
+    let output = session_start(project.path());
+    let root = dunce::canonicalize(project.path()).unwrap();
+    assert_eq!(
+        output["hookSpecificOutput"]["watchPaths"],
+        serde_json::json!([root.join(".github")])
+    );
+    assert!(output.get("systemMessage").is_none());
+    let doctor = doctor_output(project.path());
+    assert!(doctor.contains("selected 1 top-level path(s)"), "{doctor}");
+    assert!(
+        doctor.contains("hidden entries excluded by default"),
+        "{doctor}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_watch_scan_reports_unreadable_root_through_cli() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let project = TempDir::new().unwrap();
+    fs::set_permissions(project.path(), fs::Permissions::from_mode(0o000)).unwrap();
+    let inaccessible = fs::read_dir(project.path()).is_err();
+    let output = session_start(project.path());
+    let doctor = doctor_output(project.path());
+    fs::set_permissions(project.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    if inaccessible {
+        assert!(
+            output["systemMessage"]
+                .as_str()
+                .unwrap()
+                .contains("watch-path scan incomplete")
+        );
+        assert!(doctor.contains("watch scan: incomplete"), "{doctor}");
+    } else {
+        assert!(
+            output.get("systemMessage").is_none(),
+            "privileged reader can inspect this directory"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_doctor_identity_uses_current_user_without_xdg_runtime_dir() {
+    let project = TempDir::new().unwrap();
+    let mut cmd = Command::cargo_bin("mcpls").unwrap();
+    let output = clear_ambient_env(&mut cmd)
+        .env("CLAUDE_PROJECT_DIR", project.path())
+        .env_remove("XDG_RUNTIME_DIR")
+        .env("USER", "mcpls-followup-user")
+        .args(["hook", "doctor"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let expected = std::env::temp_dir().join("mcpls-mcpls-followup-user");
+    assert!(
+        stdout.starts_with(&format!("socket: {}/", expected.display())),
+        "{stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_doctor_identity_rejects_socket_path_that_cannot_bind() {
+    let project = TempDir::new().unwrap();
+    let runtime = project.path().join("x".repeat(120));
+    let mut cmd = Command::cargo_bin("mcpls").unwrap();
+    let output = clear_ambient_env(&mut cmd)
+        .env("CLAUDE_PROJECT_DIR", project.path())
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .args(["hook", "doctor"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.starts_with("socket: none; could not derive an identity"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("socket path exceeds"), "{stdout}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_hook_context_outputs_name_the_triggering_event_through_cli() {
+    use mcpls_core::hooks::{HookListener, Request, Response, SocketIdentity, identity_hash};
+    let project = TempDir::new().unwrap();
+    let runtime = TempDir::new().unwrap();
+    let hash = identity_hash(project.path()).unwrap();
+    let identity = SocketIdentity {
+        socket: runtime.path().join("mcpls").join(format!("{hash}.sock")),
+        lock: runtime.path().join("mcpls").join(format!("{hash}.lock")),
+        hash,
+    };
+    let listener = HookListener::acquire(&identity).await.unwrap().unwrap();
+    let (cancel, rx) = tokio::sync::watch::channel(false);
+    let owner = tokio::spawn(listener.serve(
+        |request| {
+            Box::pin(async move {
+                match request {
+                    Request::Changed { .. } => Response::Changed { queued: 0 },
+                    Request::Flush { .. } => Response::Flush {
+                        context: Some("diagnostic".into()),
+                        token: None,
+                    },
+                    _ => unreachable!(),
+                }
+            })
+        },
+        Duration::from_secs(1),
+        rx,
+    ));
+    tokio::task::spawn_blocking(move || {
+        for event in ["UserPromptSubmit", "PostToolBatch"] {
+            let mut cmd = Command::cargo_bin("mcpls").unwrap();
+            clear_ambient_env(&mut cmd);
+            let output = assert_cmd::Command::from_std(cmd)
+                .env("CLAUDE_PROJECT_DIR", project.path())
+                .env("XDG_RUNTIME_DIR", runtime.path())
+                .arg("hook")
+                .write_stdin(
+                    serde_json::json!({"hook_event_name": event, "session_id": "test"}).to_string(),
+                )
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone();
+            let parsed: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(
+                parsed,
+                serde_json::json!({"hookSpecificOutput": {
+                    "hookEventName": event, "additionalContext": "diagnostic"
+                }})
+            );
+        }
+    })
+    .await
+    .unwrap();
+    cancel.send(true).unwrap();
+    owner.await.unwrap();
 }
 
 /// A hook invocation must never panic on a closed stdout, the same

@@ -135,11 +135,17 @@ impl PathFilter {
     }
 }
 
-/// One root's ignore matcher: the built-in denylist plus that root's own
-/// `.gitignore`, if it has one. `admits` and `watch_paths` both build a
-/// matcher through this function rather than each deciding "ignored" its
-/// own way, so the two cannot drift into disagreeing about the same path.
+/// The path filter's ignore matcher, with failures logged for the server.
 fn gitignore_for(root: &Path) -> Gitignore {
+    let (ignore, errors) = read_gitignore(root);
+    for error in errors {
+        tracing::warn!(%error, "could not fully read the project's ignore rules");
+    }
+    ignore
+}
+
+fn read_gitignore(root: &Path) -> (Gitignore, Vec<String>) {
+    let mut errors = Vec::new();
     let mut builder = GitignoreBuilder::new(root);
     for pattern in BUILT_IN_IGNORES {
         let _ = builder.add_line(None, pattern);
@@ -150,39 +156,71 @@ fn gitignore_for(root: &Path) -> Gitignore {
             .io_error()
             .is_some_and(|io_error| io_error.kind() == std::io::ErrorKind::NotFound);
         if !missing {
-            tracing::warn!(
-                path = %gitignore.display(),
-                %error,
-                "ignoring the project's .gitignore, which could not be read or parsed"
-            );
+            errors.push(format!("{}: {error}", gitignore.display()));
         }
     }
-    builder.build().unwrap_or_else(|_| Gitignore::empty())
+    let ignore = builder.build().unwrap_or_else(|error| {
+        errors.push(error.to_string());
+        Gitignore::empty()
+    });
+    (ignore, errors)
 }
 
-/// The directories and root-level files a session's watcher should cover.
+/// Selected watch paths and failures encountered while inspecting the root.
+#[derive(Debug)]
+pub struct WatchPaths {
+    /// Top-level entries admitted by the scan and ignore rules.
+    pub paths: Vec<PathBuf>,
+    /// Traversal or ignore-rule failures; selected paths may be incomplete.
+    pub errors: Vec<String>,
+}
+
+/// Scan top-level entries using ignore rules; hidden entries are excluded by default.
 ///
-/// Filtered through the same matcher `admits` uses, so a build directory
-/// the project's own `.gitignore` does not name is kept off the watcher
-/// exactly as it is kept off the tracker.
+/// Explicit allow rules can include hidden entries.
+/// This does not verify that a host registered the paths or can watch their descendants.
 #[must_use]
-pub fn watch_paths(root: &Path) -> Vec<PathBuf> {
-    let ignore = gitignore_for(root);
-    WalkBuilder::new(root)
+pub fn watch_paths(root: &Path) -> WatchPaths {
+    let (ignore, errors) = read_gitignore(root);
+    let mut result = WatchPaths {
+        paths: Vec::new(),
+        errors,
+    };
+    if root.is_file() {
+        result.errors.push(format!(
+            "{}: project root is not a directory",
+            root.display()
+        ));
+        return result;
+    }
+    for entry in WalkBuilder::new(root)
+        .hidden(true)
         .max_depth(Some(1))
         .build()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.path() != root)
-        .filter(|entry| {
-            let is_dir = entry
-                .file_type()
-                .is_some_and(|file_type| file_type.is_dir());
-            !ignore
-                .matched_path_or_any_parents(entry.path(), is_dir)
-                .is_ignore()
-        })
-        .map(ignore::DirEntry::into_path)
-        .collect()
+    {
+        match entry {
+            Ok(entry) => {
+                if let Some(error) = entry.error() {
+                    result.errors.push(error.to_string());
+                }
+                if entry.path() == root {
+                    continue;
+                }
+                let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
+                if !ignore
+                    .matched_path_or_any_parents(entry.path(), is_dir)
+                    .is_ignore()
+                {
+                    result.paths.push(entry.into_path());
+                }
+            }
+            Err(error) => result.errors.push(error.to_string()),
+        }
+    }
+    result.paths.sort();
+    result.errors.sort();
+    result.errors.dedup();
+    result
 }
 
 #[cfg(test)]
@@ -440,13 +478,15 @@ mod tests {
 
         assert!(filter_over(dir.path()).admits(&kept));
         assert!(
-            !watch_paths(dir.path()).contains(&dir.path().join("target")),
+            !watch_paths(dir.path())
+                .paths
+                .contains(&dir.path().join("target")),
             "the troubleshooting guide tells a user what this workaround does \
              and does not buy them, and it can only be true while these two \
              answers stay apart"
         );
         assert!(
-            !watch_paths(dir.path()).contains(&kept),
+            !watch_paths(dir.path()).paths.contains(&kept),
             "the guide's sentence is about the negated file, and a list that \
              named the file rather than its directory would honour the \
              negation the guide says the watcher does not honour"
@@ -460,7 +500,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("node_modules")).expect("mkdir");
         std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
 
-        let paths = watch_paths(dir.path());
+        let paths = watch_paths(dir.path()).paths;
 
         assert!(paths.contains(&dir.path().join("src")));
         assert!(
@@ -481,7 +521,7 @@ mod tests {
         std::fs::write(dir.path().join("Cargo.toml"), "").expect("write");
         std::fs::write(dir.path().join(".gitignore"), "/target\n").expect("write");
 
-        let paths = watch_paths(dir.path());
+        let paths = watch_paths(dir.path()).paths;
 
         assert!(paths.contains(&dir.path().join("src")));
         assert!(paths.contains(&dir.path().join("Cargo.toml")));
