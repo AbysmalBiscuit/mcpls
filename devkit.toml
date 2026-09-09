@@ -8,6 +8,16 @@ baseline_ref = "origin/main"
 enforce_writes = true
 enforce_commands = true
 
+[harness.commands.worktree-add]
+programs = ["git"]
+args = ["worktree", "add"]
+reason = "Use devkit's issue binary to create worktrees: issue setup --summary --slug [branch-name]"
+
+[harness.commands.worktree-remove]
+programs = ["git"]
+args = ["worktree", "remove"]
+reason = "Use devkit's issue binary to remove worktrees: issue end [branch-name]"
+
 [tasks.build]
 description = "Build the workspace"
 run = ["cargo", "build", "--workspace", "--locked"]
