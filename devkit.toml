@@ -1,24 +1,63 @@
 #:schema https://github.com/AbysmalBiscuit/devkit/releases/latest/download/devkit-config.json
 
-# Uncomment what this project uses and replace the <placeholders>. Until
-# [defaults] is uncommented the config does not resolve, and `devkit brief`
-# reports that rather than staying quiet.
-
-# [defaults]
+[defaults]
 worktree_root = "../mcpls_worktrees/"
-# branch_prefix = "<you>/"
 baseline_ref = "origin/main"
-# baseline_dir = "~/git/<project>-worktrees/_baselines"
 
-# An app needs base_port and launch to parse at all, and path to resolve
-# without a doppler.yaml to infer it from.
-# [apps.web]
-# base_port = 9100
-# path = "apps/web"
-# launch = ["pnpm", "dev", "--port", "{{ port }}"]
+[harness]
+enforce_writes = true
+enforce_commands = true
 
-# Commands run on a lifecycle event, as argv arrays (no shell). Failures warn
-# and are skipped. after_worktree_create runs in a worktree `issue setup` or
-# `issue pr checkout` has just created.
-# [hooks]
-# after_worktree_create = [["zoxide", "add", "{{ worktree }}"]]
+[tasks.build]
+description = "Build the workspace"
+run = ["cargo", "build", "--workspace", "--locked"]
+guard = true
+
+[tasks.build-release]
+description = "Build the workspace with release optimizations"
+run = ["cargo", "build", "--workspace", "--release", "--locked"]
+guard = true
+
+[tasks.check]
+description = "Check all workspace targets and features"
+run = ["cargo", "check", "--workspace", "--all-targets", "--all-features", "--locked"]
+guard = true
+
+[tasks.test]
+description = "Run workspace tests with nextest"
+run = ["cargo", "nextest", "run", "--workspace", "--all-features", "--locked"]
+guard = true
+
+[tasks.test-doc]
+description = "Run workspace documentation tests"
+run = ["cargo", "test", "--doc", "--workspace", "--all-features", "--locked"]
+guard = true
+
+[tasks.fmt]
+description = "Format the workspace with nightly rustfmt"
+run = ["cargo", "+nightly", "fmt", "--all"]
+guard = true
+
+[tasks.fmt-check]
+description = "Check workspace formatting with nightly rustfmt"
+run = ["cargo", "+nightly", "fmt", "--all", "--", "--check"]
+guard = true
+
+[tasks.lint]
+description = "Run clippy with warnings denied"
+run = ["cargo", "clippy", "--workspace", "--all-targets", "--all-features", "--locked", "--", "-D", "warnings"]
+guard = true
+
+[tasks.docs]
+description = "Build workspace API documentation"
+run = ["cargo", "doc", "--workspace", "--no-deps", "--all-features", "--locked"]
+guard = true
+
+[tasks.clean]
+description = "Remove Cargo build artifacts"
+run = ["cargo", "clean"]
+guard = true
+
+[tasks.verify]
+description = "Check formatting, lint, and run tests including documentation tests"
+steps = [{ task = "fmt-check" }, { task = "lint" }, { task = "test" }, { task = "test-doc" }]
