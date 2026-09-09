@@ -94,7 +94,7 @@ run = [
     "warnings",
 ]
 guard = true
-env = { RUSTC_WRAPPER = "" }
+env = { ZCCACHE_PATH_REMAP = "off" }
 
 [tasks.docs]
 description = "Build workspace API documentation"
