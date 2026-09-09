@@ -101,3 +101,22 @@ steps = [
     { task = "test" },
     { task = "test-doc" },
 ]
+
+[templates]
+pr_body = '''## TL;DR (human written)
+{% if issue is defined and issue and (issue_magic_word ~ " #" ~ issue) not in input %}
+---
+
+{{ issue_magic_word }} #{{ issue }}
+{%- for extra in also_closes | replace(",", " ") | split %}
+{{ issue_magic_word }} #{{ extra | trim("#") }}
+{%- endfor %}
+{% endif %}
+{{ input }}'''
+
+# Declared so the template above renders (an undefined name is a hard error)
+# and so `issue pr create --arg` accepts them: --arg is checked against this
+# table, not against the template.
+[templates.variables]
+issue_magic_word = "Closes"
+also_closes = ""
