@@ -43,18 +43,19 @@ The malformed-environment selection failed nine tests in run `f1d1547a-2f90-44e5
 
 With the compiler wrapper enabled, the full Linux suite passed 1,137 tests with 40 skipped, run `61b805e1-7976-4ba8-ba9e-08436d127628`. The full suite passed again after the permission-fixture correction, run `c9b05be2-323b-48bf-871b-2c1b2ed16451`, with the same totals. Documentation tests passed 12 with 6 ignored. Nightly formatting and `git diff --check` passed.
 
-Clippy is blocked by the configured `zccache` 1.13.22 wrapper. It reports `multiple input filenames provided`, treating the toolchain's `rustc` path and `crates/mcpls-core/src/lib.rs` as source inputs. This is not a passing lint result. The earlier direct Clippy run caught a long API-doc first paragraph; that paragraph was split before the wrapper-enabled checks.
+Clippy initially failed through the configured `zccache` 1.13.22 wrapper with `multiple input filenames provided`, treating the toolchain's `rustc` path and `crates/mcpls-core/src/lib.rs` as source inputs. Lev subsequently authorized disabling the wrapper in the Clippy task. The task now sets `RUSTC_WRAPPER = ""`, and workspace Clippy passed for all targets and features with warnings denied. The `verify` dry run confirmed that other tasks receive no wrapper override. The earlier direct Clippy run caught a long API-doc first paragraph; that paragraph was split before the final lint check.
 
 Lev confirmed with standard shell tools that `sudo ls -la` could list a mode-000 directory while ordinary `ls -la` returned permission denied. The two permission fixtures now probe the relevant access operation and report the fixture unavailable when the runner can still access it. Permissions are restored before either return or assertion. Both tests passed under the ordinary runner after the correction, run `168f5fdf-c41a-4ee4-8372-53d404949119`. The application and its tests were not run under sudo; no privileged application result is claimed.
 
-The initial build failed in `zccache` with exit 113. Baseline and mutation runs used a command-scoped empty `RUSTC_WRAPPER`; no global Cargo configuration was changed. Remaining checks preserve the wrapper after the checkout instructions were updated to require it.
+The initial build failed in `zccache` with exit 113. Baseline and mutation runs used a command-scoped empty `RUSTC_WRAPPER`; no global Cargo configuration was changed. Final build and test commands preserve the configured wrapper. The Clippy task is the explicitly authorized exception.
 
 ## Reproduce the standard checks
 
-The main checkout's task configuration was being edited concurrently and could not be parsed. A valid configuration from commit `01f0536` supplied the local devkit tasks. To recreate the standard verification configuration in this worktree:
+The main checkout's task configuration initially could not be parsed because the verification sequence used multiline inline tables. That syntax was corrected to an array of tables while adding the Clippy override. The local validation tasks came from the valid configuration at commit `01f0536`, with the same task-specific override added. To recreate the standard verification configuration in this worktree:
 
 ```fish
 git -C /home/lev/Git/lev/mcpls show 01f0536:devkit.toml > /home/lev/Git/lev/mcpls_worktrees/diagnostics-validation/.devkit/standard-validation.toml
+printf '\n[tasks.lint.env]\nRUSTC_WRAPPER = ""\n' >> /home/lev/Git/lev/mcpls_worktrees/diagnostics-validation/.devkit/standard-validation.toml
 devrun -C /home/lev/Git/lev/mcpls_worktrees/diagnostics-validation --config /home/lev/Git/lev/mcpls_worktrees/diagnostics-validation/.devkit/standard-validation.toml task verify
 git -C /home/lev/Git/lev/mcpls_worktrees/diagnostics-validation diff --check
 ```
