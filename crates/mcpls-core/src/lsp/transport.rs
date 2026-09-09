@@ -29,6 +29,29 @@ const MAX_CONTENT_LENGTH: usize = 10 * 1024 * 1024;
 pub struct LspTransport {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    // Outbound commands can cancel receive between any two reads.
+    receive_state: ReceiveState,
+}
+
+#[derive(Debug)]
+enum ReceiveState {
+    Headers {
+        headers: HashMap<String, String>,
+        line: Vec<u8>,
+    },
+    Content {
+        bytes: Vec<u8>,
+        read: usize,
+    },
+}
+
+impl Default for ReceiveState {
+    fn default() -> Self {
+        Self::Headers {
+            headers: HashMap::new(),
+            line: Vec::new(),
+        }
+    }
 }
 
 impl LspTransport {
@@ -43,6 +66,7 @@ impl LspTransport {
         Self {
             stdin,
             stdout: BufReader::new(stdout),
+            receive_state: ReceiveState::default(),
         }
     }
 
@@ -85,23 +109,20 @@ impl LspTransport {
     /// - Message format is invalid
     pub async fn receive(&mut self) -> Result<InboundMessage> {
         loop {
-            let headers = self.read_headers().await?;
-
-            let content_length = headers
-                .get("content-length")
-                .ok_or_else(|| {
-                    Error::LspProtocolError("Missing Content-Length header".to_string())
-                })?
-                .parse::<usize>()
-                .map_err(|e| Error::LspProtocolError(format!("Invalid Content-Length: {e}")))?;
-
-            if content_length > MAX_CONTENT_LENGTH {
-                return Err(Error::LspProtocolError(format!(
-                    "Content-Length {content_length} exceeds maximum allowed size of {MAX_CONTENT_LENGTH} bytes"
-                )));
-            }
-
-            let content = self.read_content(content_length).await?;
+            let content = match &mut self.receive_state {
+                ReceiveState::Headers { headers, line } => {
+                    let length = Self::read_headers(&mut self.stdout, headers, line).await?;
+                    self.receive_state = ReceiveState::Content {
+                        bytes: vec![0; length],
+                        read: 0,
+                    };
+                    continue;
+                }
+                ReceiveState::Content { bytes, read } => {
+                    Self::read_content(&mut self.stdout, bytes, read).await?
+                }
+            };
+            self.receive_state = ReceiveState::default();
 
             trace!("Received LSP message: {}", content);
 
@@ -122,28 +143,29 @@ impl LspTransport {
         }
     }
 
-    /// Read headers until blank line.
+    /// Read headers until blank line and return the content length.
     ///
     /// Headers are in the format "Key: Value\r\n" and are terminated by
     /// a blank line ("\r\n").
-    async fn read_headers(&mut self) -> Result<HashMap<String, String>> {
-        let mut headers = HashMap::new();
-        let mut line = String::new();
-
+    async fn read_headers(
+        stdout: &mut BufReader<ChildStdout>,
+        headers: &mut HashMap<String, String>,
+        line_buffer: &mut Vec<u8>,
+    ) -> Result<usize> {
         loop {
-            line.clear();
-            let bytes_read = self.stdout.read_line(&mut line).await?;
+            let bytes_read = stdout.read_until(b'\n', line_buffer).await?;
 
-            // EOF - stream closed (read_line returns 0 bytes on EOF)
-            if bytes_read == 0 || line.is_empty() {
+            if bytes_read == 0 || line_buffer.is_empty() {
                 trace!(
                     "EOF detected in read_headers: bytes_read={}, line_len={}",
                     bytes_read,
-                    line.len()
+                    line_buffer.len()
                 );
                 return Err(Error::ServerTerminated);
             }
 
+            let line = std::str::from_utf8(line_buffer)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
             if line == "\r\n" || line == "\n" {
                 break;
             }
@@ -153,19 +175,40 @@ impl LspTransport {
             } else {
                 warn!("Malformed header: {}", line.trim());
             }
+            line_buffer.clear();
         }
 
-        Ok(headers)
+        let content_length = headers
+            .get("content-length")
+            .ok_or_else(|| Error::LspProtocolError("Missing Content-Length header".to_string()))?
+            .parse::<usize>()
+            .map_err(|e| Error::LspProtocolError(format!("Invalid Content-Length: {e}")))?;
+
+        if content_length > MAX_CONTENT_LENGTH {
+            return Err(Error::LspProtocolError(format!(
+                "Content-Length {content_length} exceeds maximum allowed size of {MAX_CONTENT_LENGTH} bytes"
+            )));
+        }
+        Ok(content_length)
     }
 
-    /// Read exact number of content bytes.
-    ///
-    /// Reads exactly `length` bytes from stdout and converts to UTF-8 string.
-    async fn read_content(&mut self, length: usize) -> Result<String> {
-        let mut buffer = vec![0u8; length];
-        self.stdout.read_exact(&mut buffer).await?;
+    /// Read the remaining content bytes and convert the complete message to UTF-8.
+    async fn read_content(
+        stdout: &mut BufReader<ChildStdout>,
+        content: &mut Vec<u8>,
+        read: &mut usize,
+    ) -> Result<String> {
+        while *read < content.len() {
+            let bytes_read = stdout.read(&mut content[*read..]).await?;
+            if bytes_read == 0 {
+                return Err(
+                    std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "early eof").into(),
+                );
+            }
+            *read += bytes_read;
+        }
 
-        String::from_utf8(buffer)
+        String::from_utf8(std::mem::take(content))
             .map_err(|e| Error::LspProtocolError(format!("Invalid UTF-8 in content: {e}")))
     }
 }
@@ -380,6 +423,116 @@ mod tests {
 
             assert_eq!(key_trimmed, "content-length");
             assert_eq!(value_trimmed, "456");
+        }
+    }
+
+    #[cfg(unix)]
+    mod fragmented_frames {
+        use std::process::Stdio;
+        use std::time::Duration;
+
+        use tokio::process::Command;
+        use tokio::sync::mpsc;
+
+        use super::*;
+        use crate::config::LspServerConfig;
+        use crate::lsp::{LspClient, LspNotification};
+
+        enum Boundary {
+            HeaderLine,
+            HeaderSeparator,
+            Body,
+        }
+
+        async fn assert_fragment_survives_outbound_response(boundary: Boundary) {
+            let mut outbound = Command::new("cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let mut inbound = Command::new("cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let mut server_writer = inbound.stdin.take().unwrap();
+            let mut server_reader = BufReader::new(outbound.stdout.take().unwrap());
+            let mut transport = LspTransport::new(
+                outbound.stdin.take().unwrap(),
+                inbound.stdout.take().unwrap(),
+            );
+
+            let request = serde_json::json!({
+                "jsonrpc": "2.0", "id": 99,
+                "method": "window/workDoneProgress/create", "params": {"token": "work"},
+            })
+            .to_string();
+            let notification = serde_json::json!({
+                "jsonrpc": "2.0", "method": "$/progress",
+                "params": {"token": "work", "value": {"kind": "end"}},
+            })
+            .to_string();
+            let header = format!("Content-Length: {}\r\n\r\n", notification.len());
+            let split = match boundary {
+                Boundary::HeaderLine => "Content-Len".len(),
+                Boundary::HeaderSeparator => header.len() - 2,
+                Boundary::Body => header.len() + notification.len() / 2,
+            };
+            let frame = format!("{header}{notification}");
+            let prefix = format!(
+                "Content-Length: {}\r\n\r\n{request}{}",
+                request.len(),
+                &frame[..split]
+            );
+            server_writer.write_all(prefix.as_bytes()).await.unwrap();
+            server_writer.flush().await.unwrap();
+            assert_eq!(
+                transport.stdout.fill_buf().await.unwrap(),
+                prefix.as_bytes()
+            );
+
+            // On this current-thread runtime, the loop consumes the buffered fragment
+            // before its spawned request responder can enqueue the outbound response.
+            let (tx, mut rx) = mpsc::channel(1);
+            let config = LspServerConfig::rust_analyzer();
+            let server_id = config.id();
+            let _client = LspClient::from_transport_with_notifications(
+                config, transport, tx, None, server_id,
+            );
+            let response = crate::test_support::read_framed_message(&mut server_reader).await;
+            assert_eq!(response["id"], 99);
+            assert_eq!(response["result"], Value::Null);
+
+            server_writer
+                .write_all(&frame.as_bytes()[split..])
+                .await
+                .unwrap();
+            server_writer.flush().await.unwrap();
+            let received = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap();
+            assert!(
+                matches!(received, Some(LspNotification::Progress { token, value })
+                    if token == "work" && value == serde_json::json!({"kind": "end"})),
+                "the fragment must survive the outbound response cancelling receive"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_fragmented_header_line_survives_outbound_commands() {
+            assert_fragment_survives_outbound_response(Boundary::HeaderLine).await;
+        }
+
+        #[tokio::test]
+        async fn test_fragmented_header_separator_survives_outbound_commands() {
+            assert_fragment_survives_outbound_response(Boundary::HeaderSeparator).await;
+        }
+
+        #[tokio::test]
+        async fn test_fragmented_body_survives_outbound_commands() {
+            assert_fragment_survives_outbound_response(Boundary::Body).await;
         }
     }
 }

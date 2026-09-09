@@ -78,6 +78,11 @@ pub struct Diagnostic {
     pub message: String,
     /// Optional diagnostic code.
     pub code: Option<String>,
+    /// The tool that produced this diagnostic (e.g. `"rustc"`,
+    /// `"rust-analyzer"`). This is how a caller tells a build error, which
+    /// requires a completed build, apart from an editor-model diagnostic,
+    /// which does not.
+    pub source: Option<String>,
 }
 
 /// Result of a diagnostics request.
@@ -173,6 +178,15 @@ pub struct FormatDocumentResult {
     /// Whether the edits were written to disk.
     #[serde(default)]
     pub applied: bool,
+    /// Files written, when `applied`. The caller's cached contents for
+    /// these paths are stale.
+    ///
+    /// Carries the path the applier resolved, not the one the caller
+    /// passed: a relative, symlinked or non-canonical `file_path` is
+    /// accepted by the tool and would not match anything a consumer
+    /// compares against a canonicalized workspace root.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub files_written: Vec<String>,
 }
 
 /// A workspace symbol.

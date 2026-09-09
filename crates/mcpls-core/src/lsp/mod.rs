@@ -7,6 +7,7 @@ mod client;
 mod lifecycle;
 mod transport;
 pub(crate) mod types;
+pub mod watched_files;
 
 pub use client::{ApplySink, LspClient};
 #[cfg(test)]
@@ -17,3 +18,4 @@ pub use types::{
     InboundMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, LspNotification,
     RequestId,
 };
+pub use watched_files::WatchRegistry;

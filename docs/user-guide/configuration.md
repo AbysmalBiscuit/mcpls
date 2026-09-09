@@ -630,6 +630,10 @@ max_per_file = 10
 max_total = 50
 settle_quiet_ms = 1000
 settle_deadline_ms = 300000
+footer = false
+footer_grace_ms = 250
+footer_quiet_ms = 200
+footer_wait_ms = 15000
 ```
 
 ### `diagnostics.severity`
@@ -668,6 +672,34 @@ How long the language servers must report no work before their view of the works
 How long to wait for that quiet before giving up and baselining anyway. Bounds the damage from a server that never finishes, or from a progress notification dropped before its pump existed.
 
 Counted from the moment the language servers are spawned, so it covers indexing rather than the handshake that precedes it. It needs to outlast a full index of your workspace: firing before that captures a partial baseline, and every file analyzed afterwards then reads as newly changed. Firing late only costs the session a longer wait for its first baseline, and `get_new_diagnostics` says so while it waits — so when in doubt, raise it.
+
+### `diagnostics.footer`
+
+**Type**: Boolean
+**Default**: `false`
+
+Whether a write tool appends the diagnostics its own edit caused to its result, instead of leaving the caller to poll for them separately.
+
+### `diagnostics.footer_grace_ms`
+
+**Type**: Integer (milliseconds)
+**Default**: `250`
+
+How long a footer waits before it starts looking for quiet. A footer that checks too soon after a write can catch the language servers before they have reacted to it at all, and report the state from before the edit as if it were the result. Bounded by `footer_wait_ms`, which is the whole wait: a grace set above it is spent only up to it.
+
+### `diagnostics.footer_quiet_ms`
+
+**Type**: Integer (milliseconds)
+**Default**: `200`
+
+How long nothing may be outstanding before a footer calls it done. Shorter than `settle_quiet_ms`, which bridges gaps between startup phases a footer never sees; what a footer bridges instead is the cancel-and-restart between two writes landing back to back.
+
+### `diagnostics.footer_wait_ms`
+
+**Type**: Integer (milliseconds)
+**Default**: `15000`
+
+How long a footer waits in total before reporting whatever it has, `footer_grace_ms` included rather than on top of it: setting this below the grace shortens the grace to match. It is a bound rather than an exact duration — a wait that never goes quiet is sampled every 50 ms, and the sample that carries it past this value has already been paid, so the wait can run up to 50 ms beyond it. Sized against a real build rather than against patience, so it clears comfortably even on a large crate's rebuild; the wait is gated on progress rather than on a timer, so a fast workspace still returns quickly and the high cap costs it nothing.
 
 ## Environment Variables
 

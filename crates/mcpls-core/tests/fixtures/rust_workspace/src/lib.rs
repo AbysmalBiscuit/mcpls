@@ -112,3 +112,18 @@ pub fn lsp317_target() {
     let s = add(1, 2);
     let _ = (p, s);
 }
+
+/// One half of a deliberate rename collision, used by the resync e2e.
+/// Renaming `tally` to `total` makes rustc report E0428 for this file.
+pub fn tally(a: i32, b: i32) -> i32 {
+    a + b
+}
+
+/// The other half. Same signature on purpose: a rename that changed a call
+/// site's arity would produce rust-analyzer's own resident diagnostics,
+/// which arrive on a `didChange` alone and would let the e2e pass with the
+/// `didSave` half of the resync entirely broken. A duplicate definition is
+/// a diagnostic only a completed build can report.
+pub fn total(a: i32, b: i32) -> i32 {
+    a + b
+}

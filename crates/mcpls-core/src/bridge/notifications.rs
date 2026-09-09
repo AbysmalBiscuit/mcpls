@@ -720,28 +720,29 @@ impl NotificationCache {
         self.diagnostics.get(uri_cache_key(uri).as_ref())
     }
 
-    /// Every cached entry with the key it is stored under and the server
-    /// that published it, ordered by key.
+    /// Every cached entry with a known owner, ordered by key.
     ///
-    /// Returns owned values so a caller can release the cache lock before
-    /// doing anything with them: the diagnostics pump needs the same lock.
+    /// Borrows rather than cloning, so a caller that only needs to hash or
+    /// filter does not copy up to 1000 entries of up to 1 MiB each. The
+    /// caller holds the lock for as long as it holds the result, so it must
+    /// not await while it does.
     ///
     /// The order is part of the contract. `DiagnosticsDelivery::flush` walks
     /// this list in order and grants its total budget to whichever files it
     /// reaches first, so leaving the entries in `HashMap` order would make a
     /// capped flush deliver a different set of files on every run.
     #[must_use]
-    pub fn diagnostics_snapshot(&self) -> Vec<(String, DiagnosticInfo, ServerId)> {
-        let mut snapshot: Vec<(String, DiagnosticInfo, ServerId)> = self
+    pub fn diagnostics_entries(&self) -> Vec<(&str, &DiagnosticInfo, &ServerId)> {
+        let mut entries: Vec<(&str, &DiagnosticInfo, &ServerId)> = self
             .diagnostics
             .iter()
             .filter_map(|(key, info)| {
                 let owner = self.diagnostics_owners.get(key)?;
-                Some((key.clone(), info.clone(), owner.clone()))
+                Some((key.as_str(), info, owner))
             })
             .collect();
-        snapshot.sort_unstable_by(|(left, _, _), (right, _, _)| left.cmp(right));
-        snapshot
+        entries.sort_unstable_by_key(|(key, _, _)| *key);
+        entries
     }
 
     /// Server that published the currently cached diagnostics for `uri`, if
@@ -2083,12 +2084,12 @@ mod tests {
     }
 
     /// `DiagnosticsDelivery::flush` grants its total budget in the order it
-    /// walks the snapshot, so an unordered snapshot would make a capped
-    /// flush deliver a different set of files on every run. Files are
-    /// stored in an order that does not match their keys so that a snapshot
-    /// merely echoing insertion order fails this too.
+    /// walks the entries, so an unordered result would make a capped flush
+    /// deliver a different set of files on every run. Files are stored in an
+    /// order that does not match their keys so that a result merely echoing
+    /// insertion order fails this too.
     #[test]
-    fn test_the_snapshot_is_ordered_by_key() {
+    fn test_diagnostics_entries_are_ordered_by_key() {
         let mut cache = NotificationCache::new();
         let server = test_server();
         for name in ["delta", "alpha", "echo", "charlie", "bravo", "foxtrot"] {
@@ -2101,17 +2102,14 @@ mod tests {
             );
         }
 
-        let keys: Vec<String> = cache
-            .diagnostics_snapshot()
+        let keys: Vec<&str> = cache
+            .diagnostics_entries()
             .into_iter()
             .map(|(key, _, _)| key)
             .collect();
 
         let mut sorted = keys.clone();
-        sorted.sort();
-        assert_eq!(
-            keys, sorted,
-            "snapshot entries must come out ordered by key"
-        );
+        sorted.sort_unstable();
+        assert_eq!(keys, sorted, "entries must come out ordered by key");
     }
 }

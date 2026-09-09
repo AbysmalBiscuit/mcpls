@@ -3,9 +3,13 @@
 //! This module provides the MCP server that exposes LSP capabilities
 //! as MCP tools using the rmcp SDK.
 
+use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use lsp_types::Uri;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -26,17 +30,38 @@ use super::tools::{
 };
 use crate::bridge::resources::{make_uri, parse_uri};
 use crate::bridge::{
-    Diagnostic, DiagnosticInfo, DiagnosticsDelivery, FileEntry, FloorTable, FlushReport,
-    NotificationCache, PositionEncoding, ResourceSubscriptions, SessionId, Translator, uri_to_path,
-    validate_path_against_roots,
+    Diagnostic, DiagnosticInfo, DiagnosticSeverity, DiagnosticsDelivery, FileEntry, FloorTable,
+    FlushReport, NotificationCache, PositionEncoding, ResourceSubscriptions, ServerSettle,
+    SessionId, Translator, uri_to_path, validate_path_against_roots,
 };
-use crate::config::{ServerId, ToolKind};
+use crate::config::{DiagnosticsConfig, ServerId, ToolKind};
+use crate::hooks::{self, ChangeEvent, Role, SocketIdentity};
 
 /// MCP server that exposes LSP capabilities as tools.
 #[derive(Clone)]
 pub struct McplsServer {
     context: Arc<BridgeContext>,
 }
+
+/// How long a fire-and-forget `changed` waits on the hook socket.
+///
+/// Nothing is read back and nothing is lost when it expires -- the owner
+/// picks the same paths up from its next hook -- so this is bounded well
+/// below anything an agent would notice rather than by the owner's own
+/// deadline.
+const HOOK_CHANGED_TIMEOUT: Duration = Duration::from_millis(50);
+
+/// How much longer than the owner's own op deadline a forwarded flush
+/// waits.
+///
+/// The owner answers *at* its deadline rather than before it, letting the
+/// work that overran keep running, so a client waiting exactly that long
+/// times out on the answer it asked for. This covers the connect and the
+/// round trip on top of it. A client bound tighter than the server's own is
+/// never right here: the owner consumes the session's report before it
+/// writes a byte back, so a client that gives up early loses a report
+/// nobody ever sees.
+const HOOK_FLUSH_GRACE: Duration = Duration::from_millis(250);
 
 /// The apply toggle a tool's writes answer to, for the tools that write.
 ///
@@ -169,29 +194,38 @@ fn build_resource_diagnostics_response(
 /// One file whose visible diagnostics changed since the caller's last
 /// `get_new_diagnostics` call.
 #[derive(Debug, Clone, serde::Serialize)]
-struct NewDiagnosticsFile {
+pub struct NewDiagnosticsFile {
     /// Path the caller can open, derived from the notification's URI.
-    file_path: String,
+    pub file_path: String,
     /// Diagnostics at or above the file's severity floor, capped.
-    diagnostics: Vec<Diagnostic>,
+    pub diagnostics: Vec<Diagnostic>,
     /// Admitted diagnostics the caps held back this call. The file is
     /// recorded as seen in full regardless, so these are not offered
     /// again: the count is what tells the agent to look at the file
     /// itself. The whole-flush `omitted` count on the response is the
     /// other thing -- those files a later call does offer again.
-    omitted: usize,
+    pub omitted: usize,
+}
+
+/// A tool result with the diagnostics that call produced appended.
+#[derive(Debug, serde::Serialize)]
+struct WithDiagnostics<T> {
+    #[serde(flatten)]
+    result: T,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    new_diagnostics: Option<NewDiagnosticsResult>,
 }
 
 /// Response shape for `get_new_diagnostics`.
 #[derive(Debug, Clone, serde::Serialize)]
-struct NewDiagnosticsResult {
+pub struct NewDiagnosticsResult {
     /// Files whose visible diagnostics differ from the caller's last call.
-    changed: Vec<NewDiagnosticsFile>,
+    pub changed: Vec<NewDiagnosticsFile>,
     /// Paths that had diagnostics before and have none now.
-    cleared: Vec<String>,
+    pub cleared: Vec<String>,
     /// Whole files the total budget could not fit this call. The caps held
     /// them back; the next call offers them again in full.
-    omitted: usize,
+    pub omitted: usize,
     /// An explanation the payload's other fields can't carry on their own:
     /// either that a real report isn't available yet (the language servers
     /// are still settling, so a caller shouldn't mistake "too early to
@@ -200,7 +234,7 @@ struct NewDiagnosticsResult {
     /// The two never overlap: the startup case returns before `omitted`
     /// could be anything but zero.
     #[serde(skip_serializing_if = "Option::is_none")]
-    note: Option<String>,
+    pub note: Option<String>,
 }
 
 impl NewDiagnosticsResult {
@@ -220,27 +254,255 @@ impl NewDiagnosticsResult {
             note: Some("Language servers are still starting up; call again shortly.".to_string()),
         }
     }
+
+    /// The owner's already-rendered report, wrapped so a passive instance
+    /// answers the same JSON object every other instance does.
+    ///
+    /// The owner sends text because that is what a hook prints and what the
+    /// socket protocol carries. Returning that string bare would make the
+    /// tool's response type depend on which process won a lock race, and
+    /// flip back mid-session the moment a forward failed.
+    const fn from_owner(context: Option<String>) -> Self {
+        Self {
+            changed: Vec::new(),
+            cleared: Vec::new(),
+            omitted: 0,
+            note: context,
+        }
+    }
+
+    /// The response when the socket's owner could not answer.
+    ///
+    /// Says so rather than reporting an empty diff, which an agent would
+    /// read as a clean workspace.
+    fn owner_unreachable() -> Self {
+        Self {
+            changed: Vec::new(),
+            cleared: Vec::new(),
+            omitted: 0,
+            note: Some(
+                "Another mcpls process owns this project's diagnostics record and could not be \
+                 reached, so nothing is reported this call. Check the mcpls logs."
+                    .to_string(),
+            ),
+        }
+    }
 }
 
-/// Build the `FileEntry` list a `get_new_diagnostics` flush should see from
-/// a diagnostics snapshot.
+/// When a flush's record changes take effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Advance {
+    /// In the flush itself. For a reader on this process's own transport,
+    /// whose answer either arrives or ends the session: the tool and the
+    /// footer.
+    Now,
+    /// When the reader acknowledges the report, or never. For the hook
+    /// socket, whose client gives up on a timer and may be gone before
+    /// the answer is written; a report it never acknowledges is offered
+    /// again.
+    OnAcknowledgement,
+}
+
+/// How long each phase of a footer's wait lasts.
+#[derive(Debug, Clone, Copy)]
+struct FooterTiming {
+    grace: Duration,
+    quiet: Duration,
+    cap: Duration,
+}
+
+impl FooterTiming {
+    const fn from_config(config: &DiagnosticsConfig) -> Self {
+        Self {
+            grace: Duration::from_millis(config.footer_grace_ms),
+            quiet: Duration::from_millis(config.footer_quiet_ms),
+            cap: Duration::from_millis(config.footer_wait_ms),
+        }
+    }
+}
+
+/// How long a footer waits before it reports what it has.
+///
+/// This is the wait `footer_for_write` runs: the loop ends the first time
+/// `footer_should_stop` reads the tracker as quiet or as running work that
+/// predates the edit, and otherwise samples again every 50 ms until
+/// `timing.cap` is reached. The cap bounds the *whole* wait, grace
+/// included, rather than sitting on top of it — a call that never goes
+/// quiet costs at most `timing.cap`, not `timing.grace + timing.cap`, which
+/// is what `footer_wait_ms`'s own "in total" documents.
+///
+/// `tick` performs the delay between samples and reports the `Instant`
+/// reached. `footer_for_write` passes a closure that awaits
+/// `tokio::time::sleep` and reads `Instant::now()`, so production pays real
+/// wall-clock time. A test that has already fixed every `begin`/`end_at`
+/// timestamp relative to a `start: Instant` can instead pass a closure that
+/// advances a counter and returns `start + elapsed` without ever
+/// suspending, so the branch tests below run instantly against the exact
+/// loop that ships rather than a replica of it.
+///
+/// Sampling starts at `grace` rather than at zero, and that is what covers
+/// the case where the check has not begun yet: flycheck starts about 90 ms
+/// after a `didSave`, and before it does the workspace reads as quiet. A
+/// `grace` larger than the cap is spent up to the cap and no further: the
+/// first sleep is the smaller of the two, because a configuration asking
+/// for a shorter total wait than the grace has asked for the total, and
+/// paying the whole grace would put the excess outside every bound the
+/// configuration names.
+///
+/// The 50 ms sampling step means a call that never goes quiet can overshoot
+/// `timing.cap` by up to one step: the tick that pushes `elapsed` past the
+/// cap has already been paid in real time by the time the loop notices, and
+/// a completed sleep cannot be undone. That residual is bounded and
+/// constant — at most 50 ms — not proportional to `timing.cap`.
+async fn wait_for_footer_quiet_at<F, Fut>(
+    settle: &ServerSettle,
+    epoch_before: u64,
+    timing: FooterTiming,
+    tick: F,
+) -> Duration
+where
+    F: Fn(Duration) -> Fut,
+    Fut: Future<Output = Instant>,
+{
+    const STEP: Duration = Duration::from_millis(50);
+    let mut elapsed = timing.grace.min(timing.cap);
+    let mut now = tick(elapsed).await;
+    loop {
+        if footer_should_stop(settle, epoch_before, now, timing.quiet) {
+            return elapsed;
+        }
+        if elapsed >= timing.cap {
+            return timing.cap;
+        }
+        now = tick(STEP).await;
+        elapsed += STEP;
+    }
+}
+
+/// Whether a footer has waited long enough, as of `now`.
+///
+/// Two ways to be done. The workspace is quiet, which is the ordinary one
+/// and the only one that fires before any work has begun. Or work is
+/// outstanding and none of it began since the resync, which means that work
+/// was already running when the edit landed: an index after a `Cargo.toml`
+/// change can run for minutes, and it is not this call's check.
+fn footer_should_stop(
+    settle: &ServerSettle,
+    epoch_before: u64,
+    now: Instant,
+    quiet: Duration,
+) -> bool {
+    if settle.is_quiet_at(now, quiet) {
+        return true;
+    }
+    settle.progress_epoch() == epoch_before
+}
+
+/// Build the `FileEntry` list a flush should see, borrowing straight out of
+/// a held cache guard rather than a cloned snapshot.
 ///
 /// Excludes any entry whose URI `uri_to_path` can't map to a filesystem
 /// path *before* `flush` ever runs, rather than dropping it from the
 /// payload afterward: `flush` records a hash for every entry it is given,
 /// so a post-hoc drop would still mark the file delivered -- permanently
 /// hiding diagnostics that were in fact never shown to anyone.
-fn routable_entries<'a>(
-    snapshot: &'a [(String, DiagnosticInfo, ServerId)],
+fn routable_entries_borrowed<'a>(
+    cache: &'a NotificationCache,
     floors: &FloorTable,
 ) -> Vec<FileEntry<'a>> {
-    snapshot
-        .iter()
+    cache
+        .diagnostics_entries()
+        .into_iter()
         .filter(|(_, info, _)| uri_to_path(&info.uri).is_some())
         .map(|(key, info, owner)| FileEntry {
             key,
             diagnostics: &info.diagnostics,
             floor: floors.for_server(owner),
+        })
+        .collect()
+}
+
+/// One flush rendered as the lines a hook prints, or `None` when the flush
+/// found nothing to say.
+///
+/// A hook's output is injected into the agent's context, so an empty report
+/// must produce no text at all rather than an empty structure the agent
+/// then has to interpret.
+fn render_for_hook(report: &NewDiagnosticsResult) -> Option<String> {
+    if report.changed.is_empty() && report.cleared.is_empty() && report.note.is_none() {
+        return None;
+    }
+    let mut lines: Vec<String> = Vec::new();
+    for file in &report.changed {
+        lines.push(format!("{}:", file.file_path));
+        for diagnostic in &file.diagnostics {
+            lines.push(format!(
+                "  {}:{} {} {}",
+                diagnostic.range.start.line,
+                diagnostic.range.start.character,
+                severity_label(&diagnostic.severity),
+                diagnostic.message
+            ));
+        }
+        if file.omitted > 0 {
+            lines.push(format!("  ({} more not shown)", file.omitted));
+        }
+    }
+    for path in &report.cleared {
+        lines.push(format!("{path}: no diagnostics"));
+    }
+    if let Some(note) = &report.note {
+        lines.push(note.clone());
+    }
+    Some(lines.join("\n"))
+}
+
+/// How one severity reads in a hook's plain-text output.
+const fn severity_label(severity: &DiagnosticSeverity) -> &'static str {
+    match severity {
+        DiagnosticSeverity::Error => "error",
+        DiagnosticSeverity::Warning => "warning",
+        DiagnosticSeverity::Information => "info",
+        DiagnosticSeverity::Hint => "hint",
+    }
+}
+
+/// What the payload build needs about one cached entry, after the cache
+/// guard is gone.
+///
+/// Carries `version` because `new_diagnostics_payload` rebuilds a
+/// `DiagnosticInfo` from these three fields before handing it to
+/// `Translator::diagnostics_from_cache_entry`, and `DiagnosticInfo` requires
+/// one. The converter itself never reads it.
+#[derive(Debug, Clone)]
+struct DiagnosticSource {
+    uri: Uri,
+    version: Option<i32>,
+    owner: ServerId,
+}
+
+/// The URI, version and owning server of every key a report names, cloned
+/// so the payload can be built after both guards are released.
+fn source_map(
+    cache: &NotificationCache,
+    report: &FlushReport,
+) -> HashMap<String, DiagnosticSource> {
+    report
+        .changed
+        .iter()
+        .map(|file| file.key.as_str())
+        .chain(report.cleared.iter().map(String::as_str))
+        .filter_map(|key| {
+            let info = cache.get_diagnostics(key)?;
+            let owner = cache.diagnostics_owner(key)?;
+            Some((
+                key.to_string(),
+                DiagnosticSource {
+                    uri: info.uri.clone(),
+                    version: info.version,
+                    owner: owner.clone(),
+                },
+            ))
         })
         .collect()
 }
@@ -260,6 +522,7 @@ impl McplsServer {
     /// diagnostics-baseline background task shares, so that `flush` and
     /// `set_baseline` observe each other's writes.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         translator: Arc<Translator>,
         notification_cache: Arc<Mutex<NotificationCache>>,
@@ -268,6 +531,8 @@ impl McplsServer {
         project_config_ignored: bool,
         delivery: Arc<Mutex<DiagnosticsDelivery>>,
         floors: Arc<FloorTable>,
+        diagnostics: DiagnosticsConfig,
+        settle: Arc<ServerSettle>,
     ) -> Self {
         let context = Arc::new(BridgeContext::new(
             translator,
@@ -277,7 +542,19 @@ impl McplsServer {
             project_config_ignored,
             delivery,
             floors,
+            diagnostics,
+            settle,
         ));
+        Self::from_context(context)
+    }
+
+    /// A server over an already-built context.
+    ///
+    /// `serve_with` decides this process's hook role before the context is
+    /// frozen into an `Arc`, and the socket handler needs a server sharing
+    /// that same context, so both are built from one `Arc<BridgeContext>`
+    /// rather than through [`Self::new`].
+    pub(crate) const fn from_context(context: Arc<BridgeContext>) -> Self {
         Self { context }
     }
 
@@ -447,12 +724,21 @@ impl McplsServer {
             apply,
         }): Parameters<RenameParams>,
     ) -> Result<String, McpError> {
-        to_tool_result(
-            self.context
-                .translator
-                .handle_rename(file_path, line, character, new_name, apply)
-                .await,
-        )
+        let result = match self
+            .context
+            .translator
+            .handle_rename(file_path, line, character, new_name, apply)
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => return Err(McpError::internal_error(err.to_string(), None)),
+        };
+        self.forward_apply_targets(&result.files_written).await;
+        let footer = self.footer_if_written(result.applied).await;
+        to_tool_result(Ok(WithDiagnostics {
+            result,
+            new_diagnostics: footer,
+        }))
     }
 
     /// Get code completion suggestions.
@@ -520,12 +806,21 @@ impl McplsServer {
             apply,
         }): Parameters<FormatDocumentParams>,
     ) -> Result<String, McpError> {
-        to_tool_result(
-            self.context
-                .translator
-                .handle_format_document(file_path, tab_size, insert_spaces, apply)
-                .await,
-        )
+        let result = match self
+            .context
+            .translator
+            .handle_format_document(file_path, tab_size, insert_spaces, apply)
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => return Err(McpError::internal_error(err.to_string(), None)),
+        };
+        self.forward_apply_targets(&result.files_written).await;
+        let footer = self.footer_if_written(result.applied).await;
+        to_tool_result(Ok(WithDiagnostics {
+            result,
+            new_diagnostics: footer,
+        }))
     }
 
     /// Search for symbols across the workspace.
@@ -617,21 +912,30 @@ impl McplsServer {
             action_title,
         }): Parameters<ApplyCodeActionParams>,
     ) -> Result<String, McpError> {
-        to_tool_result(
-            self.context
-                .translator
-                .handle_apply_code_action(
-                    file_path,
-                    start_line,
-                    start_character,
-                    end_line,
-                    end_character,
-                    kind_filter,
-                    action_index,
-                    action_title,
-                )
-                .await,
-        )
+        let result = match self
+            .context
+            .translator
+            .handle_apply_code_action(
+                file_path,
+                start_line,
+                start_character,
+                end_line,
+                end_character,
+                kind_filter,
+                action_index,
+                action_title,
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => return Err(McpError::internal_error(err.to_string(), None)),
+        };
+        self.forward_apply_targets(&result.files_written).await;
+        let footer = self.footer_if_written(result.applied).await;
+        to_tool_result(Ok(WithDiagnostics {
+            result,
+            new_diagnostics: footer,
+        }))
     }
 
     /// Prepare call hierarchy at a position.
@@ -733,7 +1037,14 @@ impl McplsServer {
             idempotent_hint = false
         )
     )]
-    async fn get_new_diagnostics(&self) -> Result<String, McpError> {
+    pub(crate) async fn get_new_diagnostics(&self) -> Result<String, McpError> {
+        // Ahead of the baseline check: a passive instance's own baseline
+        // says nothing about the record it is asking for, which lives in
+        // the owner.
+        if let Role::Passive { identity } = self.context.hooks.get() {
+            return to_tool_result(Ok(self.flush_from_owner(&identity).await));
+        }
+
         let baselined = {
             let delivery = self.context.delivery.lock().await;
             delivery.has_baseline()
@@ -742,20 +1053,152 @@ impl McplsServer {
             return to_tool_result(Ok(NewDiagnosticsResult::starting_up()));
         }
 
-        let session = SessionId::process_default();
-        let snapshot = {
-            let cache = self.context.notification_cache.lock().await;
-            cache.diagnostics_snapshot()
-        };
+        let session = SessionId::from_env_or_process();
 
-        let entries = routable_entries(&snapshot, &self.context.floors);
+        // `delivery` first, then the cache. The flush borrows its entries
+        // straight out of the cache guard, so both are held together; taking
+        // them in this order everywhere is what keeps that from deadlocking.
+        // Neither guard outlives this block: `new_diagnostics_payload` awaits
+        // per changed file, and holding the cache lock across those awaits
+        // would block the diagnostics pump, which loses publishes rather than
+        // waiting for them.
+        to_tool_result(Ok(self.flush_now(&session, Advance::Now).await.0))
+    }
 
-        let report = {
+    /// Flush `session`'s record and render it, advancing the record as
+    /// `advance` says.
+    ///
+    /// The caller checks `has_baseline()` first. Both the tool and the
+    /// footer must, because `stage` seeds a session's record from the
+    /// baseline and `set_baseline` never rewrites one that already exists.
+    ///
+    /// The token is `Some` only under `Advance::OnAcknowledgement`, and
+    /// only when the report implies a record change.
+    // What enforces the delivery-before-cache order is where the two
+    // acquires sit, not how long either guard lives afterward. Clippy's fix
+    // for this lint moves the `delivery` acquire below the cache acquire,
+    // which is the exact reversal that order forbids, so the acquires stay
+    // where they are and the lint is silenced instead.
+    #[allow(clippy::significant_drop_tightening)]
+    async fn flush_now(
+        &self,
+        session: &SessionId,
+        advance: Advance,
+    ) -> (NewDiagnosticsResult, Option<u64>) {
+        let (report, token, sources) = {
             let mut delivery = self.context.delivery.lock().await;
-            delivery.flush(&session, &entries)
+            let cache = self.context.notification_cache.lock().await;
+            let entries = routable_entries_borrowed(&cache, &self.context.floors);
+            let (report, token) = match advance {
+                Advance::Now => (delivery.flush(session, &entries), None),
+                Advance::OnAcknowledgement => delivery.stage(session, &entries),
+            };
+            let sources = source_map(&cache, &report);
+            (report, token, sources)
         };
+        (self.new_diagnostics_payload(&report, &sources).await, token)
+    }
 
-        to_tool_result(Ok(self.new_diagnostics_payload(&report, &snapshot).await))
+    /// `session`'s flush, rendered as the text a hook prints, with the
+    /// token the hook acknowledges once it has that text.
+    ///
+    /// The same report the tool would run, against the same record, so a
+    /// hook and an agent never see the same diagnostic twice once either
+    /// has confirmed it. The record moves only in `commit_for_hook`: the
+    /// hook gives up on a timer, and a report it gave up on is offered
+    /// again rather than marked delivered. Silent before a baseline exists
+    /// for the same reason the footer is: `stage` seeds a session's record
+    /// from the baseline and `set_baseline` never rewrites one that
+    /// already exists, so flushing early would leave that session
+    /// permanently believing the workspace started clean.
+    pub(crate) async fn flush_for_hook(
+        &self,
+        session: &SessionId,
+    ) -> (Option<String>, Option<u64>) {
+        if !self.context.delivery.lock().await.has_baseline() {
+            return (None, None);
+        }
+        let (report, token) = self.flush_now(session, Advance::OnAcknowledgement).await;
+        (render_for_hook(&report), token)
+    }
+
+    /// Mark the report staged under `token` delivered to `session`.
+    ///
+    /// Takes `delivery` alone. `false` when `token` no longer names the
+    /// session's staged report, in which case the record already reflects
+    /// something sent more recently, or nothing.
+    pub(crate) async fn commit_for_hook(&self, session: &SessionId, token: u64) -> bool {
+        self.context.delivery.lock().await.commit(session, token)
+    }
+
+    /// The owner's flush for this session, in the shape every other
+    /// instance answers with, acknowledged once the answer is in hand.
+    ///
+    /// Never falls back to this process's own record. The owner's record
+    /// is the session's record; a diff against this process's own would
+    /// be against a baseline the session never agreed to, and would leave
+    /// the two permanently disagreeing about what this session has been
+    /// shown. A forward that fails costs nothing on the owner's side: its
+    /// staged report is unacknowledged and the next flush offers it
+    /// again. Saying the owner could not be reached is the honest answer,
+    /// and it is the MCP tool rather than a hook, so the rule that an
+    /// edit must never fail on the socket does not apply.
+    async fn flush_from_owner(&self, identity: &SocketIdentity) -> NewDiagnosticsResult {
+        let request = hooks::Request::Flush {
+            session: SessionId::from_env_or_process().to_string(),
+        };
+        let timeout =
+            Duration::from_millis(self.context.diagnostics.hooks.op_deadline_ms) + HOOK_FLUSH_GRACE;
+        let answer = hooks::send_and_acknowledge(identity, std::slice::from_ref(&request), timeout)
+            .await
+            .map(|mut responses| responses.remove(0));
+        match answer {
+            Ok(hooks::Response::Flush { context, .. }) => NewDiagnosticsResult::from_owner(context),
+            Ok(hooks::Response::Error { message }) => {
+                tracing::warn!(%message, "the hook socket's owner refused this session's flush");
+                NewDiagnosticsResult::owner_unreachable()
+            }
+            Ok(other) => {
+                tracing::warn!(
+                    ?other,
+                    "the hook socket's owner answered a flush with something else"
+                );
+                NewDiagnosticsResult::owner_unreachable()
+            }
+            Err(error) => {
+                tracing::warn!(%error, "could not reach the hook socket's owner for this session's flush");
+                NewDiagnosticsResult::owner_unreachable()
+            }
+        }
+    }
+
+    /// Drop `session`'s delivery record.
+    pub(crate) async fn end_session(&self, session: &SessionId) {
+        self.context.delivery.lock().await.end_session(session);
+    }
+
+    /// Forward the paths an apply wrote to the socket's owner.
+    ///
+    /// A passive instance's language servers are warm but nobody is feeding
+    /// them, so a write made through this process would otherwise never
+    /// reach the servers the owner's flush reads. Silent on every failure,
+    /// for the same reason the hook is: a tool call must not fail because
+    /// the socket was unavailable.
+    pub(crate) async fn forward_apply_targets(&self, files_written: &[String]) {
+        let Role::Passive { identity } = self.context.hooks.get() else {
+            return;
+        };
+        if files_written.is_empty() {
+            return;
+        }
+        let request = hooks::Request::Changed {
+            session: SessionId::from_env_or_process().to_string(),
+            paths: files_written.iter().map(PathBuf::from).collect(),
+            event: ChangeEvent::Change,
+        };
+        if let Err(error) = hooks::send(&identity, &request, HOOK_CHANGED_TIMEOUT).await {
+            tracing::debug!(%error, "could not forward apply targets to the hook owner");
+        }
     }
 
     /// Build `get_new_diagnostics`'s payload from one flush's report.
@@ -767,23 +1210,22 @@ impl McplsServer {
     async fn new_diagnostics_payload(
         &self,
         report: &FlushReport,
-        snapshot: &[(String, DiagnosticInfo, ServerId)],
+        sources: &HashMap<String, DiagnosticSource>,
     ) -> NewDiagnosticsResult {
         let mut changed = Vec::with_capacity(report.changed.len());
         for file in &report.changed {
-            let Some((_, info, owner)) = snapshot.iter().find(|(key, _, _)| *key == file.key)
-            else {
+            let Some(source) = sources.get(&file.key) else {
                 continue;
             };
             // Drop an entry whose URI does not map to a path rather than
             // showing the agent a URI it cannot open.
-            let Some(path) = uri_to_path(&info.uri) else {
+            let Some(path) = uri_to_path(&source.uri) else {
                 continue;
             };
-            let encoding = self.context.translator.position_encoding_for(owner);
+            let encoding = self.context.translator.position_encoding_for(&source.owner);
             let entry = DiagnosticInfo {
-                uri: info.uri.clone(),
-                version: info.version,
+                uri: source.uri.clone(),
+                version: source.version,
                 diagnostics: file.diagnostics.clone(),
             };
             let converted = Translator::diagnostics_from_cache_entry(
@@ -802,8 +1244,8 @@ impl McplsServer {
         let cleared = report
             .cleared
             .iter()
-            .filter_map(|key| snapshot.iter().find(|(k, _, _)| k == key))
-            .filter_map(|(_, info, _)| uri_to_path(&info.uri))
+            .filter_map(|key| sources.get(key))
+            .filter_map(|source| uri_to_path(&source.uri))
             .map(|path| path.display().to_string())
             .collect();
 
@@ -819,6 +1261,75 @@ impl McplsServer {
                 )
             }),
         }
+    }
+
+    /// The diagnostics a write tool's own edit produced, or `None` when the
+    /// call wrote nothing.
+    ///
+    /// One method rather than an `if` repeated at three call sites, so a
+    /// fourth write tool cannot be added with the guard forgotten.
+    pub(crate) async fn footer_if_written(&self, applied: bool) -> Option<NewDiagnosticsResult> {
+        if !applied {
+            return None;
+        }
+        self.footer_for_write().await
+    }
+
+    /// The diagnostics a write tool's own edit produced, or `None`.
+    ///
+    /// Silent while no baseline exists. `flush` seeds a session's record
+    /// from the baseline, and `set_baseline` does not rewrite a record that
+    /// already exists, so a footer flushing early would leave that session
+    /// permanently believing the workspace started clean.
+    ///
+    /// Waits via `wait_for_footer_quiet_at`, which bounds the whole wait —
+    /// grace included — by `footer_wait_ms`; the real worst case for one
+    /// call is that value plus at most one 50 ms sampling tick, never the
+    /// grace and the cap stacked on top of each other.
+    pub(crate) async fn footer_for_write(&self) -> Option<NewDiagnosticsResult> {
+        // Ahead of the config check, so enabling the footer in a passive
+        // instance's config still produces nothing: this footer would
+        // consume from this process's own record while the next flush reads
+        // the owner's, delivering the same diagnostics twice from one door
+        // and never from the other.
+        if matches!(self.context.hooks.get(), Role::Passive { .. }) {
+            return None;
+        }
+        if !self.context.diagnostics.footer {
+            return None;
+        }
+        if !self.context.delivery.lock().await.has_baseline() {
+            return None;
+        }
+        let timing = FooterTiming::from_config(&self.context.diagnostics);
+        let epoch_before = self.context.settle.progress_epoch();
+        wait_for_footer_quiet_at(
+            &self.context.settle,
+            epoch_before,
+            timing,
+            |step| async move {
+                tokio::time::sleep(step).await;
+                Instant::now()
+            },
+        )
+        .await;
+
+        let session = SessionId::from_env_or_process();
+        let (mut report, _) = self.flush_now(&session, Advance::Now).await;
+        report.note = Some(report.note.take().map_or_else(
+            || {
+                "This footer is best effort; anything slower than the wait arrives in the \
+                 next get_new_diagnostics."
+                    .to_string()
+            },
+            |existing| {
+                format!(
+                    "{existing} This footer is best effort; anything slower than the wait \
+                     arrives in the next get_new_diagnostics."
+                )
+            },
+        ));
+        Some(report)
     }
 
     /// Get recent LSP server log messages.
@@ -1180,9 +1691,17 @@ impl ServerHandler for McplsServer {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
+    use crate::bridge::apply::Applier;
+    use crate::bridge::{
+        FakeServer, RenameResult, read_framed_reply, translator_with_capabilities, write_response,
+    };
+    use crate::config::ApplyConfig;
+    use crate::hooks::{HookRole, SocketIdentity};
 
     /// A `DiagnosticsDelivery`/`FloorTable` pair for tests that don't care
     /// about diagnostics config or per-server floors, just a working
@@ -1193,6 +1712,1099 @@ mod tests {
             Arc::new(Mutex::new(DiagnosticsDelivery::new(config))),
             Arc::new(FloorTable::new(&config, &[])),
         )
+    }
+
+    /// A settle tracker for tests that need a working `McplsServer::new`
+    /// call but never drive `$/progress` through it.
+    fn test_settle() -> Arc<ServerSettle> {
+        Arc::new(ServerSettle::new(
+            Duration::from_secs(1),
+            Duration::from_secs(300),
+        ))
+    }
+
+    /// An `McplsServer` together with the `Arc`s it shares, so a test can
+    /// reach the same cache and the same delivery record the server sees.
+    ///
+    /// `McplsServer::new` moves its arguments into a private
+    /// `BridgeContext`, so a test that needs both sides keeps its own
+    /// clones from before the call.
+    struct TestServer {
+        server: McplsServer,
+        notification_cache: Arc<Mutex<NotificationCache>>,
+        delivery: Arc<Mutex<DiagnosticsDelivery>>,
+    }
+
+    fn test_server_parts_with(diagnostics: DiagnosticsConfig) -> TestServer {
+        let translator = Arc::new(Translator::new());
+        let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
+        let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
+        let delivery = Arc::new(Mutex::new(DiagnosticsDelivery::new(diagnostics)));
+        let floors = Arc::new(FloorTable::new(&diagnostics, &[]));
+        let server = McplsServer::new(
+            translator,
+            Arc::clone(&notification_cache),
+            workspace_roots,
+            subscriptions,
+            false,
+            Arc::clone(&delivery),
+            floors,
+            diagnostics,
+            test_settle(),
+        );
+        TestServer {
+            server,
+            notification_cache,
+            delivery,
+        }
+    }
+
+    fn test_server_parts() -> TestServer {
+        test_server_parts_with(DiagnosticsConfig::default())
+    }
+
+    /// The same, with an empty baseline adopted so `has_baseline()` is true
+    /// and the flush is not answered with `starting_up()`.
+    async fn test_server_with_baseline() -> TestServer {
+        let parts = test_server_parts();
+        parts.delivery.lock().await.set_baseline(HashMap::new());
+        parts
+    }
+
+    /// A workspace file URI, spelled the way the running platform spells
+    /// one, for a cache fixture whose file need not exist.
+    fn workspace_uri(name: &str) -> lsp_types::Uri {
+        let uri = if cfg!(windows) {
+            format!("file:///C:/workspace/{name}")
+        } else {
+            format!("file:///workspace/{name}")
+        };
+        uri.parse().expect("a valid uri")
+    }
+
+    /// The footer switched on with its wait out of the test's way: what
+    /// these assert is the guard, the record and the note, not the timing,
+    /// which `wait_for_footer_quiet_at` covers directly.
+    fn footer_config() -> DiagnosticsConfig {
+        DiagnosticsConfig {
+            footer: true,
+            footer_grace_ms: 0,
+            footer_quiet_ms: 0,
+            footer_wait_ms: 0,
+            ..DiagnosticsConfig::default()
+        }
+    }
+
+    /// A server whose config enables the footer, with a baseline adopted
+    /// and one error in the cache, so a footer has something to report.
+    async fn test_server_with_footer_and_one_error() -> TestServer {
+        server_with_footer_and_one_error(footer_config()).await
+    }
+
+    /// The same over a caller-chosen config, for a test that needs a cap
+    /// the default leaves far out of reach.
+    async fn server_with_footer_and_one_error(diagnostics: DiagnosticsConfig) -> TestServer {
+        let parts = test_server_parts_with(diagnostics);
+        parts.notification_cache.lock().await.store_diagnostics(
+            &ServerId::from("rust"),
+            &workspace_uri("broken.rs"),
+            Some(1),
+            vec![diagnostic_at("broken")],
+        );
+        parts.delivery.lock().await.set_baseline(HashMap::new());
+        parts
+    }
+
+    /// One diagnostic, already converted to the DTO the payload carries,
+    /// so a render test asserts the same values a hook would print.
+    fn rendered_diagnostic(line: u32, severity: DiagnosticSeverity, message: &str) -> Diagnostic {
+        Diagnostic {
+            range: crate::bridge::Range {
+                start: crate::bridge::Position2D { line, character: 3 },
+                end: crate::bridge::Position2D { line, character: 9 },
+            },
+            severity,
+            message: message.to_string(),
+            code: None,
+            source: None,
+        }
+    }
+
+    /// The exact block a hook prints, pinned whole.
+    ///
+    /// Task 20's hook side parses nothing but still injects this verbatim
+    /// into an agent's context, so the header line, the two-space indent,
+    /// the `line:char severity message` order, the truncation line, the
+    /// cleared phrasing and the note's placement are the contract. A
+    /// `contains` assertion would let any of them move.
+    #[test]
+    fn test_the_hook_render_pins_every_line_it_produces() {
+        let report = NewDiagnosticsResult {
+            changed: vec![NewDiagnosticsFile {
+                file_path: "/work/a.rs".to_string(),
+                diagnostics: vec![
+                    rendered_diagnostic(12, DiagnosticSeverity::Error, "mismatched types"),
+                    rendered_diagnostic(40, DiagnosticSeverity::Warning, "unused variable"),
+                ],
+                omitted: 3,
+            }],
+            cleared: vec!["/work/b.rs".to_string()],
+            omitted: 2,
+            note: Some("2 file(s) were held back.".to_string()),
+        };
+
+        assert_eq!(
+            render_for_hook(&report).expect("a report with content renders"),
+            "/work/a.rs:\n  \
+             12:3 error mismatched types\n  \
+             40:3 warning unused variable\n  \
+             (3 more not shown)\n\
+             /work/b.rs: no diagnostics\n\
+             2 file(s) were held back."
+        );
+    }
+
+    /// The tool door advances the record in the same lock block that
+    /// computes its report, so a hook report staged for the same session
+    /// is superseded rather than committed on top of it.
+    #[tokio::test]
+    async fn test_an_immediate_flush_supersedes_a_staged_hook_report() {
+        let parts = test_server_with_footer_and_one_error().await;
+        let session = SessionId::from("s1".to_string());
+
+        let (staged, token) = parts
+            .server
+            .flush_now(&session, Advance::OnAcknowledgement)
+            .await;
+        assert_eq!(staged.changed.len(), 1);
+        let token = token.expect("a staged report with content carries a token");
+
+        let (now, none) = parts.server.flush_now(&session, Advance::Now).await;
+        assert_eq!(
+            now.changed.len(),
+            1,
+            "the hook's report was never confirmed"
+        );
+        assert_eq!(
+            none, None,
+            "an immediate flush leaves nothing to acknowledge"
+        );
+
+        assert!(
+            !parts.server.commit_for_hook(&session, token).await,
+            "the record already holds what the tool result showed"
+        );
+
+        let (after, _) = parts
+            .server
+            .flush_now(&session, Advance::OnAcknowledgement)
+            .await;
+        assert!(after.changed.is_empty());
+    }
+
+    /// A flush with nothing to say prints nothing at all: a hook's output is
+    /// injected into the agent's context, and an empty structure there is
+    /// noise the agent has to interpret.
+    #[test]
+    fn test_an_empty_report_renders_as_no_text() {
+        assert!(
+            render_for_hook(&NewDiagnosticsResult {
+                changed: Vec::new(),
+                cleared: Vec::new(),
+                omitted: 0,
+                note: None,
+            })
+            .is_none()
+        );
+    }
+
+    /// A passive instance answers the same JSON object every other instance
+    /// does, whether the forward worked or not. The shape must not depend on
+    /// which process won a lock race.
+    #[test]
+    fn test_a_forwarded_flush_keeps_the_documented_object_shape() {
+        let forwarded =
+            NewDiagnosticsResult::from_owner(Some("a.rs:\n  1:1 error boom".to_string()));
+        let json = serde_json::to_value(&forwarded).expect("serialize");
+        assert_eq!(json["changed"], json!([]));
+        assert_eq!(json["cleared"], json!([]));
+        assert_eq!(json["omitted"], json!(0));
+        assert_eq!(json["note"], json!("a.rs:\n  1:1 error boom"));
+
+        let nothing =
+            serde_json::to_value(NewDiagnosticsResult::from_owner(None)).expect("serialize");
+        assert_eq!(
+            nothing,
+            json!({"changed": [], "cleared": [], "omitted": 0}),
+            "the owner having nothing to report is the documented empty answer, \
+             not an empty string"
+        );
+    }
+
+    /// An unreachable owner says so. Reporting an empty diff instead would
+    /// read as a clean workspace, and the owner has already consumed the
+    /// report that went missing.
+    #[test]
+    fn test_an_unreachable_owner_answers_with_a_note_rather_than_an_empty_diff() {
+        let note = NewDiagnosticsResult::owner_unreachable()
+            .note
+            .expect("a note");
+        assert!(note.contains("could not be reached"), "{note}");
+    }
+
+    /// A rename result shaped the way `rename_symbol` returns one.
+    fn sample_rename_result() -> RenameResult {
+        RenameResult {
+            changes: Vec::new(),
+            resource_operations: Vec::new(),
+            applied: true,
+            files_written: vec!["/workspace/broken.rs".to_string()],
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_footer_is_silent_before_the_baseline_lands() {
+        let parts = test_server_parts_with(DiagnosticsConfig {
+            footer: true,
+            ..DiagnosticsConfig::default()
+        });
+
+        let footer = parts.server.footer_for_write().await;
+
+        assert!(
+            footer.is_none(),
+            "flush seeds a session record from the baseline, and a record made \
+             before the baseline lands stays empty forever, so the next flush \
+             would report the whole workspace. The settle deadline is 300 \
+             seconds, which puts the first rename of a session squarely inside \
+             this window"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_footer_consumes_what_it_reports() {
+        let parts = test_server_with_footer_and_one_error().await;
+
+        let footer = parts.server.footer_for_write().await.expect("a report");
+        assert_eq!(footer.changed.len(), 1);
+
+        let raw = parts
+            .server
+            .get_new_diagnostics()
+            .await
+            .expect("the flush tool");
+        let report: serde_json::Value = serde_json::from_str(&raw).expect("json");
+        assert!(
+            report["changed"].as_array().expect("changed").is_empty(),
+            "one report per problem: the footer and the flush share one record"
+        );
+    }
+
+    /// The footer's own note, in both of the shapes it is built in.
+    ///
+    /// It is the only thing telling the agent that a footer is a floor
+    /// rather than the whole answer. An agent that reads one as complete
+    /// stops looking, and whatever landed after the wait is then never
+    /// asked for, so the sentence is pinned whole, and pinned again where
+    /// it follows a note the flush had already written.
+    #[tokio::test]
+    async fn test_a_footer_says_it_is_best_effort() {
+        let parts = test_server_with_footer_and_one_error().await;
+
+        let footer = parts.server.footer_for_write().await.expect("a report");
+
+        assert_eq!(
+            footer.note.as_deref(),
+            Some(
+                "This footer is best effort; anything slower than the wait \
+                 arrives in the next get_new_diagnostics."
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_footer_that_held_a_file_back_says_both_things() {
+        let parts = server_with_footer_and_one_error(DiagnosticsConfig {
+            max_total: 1,
+            ..footer_config()
+        })
+        .await;
+        // A second file the total budget cannot reach, so the flush writes
+        // a note of its own for the footer's to follow.
+        parts.notification_cache.lock().await.store_diagnostics(
+            &ServerId::from("rust"),
+            &workspace_uri("other.rs"),
+            Some(1),
+            vec![diagnostic_at("also broken")],
+        );
+
+        let footer = parts.server.footer_for_write().await.expect("a report");
+
+        assert_eq!(
+            footer.note.as_deref(),
+            Some(
+                "1 file(s) were held back by the diagnostics caps this call; \
+                 call again to see them. This footer is best effort; anything \
+                 slower than the wait arrives in the next get_new_diagnostics."
+            )
+        );
+    }
+
+    /// The guard the three write tools run the footer behind, both ways.
+    ///
+    /// This is what `if result.applied` buys, so it is asserted against the
+    /// method the call sites use rather than against a serialized struct: a
+    /// serde test proves `skip_serializing_if`, not the guard.
+    #[tokio::test]
+    async fn test_no_footer_when_the_tool_wrote_nothing() {
+        let parts = test_server_with_footer_and_one_error().await;
+
+        assert!(
+            parts.server.footer_if_written(false).await.is_none(),
+            "a rename with apply false changed nothing and has nothing to report"
+        );
+        assert!(
+            parts.server.footer_if_written(true).await.is_some(),
+            "and a call that did write must still get one, or the guard is just \
+             a footer that never fires"
+        );
+    }
+
+    /// The three tools that can write to the working tree.
+    ///
+    /// Each of them forwards what it wrote to the socket owner and appends
+    /// the diagnostics its own edit produced, on two adjacent lines of its
+    /// own. Driving all three from one place is what keeps a fourth write
+    /// tool, or a refactor of one of these, from quietly losing either.
+    #[derive(Clone, Copy, Debug)]
+    enum WriteTool {
+        Rename,
+        Format,
+        CodeAction,
+    }
+
+    const WRITE_TOOLS: [WriteTool; 3] =
+        [WriteTool::Rename, WriteTool::Format, WriteTool::CodeAction];
+
+    impl WriteTool {
+        /// What its language server has to advertise for the call to get as
+        /// far as a request.
+        fn capabilities(self) -> lsp_types::ServerCapabilities {
+            match self {
+                Self::Rename => lsp_types::ServerCapabilities {
+                    rename_provider: Some(lsp_types::OneOf::Left(true)),
+                    ..Default::default()
+                },
+                Self::Format => lsp_types::ServerCapabilities {
+                    document_formatting_provider: Some(lsp_types::OneOf::Left(true)),
+                    ..Default::default()
+                },
+                Self::CodeAction => lsp_types::ServerCapabilities {
+                    code_action_provider: Some(lsp_types::CodeActionProviderCapability::Simple(
+                        true,
+                    )),
+                    ..Default::default()
+                },
+            }
+        }
+
+        /// The apply key the deployment has to permit for the write to
+        /// happen rather than be described.
+        fn apply_config(self) -> ApplyConfig {
+            match self {
+                Self::Rename => ApplyConfig {
+                    rename: true,
+                    ..ApplyConfig::default()
+                },
+                Self::Format => ApplyConfig {
+                    format_document: true,
+                    ..ApplyConfig::default()
+                },
+                Self::CodeAction => ApplyConfig {
+                    code_actions: true,
+                    ..ApplyConfig::default()
+                },
+            }
+        }
+
+        /// The reply to this tool's own request, carrying an edit that
+        /// rewrites `old` to `new` on the fixture's first line.
+        fn reply_rewriting(self, uri: &Uri) -> serde_json::Value {
+            let edits = json!([{
+                "range": {
+                    "start": { "line": 0, "character": 3 },
+                    "end": { "line": 0, "character": 6 },
+                },
+                "newText": "new",
+            }]);
+            match self {
+                Self::Rename => json!({ "changes": { uri.as_str(): edits } }),
+                Self::Format => edits,
+                Self::CodeAction => json!([{
+                    "title": "Rewrite it",
+                    "edit": { "changes": { uri.as_str(): edits } },
+                }]),
+            }
+        }
+
+        /// Call the tool over `path` with `apply` on, and return its raw
+        /// JSON result.
+        async fn call_applying(self, server: &McplsServer, path: &str) -> String {
+            let result = match self {
+                Self::Rename => {
+                    server
+                        .rename_symbol(Parameters(RenameParams {
+                            position: PositionParams {
+                                file_path: path.to_string(),
+                                line: 1,
+                                character: 4,
+                            },
+                            new_name: "new".to_string(),
+                            apply: true,
+                        }))
+                        .await
+                }
+                Self::Format => {
+                    server
+                        .format_document(Parameters(FormatDocumentParams {
+                            file_path: path.to_string(),
+                            tab_size: 4,
+                            insert_spaces: true,
+                            apply: true,
+                        }))
+                        .await
+                }
+                Self::CodeAction => {
+                    server
+                        .apply_code_action(Parameters(ApplyCodeActionParams {
+                            file_path: path.to_string(),
+                            range: RangeParams {
+                                start_line: 1,
+                                start_character: 1,
+                                end_line: 1,
+                                end_character: 5,
+                            },
+                            kind_filter: None,
+                            action_index: Some(0),
+                            action_title: None,
+                        }))
+                        .await
+                }
+            };
+            result.unwrap_or_else(|error| panic!("{self:?} must apply its edit: {error}"))
+        }
+    }
+
+    /// An `McplsServer` whose translator is routed to a fake language
+    /// server that advertises what `tool` needs and is permitted to write
+    /// what `tool` writes, over a workspace holding one `main.rs`.
+    struct WriteFixture {
+        server: McplsServer,
+        fake: FakeServer,
+        /// The fixture file, canonicalized, which is the spelling the
+        /// applier reports and the URI is built from.
+        path: PathBuf,
+        uri: Uri,
+        _dir: tempfile::TempDir,
+    }
+
+    impl WriteFixture {
+        fn new(tool: WriteTool, diagnostics: DiagnosticsConfig, hooks: Arc<HookRole>) -> Self {
+            let dir = tempfile::tempdir().expect("a temp dir");
+            let (translator, fake) =
+                translator_with_capabilities(&dir, &ServerId::from("rust"), tool.capabilities());
+            let translator = Arc::new(translator.with_applier(Arc::new(Applier::new(
+                vec![dir.path().to_path_buf()],
+                tool.apply_config(),
+            ))));
+
+            let path = dir.path().join("main.rs");
+            std::fs::write(&path, "fn old() {}\n").expect("write the fixture");
+            let path = dunce::canonicalize(path).expect("the fixture exists");
+            let uri = crate::bridge::path_to_uri(&path).expect("a uri for the fixture");
+
+            let mut context = BridgeContext::new(
+                translator,
+                Arc::new(Mutex::new(NotificationCache::new())),
+                Arc::from(vec![dir.path().to_path_buf()]),
+                Arc::new(ResourceSubscriptions::new()),
+                false,
+                Arc::new(Mutex::new(DiagnosticsDelivery::new(diagnostics))),
+                Arc::new(FloorTable::new(&diagnostics, &[])),
+                diagnostics,
+                test_settle(),
+            );
+            context.hooks = hooks;
+            let context = Arc::new(context);
+
+            Self {
+                server: McplsServer::from_context(context),
+                fake,
+                path,
+                uri,
+                _dir: dir,
+            }
+        }
+
+        /// Adopt an empty baseline and record one error against the fixture
+        /// file, so a footer has both a record to diff against and
+        /// something to report.
+        async fn with_one_error(self) -> Self {
+            self.server
+                .context
+                .notification_cache
+                .lock()
+                .await
+                .store_diagnostics(
+                    &ServerId::from("rust"),
+                    &self.uri,
+                    Some(1),
+                    vec![diagnostic_at("broken")],
+                );
+            self.server
+                .context
+                .delivery
+                .lock()
+                .await
+                .set_baseline(HashMap::new());
+            self
+        }
+
+        /// Drive `tool` to completion against the fake server, answering the
+        /// one request it sends, and return its raw JSON result.
+        async fn apply(&mut self, tool: WriteTool) -> String {
+            let server = self.server.clone();
+            let path = self.path.display().to_string();
+            let reply = tool.reply_rewriting(&self.uri);
+            let fake = &mut self.fake;
+            let (result, ()) = tokio::join!(tool.call_applying(&server, &path), async move {
+                let mut wire = tokio::io::BufReader::new(&mut fake.write_stdout);
+                let request = read_framed_reply(&mut wire).await;
+                write_response(&mut fake.read_half_stdin, &request["id"], reply).await;
+            });
+            result
+        }
+    }
+
+    /// Every write tool appends the diagnostics its own edit produced.
+    ///
+    /// Asserted through the tool's own JSON rather than through
+    /// `footer_if_written`, which is separately covered: what is under test
+    /// here is that each call site still calls it, and a call site that
+    /// stopped would return a result with no `new_diagnostics` key at all.
+    #[tokio::test]
+    async fn test_every_write_tool_appends_its_own_diagnostics() {
+        for tool in WRITE_TOOLS {
+            let mut fixture = WriteFixture::new(
+                tool,
+                DiagnosticsConfig {
+                    footer: true,
+                    footer_grace_ms: 0,
+                    footer_quiet_ms: 0,
+                    footer_wait_ms: 0,
+                    ..DiagnosticsConfig::default()
+                },
+                Arc::new(HookRole::disabled()),
+            )
+            .with_one_error()
+            .await;
+            let expected = fixture.path.display().to_string();
+
+            let result: serde_json::Value =
+                serde_json::from_str(&fixture.apply(tool).await).expect("json");
+
+            assert_eq!(
+                result["new_diagnostics"]["changed"][0]["file_path"],
+                json!(expected),
+                "{tool:?} answered without the diagnostics its own write \
+                 produced, so the agent has to ask for them in a second call \
+                 and pays a turn for it: {result}"
+            );
+        }
+    }
+
+    /// Every write tool tells the socket's owner what it wrote.
+    ///
+    /// A passive instance's own language servers are warm but nobody feeds
+    /// them, so without this the owner's servers never learn the file
+    /// changed and every symptom reads as a slow language server.
+    #[tokio::test]
+    async fn test_every_write_tool_reports_its_writes_to_the_socket_owner() {
+        for tool in WRITE_TOOLS {
+            let owner = RecordingOwner::listening().await;
+            let mut fixture = WriteFixture::new(
+                tool,
+                DiagnosticsConfig::default(),
+                Arc::new(HookRole::passive(owner.identity.clone())),
+            );
+            let expected = fixture.path.clone();
+
+            fixture.apply(tool).await;
+
+            assert_eq!(
+                *owner.forwarded.lock().await,
+                vec![expected],
+                "{tool:?} wrote through a passive instance, whose servers no \
+                 flush ever reads"
+            );
+        }
+    }
+
+    /// An owner listening on its own temporary socket, recording the paths
+    /// every `Changed` request names.
+    struct RecordingOwner {
+        /// What a passive instance forwards to.
+        identity: SocketIdentity,
+        /// The paths every `Changed` request named, in arrival order.
+        forwarded: Arc<Mutex<Vec<PathBuf>>>,
+        /// Dropping this cancels the listener, so it is held for as long as
+        /// the owner is expected to answer.
+        _cancel: tokio::sync::watch::Sender<bool>,
+        /// The socket and its lock live in here.
+        _dir: tempfile::TempDir,
+    }
+
+    impl RecordingOwner {
+        async fn listening() -> Self {
+            let dir = tempfile::tempdir().expect("a temp dir");
+            let hash = format!("{:016x}", unique_suffix());
+            #[cfg(windows)]
+            let socket = PathBuf::from(format!(r"\\.\pipe\mcpls-forward-{hash}"));
+            #[cfg(not(windows))]
+            let socket = dir.path().join(format!("{hash}.sock"));
+            let identity = SocketIdentity {
+                socket,
+                lock: dir.path().join(format!("{hash}.lock")),
+                hash,
+            };
+
+            let forwarded = Arc::new(Mutex::new(Vec::new()));
+            let recorder = Arc::clone(&forwarded);
+            let listener = hooks::HookListener::acquire(&identity)
+                .await
+                .expect("acquire")
+                .expect("nothing else owns a socket in a fresh temp dir");
+            let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+            tokio::spawn(listener.serve(
+                move |request: hooks::Request| {
+                    let recorder = Arc::clone(&recorder);
+                    Box::pin(async move {
+                        if let hooks::Request::Changed { paths, .. } = request {
+                            recorder.lock().await.extend(paths);
+                        }
+                        hooks::Response::Changed { queued: 0 }
+                    }) as futures::future::BoxFuture<'static, hooks::Response>
+                },
+                Duration::from_secs(5),
+                cancel_rx,
+            ));
+
+            Self {
+                identity,
+                forwarded,
+                _cancel: cancel_tx,
+                _dir: dir,
+            }
+        }
+    }
+
+    /// A suffix no other socket in this test run carries. The Windows pipe
+    /// namespace is machine-global, so a name derived from the process
+    /// alone would collide with the next owner this test starts.
+    fn unique_suffix() -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::thread::current().id().hash(&mut hasher);
+        std::time::SystemTime::now().hash(&mut hasher);
+        hasher.finish()
+    }
+
+    #[test]
+    fn test_the_wrapper_omits_an_absent_footer_from_its_json() {
+        let wrapped = WithDiagnostics {
+            result: sample_rename_result(),
+            new_diagnostics: None,
+        };
+        let json = serde_json::to_string(&wrapped).expect("serialize");
+
+        assert!(!json.contains("new_diagnostics"));
+    }
+
+    #[test]
+    fn test_the_wrapper_flattens_rather_than_nesting() {
+        let wrapped = WithDiagnostics {
+            result: sample_rename_result(),
+            new_diagnostics: None,
+        };
+        let json: serde_json::Value = serde_json::to_value(&wrapped).expect("serialize");
+
+        assert!(
+            json.get("applied").is_some(),
+            "the existing result's fields stay at the top level; a caller \
+             parsing RenameResult must keep parsing it"
+        );
+    }
+
+    /// A `wait_for_footer_quiet_at` tick that never suspends: it records
+    /// every step it was asked to sleep into `steps`, advances an internal
+    /// counter by it, and reports `start` plus the running total, so a test
+    /// can drive the exact loop that ships without paying any of its real
+    /// time.
+    ///
+    /// The steps are recorded rather than only accumulated because what the
+    /// loop reports and what it actually spends are two facts: a caller
+    /// reading only the return value cannot see a sleep the loop paid and
+    /// then declined to count.
+    fn instant_tick(
+        start: Instant,
+        steps: &std::cell::RefCell<Vec<Duration>>,
+    ) -> impl Fn(Duration) -> std::future::Ready<Instant> {
+        let accumulated = std::cell::Cell::new(Duration::ZERO);
+        move |step| {
+            steps.borrow_mut().push(step);
+            let total = accumulated.get() + step;
+            accumulated.set(total);
+            std::future::ready(start + total)
+        }
+    }
+
+    /// The steps an `instant_tick` records, for a test that only asserts on
+    /// what the loop returned.
+    fn unread_steps() -> std::cell::RefCell<Vec<Duration>> {
+        std::cell::RefCell::new(Vec::new())
+    }
+
+    /// Branch one: the grace period elapses before quiet is consulted.
+    #[tokio::test]
+    async fn test_the_footer_wait_never_returns_before_its_grace_period() {
+        let settle = ServerSettle::new(Duration::from_secs(1), Duration::from_secs(600));
+        let start = Instant::now();
+
+        // Nothing has ever begun, so the workspace reads as quiet from the very
+        // first sample.
+        let ended = wait_for_footer_quiet_at(
+            &settle,
+            settle.progress_epoch(),
+            FooterTiming {
+                grace: Duration::from_millis(250),
+                quiet: Duration::from_millis(200),
+                cap: Duration::from_secs(15),
+            },
+            instant_tick(start, &unread_steps()),
+        )
+        .await;
+
+        assert_eq!(
+            ended,
+            Duration::from_millis(250),
+            "rust-analyzer's flycheck begins about 90ms after a didSave, and a \
+             footer that sampled before then would see a quiet workspace and \
+             report the state from before the edit"
+        );
+    }
+
+    /// Branch two: quiet ends the wait early.
+    #[tokio::test]
+    async fn test_the_footer_wait_ends_on_quiet_rather_than_on_its_cap() {
+        let settle = ServerSettle::new(Duration::from_secs(1), Duration::from_secs(600));
+        let rust = ServerId::from("rust");
+        let start = Instant::now();
+        let epoch_before = settle.progress_epoch();
+        settle.begin(&rust, &json!("flycheck"));
+        settle.end_at(
+            &rust,
+            &json!("flycheck"),
+            start + Duration::from_millis(400),
+        );
+
+        let ended = wait_for_footer_quiet_at(
+            &settle,
+            epoch_before,
+            FooterTiming {
+                grace: Duration::from_millis(250),
+                quiet: Duration::from_millis(200),
+                cap: Duration::from_secs(15),
+            },
+            instant_tick(start, &unread_steps()),
+        )
+        .await;
+
+        assert!(
+            ended < Duration::from_secs(1),
+            "quiet arrived at 600ms, well inside the cap; a test that could only \
+             ever end on the cap would pass against a broken quiet check"
+        );
+        assert!(
+            ended >= Duration::from_millis(600),
+            "and not before the quiet debounce has actually run out"
+        );
+    }
+
+    /// Branch three: the cap ends it when quiet never arrives.
+    #[tokio::test]
+    async fn test_the_footer_wait_ends_on_its_cap_when_quiet_never_arrives() {
+        let settle = ServerSettle::new(Duration::from_secs(1), Duration::from_secs(600));
+        let rust = ServerId::from("rust");
+        let start = Instant::now();
+        let epoch_before = settle.progress_epoch();
+        settle.begin(&rust, &json!("flycheck"));
+        // No `end_at`: the check is still running when the cap expires.
+
+        let ended = wait_for_footer_quiet_at(
+            &settle,
+            epoch_before,
+            FooterTiming {
+                grace: Duration::from_millis(250),
+                quiet: Duration::from_millis(200),
+                cap: Duration::from_secs(15),
+            },
+            instant_tick(start, &unread_steps()),
+        )
+        .await;
+
+        assert_eq!(
+            ended,
+            Duration::from_secs(15),
+            "the footer is best effort: it reports what has landed rather than \
+             waiting on a build that has not finished"
+        );
+    }
+
+    /// `footer_wait_ms` documents a total, so a larger `footer_grace_ms`
+    /// must not be paid in full.
+    ///
+    /// The value returned and the time actually spent are two facts, and
+    /// only the first was bounded: the loop slept the whole grace before it
+    /// ever looked at the cap, then reported the cap. A user who lowered
+    /// `footer_wait_ms` to make writes snappier still paid the default
+    /// grace on every write, and the overshoot grew with the gap rather
+    /// than staying inside the documented one sampling step.
+    #[tokio::test]
+    async fn test_a_grace_beyond_the_cap_is_not_paid_beyond_it() {
+        let settle = ServerSettle::new(Duration::from_secs(1), Duration::from_secs(600));
+        let rust = ServerId::from("rust");
+        let start = Instant::now();
+        let epoch_before = settle.progress_epoch();
+        // No `end_at`: nothing here ever reads as quiet, so only the cap can
+        // end the wait.
+        settle.begin(&rust, &json!("flycheck"));
+        let steps = unread_steps();
+
+        let ended = wait_for_footer_quiet_at(
+            &settle,
+            epoch_before,
+            FooterTiming {
+                grace: Duration::from_millis(250),
+                quiet: Duration::from_millis(200),
+                cap: Duration::from_millis(100),
+            },
+            instant_tick(start, &steps),
+        )
+        .await;
+
+        assert_eq!(ended, Duration::from_millis(100));
+        assert_eq!(
+            steps.borrow().iter().sum::<Duration>(),
+            Duration::from_millis(100),
+            "the cap is documented as the whole wait, grace included, so a \
+             wait that reported the cap while sleeping the grace was reporting \
+             a number it had not honoured"
+        );
+    }
+
+    /// The sampling step, and the overshoot past the cap it buys.
+    ///
+    /// Both are named in `footer_wait_ms`'s own documentation as 50 ms, and
+    /// neither is readable from what the wait returns: the loop reports the
+    /// cap however long its samples were. What it spent is the only place
+    /// the step shows, so that is what this reads.
+    #[tokio::test]
+    async fn test_the_footer_samples_every_fifty_milliseconds() {
+        let settle = ServerSettle::new(Duration::from_secs(1), Duration::from_secs(600));
+        let rust = ServerId::from("rust");
+        let start = Instant::now();
+        let epoch_before = settle.progress_epoch();
+        // No `end_at`: nothing here ever reads as quiet, so the loop samples
+        // until the cap.
+        settle.begin(&rust, &json!("flycheck"));
+        let steps = unread_steps();
+
+        let ended = wait_for_footer_quiet_at(
+            &settle,
+            epoch_before,
+            FooterTiming {
+                grace: Duration::from_millis(100),
+                quiet: Duration::from_millis(200),
+                cap: Duration::from_millis(180),
+            },
+            instant_tick(start, &steps),
+        )
+        .await;
+
+        assert_eq!(ended, Duration::from_millis(180));
+        assert_eq!(
+            steps.borrow()[1..],
+            [Duration::from_millis(50), Duration::from_millis(50)],
+            "everything after the grace is one sampling step, and a shorter \
+             one turns a write's wait into a busier poll of the same tracker"
+        );
+        assert_eq!(
+            steps.borrow().iter().sum::<Duration>(),
+            Duration::from_millis(200),
+            "a sleep already paid cannot be undone, so a wait that never goes \
+             quiet runs to the first sample past the cap: at most one step \
+             beyond it, which is what the user-facing wait is documented to \
+             overshoot by"
+        );
+    }
+
+    /// Work that was already running when the edit landed does not eat the cap.
+    #[tokio::test]
+    async fn test_an_index_already_in_flight_does_not_hold_the_footer() {
+        let settle = ServerSettle::new(Duration::from_secs(1), Duration::from_secs(600));
+        let rust = ServerId::from("rust");
+        let start = Instant::now();
+        settle.begin(&rust, &json!("rustAnalyzer/Indexing"));
+        // Captured after the begin, the way `footer_for_write` captures it
+        // after the resync has already returned.
+        let epoch_before = settle.progress_epoch();
+
+        let ended = wait_for_footer_quiet_at(
+            &settle,
+            epoch_before,
+            FooterTiming {
+                grace: Duration::from_millis(250),
+                quiet: Duration::from_millis(200),
+                cap: Duration::from_secs(15),
+            },
+            instant_tick(start, &unread_steps()),
+        )
+        .await;
+
+        assert_eq!(
+            ended,
+            Duration::from_millis(250),
+            "an index after a Cargo.toml change can run for minutes and is not \
+             this call's check; waiting on it would spend the whole cap on \
+             something this tool call did not cause"
+        );
+    }
+
+    /// A footer with a real, non-zero grace does not answer before it
+    /// elapses. `is_quiet_at` reads a workspace that never reported
+    /// `$/progress` as quiet from the very first sample, so with nothing
+    /// gating it but the grace, this proves `footer_for_write` actually
+    /// pays that delay in real time rather than skipping straight to the
+    /// flush. Runs on a paused tokio clock so the assertion is exact and
+    /// the test itself does not sleep.
+    #[tokio::test(start_paused = true)]
+    async fn test_the_footer_actually_waits_out_its_grace_period() {
+        let parts = test_server_parts_with(DiagnosticsConfig {
+            footer: true,
+            footer_grace_ms: 250,
+            footer_quiet_ms: 200,
+            footer_wait_ms: 15_000,
+            ..DiagnosticsConfig::default()
+        });
+        parts.delivery.lock().await.set_baseline(HashMap::new());
+        let server = parts.server;
+
+        let handle = tokio::spawn(async move { server.footer_for_write().await });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        tokio::time::advance(Duration::from_millis(249)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !handle.is_finished(),
+            "nothing ever began, so is_quiet_at would read quiet at any real \
+             instant; only the grace sleep can be holding this open, and it \
+             has not elapsed yet"
+        );
+
+        tokio::time::advance(Duration::from_millis(5)).await;
+        let footer = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("the footer finished once its grace elapsed")
+            .expect("the footer task");
+        assert!(footer.is_some());
+    }
+
+    /// The footer defaults to off, and a disabled footer must never touch
+    /// its timers: with grace and cap both an hour, a regression that
+    /// forgot the `footer` guard would hang this test until it timed out
+    /// instead of merely running slower.
+    #[tokio::test]
+    async fn test_the_footer_is_off_by_default_and_never_waits() {
+        let parts = test_server_parts_with(DiagnosticsConfig {
+            footer_grace_ms: 3_600_000,
+            footer_wait_ms: 3_600_000,
+            ..DiagnosticsConfig::default()
+        });
+        parts.delivery.lock().await.set_baseline(HashMap::new());
+
+        let start = Instant::now();
+        let footer = parts.server.footer_for_write().await;
+
+        assert!(footer.is_none(), "footer defaults to off");
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "a disabled footer must return before ever consulting its timers"
+        );
+    }
+
+    /// With the footer absent, `WithDiagnostics`'s JSON must be exactly what
+    /// the tool returned before this task: `#[serde(flatten)]` inlines the
+    /// result's fields in declaration order and `skip_serializing_if` drops
+    /// `new_diagnostics` entirely, so nothing about the wrapper is visible.
+    #[test]
+    fn test_the_wrapper_matches_the_bare_result_when_the_footer_is_absent() {
+        let bare = serde_json::to_string(&sample_rename_result()).expect("serialize");
+        let wrapped = serde_json::to_string(&WithDiagnostics {
+            result: sample_rename_result(),
+            new_diagnostics: None,
+        })
+        .expect("serialize");
+
+        assert_eq!(
+            bare, wrapped,
+            "a caller of a write tool with the footer off must see byte-identical \
+             output to before this task"
+        );
+    }
+
+    /// The flush acquires `delivery` before `notification_cache`. With the
+    /// cache lock held from the outside, the flush stalls at a point where it
+    /// must already own `delivery`; the opposite acquisition order would leave
+    /// `delivery` free at that moment.
+    #[tokio::test]
+    async fn test_a_flush_takes_delivery_before_the_cache() {
+        let parts = test_server_with_baseline().await;
+        let cache = Arc::clone(&parts.notification_cache);
+        let delivery = Arc::clone(&parts.delivery);
+        let server = parts.server;
+
+        let held = cache.lock().await;
+        let flush = tokio::spawn(async move { server.get_new_diagnostics().await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert!(
+            delivery.try_lock().is_err(),
+            "a flush blocked on the cache lock must already hold delivery; \
+             finding delivery free means the cache was taken first, and two \
+             sites taking these locks in opposite orders deadlock"
+        );
+
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(5), flush)
+            .await
+            .expect("the flush finished once the cache lock was free")
+            .expect("the flush task")
+            .expect("the flush");
     }
 
     fn create_test_server() -> McplsServer {
@@ -1213,6 +2825,8 @@ mod tests {
             project_config_ignored,
             delivery,
             floors,
+            DiagnosticsConfig::default(),
+            test_settle(),
         )
     }
 
@@ -1699,6 +3313,8 @@ mod tests {
             false,
             Arc::clone(&delivery),
             floors,
+            DiagnosticsConfig::default(),
+            test_settle(),
         );
         (server, notification_cache, delivery)
     }
@@ -1732,7 +3348,7 @@ mod tests {
     /// would still record it delivered, permanently hiding diagnostics
     /// that were in fact never shown.
     #[test]
-    fn test_routable_entries_excludes_unmappable_uri() {
+    fn test_routable_entries_borrowed_excludes_unmappable_uri() {
         // `Url::to_file_path` needs a drive letter on Windows, so a bare
         // `file:///workspace/...` maps to no path there and would be
         // excluded for the wrong reason.
@@ -1741,36 +3357,26 @@ mod tests {
         #[cfg(not(windows))]
         let ok_uri: lsp_types::Uri = "file:///workspace/a.rs".parse().unwrap();
         let bad_uri: lsp_types::Uri = "http://example.com/not-a-file.rs".parse().unwrap();
-        let snapshot = vec![
-            (
-                "a".to_string(),
-                DiagnosticInfo {
-                    uri: ok_uri,
-                    version: Some(1),
-                    diagnostics: vec![diagnostic_at("ok")],
-                },
-                crate::config::ServerId::from("rust"),
-            ),
-            (
-                "b".to_string(),
-                DiagnosticInfo {
-                    uri: bad_uri,
-                    version: Some(1),
-                    diagnostics: vec![diagnostic_at("unreachable")],
-                },
-                crate::config::ServerId::from("rust"),
-            ),
-        ];
+        let owner = crate::config::ServerId::from("rust");
+
+        let mut cache = NotificationCache::new();
+        cache.store_diagnostics(&owner, &ok_uri, Some(1), vec![diagnostic_at("ok")]);
+        cache.store_diagnostics(
+            &owner,
+            &bad_uri,
+            Some(1),
+            vec![diagnostic_at("unreachable")],
+        );
         let floors = FloorTable::new(&crate::config::DiagnosticsConfig::default(), &[]);
 
-        let entries = routable_entries(&snapshot, &floors);
+        let entries = routable_entries_borrowed(&cache, &floors);
 
         assert_eq!(
             entries.len(),
             1,
             "the unmappable-URI file must be excluded before flush ever sees it"
         );
-        assert_eq!(entries[0].key, "a");
+        assert_eq!(entries[0].diagnostics[0].message, "ok");
     }
 
     /// A non-zero `omitted` count is meaningless to an agent unless the
@@ -1785,7 +3391,9 @@ mod tests {
             ..Default::default()
         };
 
-        let payload = server.new_diagnostics_payload(&report, &[]).await;
+        let payload = server
+            .new_diagnostics_payload(&report, &HashMap::new())
+            .await;
 
         assert_eq!(payload.omitted, 2);
         let note = payload
@@ -1805,7 +3413,9 @@ mod tests {
         let server = create_test_server();
         let report = FlushReport::default();
 
-        let payload = server.new_diagnostics_payload(&report, &[]).await;
+        let payload = server
+            .new_diagnostics_payload(&report, &HashMap::new())
+            .await;
 
         assert_eq!(payload.omitted, 0);
         assert!(payload.note.is_none());
@@ -1845,7 +3455,8 @@ mod tests {
         // this into the baseline once the servers went quiet.
         // `Url::to_file_path` needs a drive letter on Windows, so a bare
         // `file:///workspace/...` maps to no path there and would be
-        // dropped by `routable_entries` before any of this is exercised.
+        // dropped by `routable_entries_borrowed` before any of this is
+        // exercised.
         #[cfg(windows)]
         let pre_existing_uri: lsp_types::Uri =
             "file:///C:/workspace/pre_existing.rs".parse().unwrap();
@@ -1864,10 +3475,10 @@ mod tests {
         let baseline_key = {
             let cache = notification_cache.lock().await;
             cache
-                .diagnostics_snapshot()
+                .diagnostics_entries()
                 .into_iter()
                 .find(|(_, info, _)| info.uri == pre_existing_uri)
-                .map(|(key, _, _)| key)
+                .map(|(key, _, _)| key.to_string())
                 .unwrap()
         };
         let baseline_hash = DiagnosticsDelivery::visible_hash(
@@ -2278,6 +3889,8 @@ mod tests {
             false,
             delivery,
             floors,
+            DiagnosticsConfig::default(),
+            test_settle(),
         )
     }
 

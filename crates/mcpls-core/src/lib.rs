@@ -38,6 +38,7 @@
 pub mod bridge;
 pub mod config;
 pub mod error;
+pub mod hooks;
 pub mod lsp;
 pub mod mcp;
 pub mod transport;
@@ -502,6 +503,7 @@ fn applicable_server_configs(
     config: &ServerConfig,
     workspace_roots: &[PathBuf],
     max_depth: Option<usize>,
+    watch_registry: &Arc<lsp::WatchRegistry>,
 ) -> Vec<ServerInitConfig> {
     config
         .lsp_servers
@@ -526,6 +528,7 @@ fn applicable_server_configs(
                 initialization_options: lsp_config.initialization_options.clone(),
                 position_encodings: config.workspace.position_encodings.clone(),
                 notification_tx: None,
+                watch_registry: Some(Arc::clone(watch_registry)),
             })
         })
         .collect()
@@ -590,6 +593,43 @@ fn applicable_server_configs(
 /// }
 /// ```
 pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<(), Error> {
+    serve_with_identity(config, transport, None).await
+}
+
+/// This process's own canonicalized working directory and the socket
+/// identity derived from it, from one canonicalization rather than two, so
+/// a `Status` answer's `root` and `hash` describe the same directory by
+/// construction rather than by coincidence.
+fn canonicalized_cwd_identity() -> Result<(hooks::SocketIdentity, PathBuf), Error> {
+    let dir = std::env::current_dir().map_err(Error::Io)?;
+    let canonical = dunce::canonicalize(&dir).map_err(|e| Error::FileIo {
+        path: dir,
+        source: e,
+    })?;
+    let identity = hooks::identity_for(&canonical)?;
+    Ok((identity, canonical))
+}
+
+/// [`serve_with`], with the project's hook socket identity supplied rather
+/// than derived from the process working directory.
+///
+/// The identity is where the socket and its ownership lock live, and
+/// deriving it from the cwd means every caller in one checkout competes for
+/// one machine-global lock. A test that wants to observe the socket passes
+/// a temporary identity instead, which is also what keeps a test run from
+/// answering a real agent's hooks. An env override would not do: the
+/// derivation already reads `XDG_RUNTIME_DIR`, and a process-wide variable
+/// races between tests sharing a process.
+///
+/// # Errors
+///
+/// The same as [`serve_with`].
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn serve_with_identity(
+    config: ServerConfig,
+    transport: Transport,
+    identity_override: Option<hooks::SocketIdentity>,
+) -> Result<(), Error> {
     info!("Starting MCPLS server...");
 
     // Registered before any other startup work -- including
@@ -639,10 +679,16 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         // arbitrary placeholder rather than paying for `current_dir()`.
         canonicalize_workspace_roots(&config.workspace.roots, Path::new(""))?
     };
-    let extension_map = config.build_effective_extension_map();
+    let extension_map = Arc::new(config.build_effective_extension_map());
     let max_depth = Some(config.workspace.heuristics_max_depth);
 
-    let applicable_configs = applicable_server_configs(&config, &workspace_roots, max_depth);
+    // One registry for the process. The clients write it from their
+    // `registerCapability` arms and the translator reads it to decide whom
+    // to notify, so both sides must hold the same `Arc`.
+    let watch_registry = Arc::new(lsp::WatchRegistry::new());
+
+    let applicable_configs =
+        applicable_server_configs(&config, &workspace_roots, max_depth, &watch_registry);
 
     info!(
         "Attempting to spawn {} applicable LSP server(s)...",
@@ -667,9 +713,10 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     let translator = build_translator(
         &config,
         workspace_roots.clone(),
-        extension_map,
+        (*extension_map).clone(),
         router,
         Arc::clone(&notification_cache),
+        Arc::clone(&watch_registry),
     );
 
     // Mark applicable servers as "expected" so a tool call that arrives while
@@ -717,13 +764,97 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         &config.lsp_servers,
     ));
 
+    // The hook socket is an optimization, not a requirement: a process that
+    // cannot derive its own identity still answers every MCP tool, so this
+    // must not turn an unreadable working directory into a startup failure.
+    //
+    // The identity and the root a `Status` answer reports both come from
+    // one canonicalization, not two independent ones: a directory that
+    // canonicalizes for `identity_for` but not for a second, separate call
+    // would otherwise leave `root` silently blank while `hash` is fine.
+    let (mut hook_identity, hook_root) = if config.diagnostics.hooks.enabled {
+        identity_override.map_or_else(
+            || match canonicalized_cwd_identity() {
+                Ok((identity, root)) => (Some(identity), Some(root)),
+                Err(error) => {
+                    warn!(
+                        "hooks are configured on but this project's socket identity could not \
+                         be derived, so no socket is served: {error}"
+                    );
+                    (None, None)
+                }
+            },
+            |identity| {
+                // Test-only path (see this function's doc comment): there
+                // is no real startup directory tied to an injected
+                // identity, so this process's own cwd stands in. Nothing
+                // outside this crate's own tests reads `root` against a
+                // real directory on this path.
+                let root = std::env::current_dir()
+                    .ok()
+                    .and_then(|dir| dunce::canonicalize(&dir).ok())
+                    .unwrap_or_default();
+                (Some(identity), Some(root))
+            },
+        )
+    } else {
+        (None, None)
+    };
+
+    // Acquired before the context is built, so the role is known before the
+    // context is frozen into an `Arc`: a process that loses the lock is
+    // constructed passive and only ever moves to owner.
+    //
+    // A failure to acquire is not a failure to start, for the same reason a
+    // failure to derive the identity is not. `acquire` creates a runtime
+    // directory, opens and locks a file, unlinks a stale socket and binds,
+    // and on Windows it reports every pipe-creation error but a busy one;
+    // aborting the MCP server over any of those would trade a working
+    // bridge for a missing optimization.
+    let ownership = match &hook_identity {
+        Some(identity) => match hooks::HookListener::acquire(identity).await {
+            Ok(ownership) => ownership,
+            Err(error) => {
+                warn!(
+                    "the hook ownership lock could not be taken, so no socket is served: {error}"
+                );
+                hook_identity = None;
+                None
+            }
+        },
+        None => None,
+    };
+    let role = match (&hook_identity, &ownership) {
+        (None, _) => hooks::HookRole::disabled(),
+        (Some(_), Some(_)) => hooks::HookRole::owner(),
+        (Some(identity), None) => hooks::HookRole::passive(identity.clone()),
+    };
+
+    // Built whether this process owns the socket or not. A passive
+    // instance's sweeper is idle until it takes over, and building it here
+    // means a takeover has nothing left to construct.
+    let sweeper = hook_identity.as_ref().map(|_| {
+        let sweeper = Arc::new(hooks::Sweeper::new(
+            Arc::clone(&translator),
+            hooks::PathFilter::new(
+                Arc::clone(&workspace_roots_snapshot),
+                Arc::clone(&extension_map),
+                Some(Arc::clone(&watch_registry)),
+            ),
+            Duration::from_millis(config.diagnostics.hooks.sweep_quiet_ms),
+            config.workspace.max_documents,
+        ));
+        tokio::spawn(Arc::clone(&sweeper).run(cancel_rx.clone()));
+        sweeper
+    });
+
     let pump_shared = PumpShared {
         notification_cache: Arc::clone(&notification_cache),
         subs: Arc::clone(&subscriptions),
         peer_cell: Arc::clone(&peer_cell),
         workspace_roots: Arc::clone(&workspace_roots_snapshot),
         document_tracker: Arc::clone(translator.document_tracker()),
-        settle,
+        settle: Arc::clone(&settle),
         delivery: Arc::clone(&delivery),
         floors: Arc::clone(&floors),
     };
@@ -751,7 +882,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     };
 
     info!("Starting MCP server with rmcp...");
-    let mcp_server = mcp::McplsServer::new(
+    let mut context = mcp::BridgeContext::new(
         Arc::clone(&translator),
         Arc::clone(&notification_cache),
         Arc::clone(&workspace_roots_snapshot),
@@ -759,7 +890,49 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         project_config_ignored,
         delivery,
         floors,
+        config.diagnostics,
+        settle,
     );
+    context.hooks = Arc::new(role);
+    let context = Arc::new(context);
+    // `run_stdio` takes an `McplsServer` by value while the socket handler
+    // needs one it can keep. Both are built over the same
+    // `Arc<BridgeContext>`, which is where all the state lives, so they are
+    // the same server in every sense that matters.
+    let hook_server = Arc::new(mcp::McplsServer::from_context(Arc::clone(&context)));
+    let mcp_server = mcp::McplsServer::from_context(Arc::clone(&context));
+
+    if let (Some(identity), Some(sweeper), Some(root)) = (hook_identity, sweeper, hook_root) {
+        let location = hooks::HookLocation { identity, root };
+        let op_deadline = Duration::from_millis(config.diagnostics.hooks.op_deadline_ms);
+        let role = Arc::clone(&context.hooks);
+        let server = Arc::clone(&hook_server);
+        let cancel = cancel_rx.clone();
+        // Wrapped rather than spawned bare: a panic in either task drops the
+        // `HookListener` and so releases the ownership lock, while this
+        // process goes on believing it owns the session. Reporting it is the
+        // only thing that makes that state diagnosable.
+        tokio::spawn(log_hook_task_panic(async move {
+            match ownership {
+                Some(listener) => {
+                    hooks::hook_owner_task(
+                        listener,
+                        location,
+                        role,
+                        server,
+                        sweeper,
+                        op_deadline,
+                        cancel,
+                    )
+                    .await;
+                }
+                None => {
+                    hooks::hook_takeover_task(location, role, server, sweeper, op_deadline, cancel)
+                        .await;
+                }
+            }
+        }));
+    }
     info!("MCPLS server initialized successfully");
 
     let result = match transport {
@@ -777,6 +950,18 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     result
 }
 
+/// Run one of the hook socket tasks, reporting a panic instead of losing
+/// it.
+///
+/// Both tasks own the `HookListener` that proves this process holds the
+/// ownership lock, and unwinding drops it, releasing the lock exactly as if
+/// the process had exited. Nothing else in the process notices.
+async fn log_hook_task_panic<F: Future<Output = ()> + Send + 'static>(task: F) {
+    if let Err(panic) = tokio::spawn(task).await {
+        error!("the hook socket task stopped unexpectedly and hooks are now unserved: {panic}");
+    }
+}
+
 /// Build the translator `serve_with` runs on.
 ///
 /// A named function rather than an inline chain so a test can construct
@@ -788,6 +973,7 @@ fn build_translator(
     extension_map: HashMap<String, String>,
     router: ToolRouter,
     notification_cache: Arc<Mutex<NotificationCache>>,
+    watch_registry: Arc<lsp::WatchRegistry>,
 ) -> Translator {
     let applier = Arc::new(Applier::new(workspace_roots.clone(), config.apply.clone()));
     let mut translator = Translator::new()
@@ -795,6 +981,7 @@ fn build_translator(
         .with_extensions(extension_map)
         .with_router(router)
         .with_notification_cache(notification_cache)
+        .with_watch_registry(watch_registry)
         .with_applier(applier);
     translator.set_workspace_roots(workspace_roots);
     translator
@@ -1103,21 +1290,25 @@ async fn baseline_task(
                 if !settle.should_settle() {
                     continue;
                 }
-                let snapshot = {
+                let baseline: HashMap<String, u64> = {
                     let cache = cache.lock().await;
-                    cache.diagnostics_snapshot()
+                    cache
+                        .diagnostics_entries()
+                        .into_iter()
+                        .filter_map(|(key, info, owner)| {
+                            bridge::DiagnosticsDelivery::visible_hash(
+                                &info.diagnostics,
+                                floors.for_server(owner),
+                            )
+                            .map(|hash| (key.to_string(), hash))
+                        })
+                        .collect()
                 };
-                let baseline: HashMap<String, u64> = snapshot
-                    .iter()
-                    .filter_map(|(key, info, owner)| {
-                        bridge::DiagnosticsDelivery::visible_hash(
-                            &info.diagnostics,
-                            floors.for_server(owner),
-                        )
-                        .map(|hash| (key.clone(), hash))
-                    })
-                    .collect();
                 let baseline_len = baseline.len();
+                // Cache guard is dropped above before delivery's is taken --
+                // the opposite of the flush's delivery-before-cache order,
+                // but safe here because this task never holds both locks at
+                // once.
                 delivery.lock().await.set_baseline(baseline);
                 debug!("diagnostics baseline taken over {baseline_len} file(s)");
                 return;
@@ -1560,7 +1751,7 @@ mod tests {
                 Component::Prefix(p) => Some(p.as_os_str().to_owned()),
                 _ => None,
             })
-            .expect("temp dir path should have a Windows drive prefix");
+            .unwrap();
         let mut root = drive_prefix;
         root.push("workspace");
         let root = PathBuf::from(root);
@@ -1750,6 +1941,40 @@ mod tests {
         assert_eq!(roots[1], base.join("another path/workspace"));
     }
 
+    /// The one production `ServerInitConfig` literal is what puts the
+    /// registry in front of every spawned server's `registerCapability`
+    /// arm. A `None` here records no glob, so `notify_watched_files` finds
+    /// no server to tell and gopls and tsgo -- which give up their own
+    /// watchers on the strength of the advertisement alone -- see file
+    /// changes never at all, with nothing failing to say so.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_applicable_configs_carry_the_shared_watch_registry() {
+        let mut config: ServerConfig = toml::from_str("").expect("an empty config parses");
+        let mut server = crate::config::LspServerConfig::rust_analyzer();
+        // No markers to look for, so `should_spawn` is true without any
+        // fixture on disk.
+        server.heuristics = None;
+        config.lsp_servers = vec![server];
+
+        let registry = Arc::new(lsp::WatchRegistry::new());
+        let applicable =
+            applicable_server_configs(&config, &[PathBuf::from("/workspace")], None, &registry);
+
+        let spawned = applicable
+            .first()
+            .expect("a server with no heuristics is always applicable");
+        let carried = spawned
+            .watch_registry
+            .as_ref()
+            .expect("the production config carries the registry");
+        assert!(
+            Arc::ptr_eq(carried, &registry),
+            "every server must write the registry the translator reads, not \
+             a registry of its own"
+        );
+    }
+
     #[test]
     #[allow(clippy::expect_used)]
     fn test_serve_translator_carries_the_configured_apply_permissions() {
@@ -1761,6 +1986,7 @@ mod tests {
             HashMap::new(),
             ToolRouter::default(),
             Arc::new(Mutex::new(NotificationCache::new())),
+            Arc::new(lsp::WatchRegistry::new()),
         );
 
         assert!(
@@ -1952,7 +2178,7 @@ mod tests {
                     diagnostics_severity: None,
                 }],
                 apply: crate::config::ApplyConfig::default(),
-                diagnostics: crate::config::DiagnosticsConfig::default(),
+                diagnostics: hookless_diagnostics(),
                 project_config_ignored: false,
             };
 
@@ -1995,7 +2221,7 @@ mod tests {
                 },
                 lsp_servers: vec![],
                 apply: crate::config::ApplyConfig::default(),
-                diagnostics: crate::config::DiagnosticsConfig::default(),
+                diagnostics: hookless_diagnostics(),
                 project_config_ignored: false,
             };
 
@@ -2008,6 +2234,24 @@ mod tests {
                     !matches!(err, Error::NoServersAvailable(_)),
                     "serve() must not return NoServersAvailable for empty lsp_servers config"
                 );
+            }
+        }
+
+        /// Diagnostics with the hook socket switched off.
+        ///
+        /// A `serve()` that binds derives its socket from the process
+        /// working directory, which a test runner sets to the package
+        /// directory: several of these tests would then arbitrate one lock
+        /// between themselves, and each run would leave a socket and a lock
+        /// behind in the user's shared runtime directory that nothing ever
+        /// removes. None of them is about hooks.
+        fn hookless_diagnostics() -> crate::config::DiagnosticsConfig {
+            crate::config::DiagnosticsConfig {
+                hooks: crate::config::HooksConfig {
+                    enabled: false,
+                    ..crate::config::HooksConfig::default()
+                },
+                ..crate::config::DiagnosticsConfig::default()
             }
         }
 
@@ -2042,6 +2286,10 @@ mod tests {
             let _guard = CwdGuard::enter(doomed_cwd.path());
             doomed_cwd.close().unwrap();
 
+            // Hooks stay on here, unlike the tests above: with the cwd
+            // removed, deriving the socket identity fails, which is the
+            // path that must warn and carry on rather than fail startup.
+            // Nothing binds, so nothing is left behind either.
             let config = ServerConfig {
                 workspace: WorkspaceConfig {
                     roots: vec![workspace_root],
@@ -2285,6 +2533,36 @@ mod tests {
                     .iter()
                     .any(|m| m.contains("Background LSP initialization task failed")),
                 "expected an error! log for the panicking background init task, got: {messages:?}"
+            );
+        }
+
+        /// A panic in a hook socket task drops the `HookListener` and so
+        /// releases the ownership lock, exactly as if the process had
+        /// exited, while the process goes on believing it owns the session.
+        /// Nothing else notices, so the log line is the only thing that
+        /// makes that state diagnosable.
+        #[tokio::test]
+        async fn test_a_panicking_hook_task_is_reported() {
+            use tracing_subscriber::layer::SubscriberExt as _;
+
+            let captured = CapturedMessages::default();
+            let subscriber = tracing_subscriber::registry().with(captured.clone());
+            let guard = tracing::subscriber::set_default(subscriber);
+
+            super::super::log_hook_task_panic(async {
+                panic!("simulated hook socket task panic");
+            })
+            .await;
+
+            drop(guard);
+
+            let messages = captured.0.lock().unwrap().clone();
+            assert!(
+                messages
+                    .iter()
+                    .any(|m| m.contains("hooks are now unserved")),
+                "a hook task that dies silently leaves a project with no owner and \
+                 nothing to look at, got: {messages:?}"
             );
         }
 

@@ -135,6 +135,11 @@ fn test_config_with_empty_file() {
     clear_ambient_env(&mut cmd)
         .arg("--config")
         .arg(&config_path)
+        // An empty file parses to an all-default config, so this reaches
+        // `serve_with`, which binds the real hook socket at
+        // `identity_for`'s runtime directory unless redirected here, before
+        // failing fast on the stdio transport having no client attached.
+        .env("XDG_RUNTIME_DIR", temp_dir.path())
         .assert()
         .failure();
 }
@@ -158,6 +163,11 @@ fn test_trust_project_config_env_false_does_not_grant_trust() {
         .env_remove("MCPLS_TRUST_PROJECT_CONFIG");
     let output = cmd
         .current_dir(temp_dir.path())
+        // This path proceeds all the way to `serve_with`, which binds the
+        // real hook socket at `identity_for`'s runtime directory unless
+        // redirected here; the untrusted-ignore assertion below does not
+        // depend on where that socket lands.
+        .env("XDG_RUNTIME_DIR", temp_dir.path())
         .env("MCPLS_TRUST_PROJECT_CONFIG", "false")
         // Generous bound: the untrusted path is expected to block on stdio
         // (proving it never bailed out on the broken TOML), so this timeout
@@ -222,6 +232,9 @@ fn test_trust_project_config_env_0_does_not_grant_trust() {
         .env_remove("MCPLS_TRUST_PROJECT_CONFIG");
     let output = cmd
         .current_dir(temp_dir.path())
+        // See test_trust_project_config_env_false_does_not_grant_trust
+        // above for why this redirects the real hook socket.
+        .env("XDG_RUNTIME_DIR", temp_dir.path())
         .env("MCPLS_TRUST_PROJECT_CONFIG", "0")
         // See test_trust_project_config_env_false_does_not_grant_trust above
         // for why this timeout is expected to always elapse.
@@ -543,4 +556,100 @@ fn test_completions_survives_a_closed_pipe() {
             output.status
         );
     }
+}
+
+/// `SessionStart`'s watch paths must be absolute: the host consumes them
+/// with no obligation to resolve them against the hook process's own
+/// working directory. `mcpls hook`'s dispatcher only ever sees whatever
+/// project directory `main.rs` hands it, so a bug in that seam (passing
+/// `CLAUDE_PROJECT_DIR` through uncanonicalized) is invisible to every unit
+/// test in `hook.rs`, which always passes an absolute `tempfile::tempdir()`
+/// path directly. `CLAUDE_PROJECT_DIR` is left unset here, rather than set
+/// to the (already absolute) temp directory, so the process falls back to
+/// `main.rs`'s `PathBuf::from(".")` default: only a relative path run
+/// through canonicalization can tell this test apart from one that merely
+/// checks its own fixture.
+#[test]
+fn test_hook_session_start_emits_absolute_watch_paths() {
+    let temp_dir = TempDir::new().unwrap();
+    fs::create_dir_all(temp_dir.path().join("src")).unwrap();
+
+    let mut cmd = assert_cmd::Command::cargo_bin("mcpls").unwrap();
+    cmd.env_remove("MCPLS_LOG")
+        .env_remove("MCPLS_CONFIG")
+        .env_remove("MCPLS_TRUST_PROJECT_CONFIG")
+        .env_remove("MCPLS_LOG_JSON")
+        .env_remove("CLAUDE_PROJECT_DIR");
+    let assert = cmd
+        .arg("hook")
+        .current_dir(temp_dir.path())
+        .write_stdin(r#"{"hook_event_name":"SessionStart"}"#)
+        .assert()
+        .success();
+
+    let output = assert.get_output();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let paths = parsed["hookSpecificOutput"]["watchPaths"]
+        .as_array()
+        .unwrap();
+    assert!(!paths.is_empty());
+    for path in paths {
+        let path = path.as_str().unwrap();
+        assert!(
+            std::path::Path::new(path).is_absolute(),
+            "a watch path must be absolute, not relative to the hook \
+             process's own working directory: {path}"
+        );
+    }
+}
+
+/// A hook invocation must never panic on a closed stdout, the same
+/// guarantee `test_completions_survives_a_closed_pipe` proves for
+/// `completions`: a hook branch that wrote with `print!` would panic past
+/// the `LineWriter`'s buffer, so the project directory here has enough
+/// top-level entries to force a real write rather than one that sits in
+/// that buffer until the ignored exit-time flush.
+#[cfg(unix)]
+#[test]
+fn test_hook_survives_a_closed_pipe() {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    let temp_dir = TempDir::new().unwrap();
+    for i in 0..200 {
+        fs::create_dir_all(temp_dir.path().join(format!("dir{i}"))).unwrap();
+    }
+
+    let mut departed_reader = Command::new("true").stdin(Stdio::piped()).spawn().unwrap();
+    let closed_pipe = departed_reader.stdin.take().unwrap();
+    departed_reader.wait().unwrap();
+
+    let mut cmd = Command::cargo_bin("mcpls").unwrap();
+    let mut child = clear_ambient_env(&mut cmd)
+        .arg("hook")
+        .env("CLAUDE_PROJECT_DIR", temp_dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::from(closed_pipe))
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(br#"{"hook_event_name":"SessionStart"}"#)
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !stderr.contains("panicked"),
+        "a closed pipe must not panic: {stderr}"
+    );
+    assert!(
+        output.status.success(),
+        "a closed pipe is a clean exit, got {:?}: {stderr}",
+        output.status
+    );
 }

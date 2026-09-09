@@ -1269,10 +1269,11 @@ mod tests {
             "the error says why: {message}"
         );
         for path in [&first, &second] {
+            let canonical = path.canonicalize().expect("the fixture exists");
             assert!(
-                message.contains(&path.display().to_string()),
+                message.contains(&canonical.display().to_string()),
                 "every read-only file is named, missing {}: {message}",
-                path.display()
+                canonical.display()
             );
             assert_eq!(fs::read_to_string(path).expect("read"), "fn old() {}\n");
             set_read_only(path, false);

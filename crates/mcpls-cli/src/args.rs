@@ -122,6 +122,26 @@ pub enum Command {
         #[arg(value_enum)]
         shell: Shell,
     },
+
+    /// Serve one Claude Code hook invocation
+    ///
+    /// With no argument, reads the hook payload from stdin and writes hook
+    /// JSON to stdout, dispatching on the payload's own `hook_event_name`.
+    /// One subcommand rather than five means no shell script and the same
+    /// registrations work on Windows.
+    Hook {
+        /// What to do instead of reading a hook payload from stdin
+        #[command(subcommand)]
+        action: Option<HookAction>,
+    },
+}
+
+/// What `mcpls hook` can do besides serving a hook invocation.
+#[derive(Debug, Subcommand)]
+pub enum HookAction {
+    /// Print the socket path, both directory hashes, the owner's pid and
+    /// liveness, and whether mcpls resolves on PATH
+    Doctor,
 }
 
 #[cfg(test)]

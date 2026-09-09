@@ -169,7 +169,7 @@ impl Translator {
         // stopped awaiting it leaves its changed paths queued, and this
         // call must not go on to serve content from a tracked document one
         // of those paths has already invalidated.
-        self.forget_changed_documents().await;
+        self.resync_changed_documents().await;
 
         let path = PathBuf::from(file_path);
         let validated_path = self.validate_path(&path)?;
@@ -621,7 +621,17 @@ mod tests {
             },
             lsp_servers: vec![],
             apply: crate::config::ApplyConfig::default(),
-            diagnostics: crate::config::DiagnosticsConfig::default(),
+            // Hooks off: this test is about routing, and a `serve()` that
+            // binds derives its socket from the process working directory,
+            // leaving a socket and a lock behind in the user's shared
+            // runtime directory that nothing ever removes.
+            diagnostics: crate::config::DiagnosticsConfig {
+                hooks: crate::config::HooksConfig {
+                    enabled: false,
+                    ..crate::config::HooksConfig::default()
+                },
+                ..crate::config::DiagnosticsConfig::default()
+            },
             project_config_ignored: false,
         };
 

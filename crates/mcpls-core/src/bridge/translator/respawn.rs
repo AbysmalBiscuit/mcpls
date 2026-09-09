@@ -260,6 +260,15 @@ impl Translator {
         let language_id = config.server_config.language_id.clone();
 
         tracing::warn!("LSP server '{id}' has crashed, respawning");
+        // Cleared before the replacement is spawned, not after: the fresh
+        // process registers its own watchers during the `initialize`
+        // handshake, and a clear running afterwards would drop those along
+        // with the dead process's. Being here also means it runs even when
+        // the spawn below then fails, deliberately unlike the document
+        // tracker's clear further down: a glob belongs to the process that
+        // asked for it, so once that process is gone the glob only produces
+        // notify calls to a connection nobody is reading.
+        self.forget_watch_registrations(id);
         let mut new_server = match LspServer::spawn(config).await {
             Ok(server) => {
                 self.record_respawn_success(id);
@@ -480,6 +489,7 @@ sleep __SLEEP__
                 initialization_options: None,
                 position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
                 notification_tx: None,
+                watch_registry: None,
             }
         }
 
@@ -835,6 +845,68 @@ fi
                  an unrelated server's respawn-triggered cache clear"
             );
             drop(guard);
+        }
+
+        /// A respawned process registers again with fresh ids, so the
+        /// globs the dead one left behind have to go: otherwise a server
+        /// that narrowed its watch keeps being told about files it no
+        /// longer wants, for the life of the mcpls process.
+        ///
+        /// Drives a real `respawn_if_dead` rather than calling
+        /// `forget_watch_registrations` directly, so deleting the clear
+        /// from the respawn path fails this.
+        #[tokio::test]
+        async fn test_respawn_if_dead_clears_that_server_s_watch_registrations() {
+            let dir = TempDir::new().unwrap();
+            let seed_script = write_crash_after_init_script(dir.path());
+            let id = ServerId::from("rust");
+            let other = ServerId::from("python");
+
+            let seed = LspServer::spawn(stub_server_config("rust", &seed_script))
+                .await
+                .unwrap();
+
+            let registry = Arc::new(crate::lsp::WatchRegistry::new());
+            let translator = Translator::new().with_watch_registry(Arc::clone(&registry));
+            translator.register_client(id.clone(), seed.client().clone());
+            translator.register_server(id.clone(), seed);
+
+            registry.register(
+                &id,
+                "r1",
+                &serde_json::json!([{ "globPattern": "**/*.rs" }]),
+            );
+            registry.register(
+                &other,
+                "r2",
+                &serde_json::json!([{ "globPattern": "**/*.py" }]),
+            );
+
+            wait_until_dead(&translator, &id).await;
+
+            let respawn_script = write_responder_script(dir.path(), 1);
+            translator
+                .register_server_config(id.clone(), stub_server_config("rust", &respawn_script));
+
+            translator.respawn_if_dead(&id).await.unwrap();
+
+            assert!(
+                registry
+                    .servers_for(
+                        &dir.path().join("main.rs"),
+                        lsp_types::FileChangeType::CHANGED
+                    )
+                    .is_empty(),
+                "the crashed process's globs must not outlive it"
+            );
+            assert_eq!(
+                registry.servers_for(
+                    &dir.path().join("main.py"),
+                    lsp_types::FileChangeType::CHANGED
+                ),
+                vec![other],
+                "one server's respawn must not drop another server's registrations"
+            );
         }
 
         /// #249 C1 regression (over-clear direction): respawning a server

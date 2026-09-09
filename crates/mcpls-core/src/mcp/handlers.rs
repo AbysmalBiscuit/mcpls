@@ -10,8 +10,11 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::bridge::{
-    DiagnosticsDelivery, FloorTable, NotificationCache, ResourceSubscriptions, Translator,
+    DiagnosticsDelivery, FloorTable, NotificationCache, ResourceSubscriptions, ServerSettle,
+    Translator,
 };
+use crate::config::DiagnosticsConfig;
+use crate::hooks::HookRole;
 
 /// Shared context for all tool handlers.
 ///
@@ -50,17 +53,42 @@ pub struct BridgeContext {
     pub project_config_ignored: bool,
     /// Per-session record of which diagnostics have already been delivered.
     ///
-    /// Locked independently of `notification_cache`; a flush takes the cache
-    /// lock only long enough to copy the snapshot it works from.
+    /// A site that needs both locks takes `delivery` before
+    /// `notification_cache`, never the reverse; a site that needs only one
+    /// takes only that one.
     pub delivery: Arc<Mutex<DiagnosticsDelivery>>,
     /// The severity floor each server answers to, resolved once at startup.
     pub floors: Arc<FloorTable>,
+    /// The diagnostics configuration, fixed at startup.
+    ///
+    /// Held by value: `DiagnosticsConfig` is `Copy` and never changes while
+    /// the process runs, and the footer reads four scalars off it. Carrying
+    /// the whole `ServerConfig` would drag `lsp_servers` and `apply` into a
+    /// struct with no use for either.
+    pub diagnostics: DiagnosticsConfig,
+    /// The same settle tracker the diagnostics pump feeds.
+    ///
+    /// The footer waits on `$/progress` and the pump is what records it, so
+    /// this must be the pump's own `Arc` rather than a fresh tracker.
+    pub settle: Arc<ServerSettle>,
+    /// This process's relationship to the project's hook socket.
+    ///
+    /// Shared with the takeover task, which is what makes its
+    /// `promote_to_owner` visible to a tool call. Read by binding
+    /// `hooks.get()` to a value: the inner lock is a `std::sync::Mutex` and
+    /// no guard may cross an await point.
+    ///
+    /// [`BridgeContext::new`] sets `Disabled`, which is what every caller
+    /// but `serve_with` wants; `serve_with` decides the role before the
+    /// context is frozen into an `Arc` and overwrites this field.
+    pub hooks: Arc<HookRole>,
 }
 
 impl BridgeContext {
     /// Create a new bridge context.
     #[must_use]
-    pub const fn new(
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
         translator: Arc<Translator>,
         notification_cache: Arc<Mutex<NotificationCache>>,
         workspace_roots: Arc<[PathBuf]>,
@@ -68,6 +96,8 @@ impl BridgeContext {
         project_config_ignored: bool,
         delivery: Arc<Mutex<DiagnosticsDelivery>>,
         floors: Arc<FloorTable>,
+        diagnostics: DiagnosticsConfig,
+        settle: Arc<ServerSettle>,
     ) -> Self {
         Self {
             translator,
@@ -77,6 +107,9 @@ impl BridgeContext {
             project_config_ignored,
             delivery,
             floors,
+            diagnostics,
+            settle,
+            hooks: Arc::new(HookRole::disabled()),
         }
     }
 }
@@ -85,7 +118,6 @@ impl BridgeContext {
 mod tests {
     use super::*;
     use crate::bridge::Translator;
-    use crate::config::DiagnosticsConfig;
 
     #[test]
     fn test_bridge_context_creation() {
@@ -97,6 +129,10 @@ mod tests {
             DiagnosticsConfig::default(),
         )));
         let floors = Arc::new(FloorTable::new(&DiagnosticsConfig::default(), &[]));
+        let settle = Arc::new(ServerSettle::new(
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(300),
+        ));
         let context = BridgeContext::new(
             translator,
             notification_cache,
@@ -105,6 +141,8 @@ mod tests {
             false,
             delivery,
             floors,
+            DiagnosticsConfig::default(),
+            settle,
         );
         assert_eq!(Arc::strong_count(&context.translator), 1);
     }

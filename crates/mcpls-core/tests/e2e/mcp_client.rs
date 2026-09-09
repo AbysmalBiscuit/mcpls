@@ -45,6 +45,15 @@ pub struct McpClient {
     /// Server-pushed notifications (no matching request `id`) collected while
     /// waiting for a request/response round-trip. Drained via `take_notifications`.
     pending_notifications: Vec<Value>,
+    /// The directory the server was started in, kept alive for its lifetime.
+    ///
+    /// One per client, because mcpls derives its per-project hook socket
+    /// from the directory it starts in. Sharing the test process's own
+    /// working directory would make unrelated servers arbitrate a single
+    /// socket between themselves -- the loser forwards its diagnostics to
+    /// whichever test happened to win -- and would let a throwaway test
+    /// server take the socket of a real session running in this checkout.
+    _cwd: tempfile::TempDir,
 }
 
 /// The workspace root, from this crate's manifest directory.
@@ -161,8 +170,11 @@ impl McpClient {
     pub fn spawn_with_args(args: &[&str]) -> Result<Self> {
         let binary_path = binary_under_test()?;
 
+        let cwd = tempfile::tempdir().context("failed to create a working directory")?;
+
         let mut process = Command::new(binary_path)
             .args(args)
+            .current_dir(cwd.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -185,6 +197,7 @@ impl McpClient {
             stdout: BufReader::new(stdout),
             request_id: 0,
             pending_notifications: Vec::new(),
+            _cwd: cwd,
         })
     }
 

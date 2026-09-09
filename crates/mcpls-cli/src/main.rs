@@ -9,9 +9,10 @@ use mcpls_core::ProjectConfigTrust;
 
 mod args;
 mod completions;
+mod hook;
 mod logging;
 
-use args::{Args, Command};
+use args::{Args, Command, HookAction};
 
 #[tokio::main]
 async fn main() {
@@ -24,6 +25,59 @@ async fn main() {
         if let Err(err) = completions::emit(*shell, &mut out) {
             eprintln!("failed to write completion script: {err}");
             std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
+
+    // A hook invocation needs neither a loaded config nor a log subscriber,
+    // and reading stdin and writing hook JSON is the whole command.
+    if let Some(Command::Hook { action }) = &args.command {
+        match action {
+            None => {
+                use std::io::{Read as _, Write as _};
+                let mut stdin = String::new();
+                let _ = std::io::stdin().read_to_string(&mut stdin);
+                let raw_project_dir = std::env::var_os("CLAUDE_PROJECT_DIR")
+                    .map_or_else(|| std::path::PathBuf::from("."), std::path::PathBuf::from);
+                // A watch path is consumed by the host, which has no
+                // obligation to resolve it against this process's own
+                // working directory, so it must be absolute. Falling back
+                // to the raw path on a canonicalization failure keeps
+                // today's relative-path behaviour as the floor rather than
+                // turning it into a hard error.
+                let project_dir = dunce::canonicalize(&raw_project_dir).unwrap_or(raw_project_dir);
+                // A failed `identity_for` (an unreachable directory, or an
+                // over-long socket path) must not suppress `SessionStart`:
+                // that arm never touches the socket, which is the entire
+                // reason it exists, so every socket-using arm degrades on
+                // its own when `identity` is `None` rather than the whole
+                // dispatch short-circuiting here.
+                let identity = mcpls_core::hooks::identity_for(&project_dir).ok();
+                let out = hook::dispatch_payload(&stdin, &project_dir, identity.as_ref()).await;
+                // `print!` panics on a write failure (a closed stdout pipe
+                // reached past the `LineWriter`'s buffer), which would
+                // break the exit-0 guarantee this whole command exists to
+                // uphold. `completions::emit` already solves this the same
+                // way.
+                let mut stdout = std::io::stdout().lock();
+                let _ = stdout
+                    .write_all(out.as_bytes())
+                    .and_then(|()| stdout.flush());
+            }
+            Some(HookAction::Doctor) => {
+                // `mcpls hook doctor` reports on the socket and the install.
+                // It reads the same `CLAUDE_PROJECT_DIR` the hook itself
+                // does, canonicalized the same way, so it probes exactly
+                // the socket a real hook invocation would.
+                let raw_project_dir = std::env::var_os("CLAUDE_PROJECT_DIR")
+                    .map_or_else(|| std::path::PathBuf::from("."), std::path::PathBuf::from);
+                let project_dir = dunce::canonicalize(&raw_project_dir).unwrap_or(raw_project_dir);
+                let out = match mcpls_core::hooks::identity_for(&project_dir) {
+                    Ok(identity) => hook::doctor(&project_dir, &identity).await,
+                    Err(error) => hook::doctor_without_identity(&project_dir, &error),
+                };
+                println!("{out}");
+            }
         }
         std::process::exit(0);
     }

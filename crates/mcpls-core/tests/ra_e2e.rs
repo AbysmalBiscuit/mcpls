@@ -33,6 +33,7 @@ mod mcp_client;
 #[path = "common/ra_probe.rs"]
 mod ra_probe;
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -183,6 +184,15 @@ fn settle_deadline_ms() -> u64 {
 struct DiagnosticsTable {
     settle_quiet_ms: u64,
     settle_deadline_ms: u64,
+    hooks: HooksTable,
+}
+
+/// Hooks off. These suites exercise the MCP and LSP layers, and leaving
+/// hooks on would have every spawned server bind a socket and a lock in the
+/// user's shared runtime directory, which nothing ever removes.
+#[derive(Serialize, Deserialize)]
+struct HooksTable {
+    enabled: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -195,6 +205,7 @@ struct LspServerConfig {
     language_id: String,
     command: String,
     args: Vec<String>,
+    env: BTreeMap<String, String>,
     file_patterns: Vec<String>,
 }
 
@@ -208,6 +219,12 @@ fn write_config(ra_binary: &Path, workspace_root: &Path, config_path: &Path) {
             language_id: "rust".to_owned(),
             command: ra_binary.to_string_lossy().into_owned(),
             args: vec![],
+            // Compiler wrappers need the invoking user's identity and runtime directory
+            // to connect to their existing daemon from the sanitized LSP environment.
+            env: ["USER", "LOGNAME", "XDG_RUNTIME_DIR"]
+                .into_iter()
+                .filter_map(|key| std::env::var(key).ok().map(|value| (key.to_owned(), value)))
+                .collect(),
             file_patterns: vec!["**/*.rs".to_owned()],
         }],
         // Only `rename` is on: the earlier read-only sub-cases must keep
@@ -216,6 +233,7 @@ fn write_config(ra_binary: &Path, workspace_root: &Path, config_path: &Path) {
         diagnostics: DiagnosticsTable {
             settle_quiet_ms: SETTLE_QUIET_MS,
             settle_deadline_ms: settle_deadline_ms(),
+            hooks: HooksTable { enabled: false },
         },
     };
     let content = toml::to_string(&cfg).expect("failed to serialize e2e config");
@@ -261,7 +279,7 @@ fn ra_index_timeout_secs() -> u64 {
         .map_or(default_timeout, |t| t.max(5))
 }
 
-/// Poll `get_hover` on the `add` function until rust-analyzer returns content.
+/// Poll `get_hover` on a function until rust-analyzer returns its signature.
 ///
 /// Timeout controlled by `MCPLS_RA_INDEX_TIMEOUT_SECS` (default 60, minimum 5).
 ///
@@ -269,14 +287,15 @@ fn ra_index_timeout_secs() -> u64 {
 /// (only `window/logMessage`, `window/showMessage`, and `publishDiagnostics` are
 /// stored).  The readiness gate therefore uses hover-probe as the primary oracle.
 /// See M-r1 in the architect handoff for the follow-up to add `$/progress` capture.
-fn wait_until_ready(client: &mut McpClient, lib_rs: &Path) {
+fn wait_until_ready(client: &mut McpClient, file: &Path, function: &str) {
     let timeout_secs = ra_index_timeout_secs();
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    let lib_path = lib_rs.to_string_lossy().into_owned();
-    let add_line = find_line(lib_rs, "pub fn add(");
+    let file_path = file.to_string_lossy().into_owned();
+    let function_line = find_line(file, &format!("pub fn {function}("));
+    let signature = format!("fn {function}");
 
     println!("[ra_e2e] waiting for rust-analyzer to index (timeout {timeout_secs}s)…");
-    println!("[ra_e2e] hover probe: file={lib_path} line={add_line}");
+    println!("[ra_e2e] hover probe: file={file_path} line={function_line}");
 
     // Require 3 consecutive successful hover responses to guard against transient
     // successes during RA's intermediate indexing phases (observed on Windows CI).
@@ -284,12 +303,12 @@ fn wait_until_ready(client: &mut McpClient, lib_rs: &Path) {
     let mut consecutive = 0u32;
     let mut last_print = Instant::now();
     loop {
-        // Hover over `add` — the 'a' of "add" is at column 8 (1-based).
+        // Fixture function names start at column 8 (1-based).
         let resp = client.call_tool(
             "get_hover",
             &json!({
-                "file_path": lib_path,
-                "line": add_line,
+                "file_path": file_path,
+                "line": function_line,
                 "character": 8,
             }),
         );
@@ -298,8 +317,7 @@ fn wait_until_ready(client: &mut McpClient, lib_rs: &Path) {
             Ok(r) => {
                 let is_err = r["result"]["isError"].as_bool().unwrap_or(false);
                 let text = assertions::content_text(r);
-                // Require both "fn add" and "i32" to confirm type-checking is done.
-                if text.contains("fn add") && text.contains("i32") {
+                if text.contains(&signature) && text.contains("i32") {
                     consecutive += 1;
                     if consecutive >= required_consecutive {
                         println!("[ra_e2e] rust-analyzer is ready");
@@ -1578,12 +1596,112 @@ fn sc_rename_symbol_apply(client: &mut McpClient, workspace: &Path) -> Result<()
     Ok(())
 }
 
+/// The resync sends `didSave`, so a build error an apply introduces reaches
+/// the agent.
+///
+/// Renaming `tally` to `total` collides with the existing `total`, so rustc
+/// reports E0428 for `src/lib.rs`. Both rewritten files are open documents,
+/// so the resync sends their new contents and requests a build with `didSave`.
+///
+/// The pair is same-signature on purpose. A rename that changed a call
+/// site's arity would produce rust-analyzer's own resident diagnostics,
+/// which arrive on a `didChange` alone, and this sub-case would then pass
+/// with the `didSave` half of the resync entirely broken.
+fn sc_resync_delivers_a_build_error_after_an_apply(
+    client: &mut McpClient,
+    workspace: &Path,
+) -> Result<(), String> {
+    let lib = workspace.join("src/lib.rs");
+    let tally_line = find_line(&lib, "pub fn tally(");
+    wait_until_ready(client, &workspace.join("src/functions.rs"), "tally_twice");
+
+    let resp = client
+        .call_tool(
+            "rename_symbol",
+            &json!({
+                "file_path": lib.to_string_lossy(),
+                "line": tally_line,
+                "character": 8,
+                "new_name": "total",
+                "apply": true,
+            }),
+        )
+        .map_err(|e| format!("call failed: {e}"))?;
+
+    let text = assertions::assert_tool_ok(&resp);
+    let inner: Value = serde_json::from_str(&text).map_err(|e| format!("bad JSON: {e}"))?;
+
+    if inner["applied"] != json!(true) {
+        return Err(format!("expected applied=true, got {inner}"));
+    }
+    let written = inner["files_written"]
+        .as_array()
+        .ok_or_else(|| format!("expected files_written array, got {inner}"))?;
+    if written.len() < 2 {
+        return Err(format!(
+            "the caller in functions.rs must have been rewritten too, so the \
+             resync has more than one document to catch up; got {written:?}"
+        ));
+    }
+
+    // Poll rather than asserting on one call: how long the build takes is
+    // rust-analyzer's business, and how far into the suite this sub-case
+    // runs is the registry's.
+    //
+    // Discriminate on `omitted`, not on `note`'s presence.
+    // `NewDiagnosticsResult::starting_up` sets `note` before `flush` ever
+    // runs, with `omitted == 0`, but `new_diagnostics_payload` also sets
+    // `note` on a real report that held files back. Skipping every report
+    // carrying a `note` would skip real ones. This is the same rule
+    // `sc_get_new_diagnostics` states at `ra_e2e.rs:1445`.
+    let deadline = Instant::now() + Duration::from_millis(settle_deadline_ms());
+    let mut last = Value::Null;
+    loop {
+        let raw = client
+            .call_tool("get_new_diagnostics", &json!({}))
+            .map_err(|e| format!("flush call failed: {e}"))?;
+        let body = assertions::assert_tool_ok(&raw);
+        let report: Value = serde_json::from_str(&body).map_err(|e| format!("bad JSON: {e}"))?;
+        let omitted = report["omitted"].as_u64().unwrap_or(0);
+        let starting_up = report.get("note").is_some() && omitted == 0;
+        if !starting_up {
+            if let Some(hit) = find_rustc_e0428(&report) {
+                if hit["code"] != json!("E0428") || hit["source"] != json!("rustc") {
+                    return Err(format!("matched the wrong diagnostic: {hit}"));
+                }
+                return Ok(());
+            }
+            last = report;
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "no rustc E0428 arrived after applying the rename within the settle deadline. \
+                 Last report: {last}"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// The first `rustc`-sourced `E0428` anywhere in a flush report, or `None`.
+fn find_rustc_e0428(report: &Value) -> Option<Value> {
+    report["changed"]
+        .as_array()?
+        .iter()
+        .flat_map(|file| file["diagnostics"].as_array().into_iter().flatten())
+        .find(|d| d["source"] == json!("rustc") && d["code"] == json!("E0428"))
+        .cloned()
+}
+
 // ---------------------------------------------------------------------------
 // Suite driver
 // ---------------------------------------------------------------------------
 
 #[test]
 #[ignore = "Requires rust-analyzer in PATH; set MCPLS_SKIP_RA=1 to skip or MCPLS_RUST_ANALYZER=<path> to override"]
+// The sub-case registry grows by one line per stage; the setup and teardown
+// around it stay flat, so length here tracks sub-case count, not complexity.
+#[allow(clippy::too_many_lines)]
 fn ra_e2e_suite() {
     let ra_path = match resolve_rust_analyzer() {
         Resolution::Found(p) => p,
@@ -1626,7 +1744,7 @@ fn ra_e2e_suite() {
 
     // Wait for rust-analyzer to index.
     let lib_rs = workspace.join("src/lib.rs");
-    wait_until_ready(&mut client, &lib_rs);
+    wait_until_ready(&mut client, &lib_rs, "add");
 
     // Sub-case registry.
     let sub_cases: &[SubCase] = &[
@@ -1655,6 +1773,12 @@ fn ra_e2e_suite() {
         sub_case!(sc_subscribe_unsubscribe_resource),
         sub_case!(sc_subscribe_no_replay_without_cached_diagnostics),
         sub_case!(sc_get_new_diagnostics),
+        // After the dedup sub-case: this one deliberately introduces a
+        // compile error, which would break that sub-case's "a second drain
+        // with no edits between is empty" property. Its own anchors are
+        // symbols nothing else in the suite touches, so whether the rename
+        // sub-case below runs before or after it changes nothing.
+        sub_case!(sc_resync_delivers_a_build_error_after_an_apply),
         // Last: this one writes to the staged workspace, and every anchor
         // above it looks for text this rename moves.
         sub_case!(sc_rename_symbol_apply),

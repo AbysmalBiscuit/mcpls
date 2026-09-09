@@ -525,30 +525,39 @@ impl Translator {
 
         // An already-well-formatted file yields no edits, so there is
         // nothing to plan and nothing to write.
-        let applied = if let (Some(applier), false) = (write_permit, edits.is_empty()) {
-            // A `Uri`-keyed `changes` map would trip `clippy::mutable_key_type`
-            // (`Uri` wraps a `Cell`), so the single document is wrapped as
-            // `document_changes` instead; the LSP spec gives it precedence
-            // over `changes` anyway.
-            let plan = EditPlan::from_workspace_edit(WorkspaceEdit {
-                document_changes: Some(LspDocumentChanges::Edits(vec![TextDocumentEdit {
-                    text_document: OptionalVersionedTextDocumentIdentifier {
-                        uri: response_uri,
-                        version: None,
-                    },
-                    edits: edits.into_iter().map(OneOf::Left).collect(),
-                }])),
-                ..WorkspaceEdit::default()
-            })?;
-            let summary = self.apply_locked(&applier, plan, &server_id).await?;
-            changed_the_tree(&summary)
-        } else {
-            false
-        };
+        let (applied, files_written) =
+            if let (Some(applier), false) = (write_permit, edits.is_empty()) {
+                // A `Uri`-keyed `changes` map would trip `clippy::mutable_key_type`
+                // (`Uri` wraps a `Cell`), so the single document is wrapped as
+                // `document_changes` instead; the LSP spec gives it precedence
+                // over `changes` anyway.
+                let plan = EditPlan::from_workspace_edit(WorkspaceEdit {
+                    document_changes: Some(LspDocumentChanges::Edits(vec![TextDocumentEdit {
+                        text_document: OptionalVersionedTextDocumentIdentifier {
+                            uri: response_uri,
+                            version: None,
+                        },
+                        edits: edits.into_iter().map(OneOf::Left).collect(),
+                    }])),
+                    ..WorkspaceEdit::default()
+                })?;
+                let summary = self.apply_locked(&applier, plan, &server_id).await?;
+                (
+                    changed_the_tree(&summary),
+                    summary
+                        .files_changed
+                        .iter()
+                        .map(|change| display_path(&change.path))
+                        .collect(),
+                )
+            } else {
+                (false, Vec::new())
+            };
 
         Ok(FormatDocumentResult {
             edits: result_edits,
             applied,
+            files_written,
         })
     }
 
@@ -1411,6 +1420,90 @@ mod tests {
         );
     }
 
+    /// A format that writes reports the path the applier resolved, not the
+    /// spelling the caller passed.
+    ///
+    /// The tool accepts a path with `.` components, a symlink, or a relative
+    /// path. A consumer that compares what was written against canonicalized
+    /// workspace roots -- the hook sweep's filter does exactly that -- drops
+    /// every one of those silently, so the file the agent just rewrote is
+    /// never rechecked.
+    #[tokio::test]
+    #[allow(clippy::expect_used)]
+    async fn test_format_with_apply_reports_the_resolved_path_it_wrote() {
+        use std::sync::Arc;
+
+        use tempfile::TempDir;
+        use tokio::io::BufReader;
+        use tokio::time::{Duration, timeout};
+
+        use crate::bridge::apply::Applier;
+        use crate::config::{ApplyConfig, ServerId};
+
+        let dir = TempDir::new().expect("temp dir");
+        let root = dunce::canonicalize(dir.path()).expect("canonicalize");
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            document_formatting_provider: Some(lsp_types::OneOf::Left(true)),
+            ..Default::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
+        let translator = translator.with_applier(Arc::new(Applier::new(
+            vec![root.clone()],
+            ApplyConfig {
+                format_document: true,
+                ..ApplyConfig::default()
+            },
+        )));
+
+        let path = root.join("main.rs");
+        fs::write(&path, "fn main() {}").expect("write fixture");
+        // The same file, spelled the way a caller may well spell it.
+        let indirect = root.join(".").join("main.rs").display().to_string();
+
+        let translator = Arc::new(translator);
+        let handle = {
+            let translator = Arc::clone(&translator);
+            tokio::spawn(async move {
+                translator
+                    .handle_format_document(indirect, 4, true, true)
+                    .await
+            })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let format_request = read_framed_message(&mut wire).await;
+        assert_eq!(format_request["method"], "textDocument/formatting");
+        write_response(
+            &mut server.read_half_stdin,
+            &format_request["id"],
+            serde_json::json!([{
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 12}
+                },
+                "newText": "fn main() {\n}\n"
+            }]),
+        )
+        .await;
+
+        let result = timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handler call should not hang")
+            .expect("task should not panic")
+            .expect("apply is permitted");
+
+        assert!(result.applied);
+        assert_eq!(
+            result.files_written,
+            vec![path.display().to_string()],
+            "a consumer matching this against canonicalized workspace roots drops \
+             anything else"
+        );
+    }
+
     /// A server that returns no edits (an already-well-formatted file)
     /// must not report `applied: true` even when config permits the write:
     /// `applied` means bytes were written, not that the pipeline ran.
@@ -1836,7 +1929,7 @@ mod tests {
             result.applied,
             "the inbound edit wrote bytes, so the action applied"
         );
-        let written = path.canonicalize().expect("the fixture file exists");
+        let written = dunce::canonicalize(&path).expect("the fixture file exists");
         assert_eq!(result.files_written, vec![written.display().to_string()]);
         assert_eq!(result.executed_command.as_deref(), Some("test.extract"));
         assert_eq!(
@@ -1922,7 +2015,7 @@ mod tests {
         let written: Vec<String> = [&first, &second]
             .iter()
             .map(|path| {
-                path.canonicalize()
+                dunce::canonicalize(path)
                     .expect("the fixture file exists")
                     .display()
                     .to_string()
@@ -2024,9 +2117,10 @@ mod tests {
 
     /// An apply whose caller stopped awaiting it -- Esc in the MCP client, a
     /// `notifications/cancelled`, a disconnect -- completes its write on a
-    /// blocking thread but never reaches the close. The paths it queued must
-    /// be acted on by the next call, and before that call reads anything, or
-    /// the whole point of closing the document is lost to one keystroke.
+    /// blocking thread but never reaches the resync. The paths it queued
+    /// must be acted on by the next call, and before that call reads
+    /// anything, or the whole point of resynchronizing the document is lost
+    /// to one keystroke.
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn test_a_queued_invalidation_is_drained_before_the_next_call_opens_a_document() {
@@ -2101,15 +2195,21 @@ mod tests {
             })
         };
 
-        let closed = read_framed_message(&mut wire).await;
+        let changed = read_framed_message(&mut wire).await;
         assert_eq!(
-            closed["method"], "textDocument/didClose",
-            "the queued path must be closed before the next call opens anything"
+            changed["method"], "textDocument/didChange",
+            "the queued path must be resynchronized before the next call opens anything"
         );
-        assert_eq!(closed["params"]["textDocument"]["uri"], stale_uri.as_str());
+        assert_eq!(changed["params"]["textDocument"]["uri"], stale_uri.as_str());
+
+        let saved = read_framed_message(&mut wire).await;
+        assert_eq!(
+            saved["method"], "textDocument/didSave",
+            "the change alone does not start a build; the save does"
+        );
         assert!(
-            !translator.is_document_open(&stale_canonical),
-            "the queued path is no longer tracked"
+            translator.is_document_open(&stale_canonical),
+            "the queued path stays tracked, now at its resynchronized content"
         );
 
         assert_eq!(
@@ -2158,7 +2258,7 @@ mod tests {
         let second = dir.path().join("second.rs");
         let mut wire = BufReader::new(&mut server.write_stdout);
 
-        // Both are open in the server, which is what makes closing them
+        // Both are open in the server, which is what makes resyncing them
         // observable on the wire.
         let mut canonical = Vec::new();
         for path in [&first, &second] {
@@ -2199,14 +2299,15 @@ mod tests {
         translator.pending_invalidations.extend(&canonical);
         let drain = {
             let translator = Arc::clone(&translator);
-            tokio::spawn(async move { translator.forget_changed_documents().await })
+            tokio::spawn(async move { translator.resync_changed_documents().await })
         };
 
-        // The first path is dealt with; the drain is now parked on the
-        // second path's lock.
-        let closed = read_framed_message(&mut wire).await;
-        assert_eq!(closed["method"], "textDocument/didClose");
-        assert!(!translator.is_document_open(&canonical[0]));
+        // The first path is dealt with -- its content on disk never changed,
+        // so a save is still owed but no change is -- and the drain is now
+        // parked on the second path's lock.
+        let saved = read_framed_message(&mut wire).await;
+        assert_eq!(saved["method"], "textDocument/didSave");
+        assert!(translator.is_document_open(&canonical[0]));
 
         drain.abort();
         assert!(
@@ -2229,10 +2330,11 @@ mod tests {
     /// An apply writes files the call never queried -- a rename anchored in
     /// one file rewrites every file referencing the symbol. Those files stay
     /// open in the routed server at their pre-apply content unless mcpls
-    /// closes them, and the next edit against that content corrupts them.
+    /// resynchronizes them, and the next edit against that content corrupts
+    /// them.
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    async fn test_apply_closes_a_written_document_the_call_never_queried() {
+    async fn test_apply_resyncs_a_written_document_the_call_never_queried() {
         use std::sync::Arc;
 
         use tokio::io::BufReader;
@@ -2328,12 +2430,18 @@ mod tests {
         )
         .await;
 
-        let closed = read_framed_message(&mut wire).await;
+        let changed = read_framed_message(&mut wire).await;
         assert_eq!(
-            closed["method"], "textDocument/didClose",
+            changed["method"], "textDocument/didChange",
             "the server must be told the file it still holds open was rewritten"
         );
-        assert_eq!(closed["params"]["textDocument"]["uri"], other_uri.as_str());
+        assert_eq!(changed["params"]["textDocument"]["uri"], other_uri.as_str());
+
+        let saved = read_framed_message(&mut wire).await;
+        assert_eq!(
+            saved["method"], "textDocument/didSave",
+            "the change alone does not start a build; the save does"
+        );
 
         let result = timeout(Duration::from_secs(5), handle)
             .await
@@ -2346,8 +2454,8 @@ mod tests {
             "fn renamed() {}\n"
         );
         assert!(
-            !translator.is_document_open(&other_canonical),
-            "a written document must not stay tracked at its pre-apply content"
+            translator.is_document_open(&other_canonical),
+            "a written document stays tracked, now at its resynchronized content"
         );
     }
 
@@ -2412,9 +2520,11 @@ mod tests {
             .expect("the handler must not hang")
             .expect("the handler task must not panic")
             .expect_err("the command failed");
-        let written = path.canonicalize().expect("the fixture file exists");
+        let written = dunce::canonicalize(&path).expect("the fixture file exists");
         assert!(
-            error.to_string().contains(&written.display().to_string()),
+            error
+                .to_string()
+                .contains(&format!("{:?}", written.display().to_string())),
             "the error must name the file the failed command already wrote: {error}"
         );
         assert_eq!(
