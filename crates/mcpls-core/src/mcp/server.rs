@@ -736,6 +736,7 @@ impl McplsServer {
             apply,
         }): Parameters<RenameParams>,
     ) -> Result<String, McpError> {
+        let epoch_before = self.context.settle.progress_epoch();
         let result = match self
             .context
             .translator
@@ -746,7 +747,7 @@ impl McplsServer {
             Err(err) => return Err(McpError::internal_error(err.to_string(), None)),
         };
         self.forward_apply_targets(&result.files_written).await;
-        let footer = self.footer_if_written(result.applied).await;
+        let footer = self.footer_if_written(result.applied, epoch_before).await;
         to_tool_result(Ok(WithDiagnostics {
             result,
             new_diagnostics: footer,
@@ -818,6 +819,7 @@ impl McplsServer {
             apply,
         }): Parameters<FormatDocumentParams>,
     ) -> Result<String, McpError> {
+        let epoch_before = self.context.settle.progress_epoch();
         let result = match self
             .context
             .translator
@@ -828,7 +830,7 @@ impl McplsServer {
             Err(err) => return Err(McpError::internal_error(err.to_string(), None)),
         };
         self.forward_apply_targets(&result.files_written).await;
-        let footer = self.footer_if_written(result.applied).await;
+        let footer = self.footer_if_written(result.applied, epoch_before).await;
         to_tool_result(Ok(WithDiagnostics {
             result,
             new_diagnostics: footer,
@@ -939,6 +941,7 @@ impl McplsServer {
             action_title,
         }): Parameters<ApplyCodeActionParams>,
     ) -> Result<String, McpError> {
+        let epoch_before = self.context.settle.progress_epoch();
         let result = match self
             .context
             .translator
@@ -958,7 +961,7 @@ impl McplsServer {
             Err(err) => return Err(McpError::internal_error(err.to_string(), None)),
         };
         self.forward_apply_targets(&result.files_written).await;
-        let footer = self.footer_if_written(result.applied).await;
+        let footer = self.footer_if_written(result.applied, epoch_before).await;
         to_tool_result(Ok(WithDiagnostics {
             result,
             new_diagnostics: footer,
@@ -1295,11 +1298,15 @@ impl McplsServer {
     ///
     /// One method rather than an `if` repeated at three call sites, so a
     /// fourth write tool cannot be added with the guard forgotten.
-    pub(crate) async fn footer_if_written(&self, applied: bool) -> Option<NewDiagnosticsResult> {
+    pub(crate) async fn footer_if_written(
+        &self,
+        applied: bool,
+        epoch_before: u64,
+    ) -> Option<NewDiagnosticsResult> {
         if !applied {
             return None;
         }
-        self.footer_for_write().await
+        self.footer_for_write(epoch_before).await
     }
 
     /// The diagnostics a write tool's own edit produced, or `None`.
@@ -1313,7 +1320,7 @@ impl McplsServer {
     /// grace included — by `footer_wait_ms`; the real worst case for one
     /// call is that value plus at most one 50 ms sampling tick, never the
     /// grace and the cap stacked on top of each other.
-    pub(crate) async fn footer_for_write(&self) -> Option<NewDiagnosticsResult> {
+    pub(crate) async fn footer_for_write(&self, epoch_before: u64) -> Option<NewDiagnosticsResult> {
         // Ahead of the config check, so enabling the footer in a passive
         // instance's config still produces nothing: this footer would
         // consume from this process's own record while the next flush reads
@@ -1329,7 +1336,6 @@ impl McplsServer {
             return None;
         }
         let timing = FooterTiming::from_config(&self.context.diagnostics);
-        let epoch_before = self.context.settle.progress_epoch();
         wait_for_footer_quiet_at(
             &self.context.settle,
             epoch_before,
@@ -1997,7 +2003,8 @@ mod tests {
             ..DiagnosticsConfig::default()
         });
 
-        let footer = parts.server.footer_for_write().await;
+        let epoch_before = parts.server.context.settle.progress_epoch();
+        let footer = parts.server.footer_for_write(epoch_before).await;
 
         assert!(
             footer.is_none(),
@@ -2013,7 +2020,12 @@ mod tests {
     async fn test_a_footer_consumes_what_it_reports() {
         let parts = test_server_with_footer_and_one_error().await;
 
-        let footer = parts.server.footer_for_write().await.expect("a report");
+        let epoch_before = parts.server.context.settle.progress_epoch();
+        let footer = parts
+            .server
+            .footer_for_write(epoch_before)
+            .await
+            .expect("a report");
         assert_eq!(footer.changed.len(), 1);
 
         let raw = parts
@@ -2039,7 +2051,12 @@ mod tests {
     async fn test_a_footer_says_it_is_best_effort() {
         let parts = test_server_with_footer_and_one_error().await;
 
-        let footer = parts.server.footer_for_write().await.expect("a report");
+        let epoch_before = parts.server.context.settle.progress_epoch();
+        let footer = parts
+            .server
+            .footer_for_write(epoch_before)
+            .await
+            .expect("a report");
 
         assert_eq!(
             footer.note.as_deref(),
@@ -2066,7 +2083,12 @@ mod tests {
             vec![diagnostic_at("also broken")],
         );
 
-        let footer = parts.server.footer_for_write().await.expect("a report");
+        let epoch_before = parts.server.context.settle.progress_epoch();
+        let footer = parts
+            .server
+            .footer_for_write(epoch_before)
+            .await
+            .expect("a report");
 
         assert_eq!(
             footer.note.as_deref(),
@@ -2086,13 +2108,22 @@ mod tests {
     #[tokio::test]
     async fn test_no_footer_when_the_tool_wrote_nothing() {
         let parts = test_server_with_footer_and_one_error().await;
+        let epoch_before = parts.server.context.settle.progress_epoch();
 
         assert!(
-            parts.server.footer_if_written(false).await.is_none(),
+            parts
+                .server
+                .footer_if_written(false, epoch_before)
+                .await
+                .is_none(),
             "a rename with apply false changed nothing and has nothing to report"
         );
         assert!(
-            parts.server.footer_if_written(true).await.is_some(),
+            parts
+                .server
+                .footer_if_written(true, epoch_before)
+                .await
+                .is_some(),
             "and a call that did write must still get one, or the guard is just \
              a footer that never fires"
         );
@@ -2693,8 +2724,8 @@ mod tests {
         let rust = ServerId::from("rust");
         let start = Instant::now();
         settle.begin(&rust, &json!("rustAnalyzer/Indexing"));
-        // Captured after the begin, the way `footer_for_write` captures it
-        // after the resync has already returned.
+        // Captured after the begin to model work already in flight before the
+        // write.
         let epoch_before = settle.progress_epoch();
 
         let ended = wait_for_footer_quiet_at(
@@ -2735,9 +2766,10 @@ mod tests {
             ..DiagnosticsConfig::default()
         });
         parts.delivery.lock().await.set_baseline(HashMap::new());
+        let epoch_before = parts.server.context.settle.progress_epoch();
         let server = parts.server;
 
-        let handle = tokio::spawn(async move { server.footer_for_write().await });
+        let handle = tokio::spawn(async move { server.footer_for_write(epoch_before).await });
         for _ in 0..10 {
             tokio::task::yield_now().await;
         }
@@ -2775,7 +2807,8 @@ mod tests {
         parts.delivery.lock().await.set_baseline(HashMap::new());
 
         let start = Instant::now();
-        let footer = parts.server.footer_for_write().await;
+        let epoch_before = parts.server.context.settle.progress_epoch();
+        let footer = parts.server.footer_for_write(epoch_before).await;
 
         assert!(footer.is_none(), "footer defaults to off");
         assert!(

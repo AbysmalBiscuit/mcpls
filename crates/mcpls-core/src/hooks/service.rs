@@ -1547,7 +1547,7 @@ mod tests {
         std::fs::write(&written, "fn a() {}").expect("write");
 
         assert!(
-            passive.server.footer_if_written(true).await.is_none(),
+            passive.server.footer_if_written(true, 0).await.is_none(),
             "the footer would consume from the passive's own record while the \
              next flush reads the owner's, so the same diagnostics arrive twice \
              from one door and never from the other"

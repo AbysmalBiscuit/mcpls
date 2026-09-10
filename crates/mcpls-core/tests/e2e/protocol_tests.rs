@@ -287,6 +287,39 @@ fn write_non_diagnostics_config(
     Ok(())
 }
 
+fn write_progress_during_resync_config(
+    config_path: &Path,
+    script: &Path,
+    progress_begin_marker: &Path,
+    resync_hold_marker: &Path,
+    release_marker: &Path,
+    grace_elapsed_marker: &Path,
+    diagnostic_marker: &Path,
+) -> Result<()> {
+    let workspace = config_path
+        .parent()
+        .context("fixture config path must have a parent")?;
+    let workspace = toml::Value::String(workspace.to_string_lossy().into_owned()).to_string();
+    let script = toml::Value::String(script.to_string_lossy().into_owned()).to_string();
+    let progress_begin_marker =
+        toml::Value::String(progress_begin_marker.to_string_lossy().into_owned()).to_string();
+    let resync_hold_marker =
+        toml::Value::String(resync_hold_marker.to_string_lossy().into_owned()).to_string();
+    let release_marker =
+        toml::Value::String(release_marker.to_string_lossy().into_owned()).to_string();
+    let grace_elapsed_marker =
+        toml::Value::String(grace_elapsed_marker.to_string_lossy().into_owned()).to_string();
+    let diagnostic_marker =
+        toml::Value::String(diagnostic_marker.to_string_lossy().into_owned()).to_string();
+    fs::write(
+        config_path,
+        format!(
+            "[workspace]\nroots = [{workspace}]\n[apply]\ncode_actions = true\n[diagnostics]\nsettle_quiet_ms = 25\nsettle_deadline_ms = 5000\nfooter = true\nfooter_grace_ms = 100\nfooter_quiet_ms = 100\nfooter_wait_ms = 3000\n[diagnostics.hooks]\nenabled = false\n\n[[lsp_servers]]\nlanguage_id = \"rust\"\ncommand = \"python3\"\nargs = [{script}, {progress_begin_marker}, {resync_hold_marker}, {release_marker}, {grace_elapsed_marker}, {diagnostic_marker}, \"0.4\"]\nfile_patterns = [\"**/*.rs\"]\ndiagnostics_severity = \"warning\"\n\n[lsp_servers.heuristics]\nproject_markers = [\"main.rs\"]\n"
+        ),
+    )?;
+    Ok(())
+}
+
 fn wait_for_baseline_report(client: &mut McpClient) -> Result<String> {
     let deadline = Instant::now() + Duration::from_secs(6);
     loop {
@@ -701,6 +734,94 @@ fn i1_t5_successful_non_diagnostics_progress_does_not_hold_baseline() -> Result<
     assert!(
         hover.to_string().contains("mixed-startup-fixture"),
         "the successful non-diagnostics server must remain routable for hover, got {hover}"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "Requires mcpls binary built"]
+fn i1_t9_progress_during_resync_reaches_footer() -> Result<()> {
+    let workspace = TempDir::new()?;
+    let progress_begin_marker = workspace.path().join("progress-begin.marker");
+    let resync_hold_marker = workspace.path().join("resync-hold.marker");
+    let release_marker = workspace.path().join("release-resync.marker");
+    let grace_elapsed_marker = workspace.path().join("footer-grace-elapsed.marker");
+    let diagnostic_marker = workspace.path().join("diagnostic-published.marker");
+    let script = diagnostics_fixture::write_progress_during_resync_server(workspace.path())?;
+    let config_path = workspace.path().join("mcpls.toml");
+    write_progress_during_resync_config(
+        &config_path,
+        &script,
+        &progress_begin_marker,
+        &resync_hold_marker,
+        &release_marker,
+        &grace_elapsed_marker,
+        &diagnostic_marker,
+    )?;
+    let file_path = workspace.path().join("main.rs");
+    let other_file_path = workspace.path().join("other.rs");
+    fs::write(&file_path, "fn old() {}\n")?;
+    fs::write(&other_file_path, "fn old() {}\n")?;
+
+    let config_arg = config_path
+        .to_str()
+        .context("fixture config path must be valid UTF-8")?;
+    let mut client = McpClient::spawn_with_args(&["--config", config_arg])?;
+    client.initialize()?;
+    wait_for_baseline_report(&mut client)?;
+
+    let arguments = json!({
+        "file_path": file_path,
+        "start_line": 1,
+        "start_character": 1,
+        "end_line": 1,
+        "end_character": 6,
+        "action_index": 0,
+    });
+    let call = thread::spawn(move || client.call_tool("apply_code_action", &arguments));
+
+    wait_for_marker(&progress_begin_marker)?;
+    wait_for_marker(&resync_hold_marker)?;
+    assert!(
+        !call.is_finished(),
+        "progress begin must be observed before the translator completes the write"
+    );
+
+    fs::write(&release_marker, "release")?;
+    wait_for_marker(&grace_elapsed_marker)?;
+    assert!(
+        !call.is_finished(),
+        "the footer must not return at grace while the write's progress is still open"
+    );
+    wait_for_marker(&diagnostic_marker)?;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !call.is_finished() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        call.is_finished(),
+        "the footer did not finish after progress ended"
+    );
+    let response = call
+        .join()
+        .map_err(|_| anyhow::anyhow!("MCP write thread panicked"))??;
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .with_context(|| format!("expected tool text content, got {response}"))?;
+    let payload: serde_json::Value = serde_json::from_str(text)?;
+    let changed = payload["new_diagnostics"]["changed"]
+        .as_array()
+        .with_context(|| format!("expected footer diagnostics in {payload}"))?;
+    assert!(
+        changed.iter().any(|file| {
+            file["diagnostics"].as_array().is_some_and(|diagnostics| {
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic["message"] == "progress-during-resync")
+            })
+        }),
+        "the applied write response must contain the diagnostic published after progress ended: {payload}"
     );
     Ok(())
 }
