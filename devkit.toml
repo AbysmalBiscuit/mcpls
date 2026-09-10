@@ -35,6 +35,8 @@ Supply:
   --pr-body "<markdown>"              the body; the template appends the closing line, so leave the issue reference out
   --arg issue_magic_word=Closes       closing keyword: Closes, Fixes, or Resolves
   --arg also_closes="12 13"           further issue numbers to close, space- or comma-separated
+  --arg agent_model="Opus 5"          model that wrote the change; omit on a human-written PR
+  --arg agent_harness="Claude Code"   coding agent harness; with the model it renders the trailer
   --base <branch>                     only when the base is not `defaults.pr_base`
 The issue number comes from the worktree's .devkit/issue.toml, so a worktree made by `issue setup --slug` (no issue id) gets no closing line."""
 
@@ -125,7 +127,11 @@ pr_body = '''## TL;DR (human written)
 {{ issue_magic_word }} #{{ extra | trim("#") }}
 {%- endfor %}
 {% endif %}
-{{ input }}'''
+{{ input }}
+{%- if agent_model or agent_harness %}
+
+🤖 Generated with {{ agent_model }}{% if agent_model and agent_harness %} via {% endif %}{{ agent_harness }}
+{%- endif %}'''
 
 # Declared so the template above renders (an undefined name is a hard error)
 # and so `issue pr create --arg` accepts them: --arg is checked against this
@@ -133,3 +139,5 @@ pr_body = '''## TL;DR (human written)
 [templates.variables]
 issue_magic_word = "Closes"
 also_closes = ""
+agent_model = ""
+agent_harness = ""
