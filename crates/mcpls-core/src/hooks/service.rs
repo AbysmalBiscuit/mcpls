@@ -434,7 +434,7 @@ mod tests {
         /// on its tracker and background sweeper.
         async fn owner_with_document_limit(max_documents: usize) -> Self {
             let (dir, identity) = temp_identity();
-            let translator_harness = TranslatorHarness::with_one_server_and_limits(
+            let translator_harness = TranslatorHarness::with_diagnostics_server_and_limits(
                 "rust",
                 ResourceLimits {
                     max_documents,

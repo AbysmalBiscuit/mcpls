@@ -344,7 +344,7 @@ struct RecordingServer {
 impl RecordingServer {
     /// Start the background thread/runtime and its fake server, returning
     /// the client half for the harness to register.
-    fn spawn() -> (LspClient, Self) {
+    fn spawn(respond_to_diagnostics: bool) -> (LspClient, Self) {
         let log = Arc::new(StdMutex::new(Vec::new()));
         let sentinel_waiter: SentinelWaiter = Arc::new(StdMutex::new(None));
         let (client_tx, client_rx) = std::sync::mpsc::channel::<LspClient>();
@@ -384,7 +384,7 @@ impl RecordingServer {
                         }
                         lock_std(&log_for_thread)
                             .push((method.to_string(), message["params"].clone()));
-                        if method == "textDocument/diagnostic" {
+                        if respond_to_diagnostics && method == "textDocument/diagnostic" {
                             write_response(
                                 &mut *read_half_stdin,
                                 &message["id"],
@@ -527,6 +527,22 @@ impl TranslatorHarness {
         language_id: &str,
         limits: ResourceLimits,
     ) -> impl Future<Output = Self> {
+        Self::with_server_options(language_id, limits, false)
+    }
+
+    /// A harness with one server that answers pull diagnostics with an empty full report.
+    pub fn with_diagnostics_server_and_limits(
+        language_id: &str,
+        limits: ResourceLimits,
+    ) -> impl Future<Output = Self> {
+        Self::with_server_options(language_id, limits, true)
+    }
+
+    fn with_server_options(
+        language_id: &str,
+        limits: ResourceLimits,
+        respond_to_diagnostics: bool,
+    ) -> impl Future<Output = Self> {
         let dir = TempDir::new().expect("temp dir");
         let server_id = ServerId::from(language_id);
         let watch_registry = Arc::new(WatchRegistry::new());
@@ -544,7 +560,7 @@ impl TranslatorHarness {
             )]));
         translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
 
-        let (client, server) = RecordingServer::spawn();
+        let (client, server) = RecordingServer::spawn(respond_to_diagnostics);
         translator.register_client(server_id, client);
 
         std::future::ready(Self {
