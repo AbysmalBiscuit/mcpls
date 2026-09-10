@@ -103,6 +103,11 @@ description = "Build workspace API documentation"
 run = ["cargo", "doc", "--workspace", "--no-deps", "--all-features", "--locked"]
 guard = true
 
+[tasks.hooks]
+description = "Install the commit-msg hook into this checkout"
+run = ["prek", "install", "--hook-type", "commit-msg"]
+guard = true
+
 [tasks.clean]
 description = "Remove Cargo build artifacts"
 run = ["cargo", "clean"]

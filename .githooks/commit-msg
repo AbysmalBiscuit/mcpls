@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# Validates a commit message against the repository's Conventional Commits rules.
+# Invoked by prek as a commit-msg hook; the message file is the only argument.
+set -euo pipefail
+
+readonly TYPES='feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert'
+readonly SUBJECT_SOFT=50
+readonly SUBJECT_HARD=72
+readonly BODY_WIDTH=72
+readonly AGENT_DOMAINS='anthropic\.com|openai\.com'
+readonly AGENT_KEY='Co-Authored-By'
+
+# Past-tense and gerund forms of the verbs that show up most in commit subjects.
+# A suffix rule would reject "embed", "spread" and "seed".
+readonly NON_IMPERATIVE='added|adds|adding|fixed|fixes|fixing|updated|updates|updating|removed|removes|removing|deleted|deletes|deleting|changed|changes|changing|refactored|refactors|refactoring|implemented|implements|implementing|moved|moves|moving|renamed|renames|renaming|bumped|bumps|bumping|introduced|introduces|introducing|created|creates|creating|improved|improves|improving|allowed|allows|allowing|made|makes|making'
+
+errors=()
+warnings=()
+
+msg_file=${1:?usage: commit-msg <message-file>}
+
+lines=()
+while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line == *'>8'* && $line == '#'* ]] && break
+    [[ $line == '#'* ]] && continue
+    lines+=("$line")
+done < "$msg_file"
+
+while ((${#lines[@]} > 0)) && [[ -z ${lines[-1]// } ]]; do
+    unset 'lines[-1]'
+done
+
+# An empty message aborts the commit in git itself.
+((${#lines[@]} == 0)) && exit 0
+
+subject=${lines[0]}
+
+case $subject in
+    Merge\ * | Revert\ * | fixup!* | squash!* | amend!*) exit 0 ;;
+esac
+
+if [[ ! $subject =~ ^($TYPES)(\([a-z0-9._/-]+\))?!?:\ .+ ]]; then
+    errors+=("subject is not a conventional commit: expected 'type(scope): description' with type one of ${TYPES//|/, }")
+else
+    description=${subject#*: }
+
+    if ((${#subject} > SUBJECT_HARD)); then
+        errors+=("subject is ${#subject} chars, over the $SUBJECT_HARD-char limit")
+    elif ((${#subject} > SUBJECT_SOFT)); then
+        warnings+=("subject is ${#subject} chars, over the $SUBJECT_SOFT-char target")
+    fi
+
+    [[ $subject == *. ]] && errors+=("subject ends with a period")
+
+    [[ $description =~ ^[A-Z] ]] &&
+        errors+=("description starts with a capital: write '${description,}'")
+
+    first_word=${description%% *}
+    if [[ ${first_word,,} =~ ^($NON_IMPERATIVE)$ ]]; then
+        errors+=("description is not imperative: '$first_word' should read as 'if applied, this commit will <subject>'")
+    fi
+fi
+
+if ((${#lines[@]} > 1)) && [[ -n ${lines[1]// } ]]; then
+    errors+=("line 2 must be blank to separate the subject from the body")
+fi
+
+for i in "${!lines[@]}"; do
+    ((i < 2)) && continue
+    line=${lines[i]}
+    ((${#line} <= BODY_WIDTH)) && continue
+    # Long tokens cannot be wrapped: URLs, trailers, tables, indented code.
+    [[ $line == ' '* || $line != *' '* ]] && continue
+    [[ $line =~ ^[A-Za-z-]+:\  ]] && continue
+    warnings+=("line $((i + 1)) is ${#line} chars, over the $BODY_WIDTH-char body wrap")
+done
+
+# Git only parses trailers in the block at the end, so a Co-authored-by placed
+# anywhere else is silently dropped.
+trailer_start=${#lines[@]}
+while ((trailer_start > 0)) && [[ ${lines[trailer_start - 1]} =~ ^[A-Za-z][A-Za-z-]*:\  ]]; do
+    ((trailer_start--))
+done
+
+seen_coauthors=()
+agent_coauthors=0
+for i in "${!lines[@]}"; do
+    line=${lines[i]}
+    [[ ${line,,} == co-authored-by:* ]] || continue
+
+    ((i >= trailer_start)) ||
+        errors+=("line $((i + 1)): Co-Authored-By must sit in the trailer block at the end of the message")
+
+    if [[ ! $line =~ ^([Cc]o-[Aa]uthored-[Bb]y):\ (.+)\ \<([^[:space:]@]+@[^[:space:]@]+)\>$ ]]; then
+        errors+=("line $((i + 1)): malformed trailer, expected 'Co-Authored-By: Name <email>'")
+        continue
+    fi
+    key=${BASH_REMATCH[1]}
+    name=${BASH_REMATCH[2]}
+    email=${BASH_REMATCH[3]}
+
+    for seen in ${seen_coauthors[@]+"${seen_coauthors[@]}"}; do
+        [[ $seen == "${email,,}" ]] && errors+=("line $((i + 1)): duplicate co-author <$email>")
+    done
+    seen_coauthors+=("${email,,}")
+
+    # Human co-authors keep whatever casing GitHub generated for them.
+    [[ $email =~ ($AGENT_DOMAINS)$ ]] || continue
+    ((++agent_coauthors))
+    [[ $key == "$AGENT_KEY" ]] ||
+        errors+=("line $((i + 1)): agent trailer reads '$key', write '$AGENT_KEY'")
+    # "Claude Opus 5" and "Codex GPT-5.6-Sol" survive a log rewrite; bare "Claude" does not.
+    [[ $name == *[[:space:]]* ]] ||
+        errors+=("line $((i + 1)): agent co-author '$name' omits the model name")
+done
+
+if ((agent_coauthors == 0)) && [[ -n ${CLAUDECODE:-}${CODEX_SANDBOX:-}${CODEX_SANDBOX_NETWORK_DISABLED:-} ]]; then
+    errors+=("commit written by an agent has no Co-authored-by trailer naming the model")
+fi
+
+for warning in "${warnings[@]}"; do
+    printf 'commit-msg: warning: %s\n' "$warning" >&2
+done
+
+((${#errors[@]} == 0)) && exit 0
+
+for error in "${errors[@]}"; do
+    printf 'commit-msg: %s\n' "$error" >&2
+done
+printf '\nmessage was:\n%s\n' "$subject" >&2
+exit 1
