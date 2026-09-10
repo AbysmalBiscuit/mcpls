@@ -15,7 +15,9 @@ use tokio::sync::watch;
 
 use crate::bridge::{SessionId, lock_std};
 use crate::hooks::identity::SocketIdentity;
-use crate::hooks::listener::{HookListener, LockLoss, ServeExit};
+#[cfg(test)]
+use crate::hooks::listener::LockLoss;
+use crate::hooks::listener::{HookListener, ServeExit};
 use crate::hooks::protocol::{Request, Response};
 use crate::hooks::sweep::Sweeper;
 use crate::mcp::McplsServer;
@@ -158,17 +160,15 @@ impl HookRole {
         self.set(Role::Owner);
     }
 
-    /// Move this process back to `Passive`, called when a competitor has
-    /// taken the ownership lock away from a listener that was serving.
+    /// Move this process back to `Passive` when a serving listener can no
+    /// longer prove that it owns the lock.
     ///
     /// A competitor holds the lock for its whole life, so a process that
     /// kept reading `Owner` would run its footer, answer from its own
     /// record and forward nothing, while every hook for the same session
     /// reached the competitor's separate record: two processes behaving as
     /// owners for one session, which is what the lock exists to make
-    /// impossible. Only a replaced lock demotes; a lock file that was
-    /// merely removed leaves no competitor and is won back on the next
-    /// attempt.
+    /// impossible. A successful reacquisition promotes the process again.
     pub fn demote_to_passive(&self, identity: SocketIdentity) {
         self.set(Role::Passive { identity });
     }
@@ -270,23 +270,47 @@ pub fn build_handler(
     }
 }
 
-/// Serve the socket for as long as this process owns it, re-entering the
-/// ownership race if the lock file stops proving ownership.
-///
-/// [`ServeExit::LockLost`] means the lock file is no longer the file this
-/// listener holds a lock on: a competitor took it, or a temporary-file
-/// cleaner simply removed it. Neither is a reason to end hook support for
-/// the project for the rest of this process's life, so the listener that
-/// stood down goes back to competing on the same five second interval a
-/// passive instance uses. [`ServeExit::TransportUnrecoverable`] is the one
-/// exit that retrying cannot clear, and it stops here.
-///
-/// A [`LockLoss::Replaced`] also moves the role back to `Passive` for the
-/// duration of that wait, because a competitor holds the lock for its own
-/// whole life: a process still reading `Owner` would answer from its own
-/// record while every hook for the same session reached the competitor's.
-/// [`LockLoss::Missing`] leaves the role alone, because nothing has taken
-/// this listener's place and the next attempt wins the lock back.
+#[cfg(test)]
+struct LockLossPause {
+    identity: SocketIdentity,
+    loss: LockLoss,
+    arrived: Arc<tokio::sync::Notify>,
+    resume: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+static LOCK_LOSS_PAUSE: std::sync::Mutex<Option<LockLossPause>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+struct LockLossPauseGuard;
+
+#[cfg(test)]
+impl Drop for LockLossPauseGuard {
+    fn drop(&mut self) {
+        install_lock_loss_pause(None);
+    }
+}
+
+#[cfg(test)]
+fn install_lock_loss_pause(pause: Option<LockLossPause>) {
+    *lock_std(&LOCK_LOSS_PAUSE) = pause;
+}
+
+#[cfg(test)]
+async fn pause_after_lock_loss(identity: &SocketIdentity, loss: LockLoss) {
+    let rendezvous = lock_std(&LOCK_LOSS_PAUSE)
+        .as_ref()
+        .filter(|pause| pause.identity == *identity && pause.loss == loss)
+        .map(|pause| (Arc::clone(&pause.arrived), Arc::clone(&pause.resume)));
+    if let Some((arrived, resume)) = rendezvous {
+        arrived.notify_one();
+        resume.notified().await;
+    }
+}
+
+/// Serve while owning the socket, retrying after either kind of lock loss.
+/// Both lock-loss variants demote before retry; cancellation and
+/// unrecoverable transport errors end the task.
 pub(crate) async fn hook_owner_task(
     mut listener: HookListener,
     location: HookLocation,
@@ -304,12 +328,20 @@ pub(crate) async fn hook_owner_task(
             Arc::clone(&role),
             cancel.clone(),
         );
-        match listener.serve(handler, op_deadline, cancel.clone()).await {
+        let exit = listener.serve(handler, op_deadline, cancel.clone()).await;
+        match exit {
             ServeExit::Cancelled | ServeExit::TransportUnrecoverable => return,
-            ServeExit::LockLost(LockLoss::Replaced) => {
+            ServeExit::LockLost(loss) => {
                 role.demote_to_passive(location.identity.clone());
+                #[cfg(test)]
+                {
+                    pause_after_lock_loss(&location.identity, loss).await;
+                }
+                #[cfg(not(test))]
+                {
+                    let _ = loss;
+                }
             }
-            ServeExit::LockLost(LockLoss::Missing) => {}
         }
         let Some(reacquired) = acquire_when_free(&location.identity, &mut cancel).await else {
             return;
@@ -405,12 +437,13 @@ mod tests {
         dir: TempDir,
         root: PathBuf,
         identity: SocketIdentity,
+        role: Arc<HookRole>,
         server: Arc<McplsServer>,
         sweeper: Arc<Sweeper>,
         notification_cache: Arc<Mutex<NotificationCache>>,
         delivery: Arc<Mutex<DiagnosticsDelivery>>,
         translator_harness: Option<TranslatorHarness>,
-        _cancel: tokio::sync::watch::Sender<bool>,
+        cancel: tokio::sync::watch::Sender<bool>,
     }
 
     impl HookHarness {
@@ -425,9 +458,23 @@ mod tests {
         /// An owner whose language servers have not settled yet, so its
         /// delivery core has no baseline to seed a session's record from.
         async fn owner_without_baseline() -> Self {
+            Self::owner_without_baseline_with(DiagnosticsConfig::default()).await
+        }
+
+        /// An owner with the supplied diagnostics timing and delivery config,
+        /// before its baseline is adopted.
+        async fn owner_without_baseline_with(diagnostics: DiagnosticsConfig) -> Self {
             let (dir, identity) = temp_identity();
             let translator = Arc::new(Translator::new());
-            Self::start_owner(dir, identity, translator, None, usize::MAX).await
+            Self::start_owner(
+                dir,
+                identity,
+                translator,
+                None,
+                usize::MAX,
+                diagnostics,
+            )
+            .await
         }
 
         /// An owner with a fake LSP server and the same document limit
@@ -449,6 +496,7 @@ mod tests {
                 translator,
                 Some(translator_harness),
                 max_documents,
+                DiagnosticsConfig::default(),
             )
             .await;
             harness.delivery.lock().await.set_baseline(HashMap::new());
@@ -461,22 +509,21 @@ mod tests {
             translator: Arc<Translator>,
             translator_harness: Option<TranslatorHarness>,
             max_documents: usize,
+            diagnostics: DiagnosticsConfig,
         ) -> Self {
             let root = translator_harness.as_ref().map_or_else(
                 || dir.path().to_path_buf(),
                 |harness| harness.root().to_path_buf(),
             );
             let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
-            let delivery = Arc::new(Mutex::new(DiagnosticsDelivery::new(
-                DiagnosticsConfig::default(),
-            )));
+            let delivery = Arc::new(Mutex::new(DiagnosticsDelivery::new(diagnostics)));
             let role = Arc::new(HookRole::owner());
             let context = Arc::new(test_context(
                 &root,
                 Arc::clone(&translator),
                 Arc::clone(&notification_cache),
                 Arc::clone(&delivery),
-                DiagnosticsConfig::default(),
+                diagnostics,
                 Arc::clone(&role),
             ));
             let server = Arc::new(McplsServer::from_context(context));
@@ -492,17 +539,15 @@ mod tests {
                 .await
                 .expect("acquire")
                 .expect("the harness owns its own temporary socket");
-            tokio::spawn(listener.serve(
-                build_handler(
-                    Arc::clone(&server),
-                    Arc::clone(&sweeper),
-                    HookLocation {
-                        identity: identity.clone(),
-                        root: root.clone(),
-                    },
-                    role,
-                    cancel_rx.clone(),
-                ),
+            tokio::spawn(hook_owner_task(
+                listener,
+                HookLocation {
+                    identity: identity.clone(),
+                    root: root.clone(),
+                },
+                Arc::clone(&role),
+                Arc::clone(&server),
+                Arc::clone(&sweeper),
                 Duration::from_millis(1500),
                 cancel_rx,
             ));
@@ -511,24 +556,31 @@ mod tests {
                 dir,
                 root,
                 identity,
+                role,
                 server,
                 sweeper,
                 notification_cache,
                 delivery,
                 translator_harness,
-                _cancel: cancel_tx,
+                cancel: cancel_tx,
             }
         }
 
         /// The same, with one error already in the notification cache for
         /// `broken.rs`, so the first flush has something to report.
         async fn owner_with_one_error() -> Self {
-            let harness = Self::owner().await;
+            Self::owner_with_diagnostic(DiagnosticsConfig::default(), "broken").await
+        }
+
+        /// An owner with one named diagnostic and an adopted empty baseline.
+        async fn owner_with_diagnostic(diagnostics: DiagnosticsConfig, message: &str) -> Self {
+            let harness = Self::owner_without_baseline_with(diagnostics).await;
+            harness.delivery.lock().await.set_baseline(HashMap::new());
             harness.notification_cache.lock().await.store_diagnostics(
                 &ServerId::from("rust"),
                 &broken_uri(),
                 Some(1),
-                vec![error_diagnostic()],
+                vec![diagnostic(message)],
             );
             harness
         }
@@ -848,6 +900,36 @@ mod tests {
         )
     }
 
+    async fn server_with_diagnostic(
+        root: &std::path::Path,
+        role: Arc<HookRole>,
+        diagnostics: DiagnosticsConfig,
+        message: &str,
+    ) -> (Arc<McplsServer>, Arc<Sweeper>) {
+        let translator = Arc::new(Translator::new());
+        let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
+        notification_cache.lock().await.store_diagnostics(
+            &ServerId::from("rust"),
+            &broken_uri(),
+            Some(1),
+            vec![diagnostic(message)],
+        );
+        let delivery = Arc::new(Mutex::new(DiagnosticsDelivery::new(diagnostics)));
+        delivery.lock().await.set_baseline(HashMap::new());
+        let context = Arc::new(test_context(
+            root,
+            translator.clone(),
+            notification_cache,
+            delivery,
+            diagnostics,
+            role,
+        ));
+        (
+            Arc::new(McplsServer::from_context(context)),
+            Arc::new(test_sweeper(root, translator)),
+        )
+    }
+
     /// The URI the harness's one cached error belongs to.
     fn broken_uri() -> lsp_types::Uri {
         if cfg!(windows) {
@@ -861,6 +943,11 @@ mod tests {
 
     /// One error, at the top of whatever file it is stored against.
     fn error_diagnostic() -> lsp_types::Diagnostic {
+        diagnostic("broken")
+    }
+
+    /// One named error, at the top of whatever file it is stored against.
+    fn diagnostic(message: &str) -> lsp_types::Diagnostic {
         lsp_types::Diagnostic {
             range: lsp_types::Range {
                 start: lsp_types::Position {
@@ -873,7 +960,7 @@ mod tests {
                 },
             },
             severity: Some(lsp_types::DiagnosticSeverity::ERROR),
-            message: "broken".to_string(),
+            message: message.to_string(),
             ..lsp_types::Diagnostic::default()
         }
     }
@@ -1616,14 +1703,21 @@ mod tests {
             status_from_owner(&identity).await,
             Response::Status { owner: true, .. }
         ));
-        // Read before the lock goes, because reacquisition promotes and a
-        // role read afterwards therefore always says Owner however the
-        // arm behaved in between.
-        let transitions = role.subscribe_transitions();
+        let mut transitions = role.subscribe_transitions();
         let before = *transitions.borrow();
 
         std::fs::remove_file(&identity.lock).expect("stand in for a temp-file cleaner");
+        tokio::time::timeout(Duration::from_secs(3), transitions.changed())
+            .await
+            .expect("the owner must observe the missing lock")
+            .expect("the role outlives the owner task");
+        assert!(matches!(role.get(), Role::Passive { .. }));
+
         wait_for_lock_to_return(&identity).await;
+        tokio::time::timeout(Duration::from_secs(6), transitions.changed())
+            .await
+            .expect("the owner must promote after reacquiring the lock")
+            .expect("the role outlives the owner task");
 
         assert!(
             matches!(
@@ -1633,15 +1727,108 @@ mod tests {
             "standing down for good would end hook support for this project for \
              the rest of the process's life over a file anything may delete"
         );
-        assert_eq!(
-            *transitions.borrow(),
-            before,
-            "nothing took this listener's place, so it must not pass through \
-             Passive on its way back: while it did, its own writes would \
-             forward to the socket it is itself listening on and its footer \
-             would go silent"
-        );
+        assert_eq!(*transitions.borrow(), before + 2);
         assert_eq!(role.get(), Role::Owner);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn i1_t8_missing_lock_loser_forwards() {
+        let old_diagnostics = DiagnosticsConfig {
+            footer: true,
+            footer_grace_ms: 0,
+            footer_quiet_ms: 0,
+            footer_wait_ms: 0,
+            ..DiagnosticsConfig::default()
+        };
+        let old =
+            HookHarness::owner_with_diagnostic(old_diagnostics, "former-owner-diagnostic").await;
+        let old_role = Arc::clone(&old.role);
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        install_lock_loss_pause(Some(LockLossPause {
+            identity: old.identity.clone(),
+            loss: LockLoss::Missing,
+            arrived: Arc::clone(&arrived),
+            resume: Arc::clone(&resume),
+        }));
+        let _pause_guard = LockLossPauseGuard;
+
+        assert!(matches!(
+            status_from_owner(&old.identity).await,
+            Response::Status { owner: true, .. }
+        ));
+
+        let lock_loss = arrived.notified();
+        std::fs::remove_file(&old.identity.lock).expect("remove the old lock");
+        tokio::time::timeout(Duration::from_secs(3), lock_loss)
+            .await
+            .expect("the owner must reach the missing-lock acquisition pause");
+
+        let competitor_role = Arc::new(HookRole::owner());
+        let (competitor_server, competitor_sweeper) = server_with_diagnostic(
+            old.dir.path(),
+            Arc::clone(&competitor_role),
+            DiagnosticsConfig::default(),
+            "competitor-diagnostic",
+        )
+        .await;
+        let (competitor_cancel_tx, competitor_cancel_rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(Arc::clone(&competitor_sweeper).run(competitor_cancel_rx.clone()));
+        let competitor_listener = HookListener::acquire(&old.identity)
+            .await
+            .expect("acquire the replacement")
+            .expect("the competitor owns the replacement lock");
+        tokio::spawn(competitor_listener.serve(
+            build_handler(
+                Arc::clone(&competitor_server),
+                Arc::clone(&competitor_sweeper),
+                HookLocation {
+                    identity: old.identity.clone(),
+                    root: old.dir.path().to_path_buf(),
+                },
+                Arc::clone(&competitor_role),
+                competitor_cancel_rx.clone(),
+            ),
+            Duration::from_millis(1500),
+            competitor_cancel_rx,
+        ));
+        assert!(matches!(
+            status_from_owner(&old.identity).await,
+            Response::Status { owner: true, .. }
+        ));
+
+        resume.notify_one();
+
+        assert!(matches!(old_role.get(), Role::Passive { .. }));
+        let forwarded_report = old
+            .server
+            .get_new_diagnostics()
+            .await
+            .expect("the passive MCP flush answers");
+        assert!(forwarded_report.contains("competitor-diagnostic"));
+        assert!(!forwarded_report.contains("former-owner-diagnostic"));
+
+        let local_footer = old.server.footer_if_written(true).await;
+        let written = old.fixture("written.rs");
+        std::fs::write(&written, "fn written() {}").expect("write");
+        let mut completed = competitor_sweeper.subscribe_completions();
+        let requests_before = competitor_role.hooks_seen();
+        let sweeps_before = competitor_sweeper.sweeps_run();
+        old.server
+            .forward_apply_targets(&[written.display().to_string()])
+            .await;
+
+        assert!(local_footer.is_none());
+        assert_eq!(competitor_role.hooks_seen(), requests_before + 1);
+        tokio::time::timeout(Duration::from_secs(5), completed.changed())
+            .await
+            .expect("the competitor sweeps the forwarded write")
+            .expect("the competitor's sweeper remains alive");
+        assert!(competitor_sweeper.sweeps_run() > sweeps_before);
+
+        old.cancel.send(true).expect("cancel old owner");
+        competitor_cancel_tx.send(true).expect("cancel competitor");
     }
 
     /// A lock file a competitor took is a different situation: that process
