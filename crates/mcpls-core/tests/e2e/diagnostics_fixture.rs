@@ -273,6 +273,13 @@ while True:
                 "method": "$/progress",
                 "params": {"token": "reporting", "value": {"kind": "end"}},
             })
+        elif role == "holding":
+            send({
+                "jsonrpc": "2.0",
+                "method": "$/progress",
+                "params": {"token": "excluded", "value": {"kind": "begin"}},
+            })
+            mark(startup_marker, "holding")
         else:
             time.sleep(startup_delay)
             publish("silent-startup", startup_marker)

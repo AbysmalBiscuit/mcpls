@@ -86,12 +86,22 @@ impl NotificationPumps {
             .insert(id, Arc::new(Mutex::new(PumpTask(Some(task)))));
     }
 
+    pub(crate) fn register_diagnostics_owner(&self, id: &ServerId) {
+        self.shared.settle.register_diagnostics_owner(id);
+    }
+
+    pub(crate) fn prepare_diagnostics_replacement(&self, id: &ServerId) {
+        self.shared.settle.begin_diagnostics_replacement(id);
+    }
+
     pub(crate) async fn retire(&self, id: &ServerId) {
         let task = lock_std(&self.state).tasks.get(id).cloned();
         if let Some(task) = task {
             task.lock().await.retire().await;
         }
         self.shared.settle.forget_server(id);
+        #[cfg(all(test, unix))]
+        crate::recovery_tests::pause_after_retirement();
     }
 
     pub(crate) async fn shutdown(&self) {

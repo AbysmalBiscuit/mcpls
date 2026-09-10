@@ -1223,6 +1223,8 @@ fn spawn_lsp_servers_background(
             .filter(|&(_, &is_route)| is_route)
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
+        #[cfg(all(test, unix))]
+        recovery_tests::pause_before_owner_installation();
         shared.settle.set_diagnostics_owners(diagnostics_owners);
 
         // The settle deadline backstops indexing, which only starts here:
@@ -1233,6 +1235,8 @@ fn spawn_lsp_servers_background(
         // no progress at all is the case the backstop exists for and offers
         // no event to hang the restart on.
         shared.settle.restart_deadline();
+        #[cfg(all(test, unix))]
+        recovery_tests::pause_owner_installation();
 
         baseline_task(
             Arc::clone(&shared.settle),
@@ -1272,7 +1276,10 @@ async fn baseline_task(
                 }
             }
             () = tokio::time::sleep(BASELINE_POLL_INTERVAL) => {
-                if !settle.should_settle() {
+                let ready = settle.should_settle();
+                #[cfg(all(test, unix))]
+                recovery_tests::pause_baseline_check(ready);
+                if !ready {
                     continue;
                 }
                 let baseline: HashMap<String, u64> = {
@@ -1295,6 +1302,8 @@ async fn baseline_task(
                 // but safe here because this task never holds both locks at
                 // once.
                 delivery.lock().await.set_baseline(baseline);
+                #[cfg(all(test, unix))]
+                recovery_tests::mark_baseline_adopted();
                 debug!("diagnostics baseline taken over {baseline_len} file(s)");
                 return;
             }

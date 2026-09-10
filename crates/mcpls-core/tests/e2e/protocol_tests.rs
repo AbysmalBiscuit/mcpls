@@ -262,6 +262,30 @@ fn write_mixed_startup_config(
     Ok(())
 }
 
+fn write_non_diagnostics_config(
+    config_path: &Path,
+    script: &Path,
+    initialized_marker: &Path,
+    progress_marker: &Path,
+) -> Result<()> {
+    let workspace = config_path
+        .parent()
+        .context("fixture config path must have a parent")?;
+    let workspace = toml::Value::String(workspace.to_string_lossy().into_owned()).to_string();
+    let script = toml::Value::String(script.to_string_lossy().into_owned()).to_string();
+    let initialized_marker =
+        toml::Value::String(initialized_marker.to_string_lossy().into_owned()).to_string();
+    let progress_marker =
+        toml::Value::String(progress_marker.to_string_lossy().into_owned()).to_string();
+    fs::write(
+        config_path,
+        format!(
+            "[workspace]\nroots = [{workspace}]\n[diagnostics]\nsettle_quiet_ms = 50\nsettle_deadline_ms = 5000\n[diagnostics.hooks]\nenabled = false\n\n[[lsp_servers]]\nlanguage_id = \"elixir\"\nname = \"hover-only\"\ncommand = \"python3\"\nargs = [{script}, \"holding\", {initialized_marker}, {progress_marker}, {progress_marker}, \"main.ex\", \"0\"]\nfile_patterns = [\"**/*.ex\"]\nhandles = [\"hover\"]\ndiagnostics_severity = \"warning\"\n"
+        ),
+    )?;
+    Ok(())
+}
+
 fn wait_for_baseline_report(client: &mut McpClient) -> Result<String> {
     let deadline = Instant::now() + Duration::from_secs(6);
     loop {
@@ -495,6 +519,53 @@ fn i1_t5_mixed_owner_startup_uses_each_grace() -> Result<()> {
         thread::sleep(Duration::from_millis(25));
     }
 
+    Ok(())
+}
+
+#[test]
+#[ignore = "Requires mcpls binary built"]
+fn i1_t5_successful_non_diagnostics_progress_does_not_hold_baseline() -> Result<()> {
+    let workspace = TempDir::new()?;
+    let script = diagnostics_fixture::write_mixed_startup_server(workspace.path())?;
+    let initialized_marker = workspace.path().join("holding-initialized.marker");
+    let progress_marker = workspace.path().join("holding-progress.marker");
+    let config_path = workspace.path().join("mcpls.toml");
+    write_non_diagnostics_config(&config_path, &script, &initialized_marker, &progress_marker)?;
+    let file_path = workspace.path().join("main.ex");
+    fs::write(&file_path, "def fixture do\n  :ok\nend\n")?;
+
+    let config_arg = config_path
+        .to_str()
+        .context("fixture config path must be valid UTF-8")?;
+    let mut client = McpClient::spawn_with_args(&["--config", config_arg])?;
+    client.initialize()?;
+    wait_for_marker(&initialized_marker)?;
+    wait_for_marker(&progress_marker)?;
+    eprintln!(
+        "i1_t5 successful non-diagnostics server initialization and progress acknowledgements recorded"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let response = client.call_tool("get_new_diagnostics", &json!({}))?;
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .with_context(|| format!("expected diagnostic text content, got {response}"))?;
+        let payload: serde_json::Value = serde_json::from_str(text)?;
+        if payload.get("note").is_none() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("successful non-diagnostics server held the baseline: {text}");
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    let hover = call_hover_when_ready(&mut client, &file_path)?;
+    assert!(
+        hover.to_string().contains("mixed-startup-fixture"),
+        "the successful non-diagnostics server must remain routable for hover, got {hover}"
+    );
     Ok(())
 }
 
