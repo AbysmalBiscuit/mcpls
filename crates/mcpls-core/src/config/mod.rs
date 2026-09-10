@@ -508,6 +508,29 @@ fn language_id_for_pattern_extension(server_language_id: &str, extension: &str) 
         .to_string()
 }
 
+fn validate_server_file_mapping(
+    server: &LspServerConfig,
+    effective_extension_map: &HashMap<String, String>,
+) -> Result<()> {
+    let serves_file_tools = server.handles.as_ref().is_none_or(|handles| {
+        handles
+            .iter()
+            .any(|tool| *tool != ToolKind::WorkspaceSymbols)
+    });
+    let has_effective_mapping = effective_extension_map.values().any(|language_id| {
+        language_id == &server.language_id
+            || base_language_id(language_id).is_some_and(|base| base == server.language_id.as_str())
+    });
+    if serves_file_tools && !has_effective_mapping {
+        return Err(Error::InvalidConfig(format!(
+            "file-tool server for language '{}' has no effective extension mapping; add \
+             `file_patterns` or a workspace language mapping",
+            server.language_id
+        )));
+    }
+    Ok(())
+}
+
 /// The client-preference order offered to every spawned server during
 /// `initialize`.
 ///
@@ -1074,6 +1097,7 @@ impl ServerConfig {
             ));
         }
 
+        let effective_extension_map = self.build_effective_extension_map();
         let mut seen_names: HashMap<&str, &str> = HashMap::new();
         for server in &self.lsp_servers {
             if server.language_id.is_empty() {
@@ -1152,6 +1176,7 @@ impl ServerConfig {
                     }
                 }
             }
+            validate_server_file_mapping(server, &effective_extension_map)?;
         }
         Ok(())
     }

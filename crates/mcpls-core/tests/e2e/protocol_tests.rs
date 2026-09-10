@@ -3,10 +3,230 @@
 //! These tests validate the complete MCP protocol flow by spawning the mcpls
 //! binary and communicating with it as a real MCP client would.
 
-use anyhow::Result;
-use serde_json::json;
+use std::path::Path;
+use std::time::{Duration, Instant};
+use std::{fs, thread};
 
+use anyhow::{Context, Result};
+use serde_json::json;
+use tempfile::TempDir;
+
+use super::diagnostics_fixture;
 use super::mcp_client::McpClient;
+
+fn toml_array(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|value| format!("{value:?}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn toml_patterns(values: &[&str]) -> String {
+    values
+        .iter()
+        .map(|value| format!("{value:?}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn write_fixture_config(
+    config_path: &Path,
+    language_id: &str,
+    command: &str,
+    args: &[String],
+    file_patterns: &[&str],
+    workspace_mapping: bool,
+    handles: &[&str],
+) -> Result<()> {
+    let workspace = config_path
+        .parent()
+        .context("fixture config path must have a parent")?;
+    let workspace_mapping = if workspace_mapping {
+        "\n[[workspace.language_extensions]]\nextensions = [\"ex\"]\nlanguage_id = \"elixir\"\n"
+    } else {
+        ""
+    };
+    let file_patterns = if file_patterns.is_empty() {
+        String::new()
+    } else {
+        format!("file_patterns = [{}]\n", toml_patterns(file_patterns))
+    };
+    let handles = if handles.is_empty() {
+        String::new()
+    } else {
+        format!("handles = [{}]\n", toml_patterns(handles))
+    };
+    let workspace = toml::Value::String(workspace.to_string_lossy().into_owned()).to_string();
+    let args = toml_array(args);
+    let config = format!(
+        "[workspace]\nroots = [{workspace}]{workspace_mapping}\n[diagnostics.hooks]\nenabled = false\n\n[[lsp_servers]]\nlanguage_id = {language_id:?}\ncommand = {command:?}\nargs = [{args}]\n{file_patterns}{handles}"
+    );
+    fs::write(config_path, config)?;
+    Ok(())
+}
+
+fn call_hover_when_ready(client: &mut McpClient, file_path: &Path) -> Result<serde_json::Value> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match client.call_tool(
+            "get_hover",
+            &json!({
+                "file_path": file_path,
+                "line": 0,
+                "character": 0,
+            }),
+        ) {
+            Ok(response) => return Ok(response),
+            Err(error)
+                if error.to_string().contains("initializing") && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn call_workspace_symbol_when_ready(client: &mut McpClient) -> Result<serde_json::Value> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match client.call_tool(
+            "workspace_symbol_search",
+            &json!({"query": "workspace", "limit": 10}),
+        ) {
+            Ok(response) => return Ok(response),
+            Err(error)
+                if error.to_string().contains("initializing") && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn run_hover_case(
+    language_id: &str,
+    file_name: &str,
+    sentinel: &str,
+    file_patterns: &[&str],
+    workspace_mapping: bool,
+) -> Result<()> {
+    let workspace = TempDir::new()?;
+    run_hover_case_in_workspace(
+        &workspace,
+        language_id,
+        file_name,
+        sentinel,
+        file_patterns,
+        workspace_mapping,
+    )
+}
+
+fn run_hover_case_in_workspace(
+    workspace: &TempDir,
+    language_id: &str,
+    file_name: &str,
+    sentinel: &str,
+    file_patterns: &[&str],
+    workspace_mapping: bool,
+) -> Result<()> {
+    let script = diagnostics_fixture::write_hover_server(workspace.path())?;
+    let config_path = workspace.path().join("mcpls.toml");
+    let args = vec![script.to_string_lossy().into_owned(), sentinel.to_string()];
+    write_fixture_config(
+        &config_path,
+        language_id,
+        "python3",
+        &args,
+        file_patterns,
+        workspace_mapping,
+        &[],
+    )?;
+    let file_path = workspace.path().join(file_name);
+    if let Some(parent) = file_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&file_path, "def fixture():\n    return 1\n")?;
+
+    let config_arg = config_path.to_string_lossy().into_owned();
+    let mut client = McpClient::spawn_with_args(&["--config", &config_arg])?;
+    client.initialize()?;
+    let response = call_hover_when_ready(&mut client, &file_path)?;
+    assert!(
+        response.to_string().contains(sentinel),
+        "hover response should contain {sentinel}, got {response}"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "Requires mcpls binary built"]
+fn i1_t1_file_pattern_mapping_routes_hover() -> Result<()> {
+    run_hover_case(
+        "elixir",
+        "lib/example.ex",
+        "elixir-fixture",
+        &["**/*.ex"],
+        false,
+    )
+}
+
+#[test]
+#[ignore = "Requires mcpls binary built"]
+fn i1_t1_workspace_mapping_routes_hover() -> Result<()> {
+    run_hover_case("elixir", "lib/example.ex", "elixir-fixture", &[], true)
+}
+
+#[test]
+#[ignore = "Requires mcpls binary built"]
+fn i1_t1_builtin_command_override_preserves_mapping() -> Result<()> {
+    let workspace = TempDir::new()?;
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[package]\nname = \"fixture\"\n",
+    )?;
+    run_hover_case_in_workspace(
+        &workspace,
+        "rust",
+        "lib/example.rs",
+        "rust-fixture",
+        &[],
+        false,
+    )
+}
+
+#[test]
+#[ignore = "Requires mcpls binary built"]
+fn i1_t1_workspace_only_server_without_mapping_is_accepted() -> Result<()> {
+    let workspace = TempDir::new()?;
+    let script = diagnostics_fixture::write_hover_server(workspace.path())?;
+    let config_path = workspace.path().join("mcpls.toml");
+    let args = vec![
+        script.to_string_lossy().into_owned(),
+        "workspace-fixture".to_string(),
+    ];
+    write_fixture_config(
+        &config_path,
+        "elixir",
+        "python3",
+        &args,
+        &[],
+        false,
+        &["workspace_symbols"],
+    )?;
+
+    let config_arg = config_path.to_string_lossy().into_owned();
+    let mut client = McpClient::spawn_with_args(&["--config", &config_arg])?;
+    client.initialize()?;
+    let response = call_workspace_symbol_when_ready(&mut client)?;
+    assert!(
+        response.to_string().contains("workspace-fixture"),
+        "workspace symbol response should contain the fixture sentinel, got {response}"
+    );
+    Ok(())
+}
 
 /// Test the MCP initialize handshake.
 ///

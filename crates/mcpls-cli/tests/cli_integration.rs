@@ -141,6 +141,54 @@ fn test_config_with_empty_file() {
         .failure();
 }
 
+#[test]
+fn i1_t1_novel_file_language_requires_mapping() {
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("mcpls.toml");
+    fs::write(
+        &config_path,
+        r#"[diagnostics.hooks]
+enabled = false
+
+[[lsp_servers]]
+language_id = "elixir"
+command = "true"
+"#,
+    )
+    .unwrap();
+
+    let mut cmd = assert_cmd::Command::cargo_bin("mcpls").unwrap();
+    let output = cmd
+        .env_remove("MCPLS_LOG")
+        .env_remove("MCPLS_CONFIG")
+        .env_remove("MCPLS_TRUST_PROJECT_CONFIG")
+        .env_remove("MCPLS_LOG_JSON")
+        .arg("--config")
+        .arg(&config_path)
+        .current_dir(temp_dir.path())
+        .timeout(Duration::from_secs(5))
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "an unroutable file-tool language must fail at startup; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("elixir"),
+        "error should name elixir: {stderr}"
+    );
+    assert!(
+        stderr.contains("file_patterns"),
+        "error should explain how to add file patterns: {stderr}"
+    );
+    assert!(
+        stderr.contains("workspace"),
+        "error should explain how to add a workspace mapping: {stderr}"
+    );
+}
+
 /// A CWD-discovered `./mcpls.toml` is untrusted by default: it must not be
 /// parsed at all, regardless of `--config`/`MCPLS_CONFIG` (which are
 /// unaffected by trust and aren't exercised here). We assert this by
