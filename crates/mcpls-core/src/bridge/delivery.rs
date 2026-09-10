@@ -7,12 +7,14 @@
 //! has left the context window.
 
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hash, Hasher};
+use std::sync::OnceLock;
 
 use crate::config::{DiagnosticsConfig, LspServerConfig, ServerId, SeverityFloor};
 
 /// The session a process serves when the host names none.
-const PROCESS_DEFAULT_SESSION: &str = "local";
+static PROCESS_DEFAULT_SESSION: OnceLock<SessionId> = OnceLock::new();
 
 /// Identity of one client session.
 ///
@@ -29,18 +31,12 @@ impl From<String> for SessionId {
 }
 
 impl SessionId {
-    /// The session id the host exported, or the per-process constant.
+    /// The session id the host exported, or a stable process-local token.
     ///
-    /// Claude Code exports `CLAUDE_CODE_SESSION_ID` into the environment of
-    /// the stdio MCP servers it spawns, and the hook payload carries the
-    /// same value, so both doors key on one record. Where the variable is
-    /// absent, a per-process constant is correct: one process per client is
-    /// what stdio means.
-    ///
-    /// An empty value counts as absent. A host that exports the variable
-    /// unset leaves `""`, and keying a record on the empty string would
-    /// give every such process the same record under a name no hook payload
-    /// ever carries.
+    /// Nonempty `CLAUDE_CODE_SESSION_ID` values match the hook payload so
+    /// local and forwarded delivery use the same record. Absent and empty
+    /// values share one token within a process; its random nonce prevents
+    /// reused process IDs from inheriting another process's record.
     #[must_use]
     pub fn from_env_or_process() -> Self {
         Self::from_env_value(std::env::var("CLAUDE_CODE_SESSION_ID").ok())
@@ -48,13 +44,19 @@ impl SessionId {
 
     /// [`Self::from_env_or_process`] over an already-read variable.
     ///
-    /// Split out because `std::env::set_var` is `unsafe` from the 2024
-    /// edition and this workspace denies `unsafe_code`, so the absent and
-    /// empty cases cannot be driven through the real environment at all.
+    /// Allows tests to cover absent and empty values without mutating the
+    /// test runner's environment.
     fn from_env_value(value: Option<String>) -> Self {
-        value
-            .filter(|id| !id.is_empty())
-            .map_or_else(|| Self(PROCESS_DEFAULT_SESSION.to_string()), Self)
+        if let Some(id) = value.filter(|id| !id.is_empty()) {
+            return Self(id);
+        }
+        PROCESS_DEFAULT_SESSION
+            .get_or_init(|| {
+                let pid = std::process::id();
+                let nonce = RandomState::new().hash_one(pid);
+                Self(format!("process-{pid}-{nonce:016x}"))
+            })
+            .clone()
     }
 }
 
@@ -430,15 +432,21 @@ mod tests {
     }
 
     #[test]
-    fn test_an_absent_or_empty_session_id_falls_back_to_the_process_default() {
-        let fallback = SessionId(PROCESS_DEFAULT_SESSION.to_string());
+    fn test_an_absent_or_empty_session_id_reuses_the_process_token() {
+        let fallback = SessionId::from_env_value(None);
+        assert!(!fallback.to_string().is_empty());
         assert_eq!(SessionId::from_env_value(None), fallback);
         assert_eq!(
             SessionId::from_env_value(Some(String::new())),
             fallback,
-            "a host that exports the variable unset leaves an empty string, and \
-             keying on it would give every such process one shared record under \
-             a name no hook payload ever carries"
+            "unset and empty values use the same process identity"
+        );
+        assert_eq!(
+            std::thread::spawn(|| SessionId::from_env_value(None))
+                .join()
+                .expect("session lookup thread"),
+            fallback,
+            "local and forwarded delivery share one token across threads"
         );
     }
 

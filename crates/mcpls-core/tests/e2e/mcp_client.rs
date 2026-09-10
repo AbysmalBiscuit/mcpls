@@ -51,15 +51,10 @@ pub struct McpClient {
     /// Server-pushed notifications (no matching request `id`) collected while
     /// waiting for a request/response round-trip. Drained via `take_notifications`.
     pending_notifications: Vec<Value>,
-    /// The directory the server was started in, kept alive for its lifetime.
-    ///
-    /// One per client, because mcpls derives its per-project hook socket
-    /// from the directory it starts in. Sharing the test process's own
-    /// working directory would make unrelated servers arbitrate a single
-    /// socket between themselves -- the loser forwards its diagnostics to
-    /// whichever test happened to win -- and would let a throwaway test
-    /// server take the socket of a real session running in this checkout.
-    _cwd: tempfile::TempDir,
+    /// Keeps the default client's isolated workspace alive. Separate directories
+    /// prevent unrelated clients from sharing a hook socket. Shared-workspace
+    /// tests keep their caller-owned directory alive instead.
+    _cwd: Option<tempfile::TempDir>,
     stderr_reader: Option<JoinHandle<()>>,
     #[allow(dead_code)]
     stdio_ready: Option<Receiver<()>>,
@@ -202,12 +197,35 @@ impl McpClient {
     /// Spawn mcpls with an optional stderr reader used by readiness-sensitive tests.
     fn spawn_with_args_and_stderr(args: &[&str], capture_stderr: bool) -> Result<Self> {
         let binary_path = binary_under_test()?;
-
         let cwd = tempfile::tempdir().context("failed to create a working directory")?;
+        let mut command = Command::new(binary_path);
+        command.args(args).current_dir(cwd.path());
+        Self::spawn_command(command, Some(cwd), capture_stderr)
+    }
 
-        let mut process = Command::new(binary_path)
-            .args(args)
-            .current_dir(cwd.path())
+    /// Spawn in a caller-owned workspace with a child-only session environment.
+    /// `None` removes the variable; `Some("")` exports an empty value.
+    #[allow(dead_code)]
+    pub(crate) fn spawn_in_workspace(
+        args: &[&str],
+        workspace: &Path,
+        session: Option<&str>,
+    ) -> Result<Self> {
+        let mut command = Command::new(binary_under_test()?);
+        command.args(args).current_dir(workspace);
+        match session {
+            Some(session) => command.env("CLAUDE_CODE_SESSION_ID", session),
+            None => command.env_remove("CLAUDE_CODE_SESSION_ID"),
+        };
+        Self::spawn_command(command, None, false)
+    }
+
+    fn spawn_command(
+        mut command: Command,
+        cwd: Option<tempfile::TempDir>,
+        capture_stderr: bool,
+    ) -> Result<Self> {
+        let mut process = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(if capture_stderr {

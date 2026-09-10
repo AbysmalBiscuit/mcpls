@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use std::{fs, thread};
 
 use anyhow::{Context, Result};
+use mcpls_core::hooks::{self, Request, Response, SocketIdentity};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -350,6 +351,141 @@ fn run_duplicate_floor_case(active_first: bool) -> Result<String> {
         thread::sleep(Duration::from_millis(25));
     };
     Ok(report)
+}
+
+async fn owner_hooks_seen(identity: &SocketIdentity, pid: u32, workspace: &Path) -> Result<u64> {
+    let response = hooks::send(identity, &Request::Status, Duration::from_secs(5)).await?;
+    match response {
+        Response::Status {
+            hash,
+            socket,
+            pid: owner_pid,
+            owner,
+            root,
+            hooks_seen,
+        } => {
+            assert!(owner);
+            assert_eq!(owner_pid, pid);
+            assert_eq!(root, workspace);
+            assert_eq!(hash, identity.hash);
+            assert_eq!(socket, identity.socket);
+            Ok(hooks_seen)
+        }
+        other => anyhow::bail!("expected hook owner status, got {other:?}"),
+    }
+}
+
+async fn process_session_reports(
+    session: Option<&str>,
+    passive_first: bool,
+) -> Result<[serde_json::Value; 4]> {
+    let workspace = TempDir::new()?;
+    let root = dunce::canonicalize(workspace.path())?;
+    let script = diagnostics_fixture::write_diagnostics_server(&root)?;
+    let published_marker = root.join("published.marker");
+    let config_path = root.join("mcpls.toml");
+    let workspace_value = toml::Value::String(root.to_string_lossy().into_owned());
+    let args = toml_array(&[
+        script.to_string_lossy().into_owned(),
+        "process-session-probe".to_string(),
+        "process-session-hover".to_string(),
+        published_marker.to_string_lossy().into_owned(),
+    ]);
+    fs::write(
+        &config_path,
+        format!(
+            "[workspace]\nroots = [{workspace_value}]\n[diagnostics]\nsettle_quiet_ms = 50\nsettle_deadline_ms = 5000\n[diagnostics.hooks]\nenabled = true\n\n[[lsp_servers]]\nlanguage_id = \"python\"\ncommand = \"python3\"\nargs = [{args}]\nfile_patterns = [\"**/*.py\"]\ndiagnostics_severity = \"warning\"\n\n[lsp_servers.heuristics]\nproject_markers = [\"main.py\"]\n"
+        ),
+    )?;
+    let file_path = root.join("main.py");
+    fs::write(&file_path, "def fixture():\n    return 1\n")?;
+    let config_arg = config_path
+        .to_str()
+        .context("fixture config must be UTF-8")?;
+    let identity = hooks::identity_for(&root)?;
+
+    let mut owner = McpClient::spawn_in_workspace(&["--config", config_arg], &root, session)?;
+    owner.initialize()?;
+    wait_for_diagnostics_baseline(&mut owner)?;
+    let before = owner_hooks_seen(&identity, owner.pid(), &root).await?;
+
+    let mut passive = McpClient::spawn_in_workspace(&["--config", config_arg], &root, session)?;
+    passive.initialize()?;
+    wait_for_diagnostics_baseline(&mut passive)?;
+    assert!(
+        owner_hooks_seen(&identity, owner.pid(), &root).await? > before,
+        "the passive client's baseline flush must reach the owner"
+    );
+    assert!(!published_marker.exists());
+    eprintln!(
+        "i1_t6 session={session:?} passive_first={passive_first}: owner={}, passive={}, shared workspace and forwarding ready before publication",
+        owner.pid(),
+        passive.pid()
+    );
+
+    let hover = call_hover_when_ready(&mut owner, &file_path)?;
+    assert!(hover.to_string().contains("process-session-hover"));
+    wait_for_marker(&published_marker)?;
+
+    let (first, second) = if passive_first {
+        (&mut passive, &mut owner)
+    } else {
+        (&mut owner, &mut passive)
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let first_report = loop {
+        let report = first.call_tool("get_new_diagnostics", &json!({}))?;
+        if report.to_string().contains("process-session-probe") {
+            break report;
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "owner publication missing: {report}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    };
+    let second_report = second.call_tool("get_new_diagnostics", &json!({}))?;
+    let first_repeat = first.call_tool("get_new_diagnostics", &json!({}))?;
+    let second_repeat = second.call_tool("get_new_diagnostics", &json!({}))?;
+    eprintln!(
+        "i1_t6 first_report={first_report}\nsecond_report={second_report}\nfirst_repeat={first_repeat}\nsecond_repeat={second_repeat}"
+    );
+    Ok([first_report, second_report, first_repeat, second_repeat])
+}
+
+#[rstest::rstest]
+#[case::unset_owner_first(None, false)]
+#[case::unset_passive_first(None, true)]
+#[case::empty_owner_first(Some(""), false)]
+#[case::empty_passive_first(Some(""), true)]
+#[tokio::test]
+#[ignore = "Requires mcpls binary built"]
+async fn i1_t6_process_fallbacks_are_independent(
+    #[case] session: Option<&str>,
+    #[case] passive_first: bool,
+) -> Result<()> {
+    let [first_report, second_report, first_repeat, second_repeat] =
+        process_session_reports(session, passive_first).await?;
+    assert!(first_report.to_string().contains("process-session-probe"));
+    assert!(second_report.to_string().contains("process-session-probe"));
+    assert!(!first_repeat.to_string().contains("process-session-probe"));
+    assert!(!second_repeat.to_string().contains("process-session-probe"));
+    Ok(())
+}
+
+#[rstest::rstest]
+#[case::owner_first(false)]
+#[case::passive_first(true)]
+#[tokio::test]
+#[ignore = "Requires mcpls binary built"]
+async fn i1_t6_explicit_same_session_shares_delivery(#[case] passive_first: bool) -> Result<()> {
+    let [first_report, second_report, first_repeat, second_repeat] =
+        process_session_reports(Some("process-session-shared"), passive_first).await?;
+    assert!(first_report.to_string().contains("process-session-probe"));
+    assert!(!second_report.to_string().contains("process-session-probe"));
+    assert!(!first_repeat.to_string().contains("process-session-probe"));
+    assert!(!second_repeat.to_string().contains("process-session-probe"));
+    Ok(())
 }
 
 #[test]
