@@ -1178,6 +1178,7 @@ fn spawn_lsp_servers_background(
             // skipping it would leave every route pointed at a dead server.
             translator.rebind_router(&HashSet::new());
             translator.clear_expected_servers();
+            shared.delivery.lock().await.set_baseline(HashMap::new());
             return;
         }
 

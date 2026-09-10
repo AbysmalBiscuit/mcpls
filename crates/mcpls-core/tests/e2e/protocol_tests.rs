@@ -595,6 +595,98 @@ fn test_e2e_new_diagnostics_in_protocol_only_mode() -> Result<()> {
     Ok(())
 }
 
+#[test]
+#[ignore = "Requires mcpls binary built"]
+fn i1_t3_all_failed_startup_flushes_empty() -> Result<()> {
+    let workspace = TempDir::new()?;
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[package]\nname = \"fixture\"\n",
+    )?;
+
+    let config_path = workspace.path().join("mcpls.toml");
+    let missing_command = workspace.path().join("missing-rust-analyzer");
+    assert!(
+        !missing_command.exists(),
+        "the fixture executable must be absent before startup"
+    );
+    let missing_command = missing_command
+        .to_str()
+        .context("missing fixture executable path must be valid UTF-8")?;
+    write_fixture_config(&config_path, "rust", missing_command, &[], &[], false, &[])?;
+
+    let file_path = workspace.path().join("src/lib.rs");
+    fs::create_dir_all(
+        file_path
+            .parent()
+            .context("fixture file must have a parent")?,
+    )?;
+    fs::write(&file_path, "fn fixture() {}\n")?;
+
+    let config_arg = config_path
+        .to_str()
+        .context("fixture config path must be valid UTF-8")?;
+    let mut client = McpClient::spawn_with_args(&["--config", config_arg])?;
+    client.initialize()?;
+
+    let startup_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match client.call_tool(
+            "get_hover",
+            &json!({
+                "file_path": file_path,
+                "line": 0,
+                "character": 0,
+            }),
+        ) {
+            Ok(response) => panic!(
+                "the missing Rust LSP executable unexpectedly returned hover data: {response}"
+            ),
+            Err(error)
+                if error.to_string().contains("still initializing")
+                    && Instant::now() < startup_deadline =>
+            {
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => {
+                let message = error.to_string();
+                assert!(
+                    message.contains("no LSP server configured for language: rust"),
+                    "the failed Rust server should be removed from routing after spawn failure, \
+                     got {message}"
+                );
+                break;
+            }
+        }
+    }
+
+    let diagnostics_deadline = Instant::now() + Duration::from_secs(2);
+    let mut startup_notes = 0;
+    loop {
+        let response = client.call_tool("get_new_diagnostics", &json!({}))?;
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .with_context(|| format!("expected diagnostic text content, got {response}"))?;
+        let payload: serde_json::Value = serde_json::from_str(text)?;
+
+        if payload.get("note").is_some() {
+            startup_notes += 1;
+            if Instant::now() >= diagnostics_deadline {
+                anyhow::bail!(
+                    "get_new_diagnostics kept returning startup notes after the Rust server \
+                     spawn failure ({startup_notes} polls): {payload}"
+                );
+            }
+            thread::sleep(Duration::from_millis(50));
+            continue;
+        }
+
+        assert_eq!(payload["changed"].as_array().map(Vec::len), Some(0));
+        assert_eq!(payload["cleared"].as_array().map(Vec::len), Some(0));
+        return Ok(());
+    }
+}
+
 /// Test that mcpls exits promptly on `SIGTERM` while the client's stdin
 /// write end is still open (regression test for #308).
 ///
