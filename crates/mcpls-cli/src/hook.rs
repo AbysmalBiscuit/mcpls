@@ -11,7 +11,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Result;
-use mcpls_core::config::HooksConfig;
 use mcpls_core::hooks::filters::WatchPaths;
 use mcpls_core::hooks::{
     ChangeEvent, ProbeOutcome, Request, Response, SocketIdentity, probe, send,
@@ -765,6 +764,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
+    use mcpls_core::config::HooksConfig;
     use serde_json::json;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
