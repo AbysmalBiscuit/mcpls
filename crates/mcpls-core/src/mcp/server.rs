@@ -2938,6 +2938,7 @@ mod tests {
             for path in &paths {
                 std::fs::write(path, "fn old() {}\n").unwrap();
             }
+            let paths = paths.map(|path| dunce::canonicalize(path).expect("fixture exists"));
             let uris = paths.each_ref().map(|path| crate::bridge::path_to_uri(path).unwrap());
             let (translator, mut lsp) = translator_with_capabilities(
                 &dir, &ServerId::from("rust"), WriteTool::Rename.capabilities(),

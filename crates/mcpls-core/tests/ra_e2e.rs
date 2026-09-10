@@ -1693,8 +1693,9 @@ fn sc_resync_delivers_a_build_error_in_an_unopened_module(
     client: &mut McpClient,
     workspace: &Path,
 ) -> Result<(), String> {
-    let lib = workspace.join("src/lib.rs");
-    let module = workspace.join("src/resync_unopened.rs");
+    let lib = dunce::canonicalize(workspace.join("src/lib.rs")).map_err(|e| e.to_string())?;
+    let module =
+        dunce::canonicalize(workspace.join("src/resync_unopened.rs")).map_err(|e| e.to_string())?;
     let uri = mcpls_core::bridge::path_to_uri(&module).map_err(|e| e.to_string())?;
     let diagnostic_for_module = |report: &Value| {
         report["changed"]
@@ -1704,7 +1705,8 @@ fn sc_resync_delivers_a_build_error_in_an_unopened_module(
             .filter(|file| {
                 file["file_path"]
                     .as_str()
-                    .and_then(|path| mcpls_core::bridge::path_to_uri(Path::new(path)).ok())
+                    .and_then(|path| dunce::canonicalize(Path::new(path)).ok())
+                    .and_then(|path| mcpls_core::bridge::path_to_uri(&path).ok())
                     .as_ref()
                     == Some(&uri)
             })
