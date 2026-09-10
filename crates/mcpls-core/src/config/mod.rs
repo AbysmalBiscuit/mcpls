@@ -353,6 +353,95 @@ where
     resolve_lsp_servers(partials).map_err(serde::de::Error::custom)
 }
 
+const DEFAULT_CONFIG_TEMPLATE: &str = r#"# mcpls configuration
+#
+# Uncomment only the settings you want to override. Omitted settings inherit
+# mcpls's built-in defaults, including workspace language mappings and LSP
+# servers.
+#
+# [workspace]
+# roots = ["/path/to/project"]
+# position_encodings = ["utf-8", "utf-16"]
+# heuristics_max_depth = 10
+# max_documents = 100
+# max_file_size = 10485760
+#
+# [[workspace.language_extensions]]
+# extensions = ["rs"]
+# language_id = "rust"
+#
+# [apply]
+# rename = true
+# format_document = true
+# code_actions = true
+# allow_file_deletion = true
+#
+# [diagnostics]
+# severity = "warning"
+# max_per_file = 10
+# max_total = 50
+# settle_quiet_ms = 1000
+# settle_deadline_ms = 300000
+# footer = true
+# footer_grace_ms = 250
+# footer_quiet_ms = 200
+# footer_wait_ms = 15000
+#
+# [diagnostics.hooks]
+# enabled = true
+# sweep_quiet_ms = 500
+# op_deadline_ms = 1500
+#
+# Built-in servers are active when their project markers are present. Copy an
+# example to override one, or set enabled = false to disable it.
+#
+# [[lsp_servers]]
+# language_id = "rust"
+# command = "rust-analyzer"
+# args = []
+# file_patterns = ["**/*.rs"]
+# timeout_seconds = 30
+# request_timeout_seconds = 30
+#
+# [lsp_servers.heuristics]
+# project_markers = ["Cargo.toml", "rust-toolchain.toml"]
+#
+# [[lsp_servers]]
+# language_id = "python"
+# command = "pyright-langserver"
+# args = ["--stdio"]
+# file_patterns = ["**/*.py"]
+#
+# [[lsp_servers]]
+# language_id = "typescript"
+# command = "typescript-language-server"
+# args = ["--stdio"]
+# file_patterns = ["**/*.ts", "**/*.tsx"]
+#
+# [[lsp_servers]]
+# language_id = "go"
+# command = "gopls"
+# args = ["serve"]
+# file_patterns = ["**/*.go"]
+#
+# [[lsp_servers]]
+# language_id = "cpp"
+# command = "clangd"
+# args = []
+# file_patterns = ["**/*.c", "**/*.cpp", "**/*.h", "**/*.hpp"]
+#
+# [[lsp_servers]]
+# language_id = "zig"
+# command = "zls"
+# args = []
+# file_patterns = ["**/*.zig"]
+#
+# Optional server-specific initialization options can be added below the
+# matching [[lsp_servers]] entry.
+# [lsp_servers.initialization_options]
+# cargo.features = "all"
+"#;
+
 /// Workspace-level configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -803,8 +892,9 @@ impl ServerConfig {
     ///    - macOS: `~/Library/Application Support/mcpls/mcpls.toml`
     /// 4. `%APPDATA%\mcpls\mcpls.toml` (Windows)
     ///
-    /// If no configuration file exists, creates a default configuration file
-    /// in the user's config directory with all default language extensions.
+    /// If no configuration file exists, creates a commented configuration
+    /// template in the user's config directory. The effective configuration
+    /// still uses all built-in language extensions and LSP servers.
     ///
     /// This is a thin wrapper around
     /// [`load_with_trust(ProjectConfigTrust::Untrusted)`](Self::load_with_trust) —
@@ -1015,7 +1105,7 @@ impl ServerConfig {
         Ok(config)
     }
 
-    /// Create a default configuration file with all built-in extensions.
+    /// Create a sparse configuration template with commented examples.
     ///
     /// Creates the parent directory if it doesn't exist.
     ///
@@ -1027,9 +1117,7 @@ impl ServerConfig {
             std::fs::create_dir_all(parent)?;
         }
 
-        let default_config = Self::default();
-        let toml_content = toml::to_string_pretty(&default_config)?;
-        std::fs::write(path, toml_content)?;
+        std::fs::write(path, DEFAULT_CONFIG_TEMPLATE)?;
 
         Ok(())
     }
@@ -2428,11 +2516,14 @@ mod tests {
 
         let content = fs::read_to_string(&config_path).unwrap();
 
-        assert!(content.contains("[workspace]"));
-        assert!(content.contains("[[workspace.language_extensions]]"));
-        assert!(content.contains("[[lsp_servers]]"));
-        assert!(content.contains("language_id = \"rust\""));
-        assert!(content.contains("extensions = [\"rs\"]"));
+        assert!(content.contains("# [workspace]"));
+        assert!(content.contains("# [[workspace.language_extensions]]"));
+        assert!(content.contains("# [[lsp_servers]]"));
+        assert!(content.contains("# language_id = \"rust\""));
+        assert!(content.contains("# extensions = [\"rs\"]"));
+
+        let parsed: toml::Value = toml::from_str(&content).unwrap();
+        assert!(parsed.as_table().unwrap().is_empty());
     }
 
     #[test]

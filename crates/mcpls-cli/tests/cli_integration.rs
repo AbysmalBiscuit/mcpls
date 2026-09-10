@@ -189,6 +189,70 @@ command = "true"
     );
 }
 
+#[test]
+fn i1_t2_generated_config_inherits_builtins() {
+    let user_config = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let first_runtime = TempDir::new().unwrap();
+    let existing_path = user_config.path().join("mcpls").join("mcpls.toml");
+    let mcp_input = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"mcpls-cli-test","version":"0.1.0"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}
+"#;
+
+    let mut cmd = Command::cargo_bin("mcpls").unwrap();
+    clear_ambient_env(&mut cmd)
+        .env("XDG_CONFIG_HOME", user_config.path())
+        .env("XDG_RUNTIME_DIR", first_runtime.path())
+        .current_dir(workspace.path());
+    let first_output = assert_cmd::Command::from_std(cmd)
+        .write_stdin(mcp_input)
+        .timeout(Duration::from_secs(5))
+        .output()
+        .unwrap();
+    assert!(
+        first_output.status.success(),
+        "first-run CLI invocation failed: {}",
+        String::from_utf8_lossy(&first_output.stderr)
+    );
+
+    let generated = fs::read_to_string(&existing_path).unwrap();
+    let parsed: toml::Value = toml::from_str(&generated).unwrap();
+    assert!(parsed.get("lsp_servers").is_none(), "{generated}");
+
+    let loaded = mcpls_core::ServerConfig::load_from(&existing_path).unwrap();
+    assert_eq!(
+        serde_json::to_value(&loaded.lsp_servers).unwrap(),
+        serde_json::to_value(&mcpls_core::ServerConfig::default().lsp_servers).unwrap()
+    );
+
+    let original_bytes = br#"[[lsp_servers]]
+language_id = "rust"
+command = "custom-rust-analyzer"
+"#
+    .to_vec();
+    fs::write(&existing_path, &original_bytes).unwrap();
+
+    let second_runtime = TempDir::new().unwrap();
+    let mut cmd = Command::cargo_bin("mcpls").unwrap();
+    clear_ambient_env(&mut cmd)
+        .env("XDG_CONFIG_HOME", user_config.path())
+        .env("XDG_RUNTIME_DIR", second_runtime.path())
+        .current_dir(workspace.path())
+        .arg("--config")
+        .arg(&existing_path);
+    let second_output = assert_cmd::Command::from_std(cmd)
+        .write_stdin(mcp_input)
+        .timeout(Duration::from_secs(5))
+        .output()
+        .unwrap();
+    assert!(
+        second_output.status.success(),
+        "existing-config CLI invocation failed: {}",
+        String::from_utf8_lossy(&second_output.stderr)
+    );
+    assert_eq!(fs::read(&existing_path).unwrap(), original_bytes);
+}
+
 /// A CWD-discovered `./mcpls.toml` is untrusted by default: it must not be
 /// parsed at all, regardless of `--config`/`MCPLS_CONFIG` (which are
 /// unaffected by trust and aren't exercised here). We assert this by
