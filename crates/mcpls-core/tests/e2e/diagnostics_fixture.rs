@@ -479,6 +479,7 @@ while True:
                         },
                     })
                     mark(progress_begin_marker, "begin")
+                elif saves == 2:
                     mark(begin_observed_marker, "begin observed")
                     mark(resync_hold_marker, "waiting for later resync")
             elif message.get("id") == apply_id:
