@@ -42,7 +42,7 @@ Root must add focused tasks to `.devkit/validation.toml` before dispatch. That f
 
 ```toml
 [tasks.i1-t1]
-run = ["cargo", "nextest", "run", "-p", "mcpls-core", "-p", "mcpls-cli", "--all-features", "--locked", "--run-ignored", "all", "-E", "test(i1_t1_)"]
+run = ["cargo", "nextest", "run", "-p", "mcpls-core", "-p", "mcpls", "--all-features", "--locked", "--run-ignored", "all", "-E", "test(i1_t1_)"]
 guard = true
 
 [tasks.i1-ra]
