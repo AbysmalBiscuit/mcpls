@@ -350,8 +350,6 @@ fn i1_t1_workspace_only_server_without_mapping_is_accepted() -> Result<()> {
 #[test]
 #[ignore = "Requires mcpls binary built"]
 fn i1_t4_inactive_duplicate_cannot_choose_floor() -> Result<()> {
-    // Run the passing inactive-first control before the active-first case,
-    // whose inactive entry currently overwrites the active warning floor.
     let control_report = run_duplicate_floor_case(false)?;
     assert!(
         control_report.contains("active-warning"),
