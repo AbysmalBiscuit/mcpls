@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use tokio::sync::Mutex;
 
@@ -58,6 +58,7 @@ pub use routing::validate_path_against_roots;
 /// `textDocument/didOpen`/`didChange` notify.
 #[derive(Debug)]
 pub struct Translator {
+    pub(crate) notification_pumps: OnceLock<crate::notification_lifecycle::NotificationPumps>,
     /// LSP clients indexed by routing identity. Locked only for the map
     /// lookup/insert itself, never across an LSP request.
     lsp_clients: Arc<StdMutex<HashMap<ServerId, LspClient>>>,
@@ -219,6 +220,7 @@ impl Translator {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            notification_pumps: OnceLock::new(),
             lsp_clients: Arc::new(StdMutex::new(HashMap::new())),
             lsp_servers: Arc::new(StdMutex::new(HashMap::new())),
             document_tracker: Arc::new(DocumentTracker::new(
@@ -873,6 +875,9 @@ impl Translator {
     /// points at the now-shut-down servers, so in-flight tool calls would
     /// resolve to a client whose server is gone.
     pub(crate) async fn shutdown_servers(&self) {
+        if let Some(pumps) = self.notification_pumps.get() {
+            pumps.shutdown().await;
+        }
         let servers: Vec<(ServerId, LspServer)> = lock_std(&self.lsp_servers).drain().collect();
         if servers.is_empty() {
             return;
