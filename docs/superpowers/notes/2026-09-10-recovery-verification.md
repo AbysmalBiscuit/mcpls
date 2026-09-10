@@ -4,15 +4,27 @@ Snapshot: 2026-09-10. This note records the evidence available for issue #7 at
 the recovery-verification head. Counts and run IDs carried from earlier notes
 are historical observations, not Task 3 reruns.
 
-The functional chain is `22e97c9` (`fix(core): restore notifications after
-respawn`), `68a4b31` (`fix(core): publish startup clients first`), and
-`1d9cfd0` (`fix(bridge): sync write targets before saves`). Task 1's focused
-MCP recovery run passed 56/56; its full verification passed 1,163 tests and
-12 doctests. Task 2's focused resynchronization run passed 28/28, its installed
+The functional chain is [`22e97c91b5060d619cbc3ef5030801c7bf34b45a`](https://github.com/AbysmalBiscuit/mcpls/commit/22e97c91b5060d619cbc3ef5030801c7bf34b45a)
+(`fix(core): restore notifications after respawn`),
+[`68a4b31d39f41d4fe8913da6a0e09d0e7ff89acf`](https://github.com/AbysmalBiscuit/mcpls/commit/68a4b31d39f41d4fe8913da6a0e09d0e7ff89acf)
+(`fix(core): publish startup clients first`), and
+[`1d9cfd07a8f1258a8ad4b03f0c284ab702efce91`](https://github.com/AbysmalBiscuit/mcpls/commit/1d9cfd07a8f1258a8ad4b03f0c284ab702efce91)
+(`fix(bridge): sync write targets before saves`). Task 1's focused MCP
+recovery run passed 56/56; its full verification passed 1,163 tests and 12
+doctests. Task 2's focused resynchronization run passed 28/28, its installed
 rust-analyzer run passed 3/3 in 14.793 seconds, and its final verification
-passed 1,168 tests and 12 doctests. The details and logs are in the [Task 1
-report](../../../.superpowers/sdd/2026-09-10-recovery-verification/task-1-report.md)
-and [Task 2 report](../../../.superpowers/sdd/2026-09-10-recovery-verification/task-2-report.md).
+passed 1,168 tests and 12 doctests. The Task 1 and Task 2 reports are local
+artifacts at
+`.superpowers/sdd/2026-09-10-recovery-verification/task-1-report.md` and
+`.superpowers/sdd/2026-09-10-recovery-verification/task-2-report.md`.
+
+Immutable source anchors for the behavioral evidence are the [MCP recovery
+test](https://github.com/AbysmalBiscuit/mcpls/blob/68a4b31d39f41d4fe8913da6a0e09d0e7ff89acf/crates/mcpls-core/src/recovery_tests.rs#L85),
+[startup publication test](https://github.com/AbysmalBiscuit/mcpls/blob/68a4b31d39f41d4fe8913da6a0e09d0e7ff89acf/crates/mcpls-core/src/recovery_tests.rs#L95),
+[unopened-target save ordering test](https://github.com/AbysmalBiscuit/mcpls/blob/1d9cfd07a8f1258a8ad4b03f0c284ab702efce91/crates/mcpls-core/src/mcp/server.rs#L2929),
+[resynchronization cancellation and generation test](https://github.com/AbysmalBiscuit/mcpls/blob/1d9cfd07a8f1258a8ad4b03f0c284ab702efce91/crates/mcpls-core/src/bridge/translator/edits.rs#L2238),
+[unopened-module rust-analyzer test](https://github.com/AbysmalBiscuit/mcpls/blob/1d9cfd07a8f1258a8ad4b03f0c284ab702efce91/crates/mcpls-core/tests/ra_e2e.rs#L1692),
+and [timeout default assertion](https://github.com/AbysmalBiscuit/mcpls/blob/35f1fac1024a02e319df67b719ade4fea472ce2c/crates/mcpls-cli/src/hook.rs#L1350).
 
 ## Task 3 corrections
 
@@ -38,7 +50,15 @@ The test-first coupling check temporarily changed the default from 1,500 ms to
 skipped, in nextest run `3395a21b-684d-474d-bead-abd2ef7b7934`; its log is
 `.devkit/task3-logs/deadline-coupling-green.log`.
 
-Reproduce the focused check with:
+The tracked `devkit.toml` `test` task includes the timeout assertion and can
+reproduce it from a clean checkout:
+
+```fish
+devrun -C /home/lev/Git/lev/mcpls_worktrees/recovery-verification task test
+```
+
+The narrow Task 3 run used local ignored validation files. Reproduce that run
+only where those files exist:
 
 ```fish
 devrun -C /home/lev/Git/lev/mcpls_worktrees/recovery-verification --config /home/lev/Git/lev/mcpls_worktrees/recovery-verification/.devkit/validation.toml task issue7-audit --env-file /home/lev/Git/lev/mcpls_worktrees/recovery-verification/.devkit/test.env
@@ -46,8 +66,8 @@ devrun -C /home/lev/Git/lev/mcpls_worktrees/recovery-verification --config /home
 
 ## Seven mutation contracts
 
-The controller's [.devkit/issue7-audit.md](../../../.devkit/issue7-audit.md)
-accepts the explicit mutation record in the [2026-09-09 validation
+The controller's local `.devkit/issue7-audit.md` accepts the explicit mutation
+record in the [2026-09-09 validation
 note](2026-09-09-diagnostics-validation.md). Each named assertion failed with
 the mutation and passed after restoration:
 
@@ -72,7 +92,8 @@ claim or a claim that unobserved deletions were comments.
 ## Native Windows evidence
 
 GitHub Actions run [34451287168](https://github.com/AbysmalBiscuit/mcpls/actions/runs/34451287168)
-passed at commit `d68565a3a83e02e75461f95caf227685ef3fb61e`:
+passed at commit
+[`d68565a3a83e02e75461f95caf227685ef3fb61e`](https://github.com/AbysmalBiscuit/mcpls/commit/d68565a3a83e02e75461f95caf227685ef3fb61e):
 
 - [Integration job 102788415590](https://github.com/AbysmalBiscuit/mcpls/actions/runs/34451287168/job/102788415590)
   ran and passed the concurrent-client, deadline, overrun, SessionStart,
