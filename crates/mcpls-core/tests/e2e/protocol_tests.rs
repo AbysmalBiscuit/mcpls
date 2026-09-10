@@ -439,37 +439,16 @@ fn test_e2e_sigterm_exits_promptly_while_client_stdin_open() -> Result<()> {
     }
 }
 
-/// Test that mcpls exits promptly on `SIGTERM` sent *before* the client ever
-/// sends the `initialize` request -- i.e. strictly during the MCP handshake
-/// wait itself (regression test for #318).
+/// Test that mcpls exits promptly on `SIGTERM` during the MCP handshake wait.
 ///
-/// This targets the actual bug in #318 directly: pre-fix, `run_stdio`
-/// registered its `SIGTERM` handler only *after* `mcp_server.serve(..)`
-/// resolved, so any signal arriving while `serve(..)` was still awaiting the
-/// client's `initialize` request -- which can be an arbitrarily long wait in
-/// real usage -- fell through to the OS's default disposition (immediate
-/// kill, no graceful shutdown, no LSP cleanup). Sending `SIGTERM`
-/// immediately after spawning, before writing anything to the child's
-/// stdin, reliably lands inside that wait rather than racing the much
-/// narrower post-handshake gap that
-/// `test_e2e_sigterm_exits_promptly_while_client_stdin_open` exercises.
+/// The readiness marker follows signal registration and precedes the wait for
+/// the client's first `initialize` request, so the signal is sent without a
+/// request while avoiding the process startup race.
 #[test]
 #[cfg(unix)]
 #[ignore = "Requires mcpls binary built"]
 fn test_e2e_sigterm_exits_promptly_during_handshake_wait() -> Result<()> {
-    let mut client = McpClient::spawn()?;
-
-    // A brief sleep before signaling clears the unrelated, unfixable gap
-    // between `fork`/`exec` and the point where *any* process code (the
-    // runtime init that precedes even the fixed `ShutdownSignal::new()`)
-    // has run -- the OS applies the default disposition until then no
-    // matter what the binary does, so signaling with zero delay would fail
-    // even against the fix and wouldn't be exercising #318 at all. 50ms is
-    // far below the 5s deadline below and well within the handshake wait,
-    // since `initialize()` is deliberately never called: the child is left
-    // parked inside `mcp_server.serve(..)`, waiting to read the client's
-    // first request.
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    let mut client = McpClient::spawn_and_wait_for_stdio()?;
 
     let pid = client.pid();
     let status = std::process::Command::new("kill")

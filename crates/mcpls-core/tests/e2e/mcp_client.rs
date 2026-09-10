@@ -7,6 +7,8 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
@@ -21,6 +23,10 @@ const CONTENT_MODIFIED_RETRY_BUDGET: Duration = Duration::from_secs(20);
 /// regression that always answers -32801 fails in a few seconds instead of
 /// being absorbed for the whole time budget before finally being reported.
 const CONTENT_MODIFIED_RETRY_ATTEMPTS: u32 = 3;
+
+const STDIO_READY_MARKER: &str = "Listening for MCP requests on stdio...";
+#[allow(dead_code)]
+const STDIO_READY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Simulates an MCP client (like Claude Code) for E2E testing.
 ///
@@ -54,6 +60,9 @@ pub struct McpClient {
     /// whichever test happened to win -- and would let a throwaway test
     /// server take the socket of a real session running in this checkout.
     _cwd: tempfile::TempDir,
+    stderr_reader: Option<JoinHandle<()>>,
+    #[allow(dead_code)]
+    stdio_ready: Option<Receiver<()>>,
 }
 
 /// The workspace root, from this crate's manifest directory.
@@ -148,16 +157,35 @@ impl McpClient {
     /// - The mcpls binary cannot be found or spawned
     /// - stdin or stdout cannot be captured
     pub fn spawn() -> Result<Self> {
+        Self::spawn_with_empty_config(false)
+    }
+
+    /// Spawn mcpls and wait until its stdio transport is ready for requests.
+    ///
+    /// The readiness marker is emitted after signal registration and before the
+    /// transport waits for the client's initialize request.
+    #[allow(dead_code)]
+    pub(crate) fn spawn_and_wait_for_stdio() -> Result<Self> {
+        let client = Self::spawn_with_empty_config(true)?;
+        client.wait_for_stdio_ready()?;
+        Ok(client)
+    }
+
+    /// Spawn mcpls with the empty protocol-only configuration.
+    fn spawn_with_empty_config(capture_stderr: bool) -> Result<Self> {
         // Use empty config to avoid LSP server initialization timeouts
         let config_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/empty_config.toml");
-
-        Self::spawn_with_args(&[
-            "--config",
-            config_path
-                .to_str()
-                .ok_or_else(|| anyhow::anyhow!("Invalid config path"))?,
-        ])
+        let config_path = config_path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("Invalid config path"))?;
+        let mut args = vec!["--config", config_path];
+        if capture_stderr {
+            args.extend(["--log-level", "info"]);
+            Self::spawn_with_args_and_stderr(&args, true)
+        } else {
+            Self::spawn_with_args(&args)
+        }
     }
 
     /// Spawn mcpls process with custom arguments.
@@ -168,6 +196,11 @@ impl McpClient {
     /// - The mcpls binary cannot be found or spawned
     /// - stdin or stdout cannot be captured
     pub fn spawn_with_args(args: &[&str]) -> Result<Self> {
+        Self::spawn_with_args_and_stderr(args, false)
+    }
+
+    /// Spawn mcpls with an optional stderr reader used by readiness-sensitive tests.
+    fn spawn_with_args_and_stderr(args: &[&str], capture_stderr: bool) -> Result<Self> {
         let binary_path = binary_under_test()?;
 
         let cwd = tempfile::tempdir().context("failed to create a working directory")?;
@@ -177,7 +210,11 @@ impl McpClient {
             .current_dir(cwd.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(if capture_stderr {
+                Stdio::piped()
+            } else {
+                Stdio::inherit()
+            })
             .spawn()
             .context("failed to spawn mcpls binary")?;
 
@@ -191,6 +228,42 @@ impl McpClient {
             .take()
             .context("failed to capture stdout of mcpls process")?;
 
+        let stderr = if capture_stderr {
+            Some(
+                process
+                    .stderr
+                    .take()
+                    .context("failed to capture stderr of mcpls process")?,
+            )
+        } else {
+            None
+        };
+
+        let (stderr_reader, stdio_ready): (Option<JoinHandle<()>>, Option<Receiver<()>>) = stderr
+            .map_or_else(
+                || (None, None),
+                |stderr| {
+                    let (ready_tx, ready_rx) = mpsc::channel();
+                    let reader = std::thread::spawn(move || {
+                        for line in BufReader::new(stderr).lines() {
+                            match line {
+                                Ok(line) => {
+                                    eprintln!("{line}");
+                                    if line.contains(STDIO_READY_MARKER) {
+                                        let _ = ready_tx.send(());
+                                    }
+                                }
+                                Err(error) => {
+                                    eprintln!("failed to read mcpls stderr: {error}");
+                                    break;
+                                }
+                            }
+                        }
+                    });
+                    (Some(reader), Some(ready_rx))
+                },
+            );
+
         Ok(Self {
             process,
             stdin,
@@ -198,7 +271,27 @@ impl McpClient {
             request_id: 0,
             pending_notifications: Vec::new(),
             _cwd: cwd,
+            stderr_reader,
+            stdio_ready,
         })
+    }
+
+    #[allow(dead_code)]
+    fn wait_for_stdio_ready(&self) -> Result<()> {
+        let receiver = self
+            .stdio_ready
+            .as_ref()
+            .context("stdio readiness is unavailable for this client")?;
+
+        match receiver.recv_timeout(STDIO_READY_TIMEOUT) {
+            Ok(()) => Ok(()),
+            Err(RecvTimeoutError::Timeout) => {
+                anyhow::bail!("mcpls did not report stdio readiness within {STDIO_READY_TIMEOUT:?}")
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("mcpls stderr closed before reporting stdio readiness")
+            }
+        }
     }
 
     /// Drain and return server-pushed notifications collected so far (e.g.
@@ -489,6 +582,9 @@ impl Drop for McpClient {
     fn drop(&mut self) {
         let _ = self.process.kill();
         let _ = self.process.wait();
+        if let Some(reader) = self.stderr_reader.take() {
+            let _ = reader.join();
+        }
     }
 }
 
