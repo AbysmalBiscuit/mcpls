@@ -691,6 +691,10 @@ pub(crate) async fn serve_with_identity(
     // `handles` claims) are enforced -- a startup error naming the
     // conflicting `[[lsp_servers]]` entries, not a silent drop.
     let router = ToolRouter::from_configs(applicable_configs.iter().map(|c| &c.server_config))?;
+    let floor_configs = applicable_configs
+        .iter()
+        .map(|config| config.server_config.clone())
+        .collect::<Vec<_>>();
 
     // Built here (rather than alongside `subscriptions`/`peer_cell` below) so
     // it can be handed to the translator, which uses it to invalidate a
@@ -750,10 +754,7 @@ pub(crate) async fn serve_with_identity(
     let delivery = Arc::new(Mutex::new(bridge::DiagnosticsDelivery::new(
         config.diagnostics,
     )));
-    let floors = Arc::new(bridge::FloorTable::new(
-        &config.diagnostics,
-        &config.lsp_servers,
-    ));
+    let floors = Arc::new(bridge::FloorTable::new(&config.diagnostics, &floor_configs));
 
     // The hook socket is an optimization, not a requirement: a process that
     // cannot derive its own identity still answers every MCP tool, so this

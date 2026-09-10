@@ -161,6 +161,125 @@ fn run_hover_case_in_workspace(
     Ok(())
 }
 
+fn write_duplicate_floor_config(
+    config_path: &Path,
+    script: &Path,
+    active_marker: &Path,
+    active_publish_marker: &Path,
+    inactive_publish_marker: &Path,
+    active_first: bool,
+) -> Result<()> {
+    let workspace = config_path
+        .parent()
+        .context("fixture config path must have a parent")?;
+    let workspace = toml::Value::String(workspace.to_string_lossy().into_owned()).to_string();
+    let script = toml::Value::String(script.to_string_lossy().into_owned()).to_string();
+    let active_marker =
+        toml::Value::String(active_marker.to_string_lossy().into_owned()).to_string();
+    let active_publish_marker =
+        toml::Value::String(active_publish_marker.to_string_lossy().into_owned()).to_string();
+    let inactive_publish_marker =
+        toml::Value::String(inactive_publish_marker.to_string_lossy().into_owned()).to_string();
+    let active = format!(
+        "[[lsp_servers]]\nlanguage_id = \"python\"\ncommand = \"python3\"\nargs = [{script}, \"active-warning\", \"active-hover\", {active_publish_marker}]\nfile_patterns = [\"**/*.py\"]\ndiagnostics_severity = \"warning\"\n\n[lsp_servers.heuristics]\nproject_markers = [{active_marker}]\n"
+    );
+    let inactive = format!(
+        "[[lsp_servers]]\nlanguage_id = \"python\"\ncommand = \"python3\"\nargs = [{script}, \"inactive-fixture\", \"inactive-hover\", {inactive_publish_marker}]\nfile_patterns = [\"**/*.py\"]\ndiagnostics_severity = \"error\"\n\n[lsp_servers.heuristics]\nproject_markers = [\"inactive.marker\"]\n"
+    );
+    let servers = if active_first {
+        format!("{active}{inactive}")
+    } else {
+        format!("{inactive}{active}")
+    };
+    fs::write(
+        config_path,
+        format!(
+            "[workspace]\nroots = [{workspace}]\n[diagnostics]\nsettle_quiet_ms = 50\nsettle_deadline_ms = 10000\n[diagnostics.hooks]\nenabled = false\n\n{servers}"
+        ),
+    )?;
+    Ok(())
+}
+
+fn wait_for_diagnostics_baseline(client: &mut McpClient) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let response = client.call_tool("get_new_diagnostics", &json!({}))?;
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .with_context(|| format!("expected diagnostic text content, got {response}"))?;
+        let payload: serde_json::Value = serde_json::from_str(text)?;
+        if payload.get("note").is_none() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("diagnostics baseline was not ready: {payload}");
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn wait_for_marker(path: &Path) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !path.exists() {
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "LSP fixture did not publish its marker at {}",
+                path.display()
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
+}
+
+fn run_duplicate_floor_case(active_first: bool) -> Result<String> {
+    let workspace = TempDir::new()?;
+    let active_marker = workspace.path().join("active.marker");
+    fs::write(&active_marker, "")?;
+    let script = diagnostics_fixture::write_diagnostics_server(workspace.path())?;
+    let active_publish_marker = workspace.path().join("active-published.marker");
+    let inactive_publish_marker = workspace.path().join("inactive-published.marker");
+    let config_path = workspace.path().join("mcpls.toml");
+    write_duplicate_floor_config(
+        &config_path,
+        &script,
+        &active_marker,
+        &active_publish_marker,
+        &inactive_publish_marker,
+        active_first,
+    )?;
+    let file_path = workspace.path().join("main.py");
+    fs::write(&file_path, "def fixture():\n    return 1\n")?;
+
+    let config_arg = config_path
+        .to_str()
+        .context("fixture config path must be valid UTF-8")?;
+    let mut client = McpClient::spawn_with_args(&["--config", config_arg])?;
+    client.initialize()?;
+    wait_for_diagnostics_baseline(&mut client)?;
+
+    let hover = call_hover_when_ready(&mut client, &file_path)?;
+    assert!(
+        hover.to_string().contains("active-hover"),
+        "the applicable Python LSP must answer the control request, got {hover}"
+    );
+    wait_for_marker(&active_publish_marker)?;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let report = loop {
+        let response = client.call_tool("get_new_diagnostics", &json!({}))?;
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .with_context(|| format!("expected diagnostic text content, got {response}"))?;
+        let report = text.to_owned();
+        if report.contains("active-warning") || Instant::now() >= deadline {
+            break report;
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
+    Ok(report)
+}
+
 #[test]
 #[ignore = "Requires mcpls binary built"]
 fn i1_t1_file_pattern_mapping_routes_hover() -> Result<()> {
@@ -224,6 +343,34 @@ fn i1_t1_workspace_only_server_without_mapping_is_accepted() -> Result<()> {
     assert!(
         response.to_string().contains("workspace-fixture"),
         "workspace symbol response should contain the fixture sentinel, got {response}"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "Requires mcpls binary built"]
+fn i1_t4_inactive_duplicate_cannot_choose_floor() -> Result<()> {
+    // Run the passing inactive-first control before the active-first case,
+    // whose inactive entry currently overwrites the active warning floor.
+    let control_report = run_duplicate_floor_case(false)?;
+    assert!(
+        control_report.contains("active-warning"),
+        "inactive-first control must deliver the active warning, got {control_report}"
+    );
+    assert!(
+        !control_report.contains("inactive-fixture"),
+        "inactive fixture must not publish, got {control_report}"
+    );
+    eprintln!("i1_t4 control (inactive-first): active warning delivered");
+
+    let active_first_report = run_duplicate_floor_case(true)?;
+    assert!(
+        active_first_report.contains("active-warning"),
+        "active-first declaration must still deliver the active warning, got {active_first_report}"
+    );
+    assert!(
+        !active_first_report.contains("inactive-fixture"),
+        "inactive fixture must not publish, got {active_first_report}"
     );
     Ok(())
 }
