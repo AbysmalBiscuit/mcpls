@@ -30,6 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Synchronize all affected source documents, including unopened rename targets, before sending save notifications. Keep unfinished saves queued across cancellation and server replacement.
+
 - Resume diagnostics, logs, messages, and progress after a language server restarts. Retire the old notification task before clearing its diagnostics, preserve other servers and the session baseline, and stop replacement pumps during shutdown.
 
 - Preserve distinct pull and cached diagnostic records, including their producer sources. Only identical records are deduplicated, so one logical problem can have multiple reports.

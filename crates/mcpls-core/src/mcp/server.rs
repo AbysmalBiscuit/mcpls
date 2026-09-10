@@ -2924,6 +2924,103 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn test_rename_resyncs_unopened_targets_before_any_save() {
+        use rmcp::ServiceExt as _;
+        use tokio::io::{AsyncWriteExt as _, BufReader, BufStream};
+
+        use crate::test_support::read_framed_message;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let paths = [dir.path().join("anchor.rs"), dir.path().join("unopened.rs")];
+            for path in &paths {
+                std::fs::write(path, "fn old() {}\n").unwrap();
+            }
+            let uris = paths.each_ref().map(|path| crate::bridge::path_to_uri(path).unwrap());
+            let (translator, mut lsp) = translator_with_capabilities(
+                &dir, &ServerId::from("rust"), WriteTool::Rename.capabilities(),
+            );
+            let registry = Arc::new(crate::lsp::WatchRegistry::new());
+            registry.register(&ServerId::from("rust"), "sources", &json!([{"globPattern": "**/*.rs"}]));
+            let translator = Arc::new(translator.with_watch_registry(registry).with_applier(Arc::new(
+                Applier::new(vec![dir.path().to_path_buf()], WriteTool::Rename.apply_config()),
+            )));
+            let (delivery, floors) = default_delivery_and_floors();
+            let server = McplsServer::new(
+                Arc::clone(&translator), Arc::new(Mutex::new(NotificationCache::new())),
+                Arc::from(vec![dir.path().to_path_buf()]), Arc::new(ResourceSubscriptions::new()),
+                false, delivery, floors, DiagnosticsConfig::default(), test_settle(),
+            );
+            let (server_io, client_io) = tokio::io::duplex(65_536);
+            let started = tokio::spawn(async move { server.serve(server_io).await.unwrap() });
+            let mut wire = BufStream::new(client_io);
+            let initialized = mcp_test_request(&mut wire, json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2025-11-25", "capabilities": {},
+                    "clientInfo": {"name": "resync-test", "version": "1"}}
+            })).await;
+            assert!(initialized["result"].is_object(), "{initialized}");
+            wire.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n").await.unwrap();
+            wire.flush().await.unwrap();
+            let running = started.await.unwrap();
+            let call = mcp_test_request(&mut wire, json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "rename_symbol", "arguments": {
+                    "file_path": paths[0], "line": 1, "character": 4,
+                    "new_name": "new", "apply": true}}
+            }));
+            let respond = async {
+                let mut lsp_wire = BufReader::new(&mut lsp.write_stdout);
+                let opened = read_framed_message(&mut lsp_wire).await;
+                assert_eq!(opened["method"], "textDocument/didOpen");
+                assert_eq!(opened["params"]["textDocument"]["uri"], uris[0].as_str());
+                let rename = read_framed_message(&mut lsp_wire).await;
+                assert_eq!(rename["method"], "textDocument/rename");
+                assert!(translator.document_tracker().get(&paths[1]).is_none(), "target must be unopened at rename");
+                let changes: Vec<_> = uris.iter().map(|uri| json!({
+                    "textDocument": {"uri": uri, "version": null},
+                    "edits": [{"range": {"start": {"line": 0, "character": 3},
+                        "end": {"line": 0, "character": 6}}, "newText": "new"}]
+                })).collect();
+                write_response(&mut lsp.read_half_stdin, &rename["id"], json!({"documentChanges": changes})).await;
+                let mut contents = std::collections::HashMap::new();
+                let mut saves = std::collections::HashSet::new();
+                let mut watched = std::collections::HashSet::new();
+                while saves.len() < 2 || watched.len() < 2 {
+                    let message = read_framed_message(&mut lsp_wire).await;
+                    let params = &message["params"];
+                    let uri = params["textDocument"]["uri"].as_str().unwrap_or_default();
+                    match message["method"].as_str().unwrap() {
+                        "textDocument/didOpen" => { contents.insert(uri.to_owned(), params["textDocument"]["text"].clone()); }
+                        "textDocument/didChange" => { contents.insert(uri.to_owned(), params["contentChanges"][0]["text"].clone()); }
+                        "textDocument/didSave" => {
+                            for target in &uris {
+                                assert_eq!(contents.get(target.as_str()), Some(&json!("fn new() {}\n")), "all affected content must arrive before the first save: {message}");
+                            }
+                            saves.insert(uri.to_owned());
+                        }
+                        "workspace/didChangeWatchedFiles" => {
+                            for change in params["changes"].as_array().unwrap() {
+                                watched.insert(change["uri"].as_str().unwrap().to_owned());
+                            }
+                        }
+                        other => panic!("unexpected notification: {other}"),
+                    }
+                }
+            };
+            let (response, ()) = tokio::join!(call, respond);
+            assert!(response["error"].is_null(), "{response}");
+            assert_eq!(response["result"]["isError"], false, "{response}");
+            for path in &paths {
+                assert_eq!(std::fs::read_to_string(path).unwrap(), "fn new() {}\n");
+                assert!(translator.document_tracker().get(path).is_some());
+            }
+            running.cancel().await.unwrap();
+        }).await.expect("bounded MCP rename and LSP notification exchange");
+    }
+
     async fn mcp_test_request(
         wire: &mut tokio::io::BufStream<tokio::io::DuplexStream>,
         request: serde_json::Value,

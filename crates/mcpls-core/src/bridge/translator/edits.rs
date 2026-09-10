@@ -2231,13 +2231,11 @@ mod tests {
             .expect("the second call succeeds");
     }
 
-    /// The drain runs inside the request future, so it is dropped by the
-    /// same Esc that cancels anything else. A drain that emptied the queue
-    /// up front would lose every path it had not reached, leaving those
-    /// documents tracked at pre-apply content with nothing left to notice.
+    /// Path locks hold the drain between content and saves while cancellation,
+    /// a concurrent edit, or a server generation reset invalidates its work.
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    async fn test_a_cancelled_drain_leaves_the_paths_it_did_not_reach_queued() {
+    async fn test_resync_retries_cancellation_version_and_generation_boundaries() {
         use std::sync::Arc;
 
         use tokio::io::BufReader;
@@ -2245,86 +2243,185 @@ mod tests {
 
         use crate::config::ServerId;
 
-        let dir = tempfile::TempDir::new().expect("temp dir");
-        let caps = lsp_types::ServerCapabilities {
-            rename_provider: Some(lsp_types::OneOf::Left(true)),
-            ..Default::default()
-        };
-        let (translator, mut server) =
-            translator_with_capabilities(&dir, &ServerId::from("rust"), caps);
-        let translator = Arc::new(translator);
-
-        let first = dir.path().join("first.rs");
-        let second = dir.path().join("second.rs");
-        let mut wire = BufReader::new(&mut server.write_stdout);
-
-        // Both are open in the server, which is what makes resyncing them
-        // observable on the wire.
-        let mut canonical = Vec::new();
-        for path in [&first, &second] {
-            fs::write(path, "fn old() {}\n").expect("write the fixture");
-            canonical.push(path.canonicalize().expect("the fixture exists"));
-
-            let opening = {
-                let translator = Arc::clone(&translator);
-                let path = path.to_string_lossy().to_string();
-                tokio::spawn(async move {
-                    translator
-                        .handle_rename(path, 1, 1, "x".to_string(), false)
-                        .await
-                })
+        for boundary in ["cancel", "version", "generation"] {
+            let dir = tempfile::TempDir::new().expect("temp dir");
+            let caps = lsp_types::ServerCapabilities {
+                rename_provider: Some(lsp_types::OneOf::Left(true)),
+                ..Default::default()
             };
-            assert_eq!(
-                read_framed_message(&mut wire).await["method"],
-                "textDocument/didOpen"
-            );
-            let request = read_framed_reply(&mut wire).await;
-            write_response(
-                &mut server.read_half_stdin,
-                &request["id"],
-                serde_json::Value::Null,
-            )
-            .await;
-            timeout(Duration::from_secs(5), opening)
+            let (translator, mut server) =
+                translator_with_capabilities(&dir, &ServerId::from("rust"), caps);
+            let translator = Arc::new(translator);
+
+            let first = dir.path().join("first.rs");
+            let second = dir.path().join("second.rs");
+            let mut wire = BufReader::new(&mut server.write_stdout);
+
+            // Both are open in the server, which is what makes resyncing them
+            // observable on the wire.
+            let mut canonical = Vec::new();
+            for path in [&first, &second] {
+                fs::write(path, "fn old() {}\n").expect("write the fixture");
+                canonical.push(path.canonicalize().expect("the fixture exists"));
+
+                let opening = {
+                    let translator = Arc::clone(&translator);
+                    let path = path.to_string_lossy().to_string();
+                    tokio::spawn(async move {
+                        translator
+                            .handle_rename(path, 1, 1, "x".to_string(), false)
+                            .await
+                    })
+                };
+                assert_eq!(
+                    read_framed_message(&mut wire).await["method"],
+                    "textDocument/didOpen"
+                );
+                let request = read_framed_reply(&mut wire).await;
+                write_response(
+                    &mut server.read_half_stdin,
+                    &request["id"],
+                    serde_json::Value::Null,
+                )
+                .await;
+                timeout(Duration::from_secs(5), opening)
+                    .await
+                    .expect("the opening call must not hang")
+                    .expect("the opening task must not panic")
+                    .expect("a rename with no edits still succeeds");
+            }
+
+            for path in &canonical {
+                fs::write(path, "fn new() {}\n").unwrap();
+            }
+            let tracker = translator.document_tracker();
+            let second_held = tracker.lock_path(&canonical[1]).await;
+            translator.pending_invalidations.extend(&canonical);
+            let drain = {
+                let translator = Arc::clone(&translator);
+                tokio::spawn(async move { translator.resync_changed_documents().await })
+            };
+            let changed = timeout(Duration::from_secs(5), read_framed_message(&mut wire))
                 .await
-                .expect("the opening call must not hang")
-                .expect("the opening task must not panic")
-                .expect("a rename with no edits still succeeds");
+                .unwrap();
+            assert_eq!(changed["method"], "textDocument/didChange");
+            assert_eq!(
+                changed["params"]["contentChanges"][0]["text"],
+                "fn new() {}\n"
+            );
+            let first_held = timeout(Duration::from_secs(5), tracker.lock_path(&canonical[0]))
+                .await
+                .unwrap();
+            assert_eq!(
+                tracker
+                    .get(&canonical[0])
+                    .unwrap()
+                    .saved_version(&ServerId::from("rust")),
+                None,
+                "the first path must still owe its save while the second content sync is blocked"
+            );
+            drop(second_held);
+            let changed = timeout(Duration::from_secs(5), read_framed_message(&mut wire))
+                .await
+                .unwrap();
+            assert_eq!(changed["method"], "textDocument/didChange");
+            assert_eq!(changed["params"]["textDocument"]["version"], 2);
+            // The first path lock holds the save phase after both content frames arrived.
+            match boundary {
+                "cancel" => {
+                    drain.abort();
+                    assert!(drain.await.unwrap_err().is_cancelled());
+                    drop(first_held);
+                }
+                "version" => {
+                    fs::write(&canonical[0], "fn latest() {}\n").unwrap();
+                    tracker
+                        .update(&canonical[0], "fn latest() {}\n".to_owned())
+                        .unwrap();
+                    drop(first_held);
+                    timeout(Duration::from_secs(5), drain)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let saved = timeout(Duration::from_secs(5), read_framed_message(&mut wire))
+                        .await
+                        .unwrap();
+                    assert_eq!(saved["method"], "textDocument/didSave");
+                    assert_eq!(
+                        saved["params"]["textDocument"]["uri"],
+                        crate::bridge::path_to_uri(&canonical[1]).unwrap().as_str()
+                    );
+                }
+                "generation" => {
+                    tracker.forget_server(&ServerId::from("rust"));
+                    drop(first_held);
+                    timeout(Duration::from_secs(5), drain)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let pending = translator.pending_invalidations.take();
+            let expected = if boundary == "version" {
+                canonical[..1].to_vec()
+            } else {
+                canonical.clone()
+            };
+            assert_eq!(pending, expected, "{boundary}");
+            for path in &pending {
+                assert_eq!(
+                    tracker
+                        .get(path)
+                        .unwrap()
+                        .saved_version(&ServerId::from("rust")),
+                    None,
+                    "{boundary}"
+                );
+            }
+            translator.pending_invalidations.extend(&pending);
+            translator.resync_changed_documents().await;
+            if boundary == "version" {
+                let changed = timeout(Duration::from_secs(5), read_framed_message(&mut wire))
+                    .await
+                    .unwrap();
+                assert_eq!(changed["method"], "textDocument/didChange");
+                assert_eq!(changed["params"]["textDocument"]["version"], 3);
+                assert_eq!(
+                    changed["params"]["contentChanges"][0]["text"],
+                    "fn latest() {}\n"
+                );
+            } else if boundary == "generation" {
+                for path in &pending {
+                    let opened = timeout(Duration::from_secs(5), read_framed_message(&mut wire))
+                        .await
+                        .unwrap();
+                    assert_eq!(opened["method"], "textDocument/didOpen");
+                    assert_eq!(
+                        opened["params"]["textDocument"]["uri"],
+                        crate::bridge::path_to_uri(path).unwrap().as_str()
+                    );
+                    assert_eq!(opened["params"]["textDocument"]["version"], 2);
+                    assert_eq!(opened["params"]["textDocument"]["text"], "fn new() {}\n");
+                }
+            }
+            for path in &pending {
+                let saved = timeout(Duration::from_secs(5), read_framed_message(&mut wire))
+                    .await
+                    .unwrap();
+                assert_eq!(saved["method"], "textDocument/didSave");
+                assert_eq!(
+                    saved["params"]["textDocument"]["uri"],
+                    crate::bridge::path_to_uri(path).unwrap().as_str()
+                );
+                let state = tracker.get(path).unwrap();
+                assert_eq!(
+                    state.saved_version(&ServerId::from("rust")),
+                    Some(state.version())
+                );
+            }
+            assert!(translator.pending_invalidations.take().is_empty());
         }
-
-        // Holding the second path's lock stops the drain there, exactly
-        // where an interrupt would otherwise land between two paths.
-        let held = translator.document_tracker().lock_path(&canonical[1]).await;
-
-        translator.pending_invalidations.extend(&canonical);
-        let drain = {
-            let translator = Arc::clone(&translator);
-            tokio::spawn(async move { translator.resync_changed_documents().await })
-        };
-
-        // The first path is dealt with -- its content on disk never changed,
-        // so a save is still owed but no change is -- and the drain is now
-        // parked on the second path's lock.
-        let saved = read_framed_message(&mut wire).await;
-        assert_eq!(saved["method"], "textDocument/didSave");
-        assert!(translator.is_document_open(&canonical[0]));
-
-        drain.abort();
-        assert!(
-            drain.await.is_err(),
-            "the drain's future is dropped, as a cancelled request drops it"
-        );
-        drop(held);
-
-        assert!(
-            translator.is_document_open(&canonical[1]),
-            "the cancelled drain never got to the second path"
-        );
-        assert_eq!(
-            translator.pending_invalidations.take(),
-            vec![canonical[1].clone()],
-            "so it must still be queued for the next drain to deal with"
-        );
     }
 
     /// An apply writes files the call never queried -- a rename anchored in
