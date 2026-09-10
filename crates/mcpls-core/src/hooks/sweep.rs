@@ -75,8 +75,8 @@ pub struct Sweeper {
 impl Sweeper {
     /// A sweeper that admits paths through `filter`, acts on them through
     /// `translator`, and sweeps the pending set once it has been quiet for
-    /// `quiet_for`. Never opens more than `max_documents` documents beyond
-    /// however many `translator` already holds open.
+    /// `quiet_for`. A finite `max_documents` leaves one document slot for
+    /// ordinary requests; zero allows unbounded background opens.
     #[must_use]
     pub fn new(
         translator: Arc<Translator>,
@@ -228,11 +228,6 @@ impl Sweeper {
         if paths.is_empty() {
             return;
         }
-        // Cleared before the work rather than only overwritten after it: a
-        // read landing mid-sweep must not be answered with the previous
-        // sweep's line.
-        *lock_std(&self.last_shortfall) = None;
-
         let tracker = self.translator.document_tracker();
         let mut kinds = Vec::with_capacity(paths.len());
         let mut settle = Vec::new();
@@ -256,9 +251,14 @@ impl Sweeper {
             }
         }
 
-        let headroom = self
-            .max_documents
-            .saturating_sub(tracker.open_paths().len());
+        let open_count = tracker.open_paths().len();
+        let headroom = if self.max_documents == 0 {
+            usize::MAX
+        } else {
+            self.max_documents
+                .saturating_sub(open_count)
+                .saturating_sub(1)
+        };
         let mut opened = 0;
         let mut over_limit = 0;
         let mut unopened = 0;
@@ -308,7 +308,8 @@ impl Sweeper {
                 .await;
         }
 
-        *lock_std(&self.last_shortfall) = Self::shortfall(over_limit, unopened, self.max_documents);
+        *lock_std(&self.last_shortfall) =
+            Self::shortfall(over_limit, unopened, headroom, self.max_documents);
         *lock_std(&self.last_kinds) = kinds;
         self.last_opened_count.store(opened, Ordering::Relaxed);
         let sweeps_run = self.sweeps_run.fetch_add(1, Ordering::Relaxed) + 1;
@@ -324,11 +325,16 @@ impl Sweeper {
     /// for the document limit is answered by raising the limit, while one
     /// that could not be opened at all is not, and a single count would
     /// send a reader after the wrong one.
-    fn shortfall(over_limit: usize, unopened: usize, max_documents: usize) -> Option<String> {
+    fn shortfall(
+        over_limit: usize,
+        unopened: usize,
+        headroom: usize,
+        max_documents: usize,
+    ) -> Option<String> {
         let mut reasons = Vec::new();
         if over_limit > 0 {
             reasons.push(format!(
-                "{over_limit} file(s) not checked: the document limit of {max_documents} was reached"
+                "{over_limit} file(s) not checked: background sweep headroom of {headroom} was exhausted; coverage was skipped to reserve one document slot (document limit {max_documents})"
             ));
         }
         if unopened > 0 {
@@ -656,7 +662,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_an_atomic_save_is_swept_as_a_change_not_a_delete() {
-        let sweeper = served_sweeper(usize::MAX).await;
+        let sweeper = served_sweeper(1).await;
         let path = sweeper.write("saved.rs", "fn main() {}");
         sweeper.open(&path).await;
 
@@ -815,7 +821,7 @@ mod tests {
         // No room for another document at all, so every path this sweep
         // declines to open would be blamed on the ceiling by an accounting
         // that decided before it asked whether anything routes them.
-        let sweeper = test_sweeper_with_ceiling(Duration::from_secs(60), 0);
+        let sweeper = test_sweeper_with_ceiling(Duration::from_secs(60), 1);
         let paths: Vec<PathBuf> = (0..3).map(|i| sweeper.write(&format!("f{i}.rs"))).collect();
         sweeper.enqueue(&paths);
         sweeper.sweep_now().await;
@@ -832,6 +838,8 @@ mod tests {
     #[tokio::test]
     async fn test_a_path_arriving_during_a_sweep_lands_in_the_next_one() {
         let sweeper = test_sweeper(Duration::from_secs(60));
+        let shortfall = "1 file(s) not checked: they could not be opened";
+        sweeper.set_shortfall_for_test(shortfall);
         let first = sweeper.write("first.rs");
         std::fs::remove_file(&first).expect("remove");
         sweeper.enqueue(std::slice::from_ref(&first));
@@ -848,11 +856,13 @@ mod tests {
             async move { sweeper.sweep_now().await }
         });
         wait_until(|| sweeper.pending_len() == 0).await;
+        assert_eq!(sweeper.last_shortfall().as_deref(), Some(shortfall));
 
         let second = sweeper.write("second.rs");
         sweeper.enqueue(std::slice::from_ref(&second));
         drop(held);
         running.await.expect("the sweep task");
+        assert_eq!(sweeper.last_shortfall(), None);
 
         assert_eq!(
             sweeper.last_kinds(),
@@ -881,12 +891,12 @@ mod tests {
 
         assert_eq!(
             sweeper.last_shortfall().expect("a shortfall line"),
-            "7 file(s) not checked: the document limit of 3 was reached",
-            "asserted whole rather than by substring: a contains('7') would \
-             also match 17, 27 or '7 of 70'"
+            "8 file(s) not checked: background sweep headroom of 2 was exhausted; coverage was skipped to reserve one document slot (document limit 3)",
+            "asserted whole rather than by substring: a contains('8') would \
+             also match 18, 28 or '8 of 80'"
         );
         assert!(
-            sweeper.opened_count() <= 3,
+            sweeper.opened_count() < 3,
             "filling the tracker would make the next unrelated tool call fail \
              with DocumentLimitExceeded, which is a worse outcome than not \
              checking some files"

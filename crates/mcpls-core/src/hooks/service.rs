@@ -391,8 +391,8 @@ mod tests {
 
     use super::*;
     use crate::bridge::{
-        DiagnosticsDelivery, FloorTable, NotificationCache, ResourceSubscriptions, ServerSettle,
-        Translator,
+        DiagnosticsDelivery, FloorTable, NotificationCache, ResourceLimits, ResourceSubscriptions,
+        ServerSettle, Translator, TranslatorHarness,
     };
     use crate::config::{DiagnosticsConfig, ServerId};
     use crate::hooks::{ChangeEvent, HookListener, PathFilter, Request, Response, SocketIdentity};
@@ -403,10 +403,13 @@ mod tests {
     /// `build_handler` `serve_with` uses.
     struct HookHarness {
         dir: TempDir,
+        root: PathBuf,
         identity: SocketIdentity,
+        server: Arc<McplsServer>,
         sweeper: Arc<Sweeper>,
         notification_cache: Arc<Mutex<NotificationCache>>,
         delivery: Arc<Mutex<DiagnosticsDelivery>>,
+        translator_harness: Option<TranslatorHarness>,
         _cancel: tokio::sync::watch::Sender<bool>,
     }
 
@@ -424,13 +427,52 @@ mod tests {
         async fn owner_without_baseline() -> Self {
             let (dir, identity) = temp_identity();
             let translator = Arc::new(Translator::new());
+            Self::start_owner(dir, identity, translator, None, usize::MAX).await
+        }
+
+        /// An owner with a fake LSP server and the same document limit
+        /// on its tracker and background sweeper.
+        async fn owner_with_document_limit(max_documents: usize) -> Self {
+            let (dir, identity) = temp_identity();
+            let translator_harness = TranslatorHarness::with_one_server_and_limits(
+                "rust",
+                ResourceLimits {
+                    max_documents,
+                    ..ResourceLimits::default()
+                },
+            )
+            .await;
+            let translator = Arc::clone(&translator_harness.translator);
+            let harness = Self::start_owner(
+                dir,
+                identity,
+                translator,
+                Some(translator_harness),
+                max_documents,
+            )
+            .await;
+            harness.delivery.lock().await.set_baseline(HashMap::new());
+            harness
+        }
+
+        async fn start_owner(
+            dir: TempDir,
+            identity: SocketIdentity,
+            translator: Arc<Translator>,
+            translator_harness: Option<TranslatorHarness>,
+            max_documents: usize,
+        ) -> Self {
+            let root = translator_harness.as_ref().map_or_else(
+                || dir.path().to_path_buf(),
+                |harness| harness.root().to_path_buf(),
+            );
             let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
             let delivery = Arc::new(Mutex::new(DiagnosticsDelivery::new(
                 DiagnosticsConfig::default(),
             )));
             let role = Arc::new(HookRole::owner());
             let context = Arc::new(test_context(
-                dir.path(),
+                &root,
                 Arc::clone(&translator),
                 Arc::clone(&notification_cache),
                 Arc::clone(&delivery),
@@ -438,7 +480,11 @@ mod tests {
                 Arc::clone(&role),
             ));
             let server = Arc::new(McplsServer::from_context(context));
-            let sweeper = Arc::new(test_sweeper(dir.path(), translator));
+            let sweeper = Arc::new(test_sweeper_with_limit(
+                &root,
+                Arc::clone(&translator),
+                max_documents,
+            ));
             let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
             tokio::spawn(Arc::clone(&sweeper).run(cancel_rx.clone()));
 
@@ -448,11 +494,11 @@ mod tests {
                 .expect("the harness owns its own temporary socket");
             tokio::spawn(listener.serve(
                 build_handler(
-                    server,
+                    Arc::clone(&server),
                     Arc::clone(&sweeper),
                     HookLocation {
                         identity: identity.clone(),
-                        root: dir.path().to_path_buf(),
+                        root: root.clone(),
                     },
                     role,
                     cancel_rx.clone(),
@@ -463,10 +509,13 @@ mod tests {
 
             Self {
                 dir,
+                root,
                 identity,
+                server,
                 sweeper,
                 notification_cache,
                 delivery,
+                translator_harness,
                 _cancel: cancel_tx,
             }
         }
@@ -486,7 +535,102 @@ mod tests {
 
         /// An absolute path under this harness's temporary workspace.
         fn fixture(&self, rel: &str) -> PathBuf {
-            self.dir.path().join(rel)
+            self.root.join(rel)
+        }
+
+        /// Methods received by the fake LSP server, represented as the
+        /// method-only shape the assertions need.
+        fn lsp_notifications(&self) -> Vec<serde_json::Value> {
+            self.translator_harness
+                .as_ref()
+                .map(|harness| {
+                    harness
+                        .notifications_for("rust")
+                        .into_iter()
+                        .map(|method| serde_json::json!({ "method": method }))
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+
+        /// Call the diagnostics MCP tool over an in-memory RMCP connection.
+        async fn call_file_tool(&self, path: &std::path::Path) -> rmcp::model::CallToolResult {
+            use rmcp::ServiceExt;
+            use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufStream};
+
+            async fn request(
+                wire: &mut BufStream<tokio::io::DuplexStream>,
+                request: serde_json::Value,
+            ) -> serde_json::Value {
+                let id = request["id"].clone();
+                wire.write_all(format!("{request}\n").as_bytes())
+                    .await
+                    .expect("write MCP request");
+                wire.flush().await.expect("flush MCP request");
+
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    assert_ne!(
+                        wire.read_line(&mut line).await.expect("read MCP response"),
+                        0,
+                        "MCP server closed before answering request {id}"
+                    );
+                    let response: serde_json::Value =
+                        serde_json::from_str(&line).expect("MCP server sends valid JSON");
+                    if response["id"] == id {
+                        return response;
+                    }
+                }
+            }
+
+            let (server_transport, client_transport) = tokio::io::duplex(65_536);
+            let server = Arc::clone(&self.server);
+            let server_task = tokio::spawn(async move {
+                let service = server
+                    .serve(server_transport)
+                    .await
+                    .expect("MCP server starts");
+                service.waiting().await.expect("MCP server stays alive");
+            });
+            let mut wire = BufStream::new(client_transport);
+            let initialized = request(
+                &mut wire,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": {"name": "hook-sweep-test", "version": "1"}
+                    }
+                }),
+            )
+            .await;
+            assert!(initialized["result"].is_object(), "{initialized}");
+            wire.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+                .await
+                .expect("write MCP initialized notification");
+            wire.flush()
+                .await
+                .expect("flush MCP initialized notification");
+            let response = request(
+                &mut wire,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "get_diagnostics",
+                        "arguments": {"file_path": path.display().to_string()}
+                    }
+                }),
+            )
+            .await;
+            server_task.abort();
+            serde_json::from_value(response["result"].clone())
+                .unwrap_or_else(|error| panic!("MCP file tool failed: {response}: {error}"))
         }
 
         /// Send one request over the real socket and return the answer.
@@ -662,6 +806,14 @@ mod tests {
 
     /// A `Sweeper` over `root`, admitting `.rs` files.
     fn test_sweeper(root: &std::path::Path, translator: Arc<Translator>) -> Sweeper {
+        test_sweeper_with_limit(root, translator, usize::MAX)
+    }
+
+    fn test_sweeper_with_limit(
+        root: &std::path::Path,
+        translator: Arc<Translator>,
+        max_documents: usize,
+    ) -> Sweeper {
         Sweeper::new(
             translator,
             PathFilter::new(
@@ -670,7 +822,7 @@ mod tests {
                 None,
             ),
             Duration::from_millis(500),
-            usize::MAX,
+            max_documents,
         )
     }
 
@@ -726,6 +878,13 @@ mod tests {
         }
     }
 
+    async fn wait_for_sweep(completion: &mut tokio::sync::watch::Receiver<usize>) {
+        tokio::time::timeout(Duration::from_secs(5), completion.changed())
+            .await
+            .expect("the queued paths to be swept")
+            .expect("the sweeper stays alive");
+    }
+
     #[tokio::test]
     async fn test_a_changed_op_queues_and_returns_without_sweeping() {
         let harness = HookHarness::owner().await;
@@ -746,6 +905,155 @@ mod tests {
             0,
             "the debounce cannot fit inside the op deadline, and coalescing the \
              burst is the point"
+        );
+    }
+
+    #[tokio::test]
+    async fn i1_t7_sweep_reserves_tool_capacity() {
+        let harness = HookHarness::owner_with_document_limit(3).await;
+        let mut completion = harness.sweeper.subscribe_completions();
+        let paths: Vec<_> = (0..3)
+            .map(|index| {
+                let path = harness.fixture(&format!("background-{index}.rs"));
+                std::fs::write(&path, "fn background() {}").expect("write fixture");
+                path
+            })
+            .collect();
+
+        for path in &paths {
+            assert_eq!(
+                harness
+                    .send(Request::Changed {
+                        session: "s1".to_string(),
+                        paths: vec![path.clone()],
+                        event: ChangeEvent::Change,
+                    })
+                    .await,
+                Response::Changed { queued: 1 }
+            );
+        }
+        wait_for_sweep(&mut completion).await;
+
+        let Response::Flush { context, .. } = harness.flush_acknowledged("s1").await else {
+            panic!("the finite sweep answers with its status");
+        };
+
+        let open_count = harness
+            .translator_harness
+            .as_ref()
+            .expect("the finite harness has a recording server")
+            .translator
+            .open_document_paths()
+            .len();
+        let lsp_notifications = harness.lsp_notifications();
+
+        let unrelated = harness.fixture("unrelated.rs");
+        std::fs::write(&unrelated, "fn unrelated() {}").expect("write fixture");
+        let unrelated_tool_response = harness.call_file_tool(&unrelated).await;
+        assert!(!unrelated_tool_response.is_error.unwrap_or(false));
+        assert!(open_count < 3);
+        assert_eq!(
+            harness
+                .translator_harness
+                .as_ref()
+                .expect("the finite harness has a recording server")
+                .translator
+                .open_document_paths()
+                .len(),
+            open_count + 1
+        );
+
+        let context = context.expect("the finite sweep reports its skipped coverage");
+        assert!(context.contains("background sweep headroom"), "{context}");
+        assert!(context.contains("coverage was skipped"), "{context}");
+
+        assert!(
+            lsp_notifications
+                .iter()
+                .any(|n| n["method"] == "textDocument/didOpen")
+        );
+        assert!(
+            lsp_notifications
+                .iter()
+                .any(|n| n["method"] == "textDocument/didSave")
+        );
+
+        let latest = harness
+            .send(Request::Flush {
+                session: "s1".to_string(),
+            })
+            .await;
+        assert!(
+            matches!(&latest, Response::Flush { context: Some(text), .. } if text.contains("background sweep headroom")),
+            "the latest sweep status remains visible after ACK: {latest:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn i1_t7_zero_limit_sweeps_unbounded() {
+        let harness = HookHarness::owner_with_document_limit(0).await;
+        let mut completion = harness.sweeper.subscribe_completions();
+        let preopened = harness.fixture("preopened.rs");
+        std::fs::write(&preopened, "fn preopened() {}").expect("write fixture");
+        let preopened_tool_response = harness.call_file_tool(&preopened).await;
+        assert!(!preopened_tool_response.is_error.unwrap_or(false));
+        let notification_offset = harness.lsp_notifications().len();
+
+        std::fs::write(&preopened, "fn preopened_changed() {}").expect("rewrite fixture");
+        let paths: Vec<_> = (0..3)
+            .map(|index| {
+                let path = harness.fixture(&format!("unbounded-{index}.rs"));
+                std::fs::write(&path, "fn unbounded() {}").expect("write fixture");
+                path
+            })
+            .collect();
+        let mut changed_paths = vec![preopened.clone()];
+        changed_paths.extend(paths);
+        for path in &changed_paths {
+            assert_eq!(
+                harness
+                    .send(Request::Changed {
+                        session: "s1".to_string(),
+                        paths: vec![path.clone()],
+                        event: ChangeEvent::Change,
+                    })
+                    .await,
+                Response::Changed { queued: 1 }
+            );
+        }
+        wait_for_sweep(&mut completion).await;
+
+        let flush = harness.flush_acknowledged("s1").await;
+        let open_count = harness
+            .translator_harness
+            .as_ref()
+            .expect("the zero-limit harness has a recording server")
+            .translator
+            .open_document_paths()
+            .len();
+        assert!(open_count >= 4);
+        assert!(
+            matches!(&flush, Response::Flush { context: None, .. })
+                || matches!(&flush, Response::Flush { context: Some(text), .. } if !text.contains("headroom")),
+            "zero-limit sweeps must not report finite headroom failure: {flush:?}"
+        );
+
+        let lsp_notifications = harness.lsp_notifications();
+        let sweep_notifications = &lsp_notifications[notification_offset..];
+        assert!(
+            sweep_notifications
+                .iter()
+                .any(|n| n["method"] == "textDocument/didOpen")
+        );
+        assert!(
+            sweep_notifications
+                .iter()
+                .any(|n| n["method"] == "textDocument/didSave")
+        );
+        assert!(
+            sweep_notifications
+                .iter()
+                .any(|n| n["method"] == "textDocument/didChange")
         );
     }
 
@@ -949,7 +1257,9 @@ mod tests {
         let harness = HookHarness::owner().await;
         harness
             .sweeper
-            .set_shortfall_for_test("7 file(s) not checked: the document limit of 3 was reached");
+            .set_shortfall_for_test(
+                "7 file(s) not checked: background sweep headroom of 2 was exhausted; coverage was skipped to reserve one document slot (document limit 3)",
+            );
 
         let Response::Flush {
             context: Some(text),

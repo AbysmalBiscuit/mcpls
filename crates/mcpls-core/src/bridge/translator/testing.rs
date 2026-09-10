@@ -366,7 +366,12 @@ impl RecordingServer {
                     // drop (and kill) the rest the moment this async block
                     // is constructed.
                     let mut server = server;
-                    let mut wire = BufReader::new(&mut server.write_stdout);
+                    let FakeServer {
+                        read_half_stdin,
+                        write_stdout,
+                        ..
+                    } = &mut server;
+                    let mut wire = BufReader::new(write_stdout);
                     while let Some(message) = try_read_frame(&mut wire).await {
                         let method = message["method"].as_str().unwrap_or_default();
                         if method == SENTINEL_METHOD {
@@ -379,6 +384,14 @@ impl RecordingServer {
                         }
                         lock_std(&log_for_thread)
                             .push((method.to_string(), message["params"].clone()));
+                        if method == "textDocument/diagnostic" {
+                            write_response(
+                                &mut *read_half_stdin,
+                                &message["id"],
+                                serde_json::json!({"kind": "full", "items": []}),
+                            )
+                            .await;
+                        }
                     }
                 });
                 let _ = shutdown_rx.await;
