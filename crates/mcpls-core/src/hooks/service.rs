@@ -418,15 +418,20 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use rmcp::ServiceExt as _;
+    use serde_json::json;
     use tempfile::TempDir;
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, BufStream};
     use tokio::sync::Mutex;
 
     use super::*;
+    use crate::bridge::apply::Applier;
     use crate::bridge::{
-        DiagnosticsDelivery, FloorTable, NotificationCache, ResourceLimits, ResourceSubscriptions,
+        read_framed_reply, translator_with_capabilities, write_response, DiagnosticsDelivery,
+        FakeServer, FloorTable, NotificationCache, ResourceLimits, ResourceSubscriptions,
         ServerSettle, Translator, TranslatorHarness,
     };
-    use crate::config::{DiagnosticsConfig, ServerId};
+    use crate::config::{ApplyConfig, DiagnosticsConfig, ServerId};
     use crate::hooks::{ChangeEvent, HookListener, PathFilter, Request, Response, SocketIdentity};
     use crate::mcp::McplsServer;
 
@@ -466,11 +471,17 @@ mod tests {
         async fn owner_without_baseline_with(diagnostics: DiagnosticsConfig) -> Self {
             let (dir, identity) = temp_identity();
             let translator = Arc::new(Translator::new());
+            let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
+            let delivery = Arc::new(Mutex::new(DiagnosticsDelivery::new(diagnostics)));
+            let role = Arc::new(HookRole::owner());
             Self::start_owner(
                 dir,
                 identity,
+                role,
                 translator,
                 None,
+                notification_cache,
+                delivery,
                 usize::MAX,
                 diagnostics,
             )
@@ -490,11 +501,19 @@ mod tests {
             )
             .await;
             let translator = Arc::clone(&translator_harness.translator);
+            let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
+            let delivery = Arc::new(Mutex::new(DiagnosticsDelivery::new(
+                DiagnosticsConfig::default(),
+            )));
+            let role = Arc::new(HookRole::owner());
             let harness = Self::start_owner(
                 dir,
                 identity,
+                role,
                 translator,
                 Some(translator_harness),
+                notification_cache,
+                delivery,
                 max_documents,
                 DiagnosticsConfig::default(),
             )
@@ -506,8 +525,11 @@ mod tests {
         async fn start_owner(
             dir: TempDir,
             identity: SocketIdentity,
+            role: Arc<HookRole>,
             translator: Arc<Translator>,
             translator_harness: Option<TranslatorHarness>,
+            notification_cache: Arc<Mutex<NotificationCache>>,
+            delivery: Arc<Mutex<DiagnosticsDelivery>>,
             max_documents: usize,
             diagnostics: DiagnosticsConfig,
         ) -> Self {
@@ -515,9 +537,6 @@ mod tests {
                 || dir.path().to_path_buf(),
                 |harness| harness.root().to_path_buf(),
             );
-            let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
-            let delivery = Arc::new(Mutex::new(DiagnosticsDelivery::new(diagnostics)));
-            let role = Arc::new(HookRole::owner());
             let context = Arc::new(test_context(
                 &root,
                 Arc::clone(&translator),
@@ -583,6 +602,51 @@ mod tests {
                 vec![diagnostic(message)],
             );
             harness
+        }
+
+        async fn owner_with_write_diagnostic(
+            diagnostics: DiagnosticsConfig,
+            message: &str,
+        ) -> (Self, FakeServer) {
+            let (dir, identity) = temp_identity();
+            let role = Arc::new(HookRole::owner());
+            let (translator, fake) = translator_with_capabilities(
+                &dir,
+                &ServerId::from("rust"),
+                lsp_types::ServerCapabilities {
+                    rename_provider: Some(lsp_types::OneOf::Left(true)),
+                    ..Default::default()
+                },
+            );
+            let translator = Arc::new(translator.with_applier(Arc::new(Applier::new(
+                vec![dir.path().to_path_buf()],
+                ApplyConfig {
+                    rename: true,
+                    ..ApplyConfig::default()
+                },
+            ))));
+            let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
+            let delivery = Arc::new(Mutex::new(DiagnosticsDelivery::new(diagnostics)));
+            let harness = Self::start_owner(
+                dir,
+                identity,
+                role,
+                translator,
+                None,
+                Arc::clone(&notification_cache),
+                Arc::clone(&delivery),
+                usize::MAX,
+                diagnostics,
+            )
+            .await;
+            delivery.lock().await.set_baseline(HashMap::new());
+            notification_cache.lock().await.store_diagnostics(
+                &ServerId::from("rust"),
+                &broken_uri(),
+                Some(1),
+                vec![diagnostic(message)],
+            );
+            (harness, fake)
         }
 
         /// An absolute path under this harness's temporary workspace.
@@ -1537,6 +1601,119 @@ mod tests {
         panic!("nobody answered a status request on {:?}", identity.socket);
     }
 
+    async fn mcp_request(
+        wire: &mut BufStream<tokio::io::DuplexStream>,
+        request: serde_json::Value,
+    ) -> serde_json::Value {
+        wire.write_all(format!("{request}\n").as_bytes())
+            .await
+            .expect("write MCP request");
+        wire.flush().await.expect("flush MCP request");
+        loop {
+            let mut line = String::new();
+            assert_ne!(
+                wire.read_line(&mut line).await.expect("read MCP response"),
+                0
+            );
+            let response: serde_json::Value =
+                serde_json::from_str(&line).expect("MCP response is JSON");
+            if response["id"] == request["id"] {
+                return response;
+            }
+        }
+    }
+
+    async fn apply_rename_over_mcp(
+        server: Arc<McplsServer>,
+        fake: &mut FakeServer,
+        written: PathBuf,
+    ) -> serde_json::Value {
+        std::fs::write(&written, "fn old() {}\n").expect("write");
+        let written_uri = crate::bridge::path_to_uri(&written).expect("the fixture has a URI");
+        let (server_io, client_io) = tokio::io::duplex(65_536);
+        let started = tokio::spawn(async move {
+            server
+                .serve(server_io)
+                .await
+                .expect("the MCP service starts")
+        });
+        let mut wire = BufStream::new(client_io);
+        let initialized = mcp_request(
+            &mut wire,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": {"name": "task-8-test", "version": "1"}
+                }
+            }),
+        )
+        .await;
+        assert!(initialized["result"].is_object(), "{initialized}");
+        wire.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+            .await
+            .expect("write MCP initialized notification");
+        wire.flush()
+            .await
+            .expect("flush MCP initialized notification");
+        let _running = started.await.expect("the MCP service task survives");
+
+        let path = written.display().to_string();
+        let reply = json!({
+            "changes": {
+                written_uri.as_str(): [{
+                    "range": {
+                        "start": {"line": 0, "character": 3},
+                        "end": {"line": 0, "character": 6}
+                    },
+                    "newText": "new"
+                }]
+            }
+        });
+        let mcp_call = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "rename_symbol",
+                "arguments": {
+                    "file_path": path,
+                    "line": 1,
+                    "character": 4,
+                    "new_name": "new",
+                    "apply": true
+                }
+            }
+        });
+        let fake = &mut *fake;
+        let (tool_response, lsp_request) =
+            tokio::join!(mcp_request(&mut wire, mcp_call), async move {
+                let mut lsp_wire = BufReader::new(&mut fake.write_stdout);
+                let request = read_framed_reply(&mut lsp_wire).await;
+                write_response(&mut fake.read_half_stdin, &request["id"], reply).await;
+                request
+            });
+        assert_eq!(lsp_request["method"], "textDocument/rename");
+        assert!(tool_response["result"].is_object(), "{tool_response}");
+        let tool_text = tool_response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("the rename response has serialized tool content");
+        let tool_result: serde_json::Value =
+            serde_json::from_str(tool_text).expect("the rename response is JSON");
+        assert_eq!(
+            std::fs::read_to_string(&written).expect("read the applied fixture"),
+            "fn new() {}\n"
+        );
+        assert!(
+            tool_result.get("new_diagnostics").is_none(),
+            "a passive applied write must not serialize a local footer: {tool_result}"
+        );
+        tool_result
+    }
+
     /// A flush before the servers have settled must not seed the session's
     /// record, because `set_baseline` never rewrites a record that already
     /// exists and that session would then believe the workspace started
@@ -1705,13 +1882,27 @@ mod tests {
         ));
         let mut transitions = role.subscribe_transitions();
         let before = *transitions.borrow();
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        install_lock_loss_pause(Some(LockLossPause {
+            identity: identity.clone(),
+            loss: LockLoss::Missing,
+            arrived: Arc::clone(&arrived),
+            resume: Arc::clone(&resume),
+        }));
+        let _pause_guard = LockLossPauseGuard;
 
+        let lock_loss = arrived.notified();
         std::fs::remove_file(&identity.lock).expect("stand in for a temp-file cleaner");
-        tokio::time::timeout(Duration::from_secs(3), transitions.changed())
+        tokio::time::timeout(Duration::from_secs(3), lock_loss)
             .await
-            .expect("the owner must observe the missing lock")
-            .expect("the role outlives the owner task");
+            .expect("the owner must observe the missing lock");
         assert!(matches!(role.get(), Role::Passive { .. }));
+        tokio::time::timeout(Duration::from_secs(1), transitions.changed())
+            .await
+            .expect("the passive transition must be observable before reacquisition")
+            .expect("the role outlives the owner task");
+        resume.notify_one();
 
         wait_for_lock_to_return(&identity).await;
         tokio::time::timeout(Duration::from_secs(6), transitions.changed())
@@ -1741,8 +1932,9 @@ mod tests {
             footer_wait_ms: 0,
             ..DiagnosticsConfig::default()
         };
-        let old =
-            HookHarness::owner_with_diagnostic(old_diagnostics, "former-owner-diagnostic").await;
+        let (old, mut fake) =
+            HookHarness::owner_with_write_diagnostic(old_diagnostics, "former-owner-diagnostic")
+                .await;
         let old_role = Arc::clone(&old.role);
         let arrived = Arc::new(tokio::sync::Notify::new());
         let resume = Arc::new(tokio::sync::Notify::new());
@@ -1809,17 +2001,20 @@ mod tests {
         assert!(forwarded_report.contains("competitor-diagnostic"));
         assert!(!forwarded_report.contains("former-owner-diagnostic"));
 
-        let local_footer = old.server.footer_if_written(true).await;
-        let written = old.fixture("written.rs");
-        std::fs::write(&written, "fn written() {}").expect("write");
         let mut completed = competitor_sweeper.subscribe_completions();
         let requests_before = competitor_role.hooks_seen();
         let sweeps_before = competitor_sweeper.sweeps_run();
-        old.server
-            .forward_apply_targets(&[written.display().to_string()])
-            .await;
-
-        assert!(local_footer.is_none());
+        let tool_result = apply_rename_over_mcp(
+            Arc::clone(&old.server),
+            &mut fake,
+            old.fixture("written.rs"),
+        )
+        .await;
+        assert!(
+            tool_result.get("new_diagnostics").is_none(),
+            "a passive applied write must not serialize a local footer: {tool_result}"
+        );
+        assert!(!tool_result.to_string().contains("former-owner-diagnostic"));
         assert_eq!(competitor_role.hooks_seen(), requests_before + 1);
         tokio::time::timeout(Duration::from_secs(5), completed.changed())
             .await
