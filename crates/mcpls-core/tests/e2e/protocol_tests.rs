@@ -232,6 +232,54 @@ fn wait_for_marker(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn write_mixed_startup_config(
+    config_path: &Path,
+    script: &Path,
+    reporting_initialized: &Path,
+    silent_initialized: &Path,
+    silent_startup_published: &Path,
+    silent_changed_published: &Path,
+) -> Result<()> {
+    let workspace = config_path
+        .parent()
+        .context("fixture config path must have a parent")?;
+    let workspace = toml::Value::String(workspace.to_string_lossy().into_owned()).to_string();
+    let script = toml::Value::String(script.to_string_lossy().into_owned()).to_string();
+    let reporting_initialized =
+        toml::Value::String(reporting_initialized.to_string_lossy().into_owned()).to_string();
+    let silent_initialized =
+        toml::Value::String(silent_initialized.to_string_lossy().into_owned()).to_string();
+    let silent_startup_published =
+        toml::Value::String(silent_startup_published.to_string_lossy().into_owned()).to_string();
+    let silent_changed_published =
+        toml::Value::String(silent_changed_published.to_string_lossy().into_owned()).to_string();
+    fs::write(
+        config_path,
+        format!(
+            "[workspace]\nroots = [{workspace}]\n[diagnostics]\nsettle_quiet_ms = 50\nsettle_deadline_ms = 10000\n[diagnostics.hooks]\nenabled = false\n\n[[lsp_servers]]\nlanguage_id = \"elixir\"\ncommand = \"python3\"\nargs = [{script}, \"reporting\", {reporting_initialized}, {reporting_initialized}, {reporting_initialized}, \"main.ex\", \"0\"]\nfile_patterns = [\"**/*.ex\"]\ndiagnostics_severity = \"warning\"\n\n[[lsp_servers]]\nlanguage_id = \"haskell\"\ncommand = \"python3\"\nargs = [{script}, \"silent\", {silent_initialized}, {silent_startup_published}, {silent_changed_published}, \"main.hs\", \"1.5\"]\nfile_patterns = [\"**/*.hs\"]\ndiagnostics_severity = \"warning\"\n"
+        ),
+    )?;
+    Ok(())
+}
+
+fn wait_for_baseline_report(client: &mut McpClient) -> Result<String> {
+    let deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        let response = client.call_tool("get_new_diagnostics", &json!({}))?;
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .with_context(|| format!("expected diagnostic text content, got {response}"))?;
+        let payload: serde_json::Value = serde_json::from_str(text)?;
+        if payload.get("note").is_none() {
+            return Ok(text.to_owned());
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("diagnostics baseline was not ready: {text}");
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
 fn run_duplicate_floor_case(active_first: bool) -> Result<String> {
     let workspace = TempDir::new()?;
     let active_marker = workspace.path().join("active.marker");
@@ -370,6 +418,83 @@ fn i1_t4_inactive_duplicate_cannot_choose_floor() -> Result<()> {
         !active_first_report.contains("inactive-fixture"),
         "inactive fixture must not publish, got {active_first_report}"
     );
+    Ok(())
+}
+
+#[test]
+#[ignore = "Requires mcpls binary built"]
+fn i1_t5_mixed_owner_startup_uses_each_grace() -> Result<()> {
+    let workspace = TempDir::new()?;
+    let script = diagnostics_fixture::write_mixed_startup_server(workspace.path())?;
+    let reporting_initialized = workspace.path().join("reporting-initialized.marker");
+    let silent_initialized = workspace.path().join("silent-initialized.marker");
+    let silent_startup_published = workspace.path().join("silent-startup-published.marker");
+    let silent_changed_published = workspace.path().join("silent-changed-published.marker");
+    let config_path = workspace.path().join("mcpls.toml");
+    write_mixed_startup_config(
+        &config_path,
+        &script,
+        &reporting_initialized,
+        &silent_initialized,
+        &silent_startup_published,
+        &silent_changed_published,
+    )?;
+    let reporting_file = workspace.path().join("main.ex");
+    let silent_file = workspace.path().join("main.hs");
+    fs::write(&reporting_file, "def reporting_fixture do\n  :ok\nend\n")?;
+    fs::write(&silent_file, "silentFixture = ()\n")?;
+
+    let config_arg = config_path
+        .to_str()
+        .context("fixture config path must be valid UTF-8")?;
+    let mut client = McpClient::spawn_with_args(&["--config", config_arg])?;
+    client.initialize()?;
+
+    wait_for_marker(&reporting_initialized)?;
+    wait_for_marker(&silent_initialized)?;
+    eprintln!("i1_t5 initialization acknowledgements recorded for both LSP processes");
+
+    let startup_wait_started = Instant::now();
+    wait_for_marker(&silent_startup_published)?;
+    let startup_delay = startup_wait_started.elapsed();
+    assert!(
+        startup_delay >= Duration::from_millis(1200),
+        "silent startup publication must follow the quiet interval, took {startup_delay:?}"
+    );
+    assert!(
+        startup_delay < Duration::from_secs(2),
+        "silent startup publication must precede the existing two-second grace, took {startup_delay:?}"
+    );
+    eprintln!("i1_t5 silent startup publication acknowledgement recorded after {startup_delay:?}");
+
+    let baseline_flush = wait_for_baseline_report(&mut client)?;
+    assert!(
+        !baseline_flush.contains("silent-startup"),
+        "the silent owner's startup publication must be included in the baseline, got {baseline_flush}"
+    );
+
+    let hover = call_hover_when_ready(&mut client, &silent_file)?;
+    assert!(
+        hover.to_string().contains("mixed-startup-fixture"),
+        "the silent owner must remain routable after startup, got {hover}"
+    );
+    wait_for_marker(&silent_changed_published)?;
+
+    let changed_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let response = client.call_tool("get_new_diagnostics", &json!({}))?;
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .with_context(|| format!("expected diagnostic text content, got {response}"))?;
+        if text.contains("silent-after-startup") {
+            break;
+        }
+        if Instant::now() >= changed_deadline {
+            anyhow::bail!("explicit silent-after-startup publication was not delivered: {text}");
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+
     Ok(())
 }
 

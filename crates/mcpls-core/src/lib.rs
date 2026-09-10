@@ -1217,6 +1217,14 @@ fn spawn_lsp_servers_background(
             .await
             .set_diagnostics_route_count(diagnostics_route_count);
 
+        let diagnostics_owners = registered
+            .diagnostics_flags
+            .iter()
+            .filter(|&(_, &is_route)| is_route)
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        shared.settle.set_diagnostics_owners(diagnostics_owners);
+
         // The settle deadline backstops indexing, which only starts here:
         // everything before this point -- config load, and every server's
         // `initialize` handshake, which `timeout_seconds` alone allows 30

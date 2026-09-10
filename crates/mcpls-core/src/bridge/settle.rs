@@ -15,7 +15,7 @@
 //! between phases a server that is already talking has started, not the
 //! silence before a slower one has said anything at all.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -49,6 +49,8 @@ pub struct ServerSettle {
 #[derive(Debug)]
 struct SettleState {
     outstanding: HashSet<(ServerId, String)>,
+    server_progress: HashMap<ServerId, ServerProgress>,
+    diagnostics_owners: HashSet<ServerId>,
     /// When the outstanding set last became empty. `None` until the first
     /// operation ends, so a process that has not yet heard from a server is
     /// not mistaken for one whose servers have finished.
@@ -57,6 +59,13 @@ struct SettleState {
     deadline: Instant,
     /// How many long-running operations have ever begun.
     epoch: u64,
+}
+
+#[derive(Debug, Default)]
+struct ServerProgress {
+    outstanding: HashSet<String>,
+    quiet_since: Option<Instant>,
+    progress_seen: bool,
 }
 
 impl ServerSettle {
@@ -70,6 +79,8 @@ impl ServerSettle {
         Self {
             state: Mutex::new(SettleState {
                 outstanding: HashSet::new(),
+                server_progress: HashMap::new(),
+                diagnostics_owners: HashSet::new(),
                 quiet_since: None,
                 deadline: Instant::now() + deadline_after,
                 epoch: 0,
@@ -77,6 +88,14 @@ impl ServerSettle {
             quiet_for,
             deadline_after,
         }
+    }
+
+    /// Set the diagnostics owners whose startup silence needs its own grace.
+    pub fn set_diagnostics_owners(&self, owners: impl IntoIterator<Item = ServerId>) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        state.diagnostics_owners = owners.into_iter().collect();
     }
 
     /// Measure the deadline from now instead of from construction.
@@ -106,6 +125,13 @@ impl ServerSettle {
         if state.outstanding.is_empty() && state.quiet_since.is_none() {
             state.quiet_since = Some(now);
         }
+        let owners = state.diagnostics_owners.clone();
+        for owner in owners {
+            let progress = state.server_progress.entry(owner).or_default();
+            if progress.outstanding.is_empty() && progress.quiet_since.is_none() {
+                progress.quiet_since = Some(now);
+            }
+        }
     }
 
     /// Record that `server` started a long-running operation.
@@ -116,9 +142,12 @@ impl ServerSettle {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
-        state
-            .outstanding
-            .insert((server.clone(), token.to_string()));
+        let token = token.to_string();
+        state.outstanding.insert((server.clone(), token.clone()));
+        let progress = state.server_progress.entry(server.clone()).or_default();
+        progress.outstanding.insert(token);
+        progress.progress_seen = true;
+        progress.quiet_since = None;
         state.quiet_since = None;
         state.epoch += 1;
     }
@@ -134,11 +163,15 @@ impl ServerSettle {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
-        if !state
-            .outstanding
-            .remove(&(server.clone(), token.to_string()))
-        {
+        let token = token.to_string();
+        if !state.outstanding.remove(&(server.clone(), token.clone())) {
             return;
+        }
+        if let Some(progress) = state.server_progress.get_mut(server) {
+            progress.outstanding.remove(&token);
+            if progress.outstanding.is_empty() {
+                progress.quiet_since = Some(now);
+            }
         }
         if state.outstanding.is_empty() {
             state.quiet_since = Some(now);
@@ -160,6 +193,8 @@ impl ServerSettle {
         if state.outstanding.len() != before && state.outstanding.is_empty() {
             state.quiet_since = Some(Instant::now());
         }
+        state.server_progress.remove(server);
+        state.diagnostics_owners.remove(server);
     }
 
     /// How many long-running operations have ever begun.
@@ -217,6 +252,25 @@ impl ServerSettle {
         let Some(since) = state.quiet_since else {
             return false;
         };
+        for owner in &state.diagnostics_owners {
+            let Some(progress) = state.server_progress.get(owner) else {
+                return false;
+            };
+            if !progress.outstanding.is_empty() {
+                return false;
+            }
+            let Some(owner_quiet_since) = progress.quiet_since else {
+                return false;
+            };
+            let required = if progress.progress_seen {
+                self.quiet_for
+            } else {
+                NO_PROGRESS_GRACE
+            };
+            if now.duration_since(owner_quiet_since) < required {
+                return false;
+            }
+        }
         let required = if state.epoch == 0 {
             NO_PROGRESS_GRACE
         } else {
@@ -561,5 +615,73 @@ mod tests {
 
         settle.begin(&rust, &json!("flycheck"));
         assert_eq!(settle.progress_epoch(), before + 1);
+    }
+
+    #[test]
+    fn i1_t5_owner_progress_uses_the_exact_quiet_boundary() {
+        let quiet_for = Duration::from_millis(10);
+        let settle = ServerSettle::new(quiet_for, Duration::from_secs(60));
+        let owner = ServerId::from("owner");
+        settle.set_diagnostics_owners([owner.clone()]);
+        settle.restart_deadline();
+        settle.begin(&owner, &json!("indexing"));
+        let quiet_started = Instant::now();
+        settle.end_at(&owner, &json!("indexing"), quiet_started);
+
+        assert!(
+            !settle.should_settle_at(
+                (quiet_started + quiet_for)
+                    .checked_sub(Duration::from_nanos(1))
+                    .unwrap()
+            )
+        );
+        assert!(settle.should_settle_at(quiet_started + quiet_for));
+    }
+
+    #[test]
+    fn i1_t5_pre_registration_progress_keeps_its_quiet_state() {
+        let quiet_for = Duration::from_millis(10);
+        let settle = ServerSettle::new(quiet_for, Duration::from_secs(60));
+        let owner = ServerId::from("owner");
+        settle.begin(&owner, &json!("indexing"));
+        let quiet_started = Instant::now();
+        settle.end_at(&owner, &json!("indexing"), quiet_started);
+
+        settle.set_diagnostics_owners([owner]);
+        settle.restart_deadline();
+
+        assert!(!settle.should_settle_at(quiet_started + quiet_for / 2));
+        assert!(settle.should_settle_at(quiet_started + quiet_for * 2));
+    }
+
+    #[test]
+    fn i1_t5_no_owner_keeps_the_global_no_progress_behavior() {
+        let settle = ServerSettle::new(Duration::from_millis(10), Duration::from_secs(60));
+        settle.set_diagnostics_owners(std::iter::empty());
+        settle.restart_deadline();
+        let restart_after = Instant::now();
+
+        assert!(!settle.should_settle_at(restart_after + NO_PROGRESS_GRACE / 2));
+        assert!(settle.should_settle_at(restart_after + NO_PROGRESS_GRACE));
+    }
+
+    #[test]
+    fn i1_t5_retiring_one_owner_preserves_another_owner() {
+        let quiet_for = Duration::from_millis(10);
+        let settle = ServerSettle::new(quiet_for, Duration::from_secs(60));
+        let rust = ServerId::from("rust");
+        let python = ServerId::from("python");
+        settle.set_diagnostics_owners([rust.clone(), python.clone()]);
+        settle.restart_deadline();
+        settle.begin(&rust, &json!("indexing"));
+        settle.begin(&python, &json!("indexing"));
+        let python_quiet_started = Instant::now();
+        settle.end_at(&python, &json!("indexing"), python_quiet_started);
+        settle.forget_server(&rust);
+
+        assert!(settle.should_settle_at(python_quiet_started + quiet_for * 2));
+
+        settle.set_diagnostics_owners([rust, python]);
+        assert!(!settle.should_settle_at(python_quiet_started + quiet_for * 2));
     }
 }
