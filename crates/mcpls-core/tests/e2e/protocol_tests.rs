@@ -287,13 +287,16 @@ fn write_non_diagnostics_config(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_progress_during_resync_config(
     config_path: &Path,
     script: &Path,
     progress_begin_marker: &Path,
+    begin_observed_marker: &Path,
     resync_hold_marker: &Path,
     release_marker: &Path,
     grace_elapsed_marker: &Path,
+    end_release_marker: &Path,
     diagnostic_marker: &Path,
 ) -> Result<()> {
     let workspace = config_path
@@ -303,18 +306,22 @@ fn write_progress_during_resync_config(
     let script = toml::Value::String(script.to_string_lossy().into_owned()).to_string();
     let progress_begin_marker =
         toml::Value::String(progress_begin_marker.to_string_lossy().into_owned()).to_string();
+    let begin_observed_marker =
+        toml::Value::String(begin_observed_marker.to_string_lossy().into_owned()).to_string();
     let resync_hold_marker =
         toml::Value::String(resync_hold_marker.to_string_lossy().into_owned()).to_string();
     let release_marker =
         toml::Value::String(release_marker.to_string_lossy().into_owned()).to_string();
     let grace_elapsed_marker =
         toml::Value::String(grace_elapsed_marker.to_string_lossy().into_owned()).to_string();
+    let end_release_marker =
+        toml::Value::String(end_release_marker.to_string_lossy().into_owned()).to_string();
     let diagnostic_marker =
         toml::Value::String(diagnostic_marker.to_string_lossy().into_owned()).to_string();
     fs::write(
         config_path,
         format!(
-            "[workspace]\nroots = [{workspace}]\n[apply]\ncode_actions = true\n[diagnostics]\nsettle_quiet_ms = 25\nsettle_deadline_ms = 5000\nfooter = true\nfooter_grace_ms = 100\nfooter_quiet_ms = 100\nfooter_wait_ms = 3000\n[diagnostics.hooks]\nenabled = false\n\n[[lsp_servers]]\nlanguage_id = \"rust\"\ncommand = \"python3\"\nargs = [{script}, {progress_begin_marker}, {resync_hold_marker}, {release_marker}, {grace_elapsed_marker}, {diagnostic_marker}, \"0.4\"]\nfile_patterns = [\"**/*.rs\"]\ndiagnostics_severity = \"warning\"\n\n[lsp_servers.heuristics]\nproject_markers = [\"main.rs\"]\n"
+            "[workspace]\nroots = [{workspace}]\n[apply]\nrename = true\nformat_document = true\ncode_actions = true\n[diagnostics]\nsettle_quiet_ms = 25\nsettle_deadline_ms = 5000\nfooter = true\nfooter_grace_ms = 100\nfooter_quiet_ms = 100\nfooter_wait_ms = 3000\n[diagnostics.hooks]\nenabled = false\n\n[[lsp_servers]]\nlanguage_id = \"rust\"\ncommand = \"python3\"\nargs = [{script}, {progress_begin_marker}, {begin_observed_marker}, {resync_hold_marker}, {release_marker}, {grace_elapsed_marker}, {end_release_marker}, {diagnostic_marker}, \"0.4\"]\nfile_patterns = [\"**/*.rs\"]\ndiagnostics_severity = \"warning\"\n\n[lsp_servers.heuristics]\nproject_markers = [\"main.rs\"]\n"
         ),
     )?;
     Ok(())
@@ -740,12 +747,15 @@ fn i1_t5_successful_non_diagnostics_progress_does_not_hold_baseline() -> Result<
 
 #[test]
 #[ignore = "Requires mcpls binary built"]
+#[allow(clippy::too_many_lines)]
 fn i1_t9_progress_during_resync_reaches_footer() -> Result<()> {
     let workspace = TempDir::new()?;
     let progress_begin_marker = workspace.path().join("progress-begin.marker");
+    let begin_observed_marker = workspace.path().join("progress-begin-observed.marker");
     let resync_hold_marker = workspace.path().join("resync-hold.marker");
     let release_marker = workspace.path().join("release-resync.marker");
     let grace_elapsed_marker = workspace.path().join("footer-grace-elapsed.marker");
+    let end_release_marker = workspace.path().join("release-progress-end.marker");
     let diagnostic_marker = workspace.path().join("diagnostic-published.marker");
     let script = diagnostics_fixture::write_progress_during_resync_server(workspace.path())?;
     let config_path = workspace.path().join("mcpls.toml");
@@ -753,9 +763,11 @@ fn i1_t9_progress_during_resync_reaches_footer() -> Result<()> {
         &config_path,
         &script,
         &progress_begin_marker,
+        &begin_observed_marker,
         &resync_hold_marker,
         &release_marker,
         &grace_elapsed_marker,
+        &end_release_marker,
         &diagnostic_marker,
     )?;
     let file_path = workspace.path().join("main.rs");
@@ -781,6 +793,7 @@ fn i1_t9_progress_during_resync_reaches_footer() -> Result<()> {
     let call = thread::spawn(move || client.call_tool("apply_code_action", &arguments));
 
     wait_for_marker(&progress_begin_marker)?;
+    wait_for_marker(&begin_observed_marker)?;
     wait_for_marker(&resync_hold_marker)?;
     assert!(
         !call.is_finished(),
@@ -793,6 +806,8 @@ fn i1_t9_progress_during_resync_reaches_footer() -> Result<()> {
         !call.is_finished(),
         "the footer must not return at grace while the write's progress is still open"
     );
+    let end_released_at = Instant::now();
+    fs::write(&end_release_marker, "release")?;
     wait_for_marker(&diagnostic_marker)?;
 
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -802,6 +817,10 @@ fn i1_t9_progress_during_resync_reaches_footer() -> Result<()> {
     assert!(
         call.is_finished(),
         "the footer did not finish after progress ended"
+    );
+    assert!(
+        end_released_at.elapsed() >= Duration::from_millis(100),
+        "the footer returned before the configured quiet interval elapsed"
     );
     let response = call
         .join()
@@ -822,6 +841,37 @@ fn i1_t9_progress_during_resync_reaches_footer() -> Result<()> {
             })
         }),
         "the applied write response must contain the diagnostic published after progress ended: {payload}"
+    );
+
+    let mut write_client = McpClient::spawn_with_args(&["--config", config_arg])?;
+    write_client.initialize()?;
+    wait_for_baseline_report(&mut write_client)?;
+    let rename = write_client.call_tool(
+        "rename_symbol",
+        &json!({
+            "file_path": file_path,
+            "line": 1,
+            "character": 4,
+            "new_name": "new",
+            "apply": true,
+        }),
+    )?;
+    assert!(
+        rename["result"]["content"][0]["text"].is_string(),
+        "{rename}"
+    );
+    let format = write_client.call_tool(
+        "format_document",
+        &json!({
+            "file_path": file_path,
+            "tab_size": 4,
+            "insert_spaces": true,
+            "apply": true,
+        }),
+    )?;
+    assert!(
+        format["result"]["content"][0]["text"].is_string(),
+        "{format}"
     );
     Ok(())
 }

@@ -308,11 +308,13 @@ import sys
 import time
 
 progress_begin_marker = sys.argv[1]
-resync_hold_marker = sys.argv[2]
-release_marker = sys.argv[3]
-grace_elapsed_marker = sys.argv[4]
-diagnostic_marker = sys.argv[5]
-footer_grace_seconds = float(sys.argv[6])
+begin_observed_marker = sys.argv[2]
+resync_hold_marker = sys.argv[3]
+release_marker = sys.argv[4]
+grace_elapsed_marker = sys.argv[5]
+end_release_marker = sys.argv[6]
+diagnostic_marker = sys.argv[7]
+footer_grace_seconds = float(sys.argv[8])
 workspace_uri = "file:///tmp/mcpls-fixture"
 document_uri = None
 next_request_id = 7001
@@ -382,6 +384,8 @@ while True:
             "result": {
                 "capabilities": {
                     "textDocumentSync": 1,
+                    "renameProvider": True,
+                    "documentFormattingProvider": True,
                     "codeActionProvider": True,
                 }
             },
@@ -399,6 +403,20 @@ while True:
         })
     elif method == "textDocument/didOpen":
         document_uri = request["params"]["textDocument"]["uri"]
+    elif method == "textDocument/rename":
+        document_uri = request["params"]["textDocument"]["uri"]
+        send({"jsonrpc": "2.0", "id": request["id"], "result": {"changes": {
+            document_uri: [{"range": {"start": {"line": 0, "character": 3},
+                                      "end": {"line": 0, "character": 6}},
+                           "newText": "new"}]
+        }}})
+    elif method == "textDocument/formatting":
+        document_uri = request["params"]["textDocument"]["uri"]
+        send({"jsonrpc": "2.0", "id": request["id"], "result": [{
+            "range": {"start": {"line": 0, "character": 3},
+                      "end": {"line": 0, "character": 6}},
+            "newText": "new"
+        }]})
     elif method == "textDocument/codeAction":
         document_uri = request["params"]["textDocument"]["uri"]
         send({
@@ -461,6 +479,7 @@ while True:
                         },
                     })
                     mark(progress_begin_marker, "begin")
+                    mark(begin_observed_marker, "begin observed")
                     mark(resync_hold_marker, "waiting for later resync")
             elif message.get("id") == apply_id:
                 apply_response_seen = True
@@ -475,6 +494,8 @@ while True:
         })
         time.sleep(footer_grace_seconds)
         mark(grace_elapsed_marker, "footer grace elapsed")
+        while not os.path.exists(end_release_marker):
+            time.sleep(0.01)
         send({
             "jsonrpc": "2.0",
             "method": "$/progress",
