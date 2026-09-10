@@ -264,7 +264,7 @@ pub struct HooksConfig {
     ///
     /// Defaults on, because reaching this configuration means installing
     /// the plugin and installing the plugin is the opt-in. With this off,
-    /// nothing binds and every hook exits 0 without output.
+    /// no listener binds, but `SessionStart` still performs its local watch scan.
     #[serde(default = "default_hooks_enabled")]
     pub enabled: bool,
     /// How long the pending set must be quiet before the sweep runs.
@@ -277,9 +277,9 @@ pub struct HooksConfig {
     /// How long an op may take before it answers anyway.
     ///
     /// The host's default hook timeout is 600 seconds, so a hook that hangs
-    /// blocks the agent. This bound is the hook's protection, not the
-    /// host's; work already started keeps running and reaches the next
-    /// flush.
+    /// blocks the agent. This bound is the hook's protection, not the host's;
+    /// work already started can continue, but the deadline does not guarantee
+    /// eventual success or delivery.
     #[serde(default = "default_op_deadline_ms")]
     pub op_deadline_ms: u64,
 }
