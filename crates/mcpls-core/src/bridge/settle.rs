@@ -105,14 +105,12 @@ impl ServerSettle {
         };
         let owners: HashSet<_> = owners.into_iter().collect();
         state.pending_owners.retain(|owner| owners.contains(owner));
-        let retired_owners = owners
+        let replacement_owners = owners
             .iter()
-            .filter(|owner| {
-                state.retired_servers.contains(*owner) || state.replacement_pending.contains(*owner)
-            })
+            .filter(|owner| state.replacement_pending.contains(*owner))
             .cloned()
             .collect::<Vec<_>>();
-        state.pending_owners.extend(retired_owners);
+        state.pending_owners.extend(replacement_owners);
         state.diagnostics_owners = owners
             .into_iter()
             .filter(|owner| !state.retired_servers.contains(owner))
@@ -144,6 +142,23 @@ impl ServerSettle {
         if state.diagnostics_owners.contains(server) {
             state.pending_owners.insert(server.clone());
         }
+    }
+
+    /// Clear an unfinished replacement and retire its old owner state.
+    pub(crate) fn abort_diagnostics_replacement(&self, server: &ServerId) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        state.replacement_pending.remove(server);
+        state.pending_owners.remove(server);
+        let before = state.outstanding.len();
+        state.outstanding.retain(|(id, _)| id != server);
+        if state.outstanding.len() != before && state.outstanding.is_empty() {
+            state.quiet_since = Some(Instant::now());
+        }
+        state.server_progress.remove(server);
+        state.diagnostics_owners.remove(server);
+        state.retired_servers.insert(server.clone());
     }
 
     /// Measure the deadline from now instead of from construction.
@@ -755,5 +770,43 @@ mod tests {
         settle.forget_server(&rust);
 
         assert!(settle.should_settle_at(python_quiet_started + quiet_for * 2));
+    }
+
+    #[test]
+    fn i1_t5_retired_before_owner_installation_does_not_create_wait() {
+        let quiet_for = Duration::from_millis(10);
+        let settle = ServerSettle::new(quiet_for, Duration::from_secs(60));
+        let retired = ServerId::from("retired");
+        let surviving = ServerId::from("surviving");
+        settle.begin(&surviving, &json!("indexing"));
+        let surviving_quiet_started = Instant::now();
+        settle.end_at(&surviving, &json!("indexing"), surviving_quiet_started);
+        settle.forget_server(&retired);
+
+        settle.set_diagnostics_owners([retired, surviving]);
+        settle.restart_deadline();
+
+        assert!(settle.should_settle_at(surviving_quiet_started + quiet_for));
+    }
+
+    #[test]
+    fn i1_t5_aborted_replacement_is_not_resurrected_by_delayed_owner_installation() {
+        let quiet_for = Duration::from_millis(10);
+        let settle = ServerSettle::new(quiet_for, Duration::from_secs(60));
+        let replacement = ServerId::from("replacement");
+        let surviving = ServerId::from("surviving");
+        settle.set_diagnostics_owners([replacement.clone(), surviving.clone()]);
+        settle.restart_deadline();
+        settle.begin(&replacement, &json!("indexing"));
+        settle.begin(&surviving, &json!("indexing"));
+        let surviving_quiet_started = Instant::now();
+        settle.end_at(&surviving, &json!("indexing"), surviving_quiet_started);
+        settle.begin_diagnostics_replacement(&replacement);
+        settle.forget_server(&replacement);
+        settle.abort_diagnostics_replacement(&replacement);
+
+        settle.set_diagnostics_owners([replacement, surviving]);
+
+        assert!(settle.should_settle_at(surviving_quiet_started + quiet_for));
     }
 }

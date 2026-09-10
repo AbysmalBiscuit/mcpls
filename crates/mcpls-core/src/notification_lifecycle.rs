@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
 
-use crate::bridge::lock_std;
+use crate::bridge::{ServerSettle, lock_std};
 use crate::config::ServerId;
 use crate::lsp::LspNotification;
 use crate::{PumpShared, diagnostics_pump};
@@ -55,6 +55,28 @@ impl std::fmt::Debug for NotificationPumps {
     }
 }
 
+pub struct DiagnosticsReplacement {
+    settle: Arc<ServerSettle>,
+    id: ServerId,
+    completed: bool,
+}
+
+impl DiagnosticsReplacement {
+    pub const fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for DiagnosticsReplacement {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.settle.abort_diagnostics_replacement(&self.id);
+            #[cfg(all(test, unix))]
+            crate::recovery_tests::mark_replacement_aborted();
+        }
+    }
+}
+
 impl NotificationPumps {
     pub(crate) fn new(shared: PumpShared, cancel: watch::Receiver<bool>) -> Self {
         Self {
@@ -90,8 +112,13 @@ impl NotificationPumps {
         self.shared.settle.register_diagnostics_owner(id);
     }
 
-    pub(crate) fn prepare_diagnostics_replacement(&self, id: &ServerId) {
+    pub(crate) fn prepare_diagnostics_replacement(&self, id: &ServerId) -> DiagnosticsReplacement {
         self.shared.settle.begin_diagnostics_replacement(id);
+        DiagnosticsReplacement {
+            settle: Arc::clone(&self.shared.settle),
+            id: id.clone(),
+            completed: false,
+        }
     }
 
     pub(crate) async fn retire(&self, id: &ServerId) {
@@ -102,6 +129,8 @@ impl NotificationPumps {
         self.shared.settle.forget_server(id);
         #[cfg(all(test, unix))]
         crate::recovery_tests::pause_after_retirement();
+        #[cfg(all(test, unix))]
+        crate::recovery_tests::pause_after_retirement_async().await;
     }
 
     pub(crate) async fn shutdown(&self) {

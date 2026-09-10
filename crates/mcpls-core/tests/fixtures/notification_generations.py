@@ -13,6 +13,7 @@ startup_delay = float(options[1]) if len(options) > 1 else 0.0
 initialize_delay = float(options[2]) if len(options) > 2 else 0.0
 initialized_marker = Path(options[3]) if len(options) > 3 else None
 published_marker = Path(options[4]) if len(options) > 4 else None
+initialize_attempt_marker = Path(options[5]) if len(options) > 5 else None
 counter = Path(control + ".generation")
 generation = int(counter.read_text()) + 1 if counter.exists() else 1
 counter.write_text(str(generation))
@@ -69,6 +70,14 @@ while True:
     request = json.loads(sys.stdin.buffer.read(int(headers["content-length"])))
     method = request.get("method")
     if method == "initialize":
+        mark(initialize_attempt_marker)
+        if mode == "fail-initialize" and generation > 1:
+            send({"id": request["id"], "error": {"code": -32000,
+                "message": "controlled initialization failure"}})
+            continue
+        if mode == "hold-initialize" and generation > 1:
+            while True:
+                time.sleep(1)
         if generation > 1 and initialize_delay:
             time.sleep(initialize_delay)
         send({"id": request["id"], "result": {"capabilities": {

@@ -38,12 +38,23 @@ struct LifecyclePause {
     resume: std::sync::mpsc::Receiver<()>,
 }
 
+struct AsyncLifecyclePause {
+    entered: tokio::sync::oneshot::Sender<()>,
+    resume: tokio::sync::oneshot::Receiver<()>,
+}
+
 static OWNER_INSTALLATION_PAUSE: std::sync::Mutex<Option<LifecyclePause>> =
     std::sync::Mutex::new(None);
 static BEFORE_OWNER_INSTALLATION_PAUSE: std::sync::Mutex<Option<LifecyclePause>> =
     std::sync::Mutex::new(None);
 static RETIREMENT_PAUSE: std::sync::Mutex<Option<LifecyclePause>> = std::sync::Mutex::new(None);
+static ASYNC_RETIREMENT_PAUSE: std::sync::Mutex<Option<AsyncLifecyclePause>> =
+    std::sync::Mutex::new(None);
 static BASELINE_ADOPTED: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>> =
+    std::sync::Mutex::new(None);
+static WORKSPACE_REQUEST_CANCELLED: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>> =
+    std::sync::Mutex::new(None);
+static REPLACEMENT_ABORTED: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>> =
     std::sync::Mutex::new(None);
 
 struct BaselineCheckPause {
@@ -111,6 +122,43 @@ pub fn pause_after_retirement() {
                 .recv_timeout(Duration::from_secs(5))
                 .expect("retirement pause was not released");
         });
+    }
+}
+
+pub fn arm_async_retirement_pause(
+    entered: tokio::sync::oneshot::Sender<()>,
+    resume: tokio::sync::oneshot::Receiver<()>,
+) {
+    *ASYNC_RETIREMENT_PAUSE.lock().unwrap() = Some(AsyncLifecyclePause { entered, resume });
+}
+
+pub async fn pause_after_retirement_async() {
+    let pause = ASYNC_RETIREMENT_PAUSE.lock().unwrap().take();
+    if let Some(pause) = pause {
+        pause.entered.send(()).unwrap();
+        let _ = pause.resume.await;
+    }
+}
+
+pub fn arm_workspace_request_cancellation(cancelled: tokio::sync::oneshot::Sender<()>) {
+    *WORKSPACE_REQUEST_CANCELLED.lock().unwrap() = Some(cancelled);
+}
+
+pub fn mark_workspace_request_cancelled() {
+    let cancelled = WORKSPACE_REQUEST_CANCELLED.lock().unwrap().take();
+    if let Some(cancelled) = cancelled {
+        let _ = cancelled.send(());
+    }
+}
+
+pub fn arm_replacement_aborted(aborted: tokio::sync::oneshot::Sender<()>) {
+    *REPLACEMENT_ABORTED.lock().unwrap() = Some(aborted);
+}
+
+pub fn mark_replacement_aborted() {
+    let aborted = REPLACEMENT_ABORTED.lock().unwrap().take();
+    if let Some(aborted) = aborted {
+        let _ = aborted.send(());
     }
 }
 
@@ -185,6 +233,14 @@ async fn wait_for_baseline(wire: &mut BufStream<DuplexStream>) -> Value {
 }
 
 #[derive(Clone, Copy)]
+enum ReplacementAttempt {
+    Succeeds,
+    FailsInitialization,
+    CancelledBeforeRetirement,
+    CancelledAfterRetirement,
+}
+
+#[derive(Clone, Copy)]
 enum ReplacementOwnerOrder {
     BeforeInitialOwnerInstallation,
     AfterInitialOwnerInstallation,
@@ -192,16 +248,47 @@ enum ReplacementOwnerOrder {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn i1_t5_replacement_before_owner_installation_keeps_new_grace() {
-    replacement_owner_scenario(ReplacementOwnerOrder::BeforeInitialOwnerInstallation).await;
+    replacement_owner_scenario(
+        ReplacementOwnerOrder::BeforeInitialOwnerInstallation,
+        ReplacementAttempt::Succeeds,
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn i1_t5_replacement_after_owner_installation_keeps_new_grace() {
-    replacement_owner_scenario(ReplacementOwnerOrder::AfterInitialOwnerInstallation).await;
+    replacement_owner_scenario(
+        ReplacementOwnerOrder::AfterInitialOwnerInstallation,
+        ReplacementAttempt::Succeeds,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn i1_t5_failed_replacement_does_not_hold_baseline() {
+    replacement_owner_scenario(
+        ReplacementOwnerOrder::AfterInitialOwnerInstallation,
+        ReplacementAttempt::FailsInitialization,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn i1_t5_cancelled_replacement_does_not_hold_baseline() {
+    replacement_owner_scenario(
+        ReplacementOwnerOrder::AfterInitialOwnerInstallation,
+        ReplacementAttempt::CancelledBeforeRetirement,
+    )
+    .await;
+    replacement_owner_scenario(
+        ReplacementOwnerOrder::AfterInitialOwnerInstallation,
+        ReplacementAttempt::CancelledAfterRetirement,
+    )
+    .await;
 }
 
 #[allow(clippy::too_many_lines)]
-async fn replacement_owner_scenario(order: ReplacementOwnerOrder) {
+async fn replacement_owner_scenario(order: ReplacementOwnerOrder, attempt: ReplacementAttempt) {
     tokio::time::timeout(Duration::from_secs(30), async {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dunce::canonicalize(dir.path()).unwrap();
@@ -218,8 +305,15 @@ async fn replacement_owner_scenario(order: ReplacementOwnerOrder) {
         config.diagnostics.hooks.enabled = false;
         config.diagnostics.settle_quiet_ms = 50;
         config.diagnostics.settle_deadline_ms = 10000;
+        let rust_mode = match attempt {
+            ReplacementAttempt::Succeeds | ReplacementAttempt::CancelledAfterRetirement => {
+                "reporting-then-silent"
+            }
+            ReplacementAttempt::FailsInitialization => "fail-initialize",
+            ReplacementAttempt::CancelledBeforeRetirement => "hold-initialize",
+        };
         config.lsp_servers = [
-            ("rust", &rust, "reporting-then-silent", "1.5"),
+            ("rust", &rust, rust_mode, "1.5"),
             ("python", &python, "reporting", "0"),
         ]
         .into_iter()
@@ -227,11 +321,13 @@ async fn replacement_owner_scenario(order: ReplacementOwnerOrder) {
             let control = root.join(language);
             let initialized_marker = root.join(format!("{language}.initialized"));
             let published_marker = root.join(format!("{language}.published"));
+            let initialize_attempt_marker = root.join(format!("{language}.initialize-attempt"));
             serde_json::from_value(json!({
                 "language_id": language,
                 "command": "python3",
                 "args": [fixture, control, bridge::path_to_uri(path).unwrap().as_str(), language,
-                    mode, startup_delay, "0", initialized_marker, published_marker],
+                    mode, startup_delay, "0", initialized_marker, published_marker,
+                    initialize_attempt_marker],
                 "timeout_seconds": 5,
                 "request_timeout_seconds": 2
             }))
@@ -266,11 +362,43 @@ async fn replacement_owner_scenario(order: ReplacementOwnerOrder) {
             } else {
                 None
             };
-        let (retirement_entered, retirement_resume) = {
+        let retirement_pause = if matches!(attempt, ReplacementAttempt::Succeeds) {
             let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
             let (resume_tx, resume_rx) = std::sync::mpsc::channel();
             arm_retirement_pause(entered_tx, resume_rx);
-            (entered_rx, resume_tx)
+            Some((entered_rx, resume_tx))
+        } else {
+            None
+        };
+        let async_retirement_pause = if matches!(attempt, ReplacementAttempt::CancelledAfterRetirement) {
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+            arm_async_retirement_pause(entered_tx, resume_rx);
+            Some((entered_rx, resume_tx))
+        } else {
+            None
+        };
+        let mut cancellation_ack = if matches!(
+            attempt,
+            ReplacementAttempt::CancelledBeforeRetirement
+                | ReplacementAttempt::CancelledAfterRetirement
+        ) {
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            arm_workspace_request_cancellation(ack_tx);
+            Some(ack_rx)
+        } else {
+            None
+        };
+        let mut replacement_aborted = if matches!(
+            attempt,
+            ReplacementAttempt::CancelledBeforeRetirement
+                | ReplacementAttempt::CancelledAfterRetirement
+        ) {
+            let (aborted_tx, aborted_rx) = tokio::sync::oneshot::channel();
+            arm_replacement_aborted(aborted_tx);
+            Some(aborted_rx)
+        } else {
+            None
         };
         let (baseline_check_entered, baseline_check_resume) = {
             let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
@@ -345,6 +473,7 @@ async fn replacement_owner_scenario(order: ReplacementOwnerOrder) {
         let python_initialized = root.join("python.initialized");
         let python_published = root.join("python.published");
         if let Some((entered, resume)) = before_owner_pause {
+            let (retirement_entered, retirement_resume) = retirement_pause.unwrap();
             tokio::time::timeout(Duration::from_secs(5), entered)
                 .await
                 .unwrap()
@@ -424,52 +553,145 @@ async fn replacement_owner_scenario(order: ReplacementOwnerOrder) {
             })
             .await
             .unwrap();
-            let pending = tokio::spawn(async move {
-                let response = call(
-                    &mut wire,
-                    "workspace_symbol_search",
-                    json!({"query": "generation"}),
+            let (cancellation_trigger, cancellation) = if matches!(
+                attempt,
+                ReplacementAttempt::CancelledBeforeRetirement
+                    | ReplacementAttempt::CancelledAfterRetirement
+            ) {
+                let (trigger_tx, trigger_rx) = tokio::sync::oneshot::channel();
+                (
+                    Some(trigger_tx),
+                    Some((trigger_rx, cancellation_ack.take().unwrap())),
                 )
-                .await;
-                (wire, response)
-            });
-            tokio::time::timeout(Duration::from_secs(5), retirement_entered)
+            } else {
+                (None, None)
+            };
+            let mut cancellation_retirement_resume = None;
+            let pending = tokio::spawn(pending_workspace_call(wire, cancellation));
+            if matches!(
+                attempt,
+                ReplacementAttempt::CancelledBeforeRetirement
+                    | ReplacementAttempt::CancelledAfterRetirement
+            ) {
+                let cancellation_trigger = cancellation_trigger.unwrap();
+                if matches!(attempt, ReplacementAttempt::CancelledBeforeRetirement) {
+                    wait_for_marker(
+                        &root.join("rust.initialize-attempt"),
+                        "rust-generation-2",
+                    )
+                    .await;
+                    cancellation_trigger.send(()).unwrap();
+                } else {
+                    let (entered, resume_retirement) = async_retirement_pause.unwrap();
+                    tokio::time::timeout(Duration::from_secs(5), entered)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    cancellation_trigger.send(()).unwrap();
+                    cancellation_retirement_resume = Some(resume_retirement);
+                }
+                let (new_wire, response) = tokio::time::timeout(Duration::from_secs(5), pending)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                wire = new_wire;
+                assert!(response.is_none(), "cancelled workspace call returned: {response:?}");
+                let replacement_aborted = tokio::time::timeout(
+                    Duration::from_millis(250),
+                    replacement_aborted.take().unwrap(),
+                )
+                .await
+                .is_ok();
+                drop(cancellation_retirement_resume);
+                resume.send(()).unwrap();
+                let baseline_ready = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    baseline_check_entered,
+                )
                 .await
                 .unwrap()
                 .unwrap();
-            resume.send(()).unwrap();
-            let baseline_ready =
-                tokio::time::timeout(Duration::from_secs(5), baseline_check_entered)
+                assert!(
+                    baseline_ready,
+                    "cancelled replacement must not hold baseline (abort ack: {replacement_aborted})"
+                );
+                assert!(replacement_aborted, "cancelled replacement did not clear its pending owner");
+                baseline_check_resume.send(()).unwrap();
+                let baseline = call(&mut wire, "get_new_diagnostics", json!({})).await;
+                assert!(!baseline.to_string().contains("rust-generation-2"), "{baseline}");
+            } else if matches!(attempt, ReplacementAttempt::FailsInitialization) {
+                resume.send(()).unwrap();
+                wait_for_marker(
+                    &root.join("rust.initialize-attempt"),
+                    "rust-generation-2",
+                )
+                .await;
+                let (new_wire, response) = tokio::time::timeout(Duration::from_secs(5), pending)
                     .await
                     .unwrap()
                     .unwrap();
-            baseline_check_resume.send(()).unwrap();
-            if baseline_ready {
-                tokio::time::timeout(Duration::from_secs(5), baseline_adopted)
+                wire = new_wire;
+                let response = response.unwrap();
+                assert!(response["error"].is_object(), "{response}");
+                let baseline_ready = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    baseline_check_entered,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert!(baseline_ready, "failed replacement must not hold baseline");
+                baseline_check_resume.send(()).unwrap();
+                let baseline = call(&mut wire, "get_new_diagnostics", json!({})).await;
+                assert!(!baseline.to_string().contains("rust-generation-2"), "{baseline}");
+            } else {
+                let (retirement_entered, retirement_resume) = retirement_pause.unwrap();
+                tokio::time::timeout(Duration::from_secs(5), retirement_entered)
                     .await
                     .unwrap()
                     .unwrap();
+                resume.send(()).unwrap();
+                let baseline_ready = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    baseline_check_entered,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                baseline_check_resume.send(()).unwrap();
+                if baseline_ready {
+                    tokio::time::timeout(Duration::from_secs(5), baseline_adopted)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                }
+                retirement_resume.send(()).unwrap();
+                let (new_wire, response) = pending.await.unwrap();
+                wire = new_wire;
+                assert!(
+                    response
+                        .as_ref()
+                        .unwrap()
+                        .to_string()
+                        .contains("rust-generation-2"),
+                    "{response:?}"
+                );
             }
-            retirement_resume.send(()).unwrap();
-            let (new_wire, response) = pending.await.unwrap();
-            wire = new_wire;
-            assert!(
-                response.to_string().contains("rust-generation-2"),
-                "{response}"
-            );
         }
 
-        wait_for_marker(&rust_published, "rust-generation-2").await;
-        let baseline = wait_for_baseline(&mut wire).await;
-        assert!(
-            !baseline.to_string().contains("rust-generation-2"),
-            "replacement startup diagnostics must be adopted by the baseline: {baseline}"
-        );
-        let after_startup = call(&mut wire, "get_new_diagnostics", json!({})).await;
-        assert!(
-            !after_startup.to_string().contains("rust-generation-2"),
-            "replacement startup diagnostics must be adopted by the baseline: {after_startup}"
-        );
+        if matches!(attempt, ReplacementAttempt::Succeeds) {
+            wait_for_marker(&rust_published, "rust-generation-2").await;
+            let baseline = wait_for_baseline(&mut wire).await;
+            assert!(
+                !baseline.to_string().contains("rust-generation-2"),
+                "replacement startup diagnostics must be adopted by the baseline: {baseline}"
+            );
+            let after_startup = call(&mut wire, "get_new_diagnostics", json!({})).await;
+            assert!(
+                !after_startup.to_string().contains("rust-generation-2"),
+                "replacement startup diagnostics must be adopted by the baseline: {after_startup}"
+            );
+        }
         running.cancel().await.unwrap();
         cancel_tx.send(true).unwrap();
         translator.shutdown_servers().await;
@@ -509,6 +731,40 @@ async fn call(wire: &mut BufStream<DuplexStream>, name: &str, arguments: Value) 
         "params": {"name": name, "arguments": arguments}}),
     )
     .await
+}
+
+async fn pending_workspace_call(
+    mut wire: BufStream<DuplexStream>,
+    cancellation: Option<(
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+) -> (BufStream<DuplexStream>, Option<Value>) {
+    if let Some((cancel, cancelled)) = cancellation {
+        wire.write_all(
+            b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"workspace_symbol_search\",\"arguments\":{\"query\":\"generation\"}}}\n",
+        )
+        .await
+        .unwrap();
+        wire.flush().await.unwrap();
+        cancel.await.unwrap();
+        wire.write_all(
+            b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":2,\"reason\":\"recovery test\"}}\n",
+        )
+        .await
+        .unwrap();
+        wire.flush().await.unwrap();
+        cancelled.await.unwrap();
+        (wire, None)
+    } else {
+        let response = call(
+            &mut wire,
+            "workspace_symbol_search",
+            json!({"query": "generation"}),
+        )
+        .await;
+        (wire, Some(response))
+    }
 }
 
 async fn wait_cached(wire: &mut BufStream<DuplexStream>, path: &Path, sentinel: &str) {

@@ -842,6 +842,21 @@ impl McplsServer {
     )]
     async fn workspace_symbol_search(
         &self,
+        params: Parameters<WorkspaceSymbolParams>,
+        context: rmcp::service::RequestContext<RoleServer>,
+    ) -> Result<String, McpError> {
+        tokio::select! {
+            result = self.workspace_symbol_search_impl(params) => result,
+            () = context.ct.cancelled() => {
+                #[cfg(all(test, unix))]
+                crate::recovery_tests::mark_workspace_request_cancelled();
+                Err(McpError::internal_error("workspace symbol request cancelled", None))
+            }
+        }
+    }
+
+    async fn workspace_symbol_search_impl(
+        &self,
         Parameters(WorkspaceSymbolParams {
             query,
             kind_filter,
@@ -3301,7 +3316,7 @@ mod tests {
             kind_filter: None,
             limit: 100,
         });
-        let result = server.workspace_symbol_search(params).await;
+        let result = server.workspace_symbol_search_impl(params).await;
         assert!(result.is_err());
     }
 
