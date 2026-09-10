@@ -2946,25 +2946,108 @@ mod tests {
         }
     }
 
+    fn diagnostic_wire_record(
+        source: Option<&str>,
+        code: Option<&str>,
+        message: &str,
+        line: u32,
+    ) -> serde_json::Value {
+        let mut record = json!({
+            "range": {"start": {"line": line, "character": 0}, "end": {"line": line, "character": 1}},
+            "severity": 1, "message": message,
+        });
+        if let Some(source) = source {
+            record["source"] = json!(source);
+        }
+        if let Some(code) = code {
+            record["code"] = json!(code);
+        }
+        record
+    }
+
+    fn diagnostic_expected_record(
+        source: Option<&str>,
+        code: Option<&str>,
+        message: &str,
+        line: u32,
+    ) -> serde_json::Value {
+        json!({
+            "range": {"start": {"line": line, "character": 1}, "end": {"line": line, "character": 2}},
+            "severity": "error", "code": code, "source": source, "message": message,
+        })
+    }
+
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
     async fn test_diagnostics_structured_output_preserves_source() {
+        assert_diagnostics_wire_reports(vec![(
+            diagnostic_wire_record(Some("rust-analyzer"), Some("E0046"), "not all trait items implemented", 0),
+            vec![diagnostic_wire_record(Some("rustc"), Some("E0046"), "missing hello in implementation", 1)],
+            json!({"diagnostics": [
+                diagnostic_expected_record(Some("rust-analyzer"), Some("E0046"), "not all trait items implemented", 1),
+                diagnostic_expected_record(Some("rustc"), Some("E0046"), "missing hello in implementation", 2),
+            ]}),
+        )]).await;
+    }
+
+    #[tokio::test]
+    async fn test_diagnostics_wire_exact_equality_and_opaque_sources() {
+        for code in [Some("E0046"), None] {
+            let pull = diagnostic_wire_record(Some("producer-a"), code, "broken", 0);
+            let expected_pull = diagnostic_expected_record(Some("producer-a"), code, "broken", 1);
+            assert_diagnostics_wire_reports(vec![
+                (pull.clone(), vec![pull.clone()], json!({"diagnostics": [expected_pull.clone()]})),
+                (pull, vec![diagnostic_wire_record(Some("producer-b"), code, "broken", 0)],
+                 json!({"diagnostics": [expected_pull, diagnostic_expected_record(Some("producer-b"), code, "broken", 1)]})),
+            ]).await;
+        }
+        assert_diagnostics_wire_reports(vec![(
+            diagnostic_wire_record(None, None, "broken", 0),
+            vec![diagnostic_wire_record(Some("producer-b"), None, "broken", 0)],
+            json!({"diagnostics": [diagnostic_expected_record(None, None, "broken", 1), diagnostic_expected_record(Some("producer-b"), None, "broken", 1)]}),
+        )]).await;
+    }
+
+    #[tokio::test]
+    async fn test_diagnostics_wire_nearby_errors_and_cache_replacement() {
+        for code in [Some("E0046"), None] {
+            let pull = diagnostic_wire_record(Some("producer"), code, "fresh pull", 1);
+            let expected_pull = diagnostic_expected_record(Some("producer"), code, "fresh pull", 2);
+            assert_diagnostics_wire_reports(vec![
+            (pull.clone(), vec![diagnostic_wire_record(Some("producer"), code, "older cached report", 1)],
+             json!({"diagnostics": [expected_pull.clone(), diagnostic_expected_record(Some("producer"), code, "older cached report", 2)]})),
+            (pull.clone(), vec![diagnostic_wire_record(Some("producer"), code, "fresh pull", 0)],
+             json!({"diagnostics": [diagnostic_expected_record(Some("producer"), code, "fresh pull", 1), expected_pull.clone()]})),
+            (pull, vec![], json!({"diagnostics": [expected_pull]})),
+        ]).await;
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn assert_diagnostics_wire_reports(
+        cases: Vec<(serde_json::Value, Vec<serde_json::Value>, serde_json::Value)>,
+    ) {
         use rmcp::ServiceExt as _;
         use tokio::io::{AsyncWriteExt as _, BufReader, BufStream};
 
         tokio::time::timeout(Duration::from_secs(5), async {
             let dir = tempfile::TempDir::new().unwrap();
             let path = dir.path().join("main.rs");
-            std::fs::write(&path, "fn main() {}\n").unwrap();
+            std::fs::write(
+                &path,
+                "trait T { fn hello(); }\nstruct S;\nimpl T for S {}\n",
+            )
+            .unwrap();
             let (translator, mut lsp) = translator_with_capabilities(
                 &dir,
                 &ServerId::from("rust"),
                 lsp_types::ServerCapabilities::default(),
             );
+            let cache = Arc::new(Mutex::new(NotificationCache::new()));
+            let uri = crate::bridge::path_to_uri(&dunce::canonicalize(&path).unwrap()).unwrap();
             let (delivery, floors) = default_delivery_and_floors();
             let server = McplsServer::new(
                 Arc::new(translator),
-                Arc::new(Mutex::new(NotificationCache::new())),
+                Arc::clone(&cache),
                 Arc::from(vec![dir.path().to_path_buf()]),
                 Arc::new(ResourceSubscriptions::new()),
                 false,
@@ -2994,49 +3077,44 @@ mod tests {
             wire.flush().await.unwrap();
             let running = started.await.unwrap();
 
-            let call = mcp_test_request(
-                &mut wire,
-                json!({
-                    "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-                    "params": {"name": "get_diagnostics", "arguments": {"file_path": path}}
-                }),
-            );
-            let respond = async {
-                let request = read_framed_reply(&mut BufReader::new(&mut lsp.write_stdout)).await;
-                assert_eq!(request["method"], "textDocument/diagnostic");
-                write_response(
-                    &mut lsp.read_half_stdin,
-                    &request["id"],
+            for (pull, cached, expected) in cases {
+                cache.lock().await.store_diagnostics(
+                    &ServerId::from("rust"),
+                    &uri,
+                    Some(1),
+                    cached
+                        .into_iter()
+                        .map(|value| serde_json::from_value(value).unwrap())
+                        .collect(),
+                );
+                let call = mcp_test_request(
+                    &mut wire,
                     json!({
-                        "kind": "full",
-                        "items": [{
-                            "range": {
-                                "start": {"line": 0, "character": 0},
-                                "end": {"line": 0, "character": 1}
-                            },
-                            "severity": 1, "code": "E0428", "source": "rustc",
-                            "message": "duplicate definition"
-                        }]
+                        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                        "params": {"name": "get_diagnostics", "arguments": {"file_path": path}}
                     }),
+                );
+                let respond = async {
+                    let request =
+                        read_framed_reply(&mut BufReader::new(&mut lsp.write_stdout)).await;
+                    assert_eq!(request["method"], "textDocument/diagnostic");
+                    write_response(
+                        &mut lsp.read_half_stdin,
+                        &request["id"],
+                        json!({"kind": "full", "items": [pull]}),
+                    )
+                    .await;
+                };
+                let (response, ()) = tokio::join!(call, respond);
+                assert!(response["error"].is_null(), "{response}");
+                assert_eq!(response["result"]["isError"], false, "{response}");
+                let text: serde_json::Value = serde_json::from_str(
+                    response["result"]["content"][0]["text"].as_str().unwrap(),
                 )
-                .await;
-            };
-            let (response, ()) = tokio::join!(call, respond);
-            assert!(response["error"].is_null(), "{response}");
-            assert_eq!(response["result"]["isError"], false, "{response}");
-            let text: serde_json::Value =
-                serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
-                    .unwrap();
-            let expected = json!({"diagnostics": [{
-                "range": {
-                    "start": {"line": 1, "character": 1},
-                    "end": {"line": 1, "character": 2}
-                },
-                "severity": "error", "code": "E0428", "source": "rustc",
-                "message": "duplicate definition"
-            }]});
-            assert_eq!(text, expected);
-            assert_eq!(response["result"]["structuredContent"], text);
+                .unwrap();
+                assert_eq!(text, expected);
+                assert_eq!(response["result"]["structuredContent"], expected);
+            }
 
             let listed = mcp_test_request(
                 &mut wire,
