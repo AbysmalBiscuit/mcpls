@@ -328,8 +328,13 @@ pub(crate) fn register_servers(
                 "No respawn config registered for LSP server '{id}'; auto-respawn on crash will be unavailable for it"
             );
         }
-        translator.register_server(id.clone(), server);
-        translator.register_client(id, client);
+        #[cfg(all(test, unix))]
+        let registration_client = client.clone();
+        // Workspace searches can respawn before looking up the client.
+        translator.register_client(id.clone(), client);
+        #[cfg(all(test, unix))]
+        recovery_tests::pause_registration(translator, &id, registration_client);
+        translator.register_server(id, server);
     }
 
     RegisteredServers { diagnostics_flags }

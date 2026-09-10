@@ -43,6 +43,7 @@ while True:
     if method == "initialize":
         send({"id": request["id"], "result": {"capabilities": {
             "textDocumentSync": 1,
+            "workspaceSymbolProvider": True,
             "diagnosticProvider": {"interFileDependencies": False, "workspaceDiagnostics": False}
         }}})
     elif method == "initialized":
@@ -53,6 +54,10 @@ while True:
         send({"method": "window/logMessage", "params": {"type": 3, "message": sentinel}})
     elif method == "textDocument/diagnostic":
         send({"id": request["id"], "result": {"kind": "full", "items": []}})
+    elif method == "workspace/symbol":
+        send({"id": request["id"], "result": [{"name": sentinel, "kind": 12,
+            "location": {"uri": uri, "range": {"start": {"line": 0, "character": 0},
+                "end": {"line": 0, "character": 1}}}}]})
     elif method == "shutdown":
         send({"id": request["id"], "result": None})
     elif method == "exit":

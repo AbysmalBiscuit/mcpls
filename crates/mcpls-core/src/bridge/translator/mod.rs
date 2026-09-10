@@ -58,6 +58,8 @@ pub use routing::validate_path_against_roots;
 /// `textDocument/didOpen`/`didChange` notify.
 #[derive(Debug)]
 pub struct Translator {
+    #[cfg(all(test, unix))]
+    pub(crate) registration_pause: StdMutex<Option<crate::recovery_tests::RegistrationPause>>,
     pub(crate) notification_pumps: OnceLock<crate::notification_lifecycle::NotificationPumps>,
     /// LSP clients indexed by routing identity. Locked only for the map
     /// lookup/insert itself, never across an LSP request.
@@ -220,6 +222,8 @@ impl Translator {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            #[cfg(all(test, unix))]
+            registration_pause: StdMutex::new(None),
             notification_pumps: OnceLock::new(),
             lsp_clients: Arc::new(StdMutex::new(HashMap::new())),
             lsp_servers: Arc::new(StdMutex::new(HashMap::new())),

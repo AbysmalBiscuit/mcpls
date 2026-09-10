@@ -6,6 +6,40 @@ use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufStream, DuplexStrea
 
 use super::*;
 
+#[derive(Debug)]
+pub struct RegistrationPause {
+    server_id: ServerId,
+    entered: tokio::sync::oneshot::Sender<lsp::LspClient>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+pub fn pause_registration(translator: &Translator, id: &ServerId, client: lsp::LspClient) {
+    let pause = {
+        let mut slot = bridge::lock_std(&translator.registration_pause);
+        if slot.as_ref().is_some_and(|pause| &pause.server_id == id) {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some(pause) = pause {
+        pause.entered.send(client).unwrap();
+        tokio::task::block_in_place(|| {
+            pause
+                .resume
+                .recv_timeout(Duration::from_secs(5))
+                .expect("registration pause was not released");
+        });
+    }
+}
+
+#[derive(Clone, Copy)]
+enum StartupMode {
+    Ready,
+    CacheLocked,
+    BetweenPublications,
+}
+
 async fn request(wire: &mut BufStream<DuplexStream>, value: Value) -> Value {
     wire.write_all(format!("{value}\n").as_bytes())
         .await
@@ -49,16 +83,21 @@ async fn wait_cached(wire: &mut BufStream<DuplexStream>, path: &Path, sentinel: 
 
 #[tokio::test]
 async fn recovery_mcp_preserves_push_across_replacements() {
-    recovery_scenario(false).await;
+    recovery_scenario(StartupMode::Ready).await;
 }
 
 #[tokio::test]
 async fn recovery_mcp_replacement_during_startup_keeps_new_pump() {
-    recovery_scenario(true).await;
+    recovery_scenario(StartupMode::CacheLocked).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_workspace_symbols_during_startup_preserve_live_client() {
+    recovery_scenario(StartupMode::BetweenPublications).await;
 }
 
 #[allow(clippy::too_many_lines)]
-async fn recovery_scenario(crash_during_startup: bool) {
+async fn recovery_scenario(startup: StartupMode) {
     tokio::time::timeout(Duration::from_secs(30), async {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dunce::canonicalize(dir.path()).unwrap();
@@ -75,14 +114,25 @@ async fn recovery_scenario(crash_during_startup: bool) {
                     root.join(language), bridge::path_to_uri(path).unwrap().as_str(), language],
                 "timeout_seconds": 5, "request_timeout_seconds": 2})).unwrap()
         }).collect();
+        if matches!(startup, StartupMode::BetweenPublications) {
+            config.lsp_servers.retain(|server| server.language_id == "rust");
+        }
         let cache = Arc::new(Mutex::new(NotificationCache::new()));
         let startup_cache = Arc::clone(&cache);
-        let mut held_cache = if crash_during_startup { Some(startup_cache.lock().await) } else { None };
+        let mut held_cache = if matches!(startup, StartupMode::CacheLocked) { Some(startup_cache.lock().await) } else { None };
         let watch = Arc::new(lsp::WatchRegistry::new());
         let configs = applicable_server_configs(&config, std::slice::from_ref(&root), None, &watch);
         let translator = Arc::new(build_translator(&config, vec![root.clone()],
             HashMap::from([("rs".into(), "rust".into()), ("py".into(), "python".into())]),
             ToolRouter::from_configs(&config.lsp_servers).unwrap(), Arc::clone(&cache), watch));
+        let publication_pause = if matches!(startup, StartupMode::BetweenPublications) {
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            *bridge::lock_std(&translator.registration_pause) = Some(RegistrationPause {
+                server_id: ServerId::from("rust"), entered: entered_tx, resume: resume_rx,
+            });
+            Some((entered_rx, resume_tx))
+        } else { None };
         let subs = Arc::new(ResourceSubscriptions::new());
         let peer_cell = Arc::new(OnceCell::new());
         let settle = Arc::new(bridge::ServerSettle::new(Duration::from_millis(config.diagnostics.settle_quiet_ms),
@@ -109,6 +159,38 @@ async fn recovery_scenario(crash_during_startup: bool) {
         wire.flush().await.unwrap();
         let running = started.await.unwrap();
         peer_cell.set(running.peer().clone()).unwrap();
+        if let Some((entered, resume)) = publication_pause {
+            let original = tokio::time::timeout(Duration::from_secs(5), entered).await.unwrap().unwrap();
+            std::fs::write(root.join("rust.crash-1"), "").unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while original.notify("test/probe", json!({})).await.is_ok() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                if translator.registered_server_count() != 0 {
+                    while !translator.is_server_dead(&ServerId::from("rust")) {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }
+            }).await.expect("original fixture must exit while startup is paused");
+            let _concurrent = call(&mut wire, "workspace_symbol_search", json!({"query": "generation"})).await;
+            resume.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !delivery.lock().await.has_baseline() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }).await.unwrap();
+            for _ in 0..2 {
+                let response = call(&mut wire, "workspace_symbol_search", json!({"query": "generation"})).await;
+                assert_eq!(response["result"]["isError"], false, "startup must preserve the live replacement client: {response}");
+                assert!(response.to_string().contains("rust-generation-2"), "{response}");
+            }
+            running.cancel().await.unwrap();
+            cancel_tx.send(true).unwrap();
+            translator.shutdown_servers().await;
+            drop(abort_init);
+            init.await.unwrap();
+            return;
+        }
         let first_generation = if let Some(held_cache) = held_cache.take() {
             tokio::time::timeout(Duration::from_secs(5), async {
                 while translator.registered_server_count() != 2 {
