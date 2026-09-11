@@ -188,7 +188,7 @@ impl Applier {
 /// its canonical self, and one that does not exist yet becomes its canonical
 /// parent plus the names below it.
 fn normalize(path: &Path) -> PathBuf {
-    if let Ok(canonical) = path.canonicalize() {
+    if let Ok(canonical) = dunce::canonicalize(path) {
         return canonical;
     }
     match (path.parent(), path.file_name()) {
@@ -1142,7 +1142,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("a.rs");
         fs::write(&path, "fn old() {}\n").expect("seed");
-        let canonical = path.canonicalize().expect("the fixture exists");
+        let canonical = dunce::canonicalize(&path).expect("the fixture exists");
 
         let arrived = Arc::new(Barrier::new(2));
         let resume = Arc::new(Barrier::new(2));
@@ -1269,7 +1269,7 @@ mod tests {
             "the error says why: {message}"
         );
         for path in [&first, &second] {
-            let canonical = path.canonicalize().expect("the fixture exists");
+            let canonical = dunce::canonicalize(path).expect("the fixture exists");
             assert!(
                 message.contains(&canonical.display().to_string()),
                 "every read-only file is named, missing {}: {message}",
