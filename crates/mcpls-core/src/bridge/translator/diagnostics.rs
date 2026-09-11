@@ -10,8 +10,7 @@ use tokio::sync::Mutex;
 
 use super::Translator;
 use super::dto::{
-    Diagnostic, DiagnosticSeverity, DiagnosticsResult, Position2D, Range, ServerLogsResult,
-    ServerMessagesResult,
+    Diagnostic, DiagnosticSeverity, DiagnosticsResult, ServerLogsResult, ServerMessagesResult,
 };
 use super::encoding_ctx::EncodingCtx;
 use super::routing::validate_path_against_roots;
@@ -225,28 +224,10 @@ impl Translator {
     /// live rust-analyzer 1.97.1 session, see #244) some native diagnostics
     /// too. Those are cached separately in `NotificationCache`.
     ///
-    /// Where the *same* logical problem is reported through both paths, the
-    /// two representations were observed to differ in both `range` and
-    /// rendered `message`. Captured example, a "not all trait items
-    /// implemented" (E0046) error for one `impl` block: pull reported range
-    /// `(96,7)-(96,12)` (the trait name) with message "not all trait items
-    /// implemented, missing: `fn hello`"; the push notification for the same
-    /// error reported range `(95,1)-(95,32)` (the impl block) with message
-    /// "not all trait items implemented, missing: `hello`\nmissing `hello`
-    /// in implementation" — same `code`/`severity`, adjacent but distinct
-    /// ranges, different message text. Exact field equality never dedups
-    /// cases like that.
-    ///
-    /// Given that, a cache entry is treated as a duplicate of a pull entry
-    /// when both carry a `code`, the `(severity, code)` pair matches, *and*
-    /// the two ranges are either overlapping or start within
-    /// `DUPLICATE_RANGE_PROXIMITY_LINES` lines of each other — close
-    /// enough to be the same underlying model divergence, not two distinct
-    /// occurrences of the same error class (e.g. two unrelated `E0308`
-    /// mismatches at different call sites in one file, one caught only
-    /// natively and one only by flycheck). Diagnostics with no `code` fall
-    /// back to full-field equality, since there is no cheaper stable
-    /// identity available for them.
+    /// Cached diagnostics are omitted only when their complete MCP records
+    /// equal an original pull record, including source, message, and range.
+    /// Distinct producer reports are preserved even when they describe the
+    /// same logical problem. Source names are compared without interpretation.
     ///
     /// Output is sorted by `(start.line, start.character)` so merged
     /// cache-only entries don't land out of document order after the
@@ -258,39 +239,12 @@ impl Translator {
         encoding: PositionEncoding,
         tracker: &Arc<DocumentTracker>,
     ) -> DiagnosticsResult {
-        /// Start-line distance within which same-code, same-severity
-        /// diagnostics from the two models are still considered the same
-        /// underlying problem. Derived from the captured E0046 case above
-        /// (1 line apart); wide enough to absorb span drift between
-        /// rust-analyzer's own spans and rustc's, narrow enough that two
-        /// genuinely distinct same-code errors elsewhere in a file are not
-        /// collapsed into one.
-        const DUPLICATE_RANGE_PROXIMITY_LINES: u32 = 3;
-
-        fn position_le(a: &Position2D, b: &Position2D) -> bool {
-            (a.line, a.character) <= (b.line, b.character)
-        }
-
-        fn ranges_close(a: &Range, b: &Range) -> bool {
-            let overlaps = position_le(&a.start, &b.end) && position_le(&b.start, &a.end);
-            overlaps || a.start.line.abs_diff(b.start.line) <= DUPLICATE_RANGE_PROXIMITY_LINES
-        }
-
-        fn is_duplicate(pull: &[Diagnostic], candidate: &Diagnostic) -> bool {
-            pull.iter().any(|p| match (&candidate.code, &p.code) {
-                (Some(c), Some(pc)) if c == pc && p.severity == candidate.severity => {
-                    ranges_close(&p.range, &candidate.range)
-                }
-                _ => p == candidate,
-            })
-        }
-
         let cached = Self::diagnostics_from_cache_entry(diag_info, encoding, tracker)
             .await
             .diagnostics;
         let new_diagnostics: Vec<_> = cached
             .into_iter()
-            .filter(|c| !is_duplicate(&pull.diagnostics, c))
+            .filter(|candidate| !pull.diagnostics.contains(candidate))
             .collect();
         pull.diagnostics.extend(new_diagnostics);
         pull.diagnostics
@@ -375,6 +329,7 @@ mod tests {
     use url::Url;
 
     use super::*;
+    use crate::bridge::translator::dto::{Position2D, Range};
     use crate::bridge::translator::testing::*;
     use crate::config::{ServerId, ToolRouter};
 
@@ -902,15 +857,8 @@ mod tests {
         assert_eq!(merged.diagnostics.len(), 2);
     }
 
-    /// Pins a cross-model duplicate shape verified empirically against a live
-    /// rust-analyzer 1.97.1 session (#244): the pull and push diagnostics for
-    /// the *same* "not all trait items implemented" (E0046) error had
-    /// different ranges (trait name vs. impl block) and different messages
-    /// (terse vs. rustc's full rendering), but shared `code` and `severity`.
-    /// Exact-field dedup would report this twice; the `(severity, code)`
-    /// fingerprint must collapse it to one entry.
     #[tokio::test]
-    async fn test_merge_diagnostics_same_code_different_range_and_message_deduped() {
+    async fn test_merge_diagnostics_same_code_different_range_and_message_preserved() {
         let pull_diag = Diagnostic {
             range: Range {
                 start: Position2D {
@@ -949,24 +897,16 @@ mod tests {
         )
         .await;
 
-        assert_eq!(merged.diagnostics.len(), 1);
-        assert_eq!(merged.diagnostics[0], pull_diag);
+        assert_eq!(merged.diagnostics.len(), 2);
+        assert_eq!(merged.diagnostics[1], pull_diag);
+        assert_eq!(merged.diagnostics[0].range.start.line, 95);
+        assert_eq!(merged.diagnostics[0].code.as_deref(), Some("E0046"));
+        assert_eq!(
+            merged.diagnostics[0].message,
+            "not all trait items implemented, missing: `hello`\nmissing `hello` in implementation"
+        );
     }
 
-    /// Regression: `merge_diagnostics`'s `(severity, code)` fingerprint alone
-    /// is coarser than full-field equality and cannot tell apart two
-    /// genuinely distinct diagnostics that happen to share `code` and
-    /// `severity` -- e.g. two separate `E0308` mismatched-type errors at
-    /// different locations in the same file, one caught only by native
-    /// (pull) analysis and a second, unrelated one caught only by
-    /// flycheck/cargo check (cache), such as an error inside macro-expanded
-    /// code the native pass did not evaluate. This previously caused the
-    /// cache-only entry to be silently dropped -- reproducing #244's exact
-    /// failure mode, just relocated from "no merge" to "over-eager dedup".
-    ///
-    /// The range-proximity check on `is_duplicate` (see `merge_diagnostics`)
-    /// closes this: these two diagnostics are 45 lines apart, far outside
-    /// `DUPLICATE_RANGE_PROXIMITY_LINES`, so both must survive the merge.
     #[tokio::test]
     async fn test_merge_diagnostics_same_code_distinct_diagnostics_at_different_locations_both_kept()
      {
