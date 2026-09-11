@@ -40,6 +40,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use mcp_client::McpClient;
+use mcpls_core::bridge::Diagnostic;
 use ra_probe::{Resolution, resolve_rust_analyzer};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -1671,9 +1672,12 @@ fn sc_resync_delivers_a_build_error_after_an_apply(
         let starting_up = report.get("note").is_some() && omitted == 0;
         if !starting_up {
             if let Some(hit) = find_rustc_e0428(&report) {
-                if hit["code"] != json!("E0428") || hit["source"] != json!("rustc") {
-                    return Err(format!("matched the wrong diagnostic: {hit}"));
+                if hit.1["code"] != json!("E0428") || hit.1["source"] != json!("rustc") {
+                    return Err(format!("matched the wrong diagnostic: {}", hit.1));
                 }
+                let diagnostic: Diagnostic = serde_json::from_value(hit.1.clone())
+                    .map_err(|e| format!("bad delivered diagnostic JSON: {e}"))?;
+                assert_follow_up_has_no_repeat(client, &hit.0, &diagnostic)?;
                 return Ok(());
             }
             last = report;
@@ -1781,14 +1785,80 @@ fn sc_resync_delivers_a_build_error_in_an_unopened_module(
     }
 }
 
-/// The first `rustc`-sourced `E0428` anywhere in a flush report, or `None`.
-fn find_rustc_e0428(report: &Value) -> Option<Value> {
-    report["changed"]
-        .as_array()?
+/// The first `rustc`-sourced `E0428` and its enclosing file, or `None`.
+fn find_rustc_e0428(report: &Value) -> Option<(String, Value)> {
+    report["changed"].as_array()?.iter().find_map(|file| {
+        let file_path = file["file_path"].as_str()?.to_owned();
+        file["diagnostics"]
+            .as_array()?
+            .iter()
+            .find(|diagnostic| {
+                diagnostic["source"] == json!("rustc") && diagnostic["code"] == json!("E0428")
+            })
+            .cloned()
+            .map(|diagnostic| (file_path, diagnostic))
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct SettledDiagnosticsReport {
+    changed: Vec<SettledDiagnosticsFile>,
+    #[serde(rename = "cleared")]
+    _cleared: Vec<String>,
+    omitted: usize,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SettledDiagnosticsFile {
+    file_path: String,
+    diagnostics: Vec<Diagnostic>,
+}
+
+/// Consume one settled follow-up report and reject a repeated diagnostic.
+fn assert_follow_up_has_no_repeat(
+    client: &mut McpClient,
+    file_path: &str,
+    diagnostic: &Diagnostic,
+) -> Result<(), String> {
+    let next = client
+        .call_tool("get_new_diagnostics", &json!({}))
+        .map_err(|e| format!("follow-up flush failed: {e}"))?;
+    let next_body = assertions::assert_tool_ok(&next);
+    let next_report: SettledDiagnosticsReport = serde_json::from_str(&next_body)
+        .map_err(|e| format!("bad follow-up diagnostics JSON: {e}"))?;
+    if next_report.note.is_some() && next_report.omitted == 0 {
+        return Err(format!(
+            "follow-up report was still a startup note: {next_body}"
+        ));
+    }
+    if report_contains_diagnostic(&next_report, file_path, diagnostic) {
+        return Err(format!(
+            "the delivered rustc E0428 was repeated in the follow-up report: \
+             file={file_path}, diagnostic={diagnostic:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a report repeats one diagnostic in the file that originally held it.
+fn report_contains_diagnostic(
+    report: &SettledDiagnosticsReport,
+    file_path: &str,
+    expected: &Diagnostic,
+) -> bool {
+    report
+        .changed
         .iter()
-        .flat_map(|file| file["diagnostics"].as_array().into_iter().flatten())
-        .find(|d| d["source"] == json!("rustc") && d["code"] == json!("E0428"))
-        .cloned()
+        .filter(|file| file.file_path == file_path)
+        .flat_map(|file| file.diagnostics.iter())
+        .any(|diagnostic| {
+            diagnostic.source == expected.source
+                && diagnostic.code == expected.code
+                && diagnostic.message == expected.message
+                && diagnostic.range == expected.range
+        })
 }
 
 // ---------------------------------------------------------------------------
