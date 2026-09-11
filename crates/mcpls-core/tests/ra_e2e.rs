@@ -1620,6 +1620,7 @@ fn sc_resync_delivers_a_build_error_after_an_apply(
     let lib = workspace.join("src/lib.rs");
     let tally_line = find_line(&lib, "pub fn tally(");
     wait_until_ready(client, &workspace.join("src/functions.rs"), "tally_twice");
+    wait_for_settled_diagnostics_baseline(client)?;
 
     let resp = client
         .call_tool(
@@ -1689,6 +1690,29 @@ fn sc_resync_delivers_a_build_error_after_an_apply(
             ));
         }
         std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Wait until the startup baseline has been adopted before changing the fixture.
+fn wait_for_settled_diagnostics_baseline(client: &mut McpClient) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_millis(settle_deadline_ms());
+    loop {
+        let raw = client
+            .call_tool("get_new_diagnostics", &json!({}))
+            .map_err(|e| format!("baseline flush failed: {e}"))?;
+        let body = assertions::assert_tool_ok(&raw);
+        let report: SettledDiagnosticsReport = serde_json::from_str(&body)
+            .map_err(|e| format!("bad baseline diagnostics JSON: {e}"))?;
+        let starting_up = report.note.is_some() && report.omitted == 0;
+        if !starting_up {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "diagnostics baseline did not settle within the deadline; last report: {body}"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(200));
     }
 }
 
