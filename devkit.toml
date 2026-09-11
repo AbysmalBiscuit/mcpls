@@ -104,8 +104,8 @@ run = ["cargo", "doc", "--workspace", "--no-deps", "--all-features", "--locked"]
 guard = true
 
 [tasks.hooks]
-description = "Install the commit-msg hook into this checkout"
-run = ["prek", "install", "--hook-type", "commit-msg"]
+description = "Point git at the repository's hook directory"
+run = ["git", "config", "core.hooksPath", ".githooks"]
 guard = true
 
 [tasks.clean]

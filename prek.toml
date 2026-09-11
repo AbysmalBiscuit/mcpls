@@ -1,9 +1,0 @@
-#:schema https://www.schemastore.org/prek.json
-
-[[repos]]
-repo = "local"
-hooks = [
-    { id = "commit-msg", name = "conventional commit message", entry = ".githooks/commit-msg", language = "script", stages = [
-        "commit-msg",
-    ] },
-]
