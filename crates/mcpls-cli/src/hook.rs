@@ -657,21 +657,27 @@ fn foreign_candidates(identity: &SocketIdentity, _prefix: &str) -> std::io::Resu
 /// "nothing has ever run" answer a missing directory means on Unix.
 #[cfg(windows)]
 fn foreign_candidates(identity: &SocketIdentity, prefix: &str) -> std::io::Result<Vec<PathBuf>> {
-    let own = identity.socket.clone();
-    let entries = std::fs::read_dir(r"\\.\pipe\")?;
-    let mut candidates: Vec<PathBuf> = entries
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| {
-            *path != own
-                && path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with(prefix))
-        })
-        .collect();
-    candidates.sort_unstable();
-    Ok(candidates)
+    let mut candidates = std::collections::BTreeSet::new();
+    for _ in 0..PIPE_LISTINGS {
+        candidates.extend(
+            std::fs::read_dir(r"\\.\pipe\")?
+                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                .filter(|path| {
+                    *path != identity.socket
+                        && path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| name.starts_with(prefix))
+                }),
+        );
+    }
+    Ok(candidates.into_iter().collect())
 }
+
+/// One listing of the pipe namespace can silently omit a live pipe while
+/// other processes create and close pipes, so the scan unions several.
+#[cfg(windows)]
+const PIPE_LISTINGS: usize = 3;
 
 /// The doctor's answer when this project's own socket identity cannot be
 /// derived at all: an unreachable project directory, or a runtime

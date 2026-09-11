@@ -275,21 +275,20 @@ impl HookListener {
                 }),
             })),
             Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-                // Win32's CreateNamedPipe returns ERROR_ACCESS_DENIED both
-                // when another process already holds the first-instance
-                // pipe (routine contention) and when a DACL genuinely
-                // denies creation rights (e.g. a pipe left behind by
-                // another user's session). The two are indistinguishable
-                // from this error alone, and resolving the ambiguity by
-                // probing further (opening the pipe as a client) would
-                // itself race the very contention this is trying to
-                // detect. Treating both as "not the owner" is the safe
-                // default: failing acquisition outright on every such
-                // error would break the ordinary multi-instance takeover
-                // this exists to support whenever the real cause is
-                // routine contention, to avoid silence in the rarer case
-                // where it is a genuine permission problem.
-                tracing::warn!("hook pipe creation denied for {:?}: {e}", identity.socket);
+                // Routine contention and a DACL denial both arrive as
+                // ERROR_ACCESS_DENIED. A passive instance retries every
+                // few seconds, so only the first denial in a process warns.
+                static DENIAL_WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if DENIAL_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::debug!("hook pipe creation denied for {:?}: {e}", identity.socket);
+                } else {
+                    tracing::warn!(
+                        "hook pipe creation denied for {:?}: {e}; another mcpls \
+                         likely owns this project's hooks, so this one waits to take over",
+                        identity.socket
+                    );
+                }
                 Ok(None)
             }
             Err(e) => Err(e.into()),
