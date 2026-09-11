@@ -1314,8 +1314,8 @@ async fn baseline_task(
 /// Test helpers shared by the `#[cfg(test)]` modules across this crate,
 /// living here rather than in any one of them so all of them get the same
 /// behavior: [`CwdGuard`] for tests that mutate the process-wide working
-/// directory, and the framed-message readers for tests that talk to a fake
-/// LSP server over a pipe.
+/// directory, and [`FakeServer`] with the framed-message readers for tests
+/// that talk to a fake LSP server over in-memory pipes.
 ///
 /// The cwd lock has to be crate-wide (#348). Tests that call
 /// `std::env::set_current_dir` must not run concurrently with each other or
@@ -1330,9 +1330,43 @@ mod test_support {
     use std::sync::{Mutex, MutexGuard, PoisonError};
     use std::time::Duration;
 
-    use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt};
+    use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, DuplexStream};
+
+    use crate::lsp::LspTransport;
 
     static CWD_LOCK: Mutex<()> = Mutex::new(());
+
+    /// How many bytes a [`FakeServer`] pipe holds before its writer waits
+    /// for the reader: far more than any test leaves unread.
+    const PIPE_CAPACITY: usize = 1 << 20;
+
+    /// The server side of the in-memory connection [`fake_lsp_transport`]
+    /// builds.
+    ///
+    /// Frames written to `read_half_stdin` reach the client as server
+    /// messages, and every frame the client sends can be read back from
+    /// `write_stdout`. Dropping a field closes its direction the way an
+    /// exiting server closes its pipes: the client reads EOF once
+    /// `read_half_stdin` is gone, and its writes fail once `write_stdout` is.
+    pub struct FakeServer {
+        pub read_half_stdin: DuplexStream,
+        pub write_stdout: DuplexStream,
+    }
+
+    /// An [`LspTransport`] connected to an in-memory [`FakeServer`], so a
+    /// test can read the exact bytes sent to a server and answer them
+    /// without spawning one.
+    pub fn fake_lsp_transport() -> (LspTransport, FakeServer) {
+        let (client_writes, write_stdout) = tokio::io::duplex(PIPE_CAPACITY);
+        let (read_half_stdin, client_reads) = tokio::io::duplex(PIPE_CAPACITY);
+        (
+            LspTransport::new(client_writes, client_reads),
+            FakeServer {
+                read_half_stdin,
+                write_stdout,
+            },
+        )
+    }
 
     /// RAII guard that serializes CWD-mutating tests behind [`CWD_LOCK`] and
     /// switches into `dir` for the guard's lifetime, restoring the original

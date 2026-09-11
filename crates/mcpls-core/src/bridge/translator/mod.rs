@@ -1155,8 +1155,8 @@ mod tests {
 
     /// #241: `shutdown_servers` must drain every registered `LspServer` —
     /// this is the core behavior the issue is about (orphaned LSP children
-    /// on shutdown). Uses `fake_lsp_server()` (mock `echo`/`cat` child
-    /// processes, real `LspServer`, see `lsp::lifecycle`), which won't
+    /// on shutdown). Uses `fake_lsp_server()` (mock `echo` child process,
+    /// real `LspServer`, see `lsp::lifecycle`), which won't
     /// answer the LSP `shutdown` handshake — proving the drain completes,
     /// via the timeout/error fallback path, without hanging on
     /// non-responsive servers.

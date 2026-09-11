@@ -1604,36 +1604,16 @@ mod tests {
     /// above call the answering logic directly and never exercise that
     /// spawn-and-round-trip path.
     ///
-    /// Two `cat` subprocesses stitched together give a full-duplex pipe pair
-    /// without a real LSP server, the same trick `retry_behavior::fake_lsp_client`
-    /// uses.
     #[tokio::test]
     #[allow(clippy::expect_used)]
     async fn test_apply_edit_round_trips_through_the_message_loop() {
-        use std::process::Stdio;
-
         use tokio::io::{AsyncWriteExt, BufReader};
-        use tokio::process::Command;
 
-        let mut write_half = Command::new("cat")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .expect("spawn cat for the client's outbound half");
-        let write_stdin = write_half.stdin.take().expect("write_half stdin");
-        let write_stdout = write_half.stdout.take().expect("write_half stdout");
-
-        let mut read_half = Command::new("cat")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .expect("spawn cat for the client's inbound half");
-        let read_stdout = read_half.stdout.take().expect("read_half stdout");
-        let mut read_stdin = read_half.stdin.take().expect("read_half stdin");
-
-        let transport = LspTransport::new(write_stdin, read_stdout);
+        let (transport, server) = crate::test_support::fake_lsp_transport();
+        let crate::test_support::FakeServer {
+            read_half_stdin: mut read_stdin,
+            write_stdout,
+        } = server;
         let client = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport);
 
         let (tx, mut rx): (ApplySink, _) = mpsc::channel(1);
@@ -1691,35 +1671,19 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::expect_used)]
     async fn test_a_registration_reaches_the_registry_through_the_message_loop() {
-        use std::process::Stdio;
-
         use tokio::io::{AsyncWriteExt, BufReader};
-        use tokio::process::Command;
 
-        let mut write_half = Command::new("cat")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .expect("spawn cat for the client's outbound half");
-        let write_stdin = write_half.stdin.take().expect("write_half stdin");
-        let write_stdout = write_half.stdout.take().expect("write_half stdout");
-
-        let mut read_half = Command::new("cat")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .expect("spawn cat for the client's inbound half");
-        let read_stdout = read_half.stdout.take().expect("read_half stdout");
-        let mut read_stdin = read_half.stdin.take().expect("read_half stdin");
-
+        let (transport, server) = crate::test_support::fake_lsp_transport();
+        let crate::test_support::FakeServer {
+            read_half_stdin: mut read_stdin,
+            write_stdout,
+        } = server;
         let registry = Arc::new(WatchRegistry::new());
         let go = ServerId::from("go");
         let (notification_tx, _notification_rx) = mpsc::channel(1);
         let _client = LspClient::from_transport_with_notifications(
             LspServerConfig::rust_analyzer(),
-            LspTransport::new(write_stdin, read_stdout),
+            transport,
             notification_tx,
             Some(Arc::clone(&registry)),
             go.clone(),
@@ -1779,61 +1743,28 @@ mod tests {
     }
 
     mod retry_behavior {
-        use std::process::Stdio;
-
-        use tokio::io::{AsyncWriteExt, BufReader};
-        use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+        use tokio::io::{AsyncWriteExt, BufReader, DuplexStream};
 
         use super::*;
         use crate::config::LspServerConfig;
-
-        struct FakeServer {
-            _write_half: Child,
-            _read_half: Child,
-            read_half_stdin: ChildStdin,
-            write_stdout: ChildStdout,
-        }
+        use crate::test_support::{
+            CapturedLogs, FakeServer, assert_no_frame_within, fake_lsp_transport,
+            read_framed_message,
+        };
 
         fn fake_lsp_client() -> (LspClient, FakeServer) {
-            let mut write_half = Command::new("cat")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()
-                .unwrap();
-            let write_stdin = write_half.stdin.take().unwrap();
-            let write_stdout = write_half.stdout.take().unwrap();
-
-            let mut read_half = Command::new("cat")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()
-                .unwrap();
-            let read_stdout = read_half.stdout.take().unwrap();
-            let read_stdin = read_half.stdin.take().unwrap();
-
-            let transport = LspTransport::new(write_stdin, read_stdout);
-            let client = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport);
-
+            let (transport, server) = fake_lsp_transport();
             (
-                client,
-                FakeServer {
-                    _write_half: write_half,
-                    _read_half: read_half,
-                    read_half_stdin: read_stdin,
-                    write_stdout,
-                },
+                LspClient::from_transport(LspServerConfig::rust_analyzer(), transport),
+                server,
             )
         }
-
-        use crate::test_support::{CapturedLogs, assert_no_frame_within, read_framed_message};
 
         /// Writes a framed JSON-RPC retryable error response — either
         /// `ServerCancelled` (-32802) or `ContentModified` (-32801) — with a
         /// `data.retriggerRequest` flag.
         async fn write_retryable_error_response(
-            stdin: &mut ChildStdin,
+            stdin: &mut DuplexStream,
             id: &Value,
             code: i32,
             message: &str,
@@ -1857,7 +1788,7 @@ mod tests {
 
         /// Writes a framed JSON-RPC error response with an arbitrary code/message.
         async fn write_error_response(
-            stdin: &mut ChildStdin,
+            stdin: &mut DuplexStream,
             id: &Value,
             code: i32,
             message: &str,
@@ -1875,7 +1806,7 @@ mod tests {
         }
 
         /// Writes a framed JSON-RPC success response.
-        async fn write_success_response(stdin: &mut ChildStdin, id: &Value, result: Value) {
+        async fn write_success_response(stdin: &mut DuplexStream, id: &Value, result: Value) {
             let response = serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": id,
@@ -1889,8 +1820,8 @@ mod tests {
         }
 
         // Not `start_paused`: the retry loop's real backoff sleeps
-        // interleave with real subprocess pipe I/O below, and paused
-        // virtual time does not reliably auto-advance across both.
+        // interleave with the frame reads below, and paused virtual time
+        // does not reliably auto-advance across both.
         #[tokio::test]
         async fn test_retry_exhaustion_returns_original_server_cancelled_error() {
             use tracing_subscriber::layer::SubscriberExt as _;

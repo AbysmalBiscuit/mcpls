@@ -1,19 +1,17 @@
 //! Shared test fixtures for the `translator` module's sibling `tests`
 //! submodules: an `EncodingCtx` builder, a fake in-process LSP server driven
-//! over `cat` pipes, JSON-RPC framing helpers, and `TranslatorHarness`, which
+//! over in-memory pipes, JSON-RPC framing helpers, and `TranslatorHarness`, which
 //! drives that fake server on its own OS thread for tests that inspect the
 //! notifications it received.
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use tempfile::TempDir;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, DuplexStream};
 use tokio::sync::{mpsc, oneshot};
 
 use super::Translator;
@@ -22,7 +20,9 @@ use crate::bridge::encoding::PositionEncoding;
 use crate::bridge::state::ResourceLimits;
 use crate::bridge::{DiagnosticInfo, DocumentTracker, lock_std};
 use crate::config::{LspServerConfig, ServerId, ToolRouter};
-use crate::lsp::{LspClient, LspServer, LspTransport, WatchRegistry};
+use crate::lsp::{LspClient, LspServer, WatchRegistry};
+pub use crate::test_support::FakeServer;
+use crate::test_support::fake_lsp_transport;
 pub(super) use crate::test_support::read_framed_message;
 
 type JsonValue = serde_json::Value;
@@ -108,43 +108,6 @@ pub(super) fn diag_info(diagnostics: Vec<lsp_types::Diagnostic>) -> DiagnosticIn
     }
 }
 
-pub struct FakeServer {
-    _write_half: Child,
-    _read_half: Child,
-    pub(crate) read_half_stdin: ChildStdin,
-    pub(crate) write_stdout: ChildStdout,
-}
-
-fn fake_lsp_transport() -> (LspTransport, FakeServer) {
-    let mut write_half = Command::new("cat")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
-    let write_stdin = write_half.stdin.take().unwrap();
-    let write_stdout = write_half.stdout.take().unwrap();
-
-    let mut read_half = Command::new("cat")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
-    let read_stdout = read_half.stdout.take().unwrap();
-    let read_stdin = read_half.stdin.take().unwrap();
-
-    (
-        LspTransport::new(write_stdin, read_stdout),
-        FakeServer {
-            _write_half: write_half,
-            _read_half: read_half,
-            read_half_stdin: read_stdin,
-            write_stdout,
-        },
-    )
-}
-
 pub(super) fn fake_lsp_client() -> (LspClient, FakeServer) {
     let (transport, server) = fake_lsp_transport();
     (
@@ -185,7 +148,7 @@ pub async fn read_framed_reply<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut 
 
 /// Writes `message` behind its `Content-Length` header, the framing every
 /// LSP message on the wire uses.
-async fn write_frame(stdin: &mut ChildStdin, message: &JsonValue) {
+async fn write_frame(stdin: &mut DuplexStream, message: &JsonValue) {
     let content = serde_json::to_string(message).unwrap();
     let header = format!("Content-Length: {}\r\n\r\n", content.len());
     stdin.write_all(header.as_bytes()).await.unwrap();
@@ -194,7 +157,7 @@ async fn write_frame(stdin: &mut ChildStdin, message: &JsonValue) {
 }
 
 /// Writes a framed JSON-RPC success response, as a real LSP server would.
-pub async fn write_response(stdin: &mut ChildStdin, id: &JsonValue, result: JsonValue) {
+pub async fn write_response(stdin: &mut DuplexStream, id: &JsonValue, result: JsonValue) {
     write_frame(
         stdin,
         &serde_json::json!({
@@ -209,7 +172,7 @@ pub async fn write_response(stdin: &mut ChildStdin, id: &JsonValue, result: Json
 /// Writes a framed JSON-RPC request from the server to the client, as a
 /// server does when it answers a command with `workspace/applyEdit`.
 pub(super) async fn write_request(
-    stdin: &mut ChildStdin,
+    stdin: &mut DuplexStream,
     id: &JsonValue,
     method: &str,
     params: JsonValue,
@@ -229,7 +192,7 @@ pub(super) async fn write_request(
 /// Writes a framed JSON-RPC error response, e.g. to simulate a push-only
 /// server answering `textDocument/diagnostic` with method-not-found.
 pub(super) async fn write_error_response(
-    stdin: &mut ChildStdin,
+    stdin: &mut DuplexStream,
     id: &JsonValue,
     code: i64,
     message: &str,
@@ -386,19 +349,10 @@ impl RecordingServer {
                 let (client, server) = fake_lsp_client();
                 client_tx.send(client).expect("harness awaiting the client");
                 tokio::spawn(async move {
-                    // Names the whole struct, not just `write_stdout`, so
-                    // Rust's disjoint closure capture moves all of `server`
-                    // in here -- the other fields exist only to keep the
-                    // fake server's processes alive via `kill_on_drop`, and
-                    // a capture of `write_stdout` alone would otherwise
-                    // drop (and kill) the rest the moment this async block
-                    // is constructed.
-                    let mut server = server;
                     let FakeServer {
-                        read_half_stdin,
+                        mut read_half_stdin,
                         write_stdout,
-                        ..
-                    } = &mut server;
+                    } = server;
                     let mut wire = BufReader::new(write_stdout);
                     while let Some(message) = try_read_frame(&mut wire).await {
                         let method = message["method"].as_str().unwrap_or_default();
@@ -414,7 +368,7 @@ impl RecordingServer {
                             .push((method.to_string(), message["params"].clone()));
                         if respond_to_diagnostics && method == "textDocument/diagnostic" {
                             write_response(
-                                &mut *read_half_stdin,
+                                &mut read_half_stdin,
                                 &message["id"],
                                 serde_json::json!({"kind": "full", "items": []}),
                             )
