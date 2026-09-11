@@ -115,7 +115,7 @@ for i in "${!lines[@]}"; do
 done
 
 if ((agent_coauthors == 0)) && [[ -n ${CLAUDECODE:-}${CODEX_SANDBOX:-}${CODEX_SANDBOX_NETWORK_DISABLED:-} ]]; then
-    errors+=("commit written by an agent has no Co-authored-by trailer naming the model")
+    errors+=("commit written by an agent has no '$AGENT_KEY' trailer naming the model")
 fi
 
 for warning in "${warnings[@]}"; do
