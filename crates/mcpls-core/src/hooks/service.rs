@@ -558,6 +558,7 @@ mod tests {
                 || dir.path().to_path_buf(),
                 |harness| harness.root().to_path_buf(),
             );
+            let root = dunce::canonicalize(root).expect("canonicalize the owner root");
             let context = Arc::new(test_context(
                 &root,
                 Arc::clone(&translator),
@@ -993,6 +994,7 @@ mod tests {
         diagnostics: DiagnosticsConfig,
         message: &str,
     ) -> (Arc<McplsServer>, Arc<Sweeper>) {
+        let root = dunce::canonicalize(root).expect("canonicalize the workspace root");
         let translator = Arc::new(Translator::new());
         let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
         notification_cache.lock().await.store_diagnostics(
@@ -1004,7 +1006,7 @@ mod tests {
         let delivery = Arc::new(Mutex::new(DiagnosticsDelivery::new(diagnostics)));
         delivery.lock().await.set_baseline(HashMap::new());
         let context = Arc::new(test_context(
-            root,
+            &root,
             translator.clone(),
             notification_cache,
             delivery,
@@ -1013,7 +1015,7 @@ mod tests {
         ));
         (
             Arc::new(McplsServer::from_context(context)),
-            Arc::new(test_sweeper(root, translator)),
+            Arc::new(test_sweeper(&root, translator)),
         )
     }
 
