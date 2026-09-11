@@ -44,6 +44,14 @@ use crate::hooks::{self, ChangeEvent, Role, SocketIdentity};
 #[derive(Clone)]
 pub struct McplsServer {
     context: Arc<BridgeContext>,
+    #[cfg(test)]
+    footer_pause: Arc<std::sync::Mutex<Option<FooterPause>>>,
+}
+
+#[cfg(test)]
+struct FooterPause {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
 }
 
 /// How long a fire-and-forget `changed` waits on the hook socket.
@@ -566,8 +574,31 @@ impl McplsServer {
     /// frozen into an `Arc`, and the socket handler needs a server sharing
     /// that same context, so both are built from one `Arc<BridgeContext>`
     /// rather than through [`Self::new`].
-    pub(crate) const fn from_context(context: Arc<BridgeContext>) -> Self {
-        Self { context }
+    #[allow(clippy::missing_const_for_fn)]
+    pub(crate) fn from_context(context: Arc<BridgeContext>) -> Self {
+        Self {
+            context,
+            #[cfg(test)]
+            footer_pause: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_footer_pause(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *crate::bridge::lock_std(&self.footer_pause) = Some(FooterPause { entered, release });
+    }
+
+    #[cfg(test)]
+    async fn pause_before_footer_flush(&self) {
+        let pause = crate::bridge::lock_std(&self.footer_pause).take();
+        if let Some(FooterPause { entered, release }) = pause {
+            let _ = entered.send(());
+            let _ = release.await;
+        }
     }
 
     /// Router for every MCP tool, with the read-only classification applied
@@ -1129,6 +1160,22 @@ impl McplsServer {
         (self.new_diagnostics_payload(&report, &sources).await, token)
     }
 
+    #[allow(clippy::significant_drop_tightening)]
+    async fn flush_now_if_active(&self, session: &SessionId) -> Option<NewDiagnosticsResult> {
+        let (report, sources) = {
+            let mut delivery = self.context.delivery.lock().await;
+            let cache = self.context.notification_cache.lock().await;
+            let entries = routable_entries_borrowed(&cache, &self.context.floors);
+            let report = self
+                .context
+                .hooks
+                .with_active_role(|| delivery.flush(session, &entries))?;
+            let sources = source_map(&cache, &report);
+            (report, sources)
+        };
+        Some(self.new_diagnostics_payload(&report, &sources).await)
+    }
+
     /// `session`'s flush, rendered as the text a hook prints, with the
     /// token the hook acknowledges once it has that text.
     ///
@@ -1347,8 +1394,11 @@ impl McplsServer {
         )
         .await;
 
+        #[cfg(test)]
+        self.pause_before_footer_flush().await;
+
         let session = SessionId::from_env_or_process();
-        let (mut report, _) = self.flush_now(&session, Advance::Now).await;
+        let mut report = self.flush_now_if_active(&session).await?;
         report.note = Some(report.note.take().map_or_else(
             || {
                 "This footer is best effort; anything slower than the wait arrives in the \

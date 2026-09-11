@@ -126,6 +126,17 @@ impl HookRole {
         lock_std(&self.role).clone()
     }
 
+    /// Run a synchronous local-consumption operation while the role is active.
+    pub(crate) fn with_active_role<T>(&self, operation: impl FnOnce() -> T) -> Option<T> {
+        let role = lock_std(&self.role);
+        if matches!(*role, Role::Passive { .. }) {
+            return None;
+        }
+        let result = operation();
+        drop(role);
+        Some(result)
+    }
+
     /// A receiver that changes on every role transition.
     ///
     /// Subscribe before triggering the work under test, then await
@@ -427,9 +438,9 @@ mod tests {
     use super::*;
     use crate::bridge::apply::Applier;
     use crate::bridge::{
-        read_framed_reply, translator_with_capabilities, write_response, DiagnosticsDelivery,
-        FakeServer, FloorTable, NotificationCache, ResourceLimits, ResourceSubscriptions,
-        ServerSettle, Translator, TranslatorHarness,
+        DiagnosticsDelivery, FakeServer, FloorTable, NotificationCache, ResourceLimits,
+        ResourceSubscriptions, ServerSettle, Translator, TranslatorHarness, read_framed_reply,
+        translator_with_capabilities, write_response,
     };
     use crate::config::{ApplyConfig, DiagnosticsConfig, ServerId};
     use crate::hooks::{ChangeEvent, HookListener, PathFilter, Request, Response, SocketIdentity};
@@ -522,6 +533,7 @@ mod tests {
             harness
         }
 
+        #[allow(clippy::too_many_arguments)]
         async fn start_owner(
             dir: TempDir,
             identity: SocketIdentity,
@@ -1628,6 +1640,19 @@ mod tests {
         fake: &mut FakeServer,
         written: PathBuf,
     ) -> serde_json::Value {
+        let tool_result = apply_rename_over_mcp_result(server, fake, written).await;
+        assert!(
+            tool_result.get("new_diagnostics").is_none(),
+            "a passive applied write must not serialize a local footer: {tool_result}"
+        );
+        tool_result
+    }
+
+    async fn apply_rename_over_mcp_result(
+        server: Arc<McplsServer>,
+        fake: &mut FakeServer,
+        written: PathBuf,
+    ) -> serde_json::Value {
         std::fs::write(&written, "fn old() {}\n").expect("write");
         let written_uri = crate::bridge::path_to_uri(&written).expect("the fixture has a URI");
         let (server_io, client_io) = tokio::io::duplex(65_536);
@@ -1706,10 +1731,6 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&written).expect("read the applied fixture"),
             "fn new() {}\n"
-        );
-        assert!(
-            tool_result.get("new_diagnostics").is_none(),
-            "a passive applied write must not serialize a local footer: {tool_result}"
         );
         tool_result
     }
@@ -2024,6 +2045,189 @@ mod tests {
 
         old.cancel.send(true).expect("cancel old owner");
         competitor_cancel_tx.send(true).expect("cancel competitor");
+    }
+
+    /// A write that entered its footer while owning the hook must not consume
+    /// its local record after the real listener loses the lock.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn i1_t9_demotion_pending_footer_keeps_the_local_record() {
+        let diagnostics = DiagnosticsConfig {
+            footer: true,
+            footer_grace_ms: 0,
+            footer_quiet_ms: 0,
+            footer_wait_ms: 0,
+            ..DiagnosticsConfig::default()
+        };
+        let (old, mut fake) =
+            HookHarness::owner_with_write_diagnostic(diagnostics, "former-owner-diagnostic").await;
+        let mut transitions = old.role.subscribe_transitions();
+        let (footer_entered_tx, footer_entered_rx) = tokio::sync::oneshot::channel();
+        let (footer_release_tx, footer_release_rx) = tokio::sync::oneshot::channel();
+        old.server
+            .install_footer_pause(footer_entered_tx, footer_release_rx);
+
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        install_lock_loss_pause(Some(LockLossPause {
+            identity: old.identity.clone(),
+            loss: LockLoss::Missing,
+            arrived: Arc::clone(&arrived),
+            resume: Arc::clone(&resume),
+        }));
+        let _pause_guard = LockLossPauseGuard;
+
+        assert!(matches!(
+            status_from_owner(&old.identity).await,
+            Response::Status { owner: true, .. }
+        ));
+
+        let expected_path = old.fixture("written.rs");
+        let expected_path_text = expected_path.display().to_string();
+        let apply_path = expected_path.clone();
+        let apply = tokio::spawn({
+            let server = Arc::clone(&old.server);
+            async move { apply_rename_over_mcp_result(server, &mut fake, apply_path).await }
+        });
+        tokio::time::timeout(Duration::from_secs(3), footer_entered_rx)
+            .await
+            .expect("the serialized MCP write enters its pending footer")
+            .expect("the footer pause sender stays connected");
+
+        let lock_loss = arrived.notified();
+        std::fs::remove_file(&old.identity.lock).expect("remove the old owner lock");
+        tokio::time::timeout(Duration::from_secs(3), lock_loss)
+            .await
+            .expect("the real owner listener observes the removed lock");
+        tokio::time::timeout(Duration::from_secs(1), transitions.changed())
+            .await
+            .expect("the role transition is observable")
+            .expect("the owner task remains alive");
+        assert!(matches!(old.role.get(), Role::Passive { .. }));
+
+        let competitor_role = Arc::new(HookRole::owner());
+        let (competitor_server, competitor_sweeper) = server_with_diagnostic(
+            old.dir.path(),
+            Arc::clone(&competitor_role),
+            DiagnosticsConfig::default(),
+            "competitor-diagnostic",
+        )
+        .await;
+        let (competitor_cancel_tx, competitor_cancel_rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(Arc::clone(&competitor_sweeper).run(competitor_cancel_rx.clone()));
+        let competitor_listener = HookListener::acquire(&old.identity)
+            .await
+            .expect("acquire the replacement hook listener")
+            .expect("the competitor owns the replacement lock");
+        let competitor_task = tokio::spawn(competitor_listener.serve(
+            build_handler(
+                Arc::clone(&competitor_server),
+                Arc::clone(&competitor_sweeper),
+                HookLocation {
+                    identity: old.identity.clone(),
+                    root: old.dir.path().to_path_buf(),
+                },
+                Arc::clone(&competitor_role),
+                competitor_cancel_rx.clone(),
+            ),
+            Duration::from_millis(1500),
+            competitor_cancel_rx,
+        ));
+        assert!(matches!(
+            status_from_owner(&old.identity).await,
+            Response::Status { owner: true, .. }
+        ));
+
+        footer_release_tx
+            .send(())
+            .expect("the pending footer remains connected");
+        let tool_result = tokio::time::timeout(Duration::from_secs(5), apply)
+            .await
+            .expect("the MCP write completes after its footer is released")
+            .expect("the MCP write task remains connected");
+        assert_eq!(tool_result["applied"], true, "{tool_result}");
+        assert_eq!(
+            tool_result["files_written"],
+            serde_json::json!([expected_path_text]),
+            "{tool_result}"
+        );
+        assert!(
+            tool_result.get("new_diagnostics").is_none(),
+            "a demoted writer must not serialize its local footer: {tool_result}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&expected_path).expect("read the applied file"),
+            "fn new() {}\n"
+        );
+
+        competitor_cancel_tx
+            .send(true)
+            .expect("cancel the competing listener");
+        tokio::time::timeout(Duration::from_secs(3), competitor_task)
+            .await
+            .expect("the competing listener stops")
+            .expect("the competing listener task remains healthy");
+        resume.notify_one();
+        tokio::time::timeout(Duration::from_secs(6), transitions.changed())
+            .await
+            .expect("the original owner reacquires after competition ends")
+            .expect("the owner task remains alive");
+        assert_eq!(old.role.get(), Role::Owner);
+
+        let local = old
+            .server
+            .get_new_diagnostics()
+            .await
+            .expect("the reacquired owner flush answers");
+        assert!(
+            local.contains("former-owner-diagnostic"),
+            "the pending footer must leave the local record for a later owner flush: {local}"
+        );
+        old.cancel.send(true).expect("cancel the original owner");
+    }
+
+    /// A role change while footer lock acquisition is blocked must win over
+    /// the later local flush, so a check before either async lock is unsafe.
+    #[tokio::test]
+    async fn i1_t9_demotion_during_footer_lock_contention_skips_consumption() {
+        let diagnostics = DiagnosticsConfig {
+            footer: true,
+            footer_grace_ms: 0,
+            footer_quiet_ms: 0,
+            footer_wait_ms: 0,
+            ..DiagnosticsConfig::default()
+        };
+        let harness =
+            HookHarness::owner_with_diagnostic(diagnostics, "contention-diagnostic").await;
+        let held_cache = harness.notification_cache.lock().await;
+        let server = Arc::clone(&harness.server);
+        let footer = tokio::spawn(async move { server.footer_for_write(0).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if harness.delivery.try_lock().is_err() {
+                    tokio::task::yield_now().await;
+                    if harness.delivery.try_lock().is_err() {
+                        break;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("footer reaches delivery while cache remains held");
+
+        harness.role.demote_to_passive(harness.identity.clone());
+        drop(held_cache);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), footer)
+                .await
+                .expect("the footer completes after cache contention")
+                .expect("the footer task remains healthy")
+                .is_none(),
+            "a demoted footer must not consume after waiting for delivery and cache"
+        );
+        harness.cancel.send(true).expect("cancel the test owner");
     }
 
     /// A lock file a competitor took is a different situation: that process
