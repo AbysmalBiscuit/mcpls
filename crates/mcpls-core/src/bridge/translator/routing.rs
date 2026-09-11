@@ -35,7 +35,7 @@ pub fn validate_path_against_roots(path: &Path, workspace_roots: &[PathBuf]) -> 
 
     // If no workspace roots configured, allow any path (backward compatibility)
     if workspace_roots.is_empty() {
-        return Ok(canonical);
+        return Ok(dunce::simplified(&canonical).to_path_buf());
     }
 
     // Check if path is within any workspace root
@@ -43,7 +43,7 @@ pub fn validate_path_against_roots(path: &Path, workspace_roots: &[PathBuf]) -> 
         if let Ok(canonical_root) = root.canonicalize()
             && canonical.starts_with(&canonical_root)
         {
-            return Ok(canonical);
+            return Ok(dunce::simplified(&canonical).to_path_buf());
         }
     }
 
