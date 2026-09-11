@@ -60,10 +60,9 @@ pub enum ResourceUriError {
 /// # Examples
 ///
 /// ```
-/// use std::path::Path;
 /// use mcpls_core::bridge::resources::make_uri;
 ///
-/// let uri = make_uri(Path::new("/home/user/main.rs")).unwrap();
+/// let uri = make_uri(&std::env::temp_dir().join("main.rs")).unwrap();
 /// assert!(uri.starts_with("lsp-diagnostics:///"));
 /// ```
 pub fn make_uri(path: &Path) -> Result<String, ResourceUriError> {
@@ -88,11 +87,10 @@ pub fn make_uri(path: &Path) -> Result<String, ResourceUriError> {
 /// # Examples
 ///
 /// ```
-/// use std::path::Path;
 /// use mcpls_core::bridge::resources::{make_uri, parse_uri};
 ///
-/// let path = Path::new("/home/user/main.rs");
-/// let uri = make_uri(path).unwrap();
+/// let path = std::env::temp_dir().join("main.rs");
+/// let uri = make_uri(&path).unwrap();
 /// let recovered = parse_uri(&uri).unwrap();
 /// assert_eq!(recovered, path);
 /// ```
