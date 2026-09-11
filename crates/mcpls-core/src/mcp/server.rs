@@ -2616,7 +2616,10 @@ mod tests {
                 "jsonrpc": "2.0", "id": 2, "method": "tools/call",
                 "params": {"name": tool.mcp_name(), "arguments": tool.mcp_arguments(&path)}
             });
-            let call = tokio::spawn(async move { mcp_test_request(&mut wire, request).await });
+            let call = tokio::spawn(async move {
+                let response = mcp_test_request(&mut wire, request).await;
+                (Instant::now(), response)
+            });
 
             let mut lsp_wire = BufReader::new(&mut self.fake.write_stdout);
             let opened = crate::test_support::read_framed_message(&mut lsp_wire).await;
@@ -2689,6 +2692,7 @@ mod tests {
                 "{tool:?} completed before progress end after footer grace"
             );
 
+            let progress_end_sent_at = Instant::now();
             write_lsp_notification(
                 &mut self.fake.read_half_stdin,
                 "$/progress",
@@ -2715,10 +2719,16 @@ mod tests {
             )
             .await;
 
-            let response = tokio::time::timeout(Duration::from_secs(3), call)
-                .await
-                .expect("MCP write completed after progress end")
-                .expect("MCP write task stayed connected");
+            let (response_completed_at, response) =
+                tokio::time::timeout(Duration::from_secs(3), call)
+                    .await
+                    .expect("MCP write completed after progress end")
+                    .expect("MCP write task stayed connected");
+            assert!(
+                response_completed_at.duration_since(progress_end_sent_at)
+                    >= Duration::from_millis(self.server.context.diagnostics.footer_quiet_ms),
+                "{tool:?} completed before the configured footer quiet interval"
+            );
             assert!(response["error"].is_null(), "{response}");
             assert_eq!(response["result"]["isError"], false, "{response}");
             let payload: serde_json::Value = serde_json::from_str(
