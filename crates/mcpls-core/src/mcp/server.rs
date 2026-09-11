@@ -2146,6 +2146,48 @@ mod tests {
         [WriteTool::Rename, WriteTool::Format, WriteTool::CodeAction];
 
     impl WriteTool {
+        fn mcp_name(self) -> &'static str {
+            match self {
+                Self::Rename => "rename_symbol",
+                Self::Format => "format_document",
+                Self::CodeAction => "apply_code_action",
+            }
+        }
+
+        fn lsp_method(self) -> &'static str {
+            match self {
+                Self::Rename => "textDocument/rename",
+                Self::Format => "textDocument/formatting",
+                Self::CodeAction => "textDocument/codeAction",
+            }
+        }
+
+        fn mcp_arguments(self, path: &str) -> serde_json::Value {
+            match self {
+                Self::Rename => json!({
+                    "file_path": path,
+                    "line": 1,
+                    "character": 4,
+                    "new_name": "new",
+                    "apply": true,
+                }),
+                Self::Format => json!({
+                    "file_path": path,
+                    "tab_size": 4,
+                    "insert_spaces": true,
+                    "apply": true,
+                }),
+                Self::CodeAction => json!({
+                    "file_path": path,
+                    "start_line": 1,
+                    "start_character": 1,
+                    "end_line": 1,
+                    "end_character": 5,
+                    "action_index": 0,
+                }),
+            }
+        }
+
         /// What its language server has to advertise for the call to get as
         /// far as a request.
         fn capabilities(self) -> lsp_types::ServerCapabilities {
@@ -2407,6 +2449,326 @@ mod tests {
                  flush ever reads"
             );
         }
+    }
+
+    async fn write_lsp_notification<W>(writer: &mut W, method: &str, params: serde_json::Value)
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        use tokio::io::AsyncWriteExt as _;
+
+        let message = json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        });
+        let body = serde_json::to_vec(&message).unwrap();
+        writer
+            .write_all(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes())
+            .await
+            .unwrap();
+        writer.write_all(&body).await.unwrap();
+        writer.flush().await.unwrap();
+    }
+
+    struct CausalWriteFixture {
+        server: McplsServer,
+        translator: Arc<Translator>,
+        fake: FakeServer,
+        settle: Arc<ServerSettle>,
+        pump_cancel: tokio::sync::watch::Sender<bool>,
+        pump: tokio::task::JoinHandle<()>,
+        path: PathBuf,
+        uri: Uri,
+        _dir: tempfile::TempDir,
+    }
+
+    impl CausalWriteFixture {
+        fn new(tool: WriteTool) -> Self {
+            let dir = tempfile::tempdir().expect("a temp dir");
+            let server_id = ServerId::from("rust");
+            let cache = Arc::new(Mutex::new(NotificationCache::new()));
+            let subscriptions = Arc::new(ResourceSubscriptions::new());
+            let workspace_root = dunce::canonicalize(dir.path()).expect("the workspace exists");
+            let workspace_roots: Arc<[PathBuf]> = Arc::from(vec![workspace_root.clone()]);
+            let diagnostics = DiagnosticsConfig {
+                footer: true,
+                footer_grace_ms: 100,
+                footer_quiet_ms: 100,
+                footer_wait_ms: 3_000,
+                ..DiagnosticsConfig::default()
+            };
+            let delivery = Arc::new(Mutex::new(DiagnosticsDelivery::new(diagnostics)));
+            let floors = Arc::new(FloorTable::new(&diagnostics, &[]));
+            let settle = Arc::new(ServerSettle::new(
+                Duration::from_millis(25),
+                Duration::from_secs(5),
+            ));
+            settle.set_diagnostics_owners([server_id.clone()]);
+
+            let (client, fake, notification_rx) = FakeServer::with_notifications(server_id.clone());
+            let mut translator = Translator::new()
+                .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]))
+                .with_router(crate::config::ToolRouter::catch_all([(
+                    server_id.clone(),
+                    "rust".to_string(),
+                )]))
+                .with_notification_cache(Arc::clone(&cache))
+                .with_applier(Arc::new(Applier::new(
+                    vec![workspace_root.clone()],
+                    tool.apply_config(),
+                )));
+            translator.set_workspace_roots(vec![workspace_root]);
+            translator.register_client(server_id.clone(), client);
+            translator.register_server(
+                server_id.clone(),
+                crate::lsp::LspServer::new_for_test(tool.capabilities()),
+            );
+            let translator = Arc::new(translator);
+
+            let path = dir.path().join("main.rs");
+            std::fs::write(&path, "fn old() {}\n").expect("write the fixture");
+            let path = dunce::canonicalize(path).expect("the fixture exists");
+            let uri = crate::bridge::path_to_uri(&path).expect("a uri for the fixture");
+            let server = McplsServer::new(
+                Arc::clone(&translator),
+                Arc::clone(&cache),
+                Arc::clone(&workspace_roots),
+                Arc::clone(&subscriptions),
+                false,
+                Arc::clone(&delivery),
+                Arc::clone(&floors),
+                diagnostics,
+                Arc::clone(&settle),
+            );
+
+            let (pump_cancel, cancel_rx) = tokio::sync::watch::channel(false);
+            let pump = tokio::spawn(crate::diagnostics_pump(
+                server_id,
+                notification_rx,
+                cancel_rx,
+                true,
+                crate::PumpShared {
+                    notification_cache: cache,
+                    subs: subscriptions,
+                    peer_cell: Arc::new(tokio::sync::OnceCell::new()),
+                    workspace_roots,
+                    document_tracker: Arc::clone(translator.document_tracker()),
+                    settle: Arc::clone(&settle),
+                    delivery,
+                    floors,
+                },
+            ));
+
+            Self {
+                server,
+                translator,
+                fake,
+                settle,
+                pump_cancel,
+                pump,
+                path,
+                uri,
+                _dir: dir,
+            }
+        }
+
+        #[allow(clippy::too_many_lines)]
+        async fn run(mut self, tool: WriteTool) {
+            use rmcp::ServiceExt as _;
+            use tokio::io::{AsyncWriteExt as _, BufReader, BufStream};
+
+            let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            self.translator.install_resync_pause(reached_tx, release_rx);
+            self.server
+                .context
+                .delivery
+                .lock()
+                .await
+                .set_baseline(HashMap::new());
+
+            let (server_io, client_io) = tokio::io::duplex(65_536);
+            let server = self.server.clone();
+            let started = tokio::spawn(async move { server.serve(server_io).await.unwrap() });
+            let mut wire = BufStream::new(client_io);
+            let initialized = mcp_test_request(
+                &mut wire,
+                json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25", "capabilities": {},
+                        "clientInfo": {"name": "causal-write-test", "version": "1"}
+                    }
+                }),
+            )
+            .await;
+            assert!(initialized["result"].is_object(), "{initialized}");
+            wire.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+                .await
+                .unwrap();
+            wire.flush().await.unwrap();
+            let running = started.await.unwrap();
+
+            let epoch_before = self.settle.progress_epoch();
+            let path = self.path.display().to_string();
+            let request = json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": tool.mcp_name(), "arguments": tool.mcp_arguments(&path)}
+            });
+            let call = tokio::spawn(async move { mcp_test_request(&mut wire, request).await });
+
+            let mut lsp_wire = BufReader::new(&mut self.fake.write_stdout);
+            let opened = crate::test_support::read_framed_message(&mut lsp_wire).await;
+            assert_eq!(opened["method"], "textDocument/didOpen", "{opened}");
+            let request = crate::test_support::read_framed_message(&mut lsp_wire).await;
+            assert_eq!(request["method"], tool.lsp_method(), "{request}");
+            write_response(
+                &mut self.fake.read_half_stdin,
+                &request["id"],
+                tool.reply_rewriting(&self.uri),
+            )
+            .await;
+
+            let mut saw_change = false;
+            loop {
+                let message = crate::test_support::read_framed_message(&mut lsp_wire).await;
+                match message["method"].as_str().unwrap_or_default() {
+                    "textDocument/didOpen" => {}
+                    "textDocument/didChange" => {
+                        assert_eq!(
+                            message["params"]["contentChanges"][0]["text"], "fn new() {}\n",
+                            "{tool:?} sent stale content: {message}"
+                        );
+                        saw_change = true;
+                    }
+                    "textDocument/didSave" => {
+                        assert!(saw_change, "{tool:?} saved before its change notification");
+                        write_lsp_notification(
+                            &mut self.fake.read_half_stdin,
+                            "$/progress",
+                            json!({
+                                "token": "causal-write",
+                                "value": {"kind": "begin", "title": "checking"}
+                            }),
+                        )
+                        .await;
+                        break;
+                    }
+                    method => panic!("{tool:?} produced unexpected LSP notification: {method}"),
+                }
+            }
+
+            tokio::time::timeout(Duration::from_secs(2), reached_rx)
+                .await
+                .expect("translator reached its post-save pause")
+                .expect("translator pause receiver stayed connected");
+            let epoch_after_begin = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let epoch = self.settle.progress_epoch();
+                    if epoch > epoch_before {
+                        break epoch;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("real diagnostics pump observed progress begin");
+            assert!(epoch_after_begin > epoch_before);
+            assert!(
+                !call.is_finished(),
+                "{tool:?} completed while translator resync was paused"
+            );
+
+            release_tx
+                .send(())
+                .expect("translator resync pause receiver stayed connected");
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            assert!(
+                !call.is_finished(),
+                "{tool:?} completed before progress end after footer grace"
+            );
+
+            write_lsp_notification(
+                &mut self.fake.read_half_stdin,
+                "$/progress",
+                json!({
+                    "token": "causal-write",
+                    "value": {"kind": "end"}
+                }),
+            )
+            .await;
+            write_lsp_notification(
+                &mut self.fake.read_half_stdin,
+                "textDocument/publishDiagnostics",
+                json!({
+                    "uri": self.uri.as_str(),
+                    "diagnostics": [{
+                        "range": {
+                            "start": {"line": 0, "character": 0},
+                            "end": {"line": 0, "character": 1}
+                        },
+                        "severity": 1,
+                        "message": "after causal write"
+                    }]
+                }),
+            )
+            .await;
+
+            let response = tokio::time::timeout(Duration::from_secs(3), call)
+                .await
+                .expect("MCP write completed after progress end")
+                .expect("MCP write task stayed connected");
+            assert!(response["error"].is_null(), "{response}");
+            assert_eq!(response["result"]["isError"], false, "{response}");
+            let payload: serde_json::Value = serde_json::from_str(
+                response["result"]["content"][0]["text"]
+                    .as_str()
+                    .expect("write result text"),
+            )
+            .expect("write result JSON");
+            assert_eq!(payload["applied"], true, "{tool:?}: {payload}");
+            assert_eq!(
+                payload["files_written"],
+                json!([self.path.display().to_string()]),
+                "{tool:?}: {payload}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&self.path).unwrap(),
+                "fn new() {}\n",
+                "{tool:?} did not persist its edit"
+            );
+            let changed = payload["new_diagnostics"]["changed"]
+                .as_array()
+                .expect("footer changed diagnostics");
+            assert!(
+                changed.iter().any(|file| {
+                    file["file_path"] == self.path.display().to_string()
+                        && file["diagnostics"].as_array().is_some_and(|diagnostics| {
+                            diagnostics
+                                .iter()
+                                .any(|diagnostic| diagnostic["message"] == "after causal write")
+                        })
+                }),
+                "{tool:?} footer omitted the final diagnostic: {payload}"
+            );
+
+            let _ = self.pump_cancel.send(true);
+            self.pump.abort();
+            running.cancel().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn i1_t9_real_progress_during_resync_reaches_footer() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            for tool in WRITE_TOOLS {
+                CausalWriteFixture::new(tool).run(tool).await;
+            }
+        })
+        .await
+        .expect("bounded causal write transport scenarios");
     }
 
     /// An owner listening on its own temporary socket, recording the paths

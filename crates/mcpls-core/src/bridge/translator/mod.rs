@@ -60,6 +60,8 @@ pub use routing::validate_path_against_roots;
 pub struct Translator {
     #[cfg(all(test, unix))]
     pub(crate) registration_pause: StdMutex<Option<crate::recovery_tests::RegistrationPause>>,
+    #[cfg(test)]
+    resync_pause: StdMutex<Option<testing::ResyncPause>>,
     pub(crate) notification_pumps: OnceLock<crate::notification_lifecycle::NotificationPumps>,
     /// LSP clients indexed by routing identity. Locked only for the map
     /// lookup/insert itself, never across an LSP request.
@@ -227,6 +229,8 @@ impl Translator {
         Self {
             #[cfg(all(test, unix))]
             registration_pause: StdMutex::new(None),
+            #[cfg(test)]
+            resync_pause: StdMutex::new(None),
             notification_pumps: OnceLock::new(),
             lsp_clients: Arc::new(StdMutex::new(HashMap::new())),
             lsp_servers: Arc::new(StdMutex::new(HashMap::new())),
@@ -261,6 +265,24 @@ impl Translator {
     fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_resync_pause(
+        &self,
+        reached: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *lock_std(&self.resync_pause) = Some(testing::ResyncPause { reached, release });
+    }
+
+    #[cfg(test)]
+    async fn pause_after_resync_save(&self) {
+        let pause = lock_std(&self.resync_pause).take();
+        if let Some(pause) = pause {
+            let _ = pause.reached.send(());
+            let _ = pause.release.await;
+        }
     }
 
     /// Set the workspace roots for path validation.
@@ -477,7 +499,11 @@ impl Translator {
         }
         for (path, version, servers) in saves {
             match self.save_resynced_document(&path, version, &servers).await {
-                ResyncStep::Done => drain.remaining.retain(|pending| pending != &path),
+                ResyncStep::Done => {
+                    drain.remaining.retain(|pending| pending != &path);
+                    #[cfg(test)]
+                    self.pause_after_resync_save().await;
+                }
                 ResyncStep::NotifyFailed => break,
                 ResyncStep::Deferred | ResyncStep::NeedsSave { .. } => {}
             }

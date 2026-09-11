@@ -14,7 +14,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 use super::Translator;
 use super::encoding_ctx::EncodingCtx;
@@ -26,6 +26,12 @@ use crate::lsp::{LspClient, LspServer, LspTransport, WatchRegistry};
 pub(super) use crate::test_support::read_framed_message;
 
 type JsonValue = serde_json::Value;
+
+#[derive(Debug)]
+pub(super) struct ResyncPause {
+    pub(super) reached: oneshot::Sender<()>,
+    pub(super) release: oneshot::Receiver<()>,
+}
 
 /// One notification a [`RecordingServer`] received: its method and params.
 type Received = (String, JsonValue);
@@ -109,7 +115,7 @@ pub struct FakeServer {
     pub(crate) write_stdout: ChildStdout,
 }
 
-pub(super) fn fake_lsp_client() -> (LspClient, FakeServer) {
+fn fake_lsp_transport() -> (LspTransport, FakeServer) {
     let mut write_half = Command::new("cat")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -128,11 +134,8 @@ pub(super) fn fake_lsp_client() -> (LspClient, FakeServer) {
     let read_stdout = read_half.stdout.take().unwrap();
     let read_stdin = read_half.stdin.take().unwrap();
 
-    let transport = LspTransport::new(write_stdin, read_stdout);
-    let client = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport);
-
     (
-        client,
+        LspTransport::new(write_stdin, read_stdout),
         FakeServer {
             _write_half: write_half,
             _read_half: read_half,
@@ -140,6 +143,31 @@ pub(super) fn fake_lsp_client() -> (LspClient, FakeServer) {
             write_stdout,
         },
     )
+}
+
+pub(super) fn fake_lsp_client() -> (LspClient, FakeServer) {
+    let (transport, server) = fake_lsp_transport();
+    (
+        LspClient::from_transport(LspServerConfig::rust_analyzer(), transport),
+        server,
+    )
+}
+
+impl FakeServer {
+    pub(crate) fn with_notifications(
+        server: ServerId,
+    ) -> (LspClient, Self, mpsc::Receiver<crate::lsp::LspNotification>) {
+        let (transport, fake) = fake_lsp_transport();
+        let (notification_tx, notification_rx) = mpsc::channel(100);
+        let client = LspClient::from_transport_with_notifications(
+            LspServerConfig::rust_analyzer(),
+            transport,
+            notification_tx,
+            None,
+            server,
+        );
+        (client, fake, notification_rx)
+    }
 }
 
 /// Reads framed messages until one carries an `id`, discarding the
