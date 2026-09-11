@@ -15,7 +15,9 @@ use tokio::sync::watch;
 
 use crate::bridge::{SessionId, lock_std};
 use crate::hooks::identity::SocketIdentity;
-use crate::hooks::listener::{HookListener, LockLoss, ServeExit};
+#[cfg(test)]
+use crate::hooks::listener::LockLoss;
+use crate::hooks::listener::{HookListener, ServeExit};
 use crate::hooks::protocol::{Request, Response};
 use crate::hooks::sweep::Sweeper;
 use crate::mcp::McplsServer;
@@ -124,6 +126,17 @@ impl HookRole {
         lock_std(&self.role).clone()
     }
 
+    /// Run a synchronous local-consumption operation while the role is active.
+    pub(crate) fn with_active_role<T>(&self, operation: impl FnOnce() -> T) -> Option<T> {
+        let role = lock_std(&self.role);
+        if matches!(*role, Role::Passive { .. }) {
+            return None;
+        }
+        let result = operation();
+        drop(role);
+        Some(result)
+    }
+
     /// A receiver that changes on every role transition.
     ///
     /// Subscribe before triggering the work under test, then await
@@ -158,17 +171,15 @@ impl HookRole {
         self.set(Role::Owner);
     }
 
-    /// Move this process back to `Passive`, called when a competitor has
-    /// taken the ownership lock away from a listener that was serving.
+    /// Move this process back to `Passive` when a serving listener can no
+    /// longer prove that it owns the lock.
     ///
     /// A competitor holds the lock for its whole life, so a process that
     /// kept reading `Owner` would run its footer, answer from its own
     /// record and forward nothing, while every hook for the same session
     /// reached the competitor's separate record: two processes behaving as
     /// owners for one session, which is what the lock exists to make
-    /// impossible. Only a replaced lock demotes; a lock file that was
-    /// merely removed leaves no competitor and is won back on the next
-    /// attempt.
+    /// impossible. A successful reacquisition promotes the process again.
     pub fn demote_to_passive(&self, identity: SocketIdentity) {
         self.set(Role::Passive { identity });
     }
@@ -270,23 +281,47 @@ pub fn build_handler(
     }
 }
 
-/// Serve the socket for as long as this process owns it, re-entering the
-/// ownership race if the lock file stops proving ownership.
-///
-/// [`ServeExit::LockLost`] means the lock file is no longer the file this
-/// listener holds a lock on: a competitor took it, or a temporary-file
-/// cleaner simply removed it. Neither is a reason to end hook support for
-/// the project for the rest of this process's life, so the listener that
-/// stood down goes back to competing on the same five second interval a
-/// passive instance uses. [`ServeExit::TransportUnrecoverable`] is the one
-/// exit that retrying cannot clear, and it stops here.
-///
-/// A [`LockLoss::Replaced`] also moves the role back to `Passive` for the
-/// duration of that wait, because a competitor holds the lock for its own
-/// whole life: a process still reading `Owner` would answer from its own
-/// record while every hook for the same session reached the competitor's.
-/// [`LockLoss::Missing`] leaves the role alone, because nothing has taken
-/// this listener's place and the next attempt wins the lock back.
+#[cfg(test)]
+struct LockLossPause {
+    identity: SocketIdentity,
+    loss: LockLoss,
+    arrived: Arc<tokio::sync::Notify>,
+    resume: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+static LOCK_LOSS_PAUSE: std::sync::Mutex<Option<LockLossPause>> = std::sync::Mutex::new(None);
+
+#[cfg(all(test, unix))]
+struct LockLossPauseGuard;
+
+#[cfg(all(test, unix))]
+impl Drop for LockLossPauseGuard {
+    fn drop(&mut self) {
+        install_lock_loss_pause(None);
+    }
+}
+
+#[cfg(all(test, unix))]
+fn install_lock_loss_pause(pause: Option<LockLossPause>) {
+    *lock_std(&LOCK_LOSS_PAUSE) = pause;
+}
+
+#[cfg(test)]
+async fn pause_after_lock_loss(identity: &SocketIdentity, loss: LockLoss) {
+    let rendezvous = lock_std(&LOCK_LOSS_PAUSE)
+        .as_ref()
+        .filter(|pause| pause.identity == *identity && pause.loss == loss)
+        .map(|pause| (Arc::clone(&pause.arrived), Arc::clone(&pause.resume)));
+    if let Some((arrived, resume)) = rendezvous {
+        arrived.notify_one();
+        resume.notified().await;
+    }
+}
+
+/// Serve while owning the socket, retrying after either kind of lock loss.
+/// Both lock-loss variants demote before retry; cancellation and
+/// unrecoverable transport errors end the task.
 pub(crate) async fn hook_owner_task(
     mut listener: HookListener,
     location: HookLocation,
@@ -304,12 +339,20 @@ pub(crate) async fn hook_owner_task(
             Arc::clone(&role),
             cancel.clone(),
         );
-        match listener.serve(handler, op_deadline, cancel.clone()).await {
+        let exit = listener.serve(handler, op_deadline, cancel.clone()).await;
+        match exit {
             ServeExit::Cancelled | ServeExit::TransportUnrecoverable => return,
-            ServeExit::LockLost(LockLoss::Replaced) => {
+            ServeExit::LockLost(loss) => {
                 role.demote_to_passive(location.identity.clone());
+                #[cfg(test)]
+                {
+                    pause_after_lock_loss(&location.identity, loss).await;
+                }
+                #[cfg(not(test))]
+                {
+                    let _ = loss;
+                }
             }
-            ServeExit::LockLost(LockLoss::Missing) => {}
         }
         let Some(reacquired) = acquire_when_free(&location.identity, &mut cancel).await else {
             return;
@@ -386,14 +429,28 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    #[cfg(unix)]
+    use rmcp::ServiceExt as _;
+    #[cfg(unix)]
+    use serde_json::json;
     use tempfile::TempDir;
+    #[cfg(unix)]
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, BufStream};
     use tokio::sync::Mutex;
 
     use super::*;
+    #[cfg(unix)]
+    use crate::bridge::apply::Applier;
     use crate::bridge::{
-        DiagnosticsDelivery, FloorTable, NotificationCache, ResourceSubscriptions, ServerSettle,
-        Translator,
+        DiagnosticsDelivery, FloorTable, NotificationCache, ResourceLimits, ResourceSubscriptions,
+        ServerSettle, Translator, TranslatorHarness,
     };
+    #[cfg(unix)]
+    use crate::bridge::{
+        FakeServer, read_framed_reply, translator_with_capabilities, write_response,
+    };
+    #[cfg(unix)]
+    use crate::config::ApplyConfig;
     use crate::config::{DiagnosticsConfig, ServerId};
     use crate::hooks::{ChangeEvent, HookListener, PathFilter, Request, Response, SocketIdentity};
     use crate::mcp::McplsServer;
@@ -403,11 +460,15 @@ mod tests {
     /// `build_handler` `serve_with` uses.
     struct HookHarness {
         dir: TempDir,
+        root: PathBuf,
         identity: SocketIdentity,
+        role: Arc<HookRole>,
+        server: Arc<McplsServer>,
         sweeper: Arc<Sweeper>,
         notification_cache: Arc<Mutex<NotificationCache>>,
         delivery: Arc<Mutex<DiagnosticsDelivery>>,
-        _cancel: tokio::sync::watch::Sender<bool>,
+        translator_harness: Option<TranslatorHarness>,
+        cancel: tokio::sync::watch::Sender<bool>,
     }
 
     impl HookHarness {
@@ -422,23 +483,96 @@ mod tests {
         /// An owner whose language servers have not settled yet, so its
         /// delivery core has no baseline to seed a session's record from.
         async fn owner_without_baseline() -> Self {
+            Self::owner_without_baseline_with(DiagnosticsConfig::default()).await
+        }
+
+        /// An owner with the supplied diagnostics timing and delivery config,
+        /// before its baseline is adopted.
+        async fn owner_without_baseline_with(diagnostics: DiagnosticsConfig) -> Self {
             let (dir, identity) = temp_identity();
             let translator = Arc::new(Translator::new());
+            let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
+            let delivery = Arc::new(Mutex::new(DiagnosticsDelivery::new(diagnostics)));
+            let role = Arc::new(HookRole::owner());
+            Self::start_owner(
+                dir,
+                identity,
+                role,
+                translator,
+                None,
+                notification_cache,
+                delivery,
+                usize::MAX,
+                diagnostics,
+            )
+            .await
+        }
+
+        /// An owner with a fake LSP server and the same document limit
+        /// on its tracker and background sweeper.
+        async fn owner_with_document_limit(max_documents: usize) -> Self {
+            let (dir, identity) = temp_identity();
+            let translator_harness = TranslatorHarness::with_diagnostics_server_and_limits(
+                "rust",
+                ResourceLimits {
+                    max_documents,
+                    ..ResourceLimits::default()
+                },
+            )
+            .await;
+            let translator = Arc::clone(&translator_harness.translator);
             let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
             let delivery = Arc::new(Mutex::new(DiagnosticsDelivery::new(
                 DiagnosticsConfig::default(),
             )));
             let role = Arc::new(HookRole::owner());
+            let harness = Self::start_owner(
+                dir,
+                identity,
+                role,
+                translator,
+                Some(translator_harness),
+                notification_cache,
+                delivery,
+                max_documents,
+                DiagnosticsConfig::default(),
+            )
+            .await;
+            harness.delivery.lock().await.set_baseline(HashMap::new());
+            harness
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        async fn start_owner(
+            dir: TempDir,
+            identity: SocketIdentity,
+            role: Arc<HookRole>,
+            translator: Arc<Translator>,
+            translator_harness: Option<TranslatorHarness>,
+            notification_cache: Arc<Mutex<NotificationCache>>,
+            delivery: Arc<Mutex<DiagnosticsDelivery>>,
+            max_documents: usize,
+            diagnostics: DiagnosticsConfig,
+        ) -> Self {
+            let root = translator_harness.as_ref().map_or_else(
+                || dir.path().to_path_buf(),
+                |harness| harness.root().to_path_buf(),
+            );
+            let root = dunce::canonicalize(root).expect("canonicalize the owner root");
             let context = Arc::new(test_context(
-                dir.path(),
+                &root,
                 Arc::clone(&translator),
                 Arc::clone(&notification_cache),
                 Arc::clone(&delivery),
-                DiagnosticsConfig::default(),
+                diagnostics,
                 Arc::clone(&role),
             ));
             let server = Arc::new(McplsServer::from_context(context));
-            let sweeper = Arc::new(test_sweeper(dir.path(), translator));
+            let sweeper = Arc::new(test_sweeper_with_limit(
+                &root,
+                Arc::clone(&translator),
+                max_documents,
+            ));
             let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
             tokio::spawn(Arc::clone(&sweeper).run(cancel_rx.clone()));
 
@@ -446,47 +580,196 @@ mod tests {
                 .await
                 .expect("acquire")
                 .expect("the harness owns its own temporary socket");
-            tokio::spawn(listener.serve(
-                build_handler(
-                    server,
-                    Arc::clone(&sweeper),
-                    HookLocation {
-                        identity: identity.clone(),
-                        root: dir.path().to_path_buf(),
-                    },
-                    role,
-                    cancel_rx.clone(),
-                ),
+            tokio::spawn(hook_owner_task(
+                listener,
+                HookLocation {
+                    identity: identity.clone(),
+                    root: root.clone(),
+                },
+                Arc::clone(&role),
+                Arc::clone(&server),
+                Arc::clone(&sweeper),
                 Duration::from_millis(1500),
                 cancel_rx,
             ));
 
             Self {
                 dir,
+                root,
                 identity,
+                role,
+                server,
                 sweeper,
                 notification_cache,
                 delivery,
-                _cancel: cancel_tx,
+                translator_harness,
+                cancel: cancel_tx,
             }
         }
 
         /// The same, with one error already in the notification cache for
         /// `broken.rs`, so the first flush has something to report.
         async fn owner_with_one_error() -> Self {
-            let harness = Self::owner().await;
+            Self::owner_with_diagnostic(DiagnosticsConfig::default(), "broken").await
+        }
+
+        /// An owner with one named diagnostic and an adopted empty baseline.
+        async fn owner_with_diagnostic(diagnostics: DiagnosticsConfig, message: &str) -> Self {
+            let harness = Self::owner_without_baseline_with(diagnostics).await;
+            harness.delivery.lock().await.set_baseline(HashMap::new());
             harness.notification_cache.lock().await.store_diagnostics(
                 &ServerId::from("rust"),
                 &broken_uri(),
                 Some(1),
-                vec![error_diagnostic()],
+                vec![diagnostic(message)],
             );
             harness
         }
 
+        #[cfg(unix)]
+        async fn owner_with_write_diagnostic(
+            diagnostics: DiagnosticsConfig,
+            message: &str,
+        ) -> (Self, FakeServer) {
+            let (dir, identity) = temp_identity();
+            let role = Arc::new(HookRole::owner());
+            let (translator, fake) = translator_with_capabilities(
+                &dir,
+                &ServerId::from("rust"),
+                lsp_types::ServerCapabilities {
+                    rename_provider: Some(lsp_types::OneOf::Left(true)),
+                    ..Default::default()
+                },
+            );
+            let translator = Arc::new(translator.with_applier(Arc::new(Applier::new(
+                vec![dir.path().to_path_buf()],
+                ApplyConfig {
+                    rename: true,
+                    ..ApplyConfig::default()
+                },
+            ))));
+            let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
+            let delivery = Arc::new(Mutex::new(DiagnosticsDelivery::new(diagnostics)));
+            let harness = Self::start_owner(
+                dir,
+                identity,
+                role,
+                translator,
+                None,
+                Arc::clone(&notification_cache),
+                Arc::clone(&delivery),
+                usize::MAX,
+                diagnostics,
+            )
+            .await;
+            delivery.lock().await.set_baseline(HashMap::new());
+            notification_cache.lock().await.store_diagnostics(
+                &ServerId::from("rust"),
+                &broken_uri(),
+                Some(1),
+                vec![diagnostic(message)],
+            );
+            (harness, fake)
+        }
+
         /// An absolute path under this harness's temporary workspace.
         fn fixture(&self, rel: &str) -> PathBuf {
-            self.dir.path().join(rel)
+            self.root.join(rel)
+        }
+
+        /// Methods received by the fake LSP server, represented as the
+        /// method-only shape the assertions need.
+        fn lsp_notifications(&self) -> Vec<serde_json::Value> {
+            self.translator_harness
+                .as_ref()
+                .map(|harness| {
+                    harness
+                        .notifications_for("rust")
+                        .into_iter()
+                        .map(|method| serde_json::json!({ "method": method }))
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+
+        /// Call the diagnostics MCP tool over an in-memory RMCP connection.
+        async fn call_file_tool(&self, path: &std::path::Path) -> rmcp::model::CallToolResult {
+            use rmcp::ServiceExt;
+            use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufStream};
+
+            async fn request(
+                wire: &mut BufStream<tokio::io::DuplexStream>,
+                request: serde_json::Value,
+            ) -> serde_json::Value {
+                let id = request["id"].clone();
+                wire.write_all(format!("{request}\n").as_bytes())
+                    .await
+                    .expect("write MCP request");
+                wire.flush().await.expect("flush MCP request");
+
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    assert_ne!(
+                        wire.read_line(&mut line).await.expect("read MCP response"),
+                        0,
+                        "MCP server closed before answering request {id}"
+                    );
+                    let response: serde_json::Value =
+                        serde_json::from_str(&line).expect("MCP server sends valid JSON");
+                    if response["id"] == id {
+                        return response;
+                    }
+                }
+            }
+
+            let (server_transport, client_transport) = tokio::io::duplex(65_536);
+            let server = Arc::clone(&self.server);
+            let server_task = tokio::spawn(async move {
+                let service = server
+                    .serve(server_transport)
+                    .await
+                    .expect("MCP server starts");
+                service.waiting().await.expect("MCP server stays alive");
+            });
+            let mut wire = BufStream::new(client_transport);
+            let initialized = request(
+                &mut wire,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": {"name": "hook-sweep-test", "version": "1"}
+                    }
+                }),
+            )
+            .await;
+            assert!(initialized["result"].is_object(), "{initialized}");
+            wire.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+                .await
+                .expect("write MCP initialized notification");
+            wire.flush()
+                .await
+                .expect("flush MCP initialized notification");
+            let response = request(
+                &mut wire,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "get_diagnostics",
+                        "arguments": {"file_path": path.display().to_string()}
+                    }
+                }),
+            )
+            .await;
+            server_task.abort();
+            serde_json::from_value(response["result"].clone())
+                .unwrap_or_else(|error| panic!("MCP file tool failed: {response}: {error}"))
         }
 
         /// Send one request over the real socket and return the answer.
@@ -662,6 +945,14 @@ mod tests {
 
     /// A `Sweeper` over `root`, admitting `.rs` files.
     fn test_sweeper(root: &std::path::Path, translator: Arc<Translator>) -> Sweeper {
+        test_sweeper_with_limit(root, translator, usize::MAX)
+    }
+
+    fn test_sweeper_with_limit(
+        root: &std::path::Path,
+        translator: Arc<Translator>,
+        max_documents: usize,
+    ) -> Sweeper {
         Sweeper::new(
             translator,
             PathFilter::new(
@@ -670,7 +961,7 @@ mod tests {
                 None,
             ),
             Duration::from_millis(500),
-            usize::MAX,
+            max_documents,
         )
     }
 
@@ -696,6 +987,38 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
+    async fn server_with_diagnostic(
+        root: &std::path::Path,
+        role: Arc<HookRole>,
+        diagnostics: DiagnosticsConfig,
+        message: &str,
+    ) -> (Arc<McplsServer>, Arc<Sweeper>) {
+        let root = dunce::canonicalize(root).expect("canonicalize the workspace root");
+        let translator = Arc::new(Translator::new());
+        let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
+        notification_cache.lock().await.store_diagnostics(
+            &ServerId::from("rust"),
+            &broken_uri(),
+            Some(1),
+            vec![diagnostic(message)],
+        );
+        let delivery = Arc::new(Mutex::new(DiagnosticsDelivery::new(diagnostics)));
+        delivery.lock().await.set_baseline(HashMap::new());
+        let context = Arc::new(test_context(
+            &root,
+            translator.clone(),
+            notification_cache,
+            delivery,
+            diagnostics,
+            role,
+        ));
+        (
+            Arc::new(McplsServer::from_context(context)),
+            Arc::new(test_sweeper(&root, translator)),
+        )
+    }
+
     /// The URI the harness's one cached error belongs to.
     fn broken_uri() -> lsp_types::Uri {
         if cfg!(windows) {
@@ -709,6 +1032,11 @@ mod tests {
 
     /// One error, at the top of whatever file it is stored against.
     fn error_diagnostic() -> lsp_types::Diagnostic {
+        diagnostic("broken")
+    }
+
+    /// One named error, at the top of whatever file it is stored against.
+    fn diagnostic(message: &str) -> lsp_types::Diagnostic {
         lsp_types::Diagnostic {
             range: lsp_types::Range {
                 start: lsp_types::Position {
@@ -721,9 +1049,16 @@ mod tests {
                 },
             },
             severity: Some(lsp_types::DiagnosticSeverity::ERROR),
-            message: "broken".to_string(),
+            message: message.to_string(),
             ..lsp_types::Diagnostic::default()
         }
+    }
+
+    async fn wait_for_sweep(completion: &mut tokio::sync::watch::Receiver<usize>) {
+        tokio::time::timeout(Duration::from_secs(5), completion.changed())
+            .await
+            .expect("the queued paths to be swept")
+            .expect("the sweeper stays alive");
     }
 
     #[tokio::test]
@@ -746,6 +1081,155 @@ mod tests {
             0,
             "the debounce cannot fit inside the op deadline, and coalescing the \
              burst is the point"
+        );
+    }
+
+    #[tokio::test]
+    async fn i1_t7_sweep_reserves_tool_capacity() {
+        let harness = HookHarness::owner_with_document_limit(3).await;
+        let mut completion = harness.sweeper.subscribe_completions();
+        let paths: Vec<_> = (0..3)
+            .map(|index| {
+                let path = harness.fixture(&format!("background-{index}.rs"));
+                std::fs::write(&path, "fn background() {}").expect("write fixture");
+                path
+            })
+            .collect();
+
+        for path in &paths {
+            assert_eq!(
+                harness
+                    .send(Request::Changed {
+                        session: "s1".to_string(),
+                        paths: vec![path.clone()],
+                        event: ChangeEvent::Change,
+                    })
+                    .await,
+                Response::Changed { queued: 1 }
+            );
+        }
+        wait_for_sweep(&mut completion).await;
+
+        let Response::Flush { context, .. } = harness.flush_acknowledged("s1").await else {
+            panic!("the finite sweep answers with its status");
+        };
+
+        let open_count = harness
+            .translator_harness
+            .as_ref()
+            .expect("the finite harness has a recording server")
+            .translator
+            .open_document_paths()
+            .len();
+        let lsp_notifications = harness.lsp_notifications();
+
+        let unrelated = harness.fixture("unrelated.rs");
+        std::fs::write(&unrelated, "fn unrelated() {}").expect("write fixture");
+        let unrelated_tool_response = harness.call_file_tool(&unrelated).await;
+        assert!(!unrelated_tool_response.is_error.unwrap_or(false));
+        assert!(open_count < 3);
+        assert_eq!(
+            harness
+                .translator_harness
+                .as_ref()
+                .expect("the finite harness has a recording server")
+                .translator
+                .open_document_paths()
+                .len(),
+            open_count + 1
+        );
+
+        let context = context.expect("the finite sweep reports its skipped coverage");
+        assert!(context.contains("background sweep headroom"), "{context}");
+        assert!(context.contains("coverage was skipped"), "{context}");
+
+        assert!(
+            lsp_notifications
+                .iter()
+                .any(|n| n["method"] == "textDocument/didOpen")
+        );
+        assert!(
+            lsp_notifications
+                .iter()
+                .any(|n| n["method"] == "textDocument/didSave")
+        );
+
+        let latest = harness
+            .send(Request::Flush {
+                session: "s1".to_string(),
+            })
+            .await;
+        assert!(
+            matches!(&latest, Response::Flush { context: Some(text), .. } if text.contains("background sweep headroom")),
+            "the latest sweep status remains visible after ACK: {latest:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn i1_t7_zero_limit_sweeps_unbounded() {
+        let harness = HookHarness::owner_with_document_limit(0).await;
+        let mut completion = harness.sweeper.subscribe_completions();
+        let preopened = harness.fixture("preopened.rs");
+        std::fs::write(&preopened, "fn preopened() {}").expect("write fixture");
+        let preopened_tool_response = harness.call_file_tool(&preopened).await;
+        assert!(!preopened_tool_response.is_error.unwrap_or(false));
+        let notification_offset = harness.lsp_notifications().len();
+
+        std::fs::write(&preopened, "fn preopened_changed() {}").expect("rewrite fixture");
+        let paths: Vec<_> = (0..3)
+            .map(|index| {
+                let path = harness.fixture(&format!("unbounded-{index}.rs"));
+                std::fs::write(&path, "fn unbounded() {}").expect("write fixture");
+                path
+            })
+            .collect();
+        let mut changed_paths = vec![preopened.clone()];
+        changed_paths.extend(paths);
+        for path in &changed_paths {
+            assert_eq!(
+                harness
+                    .send(Request::Changed {
+                        session: "s1".to_string(),
+                        paths: vec![path.clone()],
+                        event: ChangeEvent::Change,
+                    })
+                    .await,
+                Response::Changed { queued: 1 }
+            );
+        }
+        wait_for_sweep(&mut completion).await;
+
+        let flush = harness.flush_acknowledged("s1").await;
+        let open_count = harness
+            .translator_harness
+            .as_ref()
+            .expect("the zero-limit harness has a recording server")
+            .translator
+            .open_document_paths()
+            .len();
+        assert!(open_count >= 4);
+        assert!(
+            matches!(&flush, Response::Flush { context: None, .. })
+                || matches!(&flush, Response::Flush { context: Some(text), .. } if !text.contains("headroom")),
+            "zero-limit sweeps must not report finite headroom failure: {flush:?}"
+        );
+
+        let lsp_notifications = harness.lsp_notifications();
+        let sweep_notifications = &lsp_notifications[notification_offset..];
+        assert!(
+            sweep_notifications
+                .iter()
+                .any(|n| n["method"] == "textDocument/didOpen")
+        );
+        assert!(
+            sweep_notifications
+                .iter()
+                .any(|n| n["method"] == "textDocument/didSave")
+        );
+        assert!(
+            sweep_notifications
+                .iter()
+                .any(|n| n["method"] == "textDocument/didChange")
         );
     }
 
@@ -949,7 +1433,9 @@ mod tests {
         let harness = HookHarness::owner().await;
         harness
             .sweeper
-            .set_shortfall_for_test("7 file(s) not checked: the document limit of 3 was reached");
+            .set_shortfall_for_test(
+                "7 file(s) not checked: background sweep headroom of 2 was exhausted; coverage was skipped to reserve one document slot (document limit 3)",
+            );
 
         let Response::Flush {
             context: Some(text),
@@ -1086,7 +1572,7 @@ mod tests {
         std::fs::write(&written, "fn a() {}").expect("write");
 
         assert!(
-            passive.server.footer_if_written(true).await.is_none(),
+            passive.server.footer_if_written(true, 0).await.is_none(),
             "the footer would consume from the passive's own record while the \
              next flush reads the owner's, so the same diagnostics arrive twice \
              from one door and never from the other"
@@ -1138,6 +1624,131 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         panic!("nobody answered a status request on {:?}", identity.socket);
+    }
+
+    #[cfg(unix)]
+    async fn mcp_request(
+        wire: &mut BufStream<tokio::io::DuplexStream>,
+        request: serde_json::Value,
+    ) -> serde_json::Value {
+        wire.write_all(format!("{request}\n").as_bytes())
+            .await
+            .expect("write MCP request");
+        wire.flush().await.expect("flush MCP request");
+        loop {
+            let mut line = String::new();
+            assert_ne!(
+                wire.read_line(&mut line).await.expect("read MCP response"),
+                0
+            );
+            let response: serde_json::Value =
+                serde_json::from_str(&line).expect("MCP response is JSON");
+            if response["id"] == request["id"] {
+                return response;
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    async fn apply_rename_over_mcp(
+        server: Arc<McplsServer>,
+        fake: &mut FakeServer,
+        written: PathBuf,
+    ) -> serde_json::Value {
+        let tool_result = apply_rename_over_mcp_result(server, fake, written).await;
+        assert!(
+            tool_result.get("new_diagnostics").is_none(),
+            "a passive applied write must not serialize a local footer: {tool_result}"
+        );
+        tool_result
+    }
+
+    #[cfg(unix)]
+    async fn apply_rename_over_mcp_result(
+        server: Arc<McplsServer>,
+        fake: &mut FakeServer,
+        written: PathBuf,
+    ) -> serde_json::Value {
+        std::fs::write(&written, "fn old() {}\n").expect("write");
+        let written_uri = crate::bridge::path_to_uri(&written).expect("the fixture has a URI");
+        let (server_io, client_io) = tokio::io::duplex(65_536);
+        let started = tokio::spawn(async move {
+            server
+                .serve(server_io)
+                .await
+                .expect("the MCP service starts")
+        });
+        let mut wire = BufStream::new(client_io);
+        let initialized = mcp_request(
+            &mut wire,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": {"name": "task-8-test", "version": "1"}
+                }
+            }),
+        )
+        .await;
+        assert!(initialized["result"].is_object(), "{initialized}");
+        wire.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+            .await
+            .expect("write MCP initialized notification");
+        wire.flush()
+            .await
+            .expect("flush MCP initialized notification");
+        let _running = started.await.expect("the MCP service task survives");
+
+        let path = written.display().to_string();
+        let reply = json!({
+            "changes": {
+                written_uri.as_str(): [{
+                    "range": {
+                        "start": {"line": 0, "character": 3},
+                        "end": {"line": 0, "character": 6}
+                    },
+                    "newText": "new"
+                }]
+            }
+        });
+        let mcp_call = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "rename_symbol",
+                "arguments": {
+                    "file_path": path,
+                    "line": 1,
+                    "character": 4,
+                    "new_name": "new",
+                    "apply": true
+                }
+            }
+        });
+        let fake = &mut *fake;
+        let (tool_response, lsp_request) =
+            tokio::join!(mcp_request(&mut wire, mcp_call), async move {
+                let mut lsp_wire = BufReader::new(&mut fake.write_stdout);
+                let request = read_framed_reply(&mut lsp_wire).await;
+                write_response(&mut fake.read_half_stdin, &request["id"], reply).await;
+                request
+            });
+        assert_eq!(lsp_request["method"], "textDocument/rename");
+        assert!(tool_response["result"].is_object(), "{tool_response}");
+        let tool_text = tool_response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("the rename response has serialized tool content");
+        let tool_result: serde_json::Value =
+            serde_json::from_str(tool_text).expect("the rename response is JSON");
+        assert_eq!(
+            std::fs::read_to_string(&written).expect("read the applied fixture"),
+            "fn new() {}\n"
+        );
+        tool_result
     }
 
     /// A flush before the servers have settled must not seed the session's
@@ -1306,14 +1917,35 @@ mod tests {
             status_from_owner(&identity).await,
             Response::Status { owner: true, .. }
         ));
-        // Read before the lock goes, because reacquisition promotes and a
-        // role read afterwards therefore always says Owner however the
-        // arm behaved in between.
-        let transitions = role.subscribe_transitions();
+        let mut transitions = role.subscribe_transitions();
         let before = *transitions.borrow();
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        install_lock_loss_pause(Some(LockLossPause {
+            identity: identity.clone(),
+            loss: LockLoss::Missing,
+            arrived: Arc::clone(&arrived),
+            resume: Arc::clone(&resume),
+        }));
+        let _pause_guard = LockLossPauseGuard;
 
+        let lock_loss = arrived.notified();
         std::fs::remove_file(&identity.lock).expect("stand in for a temp-file cleaner");
+        tokio::time::timeout(Duration::from_secs(3), lock_loss)
+            .await
+            .expect("the owner must observe the missing lock");
+        assert!(matches!(role.get(), Role::Passive { .. }));
+        tokio::time::timeout(Duration::from_secs(1), transitions.changed())
+            .await
+            .expect("the passive transition must be observable before reacquisition")
+            .expect("the role outlives the owner task");
+        resume.notify_one();
+
         wait_for_lock_to_return(&identity).await;
+        tokio::time::timeout(Duration::from_secs(6), transitions.changed())
+            .await
+            .expect("the owner must promote after reacquiring the lock")
+            .expect("the role outlives the owner task");
 
         assert!(
             matches!(
@@ -1323,15 +1955,295 @@ mod tests {
             "standing down for good would end hook support for this project for \
              the rest of the process's life over a file anything may delete"
         );
-        assert_eq!(
-            *transitions.borrow(),
-            before,
-            "nothing took this listener's place, so it must not pass through \
-             Passive on its way back: while it did, its own writes would \
-             forward to the socket it is itself listening on and its footer \
-             would go silent"
-        );
+        assert_eq!(*transitions.borrow(), before + 2);
         assert_eq!(role.get(), Role::Owner);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn i1_t8_missing_lock_loser_forwards() {
+        let old_diagnostics = DiagnosticsConfig {
+            footer: true,
+            footer_grace_ms: 0,
+            footer_quiet_ms: 0,
+            footer_wait_ms: 0,
+            ..DiagnosticsConfig::default()
+        };
+        let (old, mut fake) =
+            HookHarness::owner_with_write_diagnostic(old_diagnostics, "former-owner-diagnostic")
+                .await;
+        let old_role = Arc::clone(&old.role);
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        install_lock_loss_pause(Some(LockLossPause {
+            identity: old.identity.clone(),
+            loss: LockLoss::Missing,
+            arrived: Arc::clone(&arrived),
+            resume: Arc::clone(&resume),
+        }));
+        let _pause_guard = LockLossPauseGuard;
+
+        assert!(matches!(
+            status_from_owner(&old.identity).await,
+            Response::Status { owner: true, .. }
+        ));
+
+        let lock_loss = arrived.notified();
+        std::fs::remove_file(&old.identity.lock).expect("remove the old lock");
+        tokio::time::timeout(Duration::from_secs(3), lock_loss)
+            .await
+            .expect("the owner must reach the missing-lock acquisition pause");
+
+        let competitor_role = Arc::new(HookRole::owner());
+        let (competitor_server, competitor_sweeper) = server_with_diagnostic(
+            old.dir.path(),
+            Arc::clone(&competitor_role),
+            DiagnosticsConfig::default(),
+            "competitor-diagnostic",
+        )
+        .await;
+        let (competitor_cancel_tx, competitor_cancel_rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(Arc::clone(&competitor_sweeper).run(competitor_cancel_rx.clone()));
+        let competitor_listener = HookListener::acquire(&old.identity)
+            .await
+            .expect("acquire the replacement")
+            .expect("the competitor owns the replacement lock");
+        tokio::spawn(competitor_listener.serve(
+            build_handler(
+                Arc::clone(&competitor_server),
+                Arc::clone(&competitor_sweeper),
+                HookLocation {
+                    identity: old.identity.clone(),
+                    root: old.dir.path().to_path_buf(),
+                },
+                Arc::clone(&competitor_role),
+                competitor_cancel_rx.clone(),
+            ),
+            Duration::from_millis(1500),
+            competitor_cancel_rx,
+        ));
+        assert!(matches!(
+            status_from_owner(&old.identity).await,
+            Response::Status { owner: true, .. }
+        ));
+
+        resume.notify_one();
+
+        assert!(matches!(old_role.get(), Role::Passive { .. }));
+        let forwarded_report = old
+            .server
+            .get_new_diagnostics()
+            .await
+            .expect("the passive MCP flush answers");
+        assert!(forwarded_report.contains("competitor-diagnostic"));
+        assert!(!forwarded_report.contains("former-owner-diagnostic"));
+
+        let mut completed = competitor_sweeper.subscribe_completions();
+        let requests_before = competitor_role.hooks_seen();
+        let sweeps_before = competitor_sweeper.sweeps_run();
+        let tool_result = apply_rename_over_mcp(
+            Arc::clone(&old.server),
+            &mut fake,
+            old.fixture("written.rs"),
+        )
+        .await;
+        assert!(
+            tool_result.get("new_diagnostics").is_none(),
+            "a passive applied write must not serialize a local footer: {tool_result}"
+        );
+        assert!(!tool_result.to_string().contains("former-owner-diagnostic"));
+        assert_eq!(competitor_role.hooks_seen(), requests_before + 1);
+        tokio::time::timeout(Duration::from_secs(5), completed.changed())
+            .await
+            .expect("the competitor sweeps the forwarded write")
+            .expect("the competitor's sweeper remains alive");
+        assert!(competitor_sweeper.sweeps_run() > sweeps_before);
+
+        old.cancel.send(true).expect("cancel old owner");
+        competitor_cancel_tx.send(true).expect("cancel competitor");
+    }
+
+    /// A write that entered its footer while owning the hook must not consume
+    /// its local record after the real listener loses the lock.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn i1_t9_demotion_pending_footer_keeps_the_local_record() {
+        let diagnostics = DiagnosticsConfig {
+            footer: true,
+            footer_grace_ms: 0,
+            footer_quiet_ms: 0,
+            footer_wait_ms: 0,
+            ..DiagnosticsConfig::default()
+        };
+        let (old, mut fake) =
+            HookHarness::owner_with_write_diagnostic(diagnostics, "former-owner-diagnostic").await;
+        let mut transitions = old.role.subscribe_transitions();
+        let (footer_entered_tx, footer_entered_rx) = tokio::sync::oneshot::channel();
+        let (footer_release_tx, footer_release_rx) = tokio::sync::oneshot::channel();
+        old.server
+            .install_footer_pause(footer_entered_tx, footer_release_rx);
+
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        install_lock_loss_pause(Some(LockLossPause {
+            identity: old.identity.clone(),
+            loss: LockLoss::Missing,
+            arrived: Arc::clone(&arrived),
+            resume: Arc::clone(&resume),
+        }));
+        let _pause_guard = LockLossPauseGuard;
+
+        assert!(matches!(
+            status_from_owner(&old.identity).await,
+            Response::Status { owner: true, .. }
+        ));
+
+        let expected_path = old.fixture("written.rs");
+        let expected_path_text = expected_path.display().to_string();
+        let apply_path = expected_path.clone();
+        let apply = tokio::spawn({
+            let server = Arc::clone(&old.server);
+            async move { apply_rename_over_mcp_result(server, &mut fake, apply_path).await }
+        });
+        tokio::time::timeout(Duration::from_secs(3), footer_entered_rx)
+            .await
+            .expect("the serialized MCP write enters its pending footer")
+            .expect("the footer pause sender stays connected");
+
+        let lock_loss = arrived.notified();
+        std::fs::remove_file(&old.identity.lock).expect("remove the old owner lock");
+        tokio::time::timeout(Duration::from_secs(3), lock_loss)
+            .await
+            .expect("the real owner listener observes the removed lock");
+        tokio::time::timeout(Duration::from_secs(1), transitions.changed())
+            .await
+            .expect("the role transition is observable")
+            .expect("the owner task remains alive");
+        assert!(matches!(old.role.get(), Role::Passive { .. }));
+
+        let competitor_role = Arc::new(HookRole::owner());
+        let (competitor_server, competitor_sweeper) = server_with_diagnostic(
+            old.dir.path(),
+            Arc::clone(&competitor_role),
+            DiagnosticsConfig::default(),
+            "competitor-diagnostic",
+        )
+        .await;
+        let (competitor_cancel_tx, competitor_cancel_rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(Arc::clone(&competitor_sweeper).run(competitor_cancel_rx.clone()));
+        let competitor_listener = HookListener::acquire(&old.identity)
+            .await
+            .expect("acquire the replacement hook listener")
+            .expect("the competitor owns the replacement lock");
+        let competitor_task = tokio::spawn(competitor_listener.serve(
+            build_handler(
+                Arc::clone(&competitor_server),
+                Arc::clone(&competitor_sweeper),
+                HookLocation {
+                    identity: old.identity.clone(),
+                    root: old.dir.path().to_path_buf(),
+                },
+                Arc::clone(&competitor_role),
+                competitor_cancel_rx.clone(),
+            ),
+            Duration::from_millis(1500),
+            competitor_cancel_rx,
+        ));
+        assert!(matches!(
+            status_from_owner(&old.identity).await,
+            Response::Status { owner: true, .. }
+        ));
+
+        footer_release_tx
+            .send(())
+            .expect("the pending footer remains connected");
+        let tool_result = tokio::time::timeout(Duration::from_secs(5), apply)
+            .await
+            .expect("the MCP write completes after its footer is released")
+            .expect("the MCP write task remains connected");
+        assert_eq!(tool_result["applied"], true, "{tool_result}");
+        assert_eq!(
+            tool_result["files_written"],
+            serde_json::json!([expected_path_text]),
+            "{tool_result}"
+        );
+        assert!(
+            tool_result.get("new_diagnostics").is_none(),
+            "a demoted writer must not serialize its local footer: {tool_result}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&expected_path).expect("read the applied file"),
+            "fn new() {}\n"
+        );
+
+        competitor_cancel_tx
+            .send(true)
+            .expect("cancel the competing listener");
+        tokio::time::timeout(Duration::from_secs(3), competitor_task)
+            .await
+            .expect("the competing listener stops")
+            .expect("the competing listener task remains healthy");
+        resume.notify_one();
+        tokio::time::timeout(Duration::from_secs(6), transitions.changed())
+            .await
+            .expect("the original owner reacquires after competition ends")
+            .expect("the owner task remains alive");
+        assert_eq!(old.role.get(), Role::Owner);
+
+        let local = old
+            .server
+            .get_new_diagnostics()
+            .await
+            .expect("the reacquired owner flush answers");
+        assert!(
+            local.contains("former-owner-diagnostic"),
+            "the pending footer must leave the local record for a later owner flush: {local}"
+        );
+        old.cancel.send(true).expect("cancel the original owner");
+    }
+
+    /// A role change while footer lock acquisition is blocked must win over
+    /// the later local flush, so a check before either async lock is unsafe.
+    #[tokio::test]
+    async fn i1_t9_demotion_during_footer_lock_contention_skips_consumption() {
+        let diagnostics = DiagnosticsConfig {
+            footer: true,
+            footer_grace_ms: 0,
+            footer_quiet_ms: 0,
+            footer_wait_ms: 0,
+            ..DiagnosticsConfig::default()
+        };
+        let harness =
+            HookHarness::owner_with_diagnostic(diagnostics, "contention-diagnostic").await;
+        let held_cache = harness.notification_cache.lock().await;
+        let server = Arc::clone(&harness.server);
+        let footer = tokio::spawn(async move { server.footer_for_write(0).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if harness.delivery.try_lock().is_err() {
+                    tokio::task::yield_now().await;
+                    if harness.delivery.try_lock().is_err() {
+                        break;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("footer reaches delivery while cache remains held");
+
+        harness.role.demote_to_passive(harness.identity.clone());
+        drop(held_cache);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), footer)
+                .await
+                .expect("the footer completes after cache contention")
+                .expect("the footer task remains healthy")
+                .is_none(),
+            "a demoted footer must not consume after waiting for delivery and cache"
+        );
+        harness.cancel.send(true).expect("cancel the test owner");
     }
 
     /// A lock file a competitor took is a different situation: that process

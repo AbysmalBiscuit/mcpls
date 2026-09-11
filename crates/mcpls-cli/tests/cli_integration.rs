@@ -11,6 +11,10 @@ use assert_cmd::prelude::*;
 use predicates::prelude::*;
 use tempfile::TempDir;
 
+const MCP_INPUT: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"mcpls-cli-test","version":"0.1.0"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}
+"#;
+
 /// Vars that could leak in from the ambient environment (e.g. a developer's
 /// shell, or a repo `.envrc`) and change these tests' outcome: `MCPLS_LOG`
 /// could suppress a warning a test greps for, `MCPLS_CONFIG` could redirect
@@ -139,6 +143,134 @@ fn test_config_with_empty_file() {
         .env("XDG_RUNTIME_DIR", temp_dir.path())
         .assert()
         .failure();
+}
+
+#[test]
+fn i1_t1_novel_file_language_requires_mapping() {
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("mcpls.toml");
+    fs::write(
+        &config_path,
+        r#"[diagnostics.hooks]
+enabled = false
+
+[[lsp_servers]]
+language_id = "elixir"
+command = "true"
+"#,
+    )
+    .unwrap();
+
+    let mut cmd = assert_cmd::Command::cargo_bin("mcpls").unwrap();
+    let output = cmd
+        .env_remove("MCPLS_LOG")
+        .env_remove("MCPLS_CONFIG")
+        .env_remove("MCPLS_TRUST_PROJECT_CONFIG")
+        .env_remove("MCPLS_LOG_JSON")
+        .arg("--config")
+        .arg(&config_path)
+        .current_dir(temp_dir.path())
+        .timeout(Duration::from_secs(5))
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "an unroutable file-tool language must fail at startup; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("elixir"),
+        "error should name elixir: {stderr}"
+    );
+    assert!(
+        stderr.contains("file_patterns"),
+        "error should explain how to add file patterns: {stderr}"
+    );
+    assert!(
+        stderr.contains("workspace"),
+        "error should explain how to add a workspace mapping: {stderr}"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn i1_t2_generated_config_inherits_builtins() {
+    let user_config = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let first_runtime = TempDir::new().unwrap();
+
+    #[cfg(target_os = "linux")]
+    let existing_path = user_config.path().join("mcpls").join("mcpls.toml");
+    #[cfg(target_os = "macos")]
+    let existing_path = user_config
+        .path()
+        .join("Library")
+        .join("Application Support")
+        .join("mcpls")
+        .join("mcpls.toml");
+    #[cfg(target_os = "linux")]
+    let config_env = "XDG_CONFIG_HOME";
+    #[cfg(target_os = "macos")]
+    let config_env = "HOME";
+
+    let mut cmd = Command::cargo_bin("mcpls").unwrap();
+    clear_ambient_env(&mut cmd)
+        .env(config_env, user_config.path())
+        .env("XDG_RUNTIME_DIR", first_runtime.path())
+        .current_dir(workspace.path());
+    let first_output = assert_cmd::Command::from_std(cmd)
+        .write_stdin(MCP_INPUT)
+        .timeout(Duration::from_secs(5))
+        .output()
+        .unwrap();
+    assert!(
+        first_output.status.success(),
+        "first-run CLI invocation failed: {}",
+        String::from_utf8_lossy(&first_output.stderr)
+    );
+
+    let generated = fs::read_to_string(&existing_path).unwrap();
+    let parsed: toml::Value = toml::from_str(&generated).unwrap();
+    assert!(parsed.get("lsp_servers").is_none(), "{generated}");
+
+    let loaded = mcpls_core::ServerConfig::load_from(&existing_path).unwrap();
+    assert_eq!(
+        serde_json::to_value(&loaded.lsp_servers).unwrap(),
+        serde_json::to_value(&mcpls_core::ServerConfig::default().lsp_servers).unwrap()
+    );
+}
+
+#[test]
+fn i1_t2_explicit_config_remains_unchanged() {
+    let config_dir = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let runtime = TempDir::new().unwrap();
+    let config_path = config_dir.path().join("mcpls.toml");
+    let original_bytes = br#"[[lsp_servers]]
+language_id = "rust"
+command = "custom-rust-analyzer"
+"#
+    .to_vec();
+    fs::write(&config_path, &original_bytes).unwrap();
+
+    let mut cmd = Command::cargo_bin("mcpls").unwrap();
+    clear_ambient_env(&mut cmd)
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .current_dir(workspace.path())
+        .arg("--config")
+        .arg(&config_path);
+    let output = assert_cmd::Command::from_std(cmd)
+        .write_stdin(MCP_INPUT)
+        .timeout(Duration::from_secs(5))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "existing-config CLI invocation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read(&config_path).unwrap(), original_bytes);
 }
 
 /// A CWD-discovered `./mcpls.toml` is untrusted by default: it must not be

@@ -865,8 +865,8 @@ fn workspace_folder(root: &Path) -> Result<WorkspaceFolder> {
     })
 }
 
-/// Builds an `LspServer` backed by mock `echo`/`cat` child processes, so it
-/// can be registered without a real language server.
+/// Builds an `LspServer` backed by a mock `echo` child and an inert
+/// transport, so it can be registered without a real language server.
 ///
 /// `child` is an already-exited `echo`, unlike
 /// [`LspServer::new_for_test_with_encoding`]'s live `cat`: the shutdown-path
@@ -891,21 +891,7 @@ pub fn fake_lsp_server() -> LspServer {
         .kill_on_drop(true)
         .spawn()
         .unwrap();
-    let mock_stdin = tokio::process::Command::new("cat")
-        .stdin(Stdio::piped())
-        .spawn()
-        .unwrap()
-        .stdin
-        .take()
-        .unwrap();
-    let mock_stdout = tokio::process::Command::new("echo")
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap()
-        .stdout
-        .take()
-        .unwrap();
-    let transport = LspTransport::new(mock_stdin, mock_stdout);
+    let transport = inert_transport();
     let client = LspClient::from_transport(LspServerConfig::pyright(), transport);
     let (_, mock_notification_rx) = mpsc::channel(1);
     LspServer {
@@ -915,6 +901,13 @@ pub fn fake_lsp_server() -> LspServer {
         notification_rx: mock_notification_rx,
         child: mock_child,
     }
+}
+
+/// A transport whose server has already hung up: reads hit EOF at once and
+/// writes are discarded.
+#[cfg(test)]
+fn inert_transport() -> LspTransport {
+    LspTransport::new(tokio::io::sink(), tokio::io::empty())
 }
 
 #[cfg(test)]
@@ -1360,23 +1353,7 @@ mod tests {
             .spawn()
             .unwrap();
 
-        let mock_stdin = tokio::process::Command::new("cat")
-            .stdin(Stdio::piped())
-            .spawn()
-            .unwrap()
-            .stdin
-            .take()
-            .unwrap();
-
-        let mock_stdout = tokio::process::Command::new("echo")
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap()
-            .stdout
-            .take()
-            .unwrap();
-
-        let transport = LspTransport::new(mock_stdin, mock_stdout);
+        let transport = inert_transport();
         let client = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport);
         let (_, mock_notification_rx) = mpsc::channel(1);
 
@@ -1450,23 +1427,7 @@ mod tests {
             .spawn()
             .unwrap();
 
-        let mock_stdin1 = tokio::process::Command::new("cat")
-            .stdin(Stdio::piped())
-            .spawn()
-            .unwrap()
-            .stdin
-            .take()
-            .unwrap();
-
-        let mock_stdout1 = tokio::process::Command::new("echo")
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap()
-            .stdout
-            .take()
-            .unwrap();
-
-        let transport1 = LspTransport::new(mock_stdin1, mock_stdout1);
+        let transport1 = inert_transport();
         let client1 = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport1);
         let (_, mock_notification_rx1) = mpsc::channel(1);
 
@@ -1498,23 +1459,7 @@ mod tests {
             .spawn()
             .unwrap();
 
-        let mock_stdin = tokio::process::Command::new("cat")
-            .stdin(Stdio::piped())
-            .spawn()
-            .unwrap()
-            .stdin
-            .take()
-            .unwrap();
-
-        let mock_stdout = tokio::process::Command::new("echo")
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap()
-            .stdout
-            .take()
-            .unwrap();
-
-        let transport = LspTransport::new(mock_stdin, mock_stdout);
+        let transport = inert_transport();
         let client = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport);
         let (_, mock_notification_rx) = mpsc::channel(1);
 
@@ -1554,23 +1499,7 @@ mod tests {
                 .spawn()
                 .unwrap();
 
-            let mock_stdin = tokio::process::Command::new("cat")
-                .stdin(Stdio::piped())
-                .spawn()
-                .unwrap()
-                .stdin
-                .take()
-                .unwrap();
-
-            let mock_stdout = tokio::process::Command::new("echo")
-                .stdout(Stdio::piped())
-                .spawn()
-                .unwrap()
-                .stdout
-                .take()
-                .unwrap();
-
-            let transport = LspTransport::new(mock_stdin, mock_stdout);
+            let transport = inert_transport();
             let config = if i == 0 {
                 LspServerConfig::rust_analyzer()
             } else if i == 1 {
@@ -1610,23 +1539,7 @@ mod tests {
             .spawn()
             .unwrap();
 
-        let mock_stdin1 = tokio::process::Command::new("cat")
-            .stdin(Stdio::piped())
-            .spawn()
-            .unwrap()
-            .stdin
-            .take()
-            .unwrap();
-
-        let mock_stdout1 = tokio::process::Command::new("echo")
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap()
-            .stdout
-            .take()
-            .unwrap();
-
-        let transport1 = LspTransport::new(mock_stdin1, mock_stdout1);
+        let transport1 = inert_transport();
         let client1 = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport1);
         let (_, mock_notification_rx1) = mpsc::channel(1);
 
@@ -1648,23 +1561,7 @@ mod tests {
             .spawn()
             .unwrap();
 
-        let mock_stdin2 = tokio::process::Command::new("cat")
-            .stdin(Stdio::piped())
-            .spawn()
-            .unwrap()
-            .stdin
-            .take()
-            .unwrap();
-
-        let mock_stdout2 = tokio::process::Command::new("echo")
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap()
-            .stdout
-            .take()
-            .unwrap();
-
-        let transport2 = LspTransport::new(mock_stdin2, mock_stdout2);
+        let transport2 = inert_transport();
         let client2 = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport2);
         let (_, mock_notification_rx2) = mpsc::channel(1);
 
@@ -1920,65 +1817,27 @@ mod tests {
     }
 
     /// Wire-level regressions for the `initialize` request. The tests capture
-    /// the real bytes `LspServer::initialize` writes over a piped `cat`
-    /// subprocess standing in for the LSP server. Mirrors the
-    /// `fake_lsp_client`/`FakeServer` pattern in
-    /// `client.rs::tests::retry_behavior`.
+    /// the real bytes `LspServer::initialize` writes to an in-memory
+    /// [`FakeServer`] standing in for the LSP server.
     mod initialize_wire {
-        use std::process::Stdio;
-
         use serde_json::Value;
         use tempfile::TempDir;
-        use tokio::io::{AsyncWriteExt, BufReader};
-        use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+        use tokio::io::{AsyncWriteExt, BufReader, DuplexStream};
 
         use super::*;
         use crate::lsp::client::LspClient;
-
-        struct FakeServer {
-            _write_half: Child,
-            _read_half: Child,
-            read_half_stdin: ChildStdin,
-            write_stdout: ChildStdout,
-        }
+        use crate::test_support::{FakeServer, fake_lsp_transport, read_framed_message};
 
         fn fake_lsp_client() -> (LspClient, FakeServer) {
-            let mut write_half = Command::new("cat")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()
-                .unwrap();
-            let write_stdin = write_half.stdin.take().unwrap();
-            let write_stdout = write_half.stdout.take().unwrap();
-
-            let mut read_half = Command::new("cat")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()
-                .unwrap();
-            let read_stdout = read_half.stdout.take().unwrap();
-            let read_stdin = read_half.stdin.take().unwrap();
-
-            let transport = LspTransport::new(write_stdin, read_stdout);
-            let client = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport);
-
+            let (transport, server) = fake_lsp_transport();
             (
-                client,
-                FakeServer {
-                    _write_half: write_half,
-                    _read_half: read_half,
-                    read_half_stdin: read_stdin,
-                    write_stdout,
-                },
+                LspClient::from_transport(LspServerConfig::rust_analyzer(), transport),
+                server,
             )
         }
 
-        use crate::test_support::read_framed_message;
-
         /// Writes a framed JSON-RPC success response.
-        async fn write_success_response(stdin: &mut ChildStdin, id: &Value, result: Value) {
+        async fn write_success_response(stdin: &mut DuplexStream, id: &Value, result: Value) {
             let response = serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": id,

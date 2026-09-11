@@ -956,6 +956,8 @@ While the language servers are still starting up (before mcpls has a stable base
 }
 ```
 
+If every applicable language server fails to start, mcpls adopts a terminal empty baseline. Later settled calls return the ordinary empty report with no startup `note`, rather than repeating the startup response forever.
+
 `note` also appears whenever the top-level `omitted` is non-zero, explaining how many files the caps held back and that calling again offers them:
 
 ```json
@@ -967,7 +969,7 @@ While the language servers are still starting up (before mcpls has a stable base
 }
 ```
 
-When several mcpls processes serve one project, one of them owns the project's diagnostics record and the others forward to it, so a session sees one record whichever process it is talking to. A forwarding process answers the same object shape, with the owner's already-rendered report in `note` and `changed`/`cleared` empty; if it cannot reach the owner, `note` says so rather than reporting an empty diff, which would read as a clean workspace:
+When several mcpls processes serve one project, one of them owns the project's diagnostics record and the others forward to it, so a session sees one record whichever process it is talking to. A nonempty `CLAUDE_CODE_SESSION_ID` deliberately names the shared record across the MCP and hook processes. An unset or empty variable uses a stable process-local fallback, so separate stdio processes keep separate records. A forwarding process answers the same object shape, with the owner's already-rendered report in `note` and `changed`/`cleared` empty. An owner that loses its lock demotes before serving a local footer or flush and forwards until it reacquires ownership. If it cannot reach the owner, `note` says so rather than reporting an empty diff, which would read as a clean workspace:
 
 ```json
 {
@@ -984,6 +986,7 @@ When several mcpls processes serve one project, one of them owns the project's d
 - `changed[].omitted` counts admitted diagnostics the per-file/total caps held back for that file this call; the top-level `omitted` counts whole files the total budget could not fit. The two behave differently: a file that was delivered is recorded as seen in full, so its `changed[].omitted` diagnostics are not offered again and the count is the cue to open the file itself, while a whole file the budget deferred is offered again on a later call. A non-zero top-level `omitted` also sets `note` to say so, since a bare count doesn't tell an agent that a retry gets the rest
 - `cleared` lists files that had diagnostics on a previous call and now report none
 - Filtered by the `[diagnostics]` config table's severity floor (and any per-server `diagnostics_severity` override), same as every other diagnostics tool
+- Hook flush responses may append a background sweep's document shortfall as the latest sweep status. Each sweep replaces that status or clears it when coverage is complete; it is not a new diagnostic file and is not re-counted on each flush
 - Positions use the same encoding conversion as `get_cached_diagnostics`, so the two tools never disagree about a column
 - Call it as often as you like: it costs nothing when nothing changed
 

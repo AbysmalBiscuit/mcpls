@@ -691,6 +691,10 @@ pub(crate) async fn serve_with_identity(
     // `handles` claims) are enforced -- a startup error naming the
     // conflicting `[[lsp_servers]]` entries, not a silent drop.
     let router = ToolRouter::from_configs(applicable_configs.iter().map(|c| &c.server_config))?;
+    let floor_configs = applicable_configs
+        .iter()
+        .map(|config| config.server_config.clone())
+        .collect::<Vec<_>>();
 
     // Built here (rather than alongside `subscriptions`/`peer_cell` below) so
     // it can be handed to the translator, which uses it to invalidate a
@@ -750,10 +754,7 @@ pub(crate) async fn serve_with_identity(
     let delivery = Arc::new(Mutex::new(bridge::DiagnosticsDelivery::new(
         config.diagnostics,
     )));
-    let floors = Arc::new(bridge::FloorTable::new(
-        &config.diagnostics,
-        &config.lsp_servers,
-    ));
+    let floors = Arc::new(bridge::FloorTable::new(&config.diagnostics, &floor_configs));
 
     // The hook socket is an optimization, not a requirement: a process that
     // cannot derive its own identity still answers every MCP tool, so this
@@ -1178,6 +1179,7 @@ fn spawn_lsp_servers_background(
             // skipping it would leave every route pointed at a dead server.
             translator.rebind_router(&HashSet::new());
             translator.clear_expected_servers();
+            shared.delivery.lock().await.set_baseline(HashMap::new());
             return;
         }
 
@@ -1215,6 +1217,16 @@ fn spawn_lsp_servers_background(
             .await
             .set_diagnostics_route_count(diagnostics_route_count);
 
+        let diagnostics_owners = registered
+            .diagnostics_flags
+            .iter()
+            .filter(|&(_, &is_route)| is_route)
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        #[cfg(all(test, unix))]
+        recovery_tests::pause_before_owner_installation();
+        shared.settle.set_diagnostics_owners(diagnostics_owners);
+
         // The settle deadline backstops indexing, which only starts here:
         // everything before this point -- config load, and every server's
         // `initialize` handshake, which `timeout_seconds` alone allows 30
@@ -1223,6 +1235,8 @@ fn spawn_lsp_servers_background(
         // no progress at all is the case the backstop exists for and offers
         // no event to hang the restart on.
         shared.settle.restart_deadline();
+        #[cfg(all(test, unix))]
+        recovery_tests::pause_owner_installation();
 
         baseline_task(
             Arc::clone(&shared.settle),
@@ -1262,7 +1276,10 @@ async fn baseline_task(
                 }
             }
             () = tokio::time::sleep(BASELINE_POLL_INTERVAL) => {
-                if !settle.should_settle() {
+                let ready = settle.should_settle();
+                #[cfg(all(test, unix))]
+                recovery_tests::pause_baseline_check(ready);
+                if !ready {
                     continue;
                 }
                 let baseline: HashMap<String, u64> = {
@@ -1285,6 +1302,8 @@ async fn baseline_task(
                 // but safe here because this task never holds both locks at
                 // once.
                 delivery.lock().await.set_baseline(baseline);
+                #[cfg(all(test, unix))]
+                recovery_tests::mark_baseline_adopted();
                 debug!("diagnostics baseline taken over {baseline_len} file(s)");
                 return;
             }
@@ -1295,8 +1314,8 @@ async fn baseline_task(
 /// Test helpers shared by the `#[cfg(test)]` modules across this crate,
 /// living here rather than in any one of them so all of them get the same
 /// behavior: [`CwdGuard`] for tests that mutate the process-wide working
-/// directory, and the framed-message readers for tests that talk to a fake
-/// LSP server over a pipe.
+/// directory, and [`FakeServer`] with the framed-message readers for tests
+/// that talk to a fake LSP server over in-memory pipes.
 ///
 /// The cwd lock has to be crate-wide (#348). Tests that call
 /// `std::env::set_current_dir` must not run concurrently with each other or
@@ -1311,9 +1330,43 @@ mod test_support {
     use std::sync::{Mutex, MutexGuard, PoisonError};
     use std::time::Duration;
 
-    use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt};
+    use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, DuplexStream};
+
+    use crate::lsp::LspTransport;
 
     static CWD_LOCK: Mutex<()> = Mutex::new(());
+
+    /// How many bytes a [`FakeServer`] pipe holds before its writer waits
+    /// for the reader: far more than any test leaves unread.
+    const PIPE_CAPACITY: usize = 1 << 20;
+
+    /// The server side of the in-memory connection [`fake_lsp_transport`]
+    /// builds.
+    ///
+    /// Frames written to `read_half_stdin` reach the client as server
+    /// messages, and every frame the client sends can be read back from
+    /// `write_stdout`. Dropping a field closes its direction the way an
+    /// exiting server closes its pipes: the client reads EOF once
+    /// `read_half_stdin` is gone, and its writes fail once `write_stdout` is.
+    pub struct FakeServer {
+        pub read_half_stdin: DuplexStream,
+        pub write_stdout: DuplexStream,
+    }
+
+    /// An [`LspTransport`] connected to an in-memory [`FakeServer`], so a
+    /// test can read the exact bytes sent to a server and answer them
+    /// without spawning one.
+    pub fn fake_lsp_transport() -> (LspTransport, FakeServer) {
+        let (client_writes, write_stdout) = tokio::io::duplex(PIPE_CAPACITY);
+        let (read_half_stdin, client_reads) = tokio::io::duplex(PIPE_CAPACITY);
+        (
+            LspTransport::new(client_writes, client_reads),
+            FakeServer {
+                read_half_stdin,
+                write_stdout,
+            },
+        )
+    }
 
     /// RAII guard that serializes CWD-mutating tests behind [`CWD_LOCK`] and
     /// switches into `dir` for the guard's lifetime, restoring the original

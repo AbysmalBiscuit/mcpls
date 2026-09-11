@@ -225,7 +225,9 @@ mcpls includes 30 language mappings by default:
 | F# | fs, fsi, fsx | fsharp |
 | R | r, R | r |
 
-These defaults are automatically included when you don't specify custom `language_extensions`. If you provide any custom mappings, you must include all languages you want to use.
+These defaults are automatically included when you don't specify custom `language_extensions`. If you provide custom mappings, include every language you want to route because the custom list replaces the default mapping list.
+
+An LSP server for a language outside the built-in set also needs an effective extension mapping when it serves document-scoped tools. Supply `file_patterns` on the server or a matching `workspace.language_extensions` entry. A server that handles only `workspace_symbols` does not need a file mapping because that tool has no document to route.
 
 #### Minimal Configuration Strategy
 
@@ -244,14 +246,16 @@ extensions = ["py", "pyi"]
 language_id = "python"
 ```
 
-This reduces memory usage compared to loading all 30 default mappings.
+This reduces memory usage compared to loading every default mapping.
 
 ### `workspace.max_documents`
 
 **Type**: Integer
 **Default**: `100`
 
-Maximum number of documents mcpls will keep open simultaneously. A tool call (hover, definition, diagnostics, etc.) that would open a document beyond this count fails with a "document limit exceeded" error. Documents stay tracked for the whole mcpls process lifetime — there is no automatic eviction — so once the ceiling is reached, opening any further new file fails until you restart mcpls or raise this limit; already-open files are unaffected. Set to `0` to disable the limit.
+Maximum number of documents mcpls will keep open simultaneously. A tool call (hover, definition, diagnostics, etc.) that would open a document beyond this count fails with a "document limit exceeded" error. Documents stay tracked for the whole mcpls process lifetime — there is no automatic eviction — so once the ceiling is reached, opening any further new file fails until you restart mcpls or raise this limit; already-open files are unaffected. Set to `0` for unlimited document capacity.
+
+Background diagnostics sweeps also open untracked files. With a finite limit, a sweep reserves one document slot for an ordinary request and uses the remaining headroom for background files. A sweep reports files it could not check in its latest status; the status is replaced or cleared when the next sweep completes. With `max_documents = 0`, sweeps have unlimited background capacity and reserve no slot.
 
 ```toml
 [workspace]
@@ -276,7 +280,7 @@ Useful when a project contains files larger than 10MB (e.g. generated code, data
 
 ## LSP Server Configuration
 
-mcpls ships six built-in servers — rust-analyzer, pyright, the TypeScript language server, gopls, clangd, and zls, covering `rust`, `python`, `typescript`, `go`, `cpp`, and `zig` respectively. Each `[[lsp_servers]]` entry you write **merges onto** the built-in sharing its routing identity (`name` if set, otherwise `language_id`): whatever field the entry omits, it inherits from the built-in, and whatever it sets, it overrides. An entry whose identity matches no built-in defines a brand-new server instead, with nothing to inherit.
+mcpls ships six built-in servers — rust-analyzer, pyright, the TypeScript language server, gopls, clangd, and zls, covering `rust`, `python`, `typescript`, `go`, `cpp`, and `zig` respectively. Each `[[lsp_servers]]` entry you write **merges onto** the built-in sharing its routing identity (`name` if set, otherwise `language_id`): whatever field the entry omits, it inherits from the built-in, and whatever it sets, it overrides. An entry whose identity matches no built-in defines a brand-new server instead, with nothing to inherit. The generated config is sparse, so these defaults remain effective until you override them explicitly.
 
 Overriding `command` drops the built-in's `args`, `env`, and `initialization_options`, since those belong to the binary being replaced (pyright's `--stdio` means nothing to a different program) — `file_patterns` survive, since they describe the language rather than the binary.
 
@@ -331,6 +335,8 @@ args = ["--stdio"]  # Many servers require --stdio flag
 **Required**: No (defaults to empty array)
 
 File patterns to associate with this language server.
+
+An empty list is valid for a server that has a matching `workspace.language_extensions` mapping or handles only `workspace_symbols`. A server that handles document-scoped tools and has a novel language must have an effective mapping from either `file_patterns` or `workspace.language_extensions`; otherwise configuration validation fails before startup.
 
 ```toml
 [[lsp_servers]]
@@ -641,7 +647,7 @@ footer_wait_ms = 15000
 **Type**: String (`"off"`, `"error"`, `"warning"`, `"information"`, or `"hint"`)
 **Default**: `"warning"`
 
-The least severe diagnostic worth delivering, for any server that does not set its own `diagnostics_severity` (see [`diagnostics_severity`](#diagnostics_severity)). A diagnostic with no severity at all clears every floor but `"off"`, since LSP makes severity optional and a server that omits it is not thereby saying the diagnostic does not matter.
+The least severe diagnostic worth delivering, for any applicable server that does not set its own `diagnostics_severity` (see [`diagnostics_severity`](#diagnostics_severity)). Per-server floors are considered only for servers applicable to the current workspace; an inapplicable server cannot change the active route's floor. A diagnostic with no severity at all clears every floor but `"off"`, since LSP makes severity optional and a server that omits it is not thereby saying the diagnostic does not matter.
 
 ### `diagnostics.max_per_file`
 
@@ -671,7 +677,7 @@ How long the language servers must report no work before their view of the works
 
 How long to wait for that quiet before giving up and baselining anyway. Bounds the damage from a server that never finishes, or from a progress notification dropped before its pump existed.
 
-Counted from the moment the language servers are spawned, so it covers indexing rather than the handshake that precedes it. It needs to outlast a full index of your workspace: firing before that captures a partial baseline, and every file analyzed afterwards then reads as newly changed. Firing late only costs the session a longer wait for its first baseline, and `get_new_diagnostics` says so while it waits — so when in doubt, raise it.
+The deadline starts after applicable servers have successfully registered, so the initialization handshake does not consume the indexing budget. It needs to outlast a full index of your workspace: firing before that captures a partial baseline, and every file analyzed afterwards then reads as newly changed. Each active diagnostics owner gets its own two-second grace when it has not reported progress; owners that have reported progress use the normal quiet debounce. Failed and non-diagnostics servers do not extend the wait. If every applicable server fails, mcpls adopts a terminal empty baseline and settled flushes return empty reports instead of startup notes.
 
 ### `diagnostics.footer`
 
@@ -685,14 +691,14 @@ Whether a write tool appends the diagnostics its own edit caused to its result, 
 **Type**: Integer (milliseconds)
 **Default**: `250`
 
-How long a footer waits before it starts looking for quiet. A footer that checks too soon after a write can catch the language servers before they have reacted to it at all, and report the state from before the edit as if it were the result. Bounded by `footer_wait_ms`, which is the whole wait: a grace set above it is spent only up to it.
+How long a footer waits before it starts looking for quiet. The write handler captures a progress epoch before the write and the footer waits after the write returns. If no progress begins after the captured epoch, the footer can finish after grace. If new progress begins, it waits for all outstanding work to become quiet or reaches the cap. A footer that checks too soon after a write can catch the language servers before they have reacted to it at all, and report the state from before the edit as if it were the result. Bounded by `footer_wait_ms`, which is the whole wait: a grace set above it is spent only up to it.
 
 ### `diagnostics.footer_quiet_ms`
 
 **Type**: Integer (milliseconds)
 **Default**: `200`
 
-How long nothing may be outstanding before a footer calls it done. Shorter than `settle_quiet_ms`, which bridges gaps between startup phases a footer never sees; what a footer bridges instead is the cancel-and-restart between two writes landing back to back.
+How long nothing may be outstanding before a footer calls it done. If no progress begins after the captured epoch, the footer can finish after grace. If new progress begins, it waits for all outstanding work to become quiet or reaches the cap. This is shorter than `settle_quiet_ms`, which bridges gaps between startup phases a footer never sees; what a footer bridges instead is the cancel-and-restart between two writes landing back to back.
 
 ### `diagnostics.footer_wait_ms`
 
@@ -992,7 +998,7 @@ mcpls --log-level debug
 ```
 
 Common validation errors:
-- Missing required fields (`language_id`, `command`, `file_patterns`)
+- Missing required fields (`language_id`, `command`) or an effective file mapping for a document-scoped server
 - Invalid TOML syntax
 - Command not found in PATH
 - Invalid glob patterns

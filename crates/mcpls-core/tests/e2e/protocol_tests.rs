@@ -3,10 +3,707 @@
 //! These tests validate the complete MCP protocol flow by spawning the mcpls
 //! binary and communicating with it as a real MCP client would.
 
-use anyhow::Result;
-use serde_json::json;
+use std::path::Path;
+use std::time::{Duration, Instant};
+use std::{fs, thread};
 
+use anyhow::{Context, Result};
+use mcpls_core::hooks::{self, Request, Response, SocketIdentity};
+use serde_json::json;
+use tempfile::TempDir;
+
+use super::diagnostics_fixture;
 use super::mcp_client::McpClient;
+
+fn toml_array(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|value| format!("{value:?}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn toml_patterns(values: &[&str]) -> String {
+    values
+        .iter()
+        .map(|value| format!("{value:?}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn write_fixture_config(
+    config_path: &Path,
+    language_id: &str,
+    command: &str,
+    args: &[String],
+    file_patterns: &[&str],
+    workspace_mapping: bool,
+    handles: &[&str],
+) -> Result<()> {
+    let workspace = config_path
+        .parent()
+        .context("fixture config path must have a parent")?;
+    let workspace_mapping = if workspace_mapping {
+        "\n[[workspace.language_extensions]]\nextensions = [\"ex\"]\nlanguage_id = \"elixir\"\n"
+    } else {
+        ""
+    };
+    let file_patterns = if file_patterns.is_empty() {
+        String::new()
+    } else {
+        format!("file_patterns = [{}]\n", toml_patterns(file_patterns))
+    };
+    let handles = if handles.is_empty() {
+        String::new()
+    } else {
+        format!("handles = [{}]\n", toml_patterns(handles))
+    };
+    let workspace = toml::Value::String(workspace.to_string_lossy().into_owned()).to_string();
+    let args = toml_array(args);
+    let config = format!(
+        "[workspace]\nroots = [{workspace}]{workspace_mapping}\n[diagnostics.hooks]\nenabled = false\n\n[[lsp_servers]]\nlanguage_id = {language_id:?}\ncommand = {command:?}\nargs = [{args}]\n{file_patterns}{handles}"
+    );
+    fs::write(config_path, config)?;
+    Ok(())
+}
+
+fn call_hover_when_ready(client: &mut McpClient, file_path: &Path) -> Result<serde_json::Value> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match client.call_tool(
+            "get_hover",
+            &json!({
+                "file_path": file_path,
+                "line": 0,
+                "character": 0,
+            }),
+        ) {
+            Ok(response) => return Ok(response),
+            Err(error)
+                if error.to_string().contains("initializing") && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn call_workspace_symbol_when_ready(client: &mut McpClient) -> Result<serde_json::Value> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match client.call_tool(
+            "workspace_symbol_search",
+            &json!({"query": "workspace", "limit": 10}),
+        ) {
+            Ok(response) => return Ok(response),
+            Err(error)
+                if error.to_string().contains("initializing") && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn run_hover_case(
+    language_id: &str,
+    file_name: &str,
+    sentinel: &str,
+    file_patterns: &[&str],
+    workspace_mapping: bool,
+) -> Result<()> {
+    let workspace = TempDir::new()?;
+    run_hover_case_in_workspace(
+        &workspace,
+        language_id,
+        file_name,
+        sentinel,
+        file_patterns,
+        workspace_mapping,
+    )
+}
+
+fn run_hover_case_in_workspace(
+    workspace: &TempDir,
+    language_id: &str,
+    file_name: &str,
+    sentinel: &str,
+    file_patterns: &[&str],
+    workspace_mapping: bool,
+) -> Result<()> {
+    let script = diagnostics_fixture::write_hover_server(workspace.path())?;
+    let config_path = workspace.path().join("mcpls.toml");
+    let args = vec![script.to_string_lossy().into_owned(), sentinel.to_string()];
+    write_fixture_config(
+        &config_path,
+        language_id,
+        "python3",
+        &args,
+        file_patterns,
+        workspace_mapping,
+        &[],
+    )?;
+    let file_path = workspace.path().join(file_name);
+    if let Some(parent) = file_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&file_path, "def fixture():\n    return 1\n")?;
+
+    let config_arg = config_path.to_string_lossy().into_owned();
+    let mut client = McpClient::spawn_with_args(&["--config", &config_arg])?;
+    client.initialize()?;
+    let response = call_hover_when_ready(&mut client, &file_path)?;
+    assert!(
+        response.to_string().contains(sentinel),
+        "hover response should contain {sentinel}, got {response}"
+    );
+    Ok(())
+}
+
+fn write_duplicate_floor_config(
+    config_path: &Path,
+    script: &Path,
+    active_marker: &Path,
+    active_publish_marker: &Path,
+    inactive_publish_marker: &Path,
+    active_first: bool,
+) -> Result<()> {
+    let workspace = config_path
+        .parent()
+        .context("fixture config path must have a parent")?;
+    let workspace = toml::Value::String(workspace.to_string_lossy().into_owned()).to_string();
+    let script = toml::Value::String(script.to_string_lossy().into_owned()).to_string();
+    let active_marker =
+        toml::Value::String(active_marker.to_string_lossy().into_owned()).to_string();
+    let active_publish_marker =
+        toml::Value::String(active_publish_marker.to_string_lossy().into_owned()).to_string();
+    let inactive_publish_marker =
+        toml::Value::String(inactive_publish_marker.to_string_lossy().into_owned()).to_string();
+    let active = format!(
+        "[[lsp_servers]]\nlanguage_id = \"python\"\ncommand = \"python3\"\nargs = [{script}, \"active-warning\", \"active-hover\", {active_publish_marker}]\nfile_patterns = [\"**/*.py\"]\ndiagnostics_severity = \"warning\"\n\n[lsp_servers.heuristics]\nproject_markers = [{active_marker}]\n"
+    );
+    let inactive = format!(
+        "[[lsp_servers]]\nlanguage_id = \"python\"\ncommand = \"python3\"\nargs = [{script}, \"inactive-fixture\", \"inactive-hover\", {inactive_publish_marker}]\nfile_patterns = [\"**/*.py\"]\ndiagnostics_severity = \"error\"\n\n[lsp_servers.heuristics]\nproject_markers = [\"inactive.marker\"]\n"
+    );
+    let servers = if active_first {
+        format!("{active}{inactive}")
+    } else {
+        format!("{inactive}{active}")
+    };
+    fs::write(
+        config_path,
+        format!(
+            "[workspace]\nroots = [{workspace}]\n[diagnostics]\nsettle_quiet_ms = 50\nsettle_deadline_ms = 10000\n[diagnostics.hooks]\nenabled = false\n\n{servers}"
+        ),
+    )?;
+    Ok(())
+}
+
+fn wait_for_diagnostics_baseline(client: &mut McpClient) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let response = client.call_tool("get_new_diagnostics", &json!({}))?;
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .with_context(|| format!("expected diagnostic text content, got {response}"))?;
+        let payload: serde_json::Value = serde_json::from_str(text)?;
+        if payload.get("note").is_none() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("diagnostics baseline was not ready: {payload}");
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn wait_for_marker(path: &Path) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !path.exists() {
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "LSP fixture did not publish its marker at {}",
+                path.display()
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
+}
+
+fn write_mixed_startup_config(
+    config_path: &Path,
+    script: &Path,
+    reporting_initialized: &Path,
+    silent_initialized: &Path,
+    silent_startup_published: &Path,
+    silent_changed_published: &Path,
+) -> Result<()> {
+    let workspace = config_path
+        .parent()
+        .context("fixture config path must have a parent")?;
+    let workspace = toml::Value::String(workspace.to_string_lossy().into_owned()).to_string();
+    let script = toml::Value::String(script.to_string_lossy().into_owned()).to_string();
+    let reporting_initialized =
+        toml::Value::String(reporting_initialized.to_string_lossy().into_owned()).to_string();
+    let silent_initialized =
+        toml::Value::String(silent_initialized.to_string_lossy().into_owned()).to_string();
+    let silent_startup_published =
+        toml::Value::String(silent_startup_published.to_string_lossy().into_owned()).to_string();
+    let silent_changed_published =
+        toml::Value::String(silent_changed_published.to_string_lossy().into_owned()).to_string();
+    fs::write(
+        config_path,
+        format!(
+            "[workspace]\nroots = [{workspace}]\n[diagnostics]\nsettle_quiet_ms = 50\nsettle_deadline_ms = 10000\n[diagnostics.hooks]\nenabled = false\n\n[[lsp_servers]]\nlanguage_id = \"elixir\"\ncommand = \"python3\"\nargs = [{script}, \"reporting\", {reporting_initialized}, {reporting_initialized}, {reporting_initialized}, \"main.ex\", \"0\"]\nfile_patterns = [\"**/*.ex\"]\ndiagnostics_severity = \"warning\"\n\n[[lsp_servers]]\nlanguage_id = \"haskell\"\ncommand = \"python3\"\nargs = [{script}, \"silent\", {silent_initialized}, {silent_startup_published}, {silent_changed_published}, \"main.hs\", \"1.5\"]\nfile_patterns = [\"**/*.hs\"]\ndiagnostics_severity = \"warning\"\n"
+        ),
+    )?;
+    Ok(())
+}
+
+fn write_non_diagnostics_config(
+    config_path: &Path,
+    script: &Path,
+    initialized_marker: &Path,
+    progress_marker: &Path,
+) -> Result<()> {
+    let workspace = config_path
+        .parent()
+        .context("fixture config path must have a parent")?;
+    let workspace = toml::Value::String(workspace.to_string_lossy().into_owned()).to_string();
+    let script = toml::Value::String(script.to_string_lossy().into_owned()).to_string();
+    let initialized_marker =
+        toml::Value::String(initialized_marker.to_string_lossy().into_owned()).to_string();
+    let progress_marker =
+        toml::Value::String(progress_marker.to_string_lossy().into_owned()).to_string();
+    fs::write(
+        config_path,
+        format!(
+            "[workspace]\nroots = [{workspace}]\n[diagnostics]\nsettle_quiet_ms = 50\nsettle_deadline_ms = 5000\n[diagnostics.hooks]\nenabled = false\n\n[[lsp_servers]]\nlanguage_id = \"elixir\"\nname = \"hover-only\"\ncommand = \"python3\"\nargs = [{script}, \"holding\", {initialized_marker}, {progress_marker}, {progress_marker}, \"main.ex\", \"0\"]\nfile_patterns = [\"**/*.ex\"]\nhandles = [\"hover\"]\ndiagnostics_severity = \"warning\"\n"
+        ),
+    )?;
+    Ok(())
+}
+
+fn wait_for_baseline_report(client: &mut McpClient) -> Result<String> {
+    let deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        let response = client.call_tool("get_new_diagnostics", &json!({}))?;
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .with_context(|| format!("expected diagnostic text content, got {response}"))?;
+        let payload: serde_json::Value = serde_json::from_str(text)?;
+        if payload.get("note").is_none() {
+            return Ok(text.to_owned());
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("diagnostics baseline was not ready: {text}");
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn run_duplicate_floor_case(active_first: bool) -> Result<String> {
+    let workspace = TempDir::new()?;
+    let active_marker = workspace.path().join("active.marker");
+    fs::write(&active_marker, "")?;
+    let script = diagnostics_fixture::write_diagnostics_server(workspace.path())?;
+    let active_publish_marker = workspace.path().join("active-published.marker");
+    let inactive_publish_marker = workspace.path().join("inactive-published.marker");
+    let config_path = workspace.path().join("mcpls.toml");
+    write_duplicate_floor_config(
+        &config_path,
+        &script,
+        &active_marker,
+        &active_publish_marker,
+        &inactive_publish_marker,
+        active_first,
+    )?;
+    let file_path = workspace.path().join("main.py");
+    fs::write(&file_path, "def fixture():\n    return 1\n")?;
+
+    let config_arg = config_path
+        .to_str()
+        .context("fixture config path must be valid UTF-8")?;
+    let mut client = McpClient::spawn_with_args(&["--config", config_arg])?;
+    client.initialize()?;
+    wait_for_diagnostics_baseline(&mut client)?;
+
+    let hover = call_hover_when_ready(&mut client, &file_path)?;
+    assert!(
+        hover.to_string().contains("active-hover"),
+        "the applicable Python LSP must answer the control request, got {hover}"
+    );
+    wait_for_marker(&active_publish_marker)?;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let report = loop {
+        let response = client.call_tool("get_new_diagnostics", &json!({}))?;
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .with_context(|| format!("expected diagnostic text content, got {response}"))?;
+        let report = text.to_owned();
+        if report.contains("active-warning") || Instant::now() >= deadline {
+            break report;
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
+    Ok(report)
+}
+
+async fn owner_hooks_seen(identity: &SocketIdentity, pid: u32, workspace: &Path) -> Result<u64> {
+    let response = hooks::send(identity, &Request::Status, Duration::from_secs(5)).await?;
+    match response {
+        Response::Status {
+            hash,
+            socket,
+            pid: owner_pid,
+            owner,
+            root,
+            hooks_seen,
+        } => {
+            assert!(owner);
+            assert_eq!(owner_pid, pid);
+            assert_eq!(root, workspace);
+            assert_eq!(hash, identity.hash);
+            assert_eq!(socket, identity.socket);
+            Ok(hooks_seen)
+        }
+        other => anyhow::bail!("expected hook owner status, got {other:?}"),
+    }
+}
+
+async fn process_session_reports(
+    session: Option<&str>,
+    passive_first: bool,
+) -> Result<[serde_json::Value; 4]> {
+    let workspace = TempDir::new()?;
+    let root = dunce::canonicalize(workspace.path())?;
+    let script = diagnostics_fixture::write_diagnostics_server(&root)?;
+    let published_marker = root.join("published.marker");
+    let config_path = root.join("mcpls.toml");
+    let workspace_value = toml::Value::String(root.to_string_lossy().into_owned());
+    let args = toml_array(&[
+        script.to_string_lossy().into_owned(),
+        "process-session-probe".to_string(),
+        "process-session-hover".to_string(),
+        published_marker.to_string_lossy().into_owned(),
+    ]);
+    fs::write(
+        &config_path,
+        format!(
+            "[workspace]\nroots = [{workspace_value}]\n[diagnostics]\nsettle_quiet_ms = 50\nsettle_deadline_ms = 5000\n[diagnostics.hooks]\nenabled = true\n\n[[lsp_servers]]\nlanguage_id = \"python\"\ncommand = \"python3\"\nargs = [{args}]\nfile_patterns = [\"**/*.py\"]\ndiagnostics_severity = \"warning\"\n\n[lsp_servers.heuristics]\nproject_markers = [\"main.py\"]\n"
+        ),
+    )?;
+    let file_path = root.join("main.py");
+    fs::write(&file_path, "def fixture():\n    return 1\n")?;
+    let config_arg = config_path
+        .to_str()
+        .context("fixture config must be UTF-8")?;
+    let identity = hooks::identity_for(&root)?;
+
+    let mut owner = McpClient::spawn_in_workspace(&["--config", config_arg], &root, session)?;
+    owner.initialize()?;
+    wait_for_diagnostics_baseline(&mut owner)?;
+    let before = owner_hooks_seen(&identity, owner.pid(), &root).await?;
+
+    let mut passive = McpClient::spawn_in_workspace(&["--config", config_arg], &root, session)?;
+    passive.initialize()?;
+    wait_for_diagnostics_baseline(&mut passive)?;
+    assert!(
+        owner_hooks_seen(&identity, owner.pid(), &root).await? > before,
+        "the passive client's baseline flush must reach the owner"
+    );
+    assert!(!published_marker.exists());
+    eprintln!(
+        "i1_t6 session={session:?} passive_first={passive_first}: owner={}, passive={}, shared workspace and forwarding ready before publication",
+        owner.pid(),
+        passive.pid()
+    );
+
+    let hover = call_hover_when_ready(&mut owner, &file_path)?;
+    assert!(hover.to_string().contains("process-session-hover"));
+    wait_for_marker(&published_marker)?;
+
+    let (first, second) = if passive_first {
+        (&mut passive, &mut owner)
+    } else {
+        (&mut owner, &mut passive)
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let first_report = loop {
+        let report = first.call_tool("get_new_diagnostics", &json!({}))?;
+        if report.to_string().contains("process-session-probe") {
+            break report;
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "owner publication missing: {report}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    };
+    let second_report = second.call_tool("get_new_diagnostics", &json!({}))?;
+    let first_repeat = first.call_tool("get_new_diagnostics", &json!({}))?;
+    let second_repeat = second.call_tool("get_new_diagnostics", &json!({}))?;
+    eprintln!(
+        "i1_t6 first_report={first_report}\nsecond_report={second_report}\nfirst_repeat={first_repeat}\nsecond_repeat={second_repeat}"
+    );
+    Ok([first_report, second_report, first_repeat, second_repeat])
+}
+
+#[rstest::rstest]
+#[case::unset_owner_first(None, false)]
+#[case::unset_passive_first(None, true)]
+#[case::empty_owner_first(Some(""), false)]
+#[case::empty_passive_first(Some(""), true)]
+#[tokio::test]
+#[ignore = "Requires mcpls binary built"]
+async fn i1_t6_process_fallbacks_are_independent(
+    #[case] session: Option<&str>,
+    #[case] passive_first: bool,
+) -> Result<()> {
+    let [first_report, second_report, first_repeat, second_repeat] =
+        process_session_reports(session, passive_first).await?;
+    assert!(first_report.to_string().contains("process-session-probe"));
+    assert!(second_report.to_string().contains("process-session-probe"));
+    assert!(!first_repeat.to_string().contains("process-session-probe"));
+    assert!(!second_repeat.to_string().contains("process-session-probe"));
+    Ok(())
+}
+
+#[rstest::rstest]
+#[case::owner_first(false)]
+#[case::passive_first(true)]
+#[tokio::test]
+#[ignore = "Requires mcpls binary built"]
+async fn i1_t6_explicit_same_session_shares_delivery(#[case] passive_first: bool) -> Result<()> {
+    let [first_report, second_report, first_repeat, second_repeat] =
+        process_session_reports(Some("process-session-shared"), passive_first).await?;
+    assert!(first_report.to_string().contains("process-session-probe"));
+    assert!(!second_report.to_string().contains("process-session-probe"));
+    assert!(!first_repeat.to_string().contains("process-session-probe"));
+    assert!(!second_repeat.to_string().contains("process-session-probe"));
+    Ok(())
+}
+
+#[test]
+#[ignore = "Requires mcpls binary built"]
+fn i1_t1_file_pattern_mapping_routes_hover() -> Result<()> {
+    run_hover_case(
+        "elixir",
+        "lib/example.ex",
+        "elixir-fixture",
+        &["**/*.ex"],
+        false,
+    )
+}
+
+#[test]
+#[ignore = "Requires mcpls binary built"]
+fn i1_t1_workspace_mapping_routes_hover() -> Result<()> {
+    run_hover_case("elixir", "lib/example.ex", "elixir-fixture", &[], true)
+}
+
+#[test]
+#[ignore = "Requires mcpls binary built"]
+fn i1_t1_builtin_command_override_preserves_mapping() -> Result<()> {
+    let workspace = TempDir::new()?;
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[package]\nname = \"fixture\"\n",
+    )?;
+    run_hover_case_in_workspace(
+        &workspace,
+        "rust",
+        "lib/example.rs",
+        "rust-fixture",
+        &[],
+        false,
+    )
+}
+
+#[test]
+#[ignore = "Requires mcpls binary built"]
+fn i1_t1_workspace_only_server_without_mapping_is_accepted() -> Result<()> {
+    let workspace = TempDir::new()?;
+    let script = diagnostics_fixture::write_hover_server(workspace.path())?;
+    let config_path = workspace.path().join("mcpls.toml");
+    let args = vec![
+        script.to_string_lossy().into_owned(),
+        "workspace-fixture".to_string(),
+    ];
+    write_fixture_config(
+        &config_path,
+        "elixir",
+        "python3",
+        &args,
+        &[],
+        false,
+        &["workspace_symbols"],
+    )?;
+
+    let config_arg = config_path.to_string_lossy().into_owned();
+    let mut client = McpClient::spawn_with_args(&["--config", &config_arg])?;
+    client.initialize()?;
+    let response = call_workspace_symbol_when_ready(&mut client)?;
+    assert!(
+        response.to_string().contains("workspace-fixture"),
+        "workspace symbol response should contain the fixture sentinel, got {response}"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "Requires mcpls binary built"]
+fn i1_t4_inactive_duplicate_cannot_choose_floor() -> Result<()> {
+    let control_report = run_duplicate_floor_case(false)?;
+    assert!(
+        control_report.contains("active-warning"),
+        "inactive-first control must deliver the active warning, got {control_report}"
+    );
+    assert!(
+        !control_report.contains("inactive-fixture"),
+        "inactive fixture must not publish, got {control_report}"
+    );
+    eprintln!("i1_t4 control (inactive-first): active warning delivered");
+
+    let active_first_report = run_duplicate_floor_case(true)?;
+    assert!(
+        active_first_report.contains("active-warning"),
+        "active-first declaration must still deliver the active warning, got {active_first_report}"
+    );
+    assert!(
+        !active_first_report.contains("inactive-fixture"),
+        "inactive fixture must not publish, got {active_first_report}"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "Requires mcpls binary built"]
+fn i1_t5_mixed_owner_startup_uses_each_grace() -> Result<()> {
+    let workspace = TempDir::new()?;
+    let script = diagnostics_fixture::write_mixed_startup_server(workspace.path())?;
+    let reporting_initialized = workspace.path().join("reporting-initialized.marker");
+    let silent_initialized = workspace.path().join("silent-initialized.marker");
+    let silent_startup_published = workspace.path().join("silent-startup-published.marker");
+    let silent_changed_published = workspace.path().join("silent-changed-published.marker");
+    let config_path = workspace.path().join("mcpls.toml");
+    write_mixed_startup_config(
+        &config_path,
+        &script,
+        &reporting_initialized,
+        &silent_initialized,
+        &silent_startup_published,
+        &silent_changed_published,
+    )?;
+    let reporting_file = workspace.path().join("main.ex");
+    let silent_file = workspace.path().join("main.hs");
+    fs::write(&reporting_file, "def reporting_fixture do\n  :ok\nend\n")?;
+    fs::write(&silent_file, "silentFixture = ()\n")?;
+
+    let config_arg = config_path
+        .to_str()
+        .context("fixture config path must be valid UTF-8")?;
+    let mut client = McpClient::spawn_with_args(&["--config", config_arg])?;
+    client.initialize()?;
+
+    wait_for_marker(&reporting_initialized)?;
+    wait_for_marker(&silent_initialized)?;
+    eprintln!("i1_t5 initialization acknowledgements recorded for both LSP processes");
+
+    let startup_wait_started = Instant::now();
+    wait_for_marker(&silent_startup_published)?;
+    let startup_delay = startup_wait_started.elapsed();
+    assert!(
+        startup_delay >= Duration::from_millis(1200),
+        "silent startup publication must follow the quiet interval, took {startup_delay:?}"
+    );
+    assert!(
+        startup_delay < Duration::from_secs(2),
+        "silent startup publication must precede the existing two-second grace, took {startup_delay:?}"
+    );
+    eprintln!("i1_t5 silent startup publication acknowledgement recorded after {startup_delay:?}");
+
+    let baseline_flush = wait_for_baseline_report(&mut client)?;
+    assert!(
+        !baseline_flush.contains("silent-startup"),
+        "the silent owner's startup publication must be included in the baseline, got {baseline_flush}"
+    );
+
+    let hover = call_hover_when_ready(&mut client, &silent_file)?;
+    assert!(
+        hover.to_string().contains("mixed-startup-fixture"),
+        "the silent owner must remain routable after startup, got {hover}"
+    );
+    wait_for_marker(&silent_changed_published)?;
+
+    let changed_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let response = client.call_tool("get_new_diagnostics", &json!({}))?;
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .with_context(|| format!("expected diagnostic text content, got {response}"))?;
+        if text.contains("silent-after-startup") {
+            break;
+        }
+        if Instant::now() >= changed_deadline {
+            anyhow::bail!("explicit silent-after-startup publication was not delivered: {text}");
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    Ok(())
+}
+
+#[test]
+#[ignore = "Requires mcpls binary built"]
+fn i1_t5_successful_non_diagnostics_progress_does_not_hold_baseline() -> Result<()> {
+    let workspace = TempDir::new()?;
+    let script = diagnostics_fixture::write_mixed_startup_server(workspace.path())?;
+    let initialized_marker = workspace.path().join("holding-initialized.marker");
+    let progress_marker = workspace.path().join("holding-progress.marker");
+    let config_path = workspace.path().join("mcpls.toml");
+    write_non_diagnostics_config(&config_path, &script, &initialized_marker, &progress_marker)?;
+    let file_path = workspace.path().join("main.ex");
+    fs::write(&file_path, "def fixture do\n  :ok\nend\n")?;
+
+    let config_arg = config_path
+        .to_str()
+        .context("fixture config path must be valid UTF-8")?;
+    let mut client = McpClient::spawn_with_args(&["--config", config_arg])?;
+    client.initialize()?;
+    wait_for_marker(&initialized_marker)?;
+    wait_for_marker(&progress_marker)?;
+    eprintln!(
+        "i1_t5 successful non-diagnostics server initialization and progress acknowledgements recorded"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let response = client.call_tool("get_new_diagnostics", &json!({}))?;
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .with_context(|| format!("expected diagnostic text content, got {response}"))?;
+        let payload: serde_json::Value = serde_json::from_str(text)?;
+        if payload.get("note").is_none() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("successful non-diagnostics server held the baseline: {text}");
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    let hover = call_hover_when_ready(&mut client, &file_path)?;
+    assert!(
+        hover.to_string().contains("mixed-startup-fixture"),
+        "the successful non-diagnostics server must remain routable for hover, got {hover}"
+    );
+    Ok(())
+}
 
 /// Test the MCP initialize handshake.
 ///
@@ -373,6 +1070,98 @@ fn test_e2e_new_diagnostics_in_protocol_only_mode() -> Result<()> {
     assert_eq!(payload["cleared"].as_array().map(Vec::len), Some(0));
 
     Ok(())
+}
+
+#[test]
+#[ignore = "Requires mcpls binary built"]
+fn i1_t3_all_failed_startup_flushes_empty() -> Result<()> {
+    let workspace = TempDir::new()?;
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[package]\nname = \"fixture\"\n",
+    )?;
+
+    let config_path = workspace.path().join("mcpls.toml");
+    let missing_command = workspace.path().join("missing-rust-analyzer");
+    assert!(
+        !missing_command.exists(),
+        "the fixture executable must be absent before startup"
+    );
+    let missing_command = missing_command
+        .to_str()
+        .context("missing fixture executable path must be valid UTF-8")?;
+    write_fixture_config(&config_path, "rust", missing_command, &[], &[], false, &[])?;
+
+    let file_path = workspace.path().join("src/lib.rs");
+    fs::create_dir_all(
+        file_path
+            .parent()
+            .context("fixture file must have a parent")?,
+    )?;
+    fs::write(&file_path, "fn fixture() {}\n")?;
+
+    let config_arg = config_path
+        .to_str()
+        .context("fixture config path must be valid UTF-8")?;
+    let mut client = McpClient::spawn_with_args(&["--config", config_arg])?;
+    client.initialize()?;
+
+    let startup_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match client.call_tool(
+            "get_hover",
+            &json!({
+                "file_path": file_path,
+                "line": 0,
+                "character": 0,
+            }),
+        ) {
+            Ok(response) => panic!(
+                "the missing Rust LSP executable unexpectedly returned hover data: {response}"
+            ),
+            Err(error)
+                if error.to_string().contains("still initializing")
+                    && Instant::now() < startup_deadline =>
+            {
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => {
+                let message = error.to_string();
+                assert!(
+                    message.contains("no LSP server configured for language: rust"),
+                    "the failed Rust server should be removed from routing after spawn failure, \
+                     got {message}"
+                );
+                break;
+            }
+        }
+    }
+
+    let diagnostics_deadline = Instant::now() + Duration::from_secs(2);
+    let mut startup_notes = 0;
+    loop {
+        let response = client.call_tool("get_new_diagnostics", &json!({}))?;
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .with_context(|| format!("expected diagnostic text content, got {response}"))?;
+        let payload: serde_json::Value = serde_json::from_str(text)?;
+
+        if payload.get("note").is_some() {
+            startup_notes += 1;
+            if Instant::now() >= diagnostics_deadline {
+                anyhow::bail!(
+                    "get_new_diagnostics kept returning startup notes after the Rust server \
+                     spawn failure ({startup_notes} polls): {payload}"
+                );
+            }
+            thread::sleep(Duration::from_millis(50));
+            continue;
+        }
+
+        assert_eq!(payload["changed"].as_array().map(Vec::len), Some(0));
+        assert_eq!(payload["cleared"].as_array().map(Vec::len), Some(0));
+        return Ok(());
+    }
 }
 
 /// Test that mcpls exits promptly on `SIGTERM` while the client's stdin

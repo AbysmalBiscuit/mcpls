@@ -265,6 +265,14 @@ impl Translator {
         // asked for it, so once that process is gone the glob only produces
         // notify calls to a connection nobody is reading.
         self.forget_watch_registrations(id);
+        let caches_diagnostics = self.is_diagnostics_route(&language_id, id);
+        let mut replacement_attempt = if caches_diagnostics {
+            self.notification_pumps
+                .get()
+                .map(|pumps| pumps.prepare_diagnostics_replacement(id))
+        } else {
+            None
+        };
         let mut new_server = match LspServer::spawn(config).await {
             Ok(server) => server,
             Err(err) => {
@@ -281,7 +289,6 @@ impl Translator {
         if let Some(pumps) = self.notification_pumps.get() {
             pumps.retire(id).await;
         }
-        let caches_diagnostics = self.is_diagnostics_route(&language_id, id);
         if caches_diagnostics && let Some(cache) = &self.notification_cache {
             cache.lock().await.clear_server_diagnostics(id);
         }
@@ -289,6 +296,12 @@ impl Translator {
         self.document_tracker.forget_server(id);
         if let Some(pumps) = self.notification_pumps.get() {
             pumps.install(id.clone(), notification_rx, caches_diagnostics);
+            if caches_diagnostics {
+                pumps.register_diagnostics_owner(id);
+                if let Some(attempt) = replacement_attempt.as_mut() {
+                    attempt.complete();
+                }
+            }
         }
         let old_server = lock_std(&self.lsp_servers).insert(id.clone(), new_server);
         lock_std(&self.lsp_clients).insert(id.clone(), new_client);

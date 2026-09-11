@@ -1406,10 +1406,10 @@ mod tests {
     /// #249 S1 regression: a `sync_phase` call that captured `server`'s
     /// generation *before* a concurrent `forget_server` bumped it must not
     /// commit its `synced` write, even though its notification against the
-    /// now-superseded connection reports success (`fake_lsp_client`'s `cat`
-    /// backend always accepts writes, standing in for the window where a
-    /// server's process has already died but its message loop has not yet
-    /// observed that). Without this, a document synced against the old
+    /// now-superseded connection reports success (`fake_lsp_client`'s pipe
+    /// accepts writes while its guard is held, standing in for the window
+    /// where a server's process has already died but its message loop has
+    /// not yet observed that). Without this, a document synced against the old
     /// (crashed) process would be wrongly marked as already open on the
     /// respawned one, permanently desyncing it.
     #[tokio::test]
@@ -2169,76 +2169,31 @@ mod tests {
     // ensure_open resync (issue #102)
     // ------------------------------------------------------------------
 
-    use std::process::Stdio;
-
     use tempfile::TempDir;
     use tokio::io::BufReader;
-    use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
     use crate::config::LspServerConfig;
-    use crate::lsp::LspTransport;
-    use crate::test_support::{assert_no_frame_within, read_framed_message};
+    use crate::test_support::{
+        FakeServer, assert_no_frame_within, fake_lsp_transport, read_framed_message,
+    };
 
-    /// Holds both fake-transport child processes alive for a test.
-    ///
-    /// The read-half's stdin is deliberately never written to, so its `cat`
-    /// process never sees EOF on input, never exits, and its stdout (which
-    /// backs the transport's `receive()`) never closes -- `receive()` pends
-    /// forever instead of observing EOF and tearing down the client's
-    /// message loop. Using `echo` here instead would exit immediately and
-    /// break every subsequent `notify()` call.
-    ///
-    /// `write_stdout` is the write-half's own stdout: since `cat` echoes
-    /// whatever mcpls writes to its stdin, reading this back is how a test
-    /// observes the actual framed JSON-RPC bytes sent to the "server".
-    struct FakeServer {
-        _write_half: Child,
-        _read_half: Child,
-        _read_half_stdin: ChildStdin,
-        write_stdout: ChildStdout,
-    }
-
-    /// Builds an `LspClient` backed by two `cat` child processes so
-    /// `notify()` succeeds without a real language server.
+    /// Builds an `LspClient` over an in-memory [`FakeServer`]: reading its
+    /// `write_stdout` back is how a test observes the actual framed
+    /// JSON-RPC bytes sent to the "server".
     fn fake_lsp_client() -> (LspClient, FakeServer) {
-        let mut write_half = Command::new("cat")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        let write_stdin = write_half.stdin.take().unwrap();
-        let write_stdout = write_half.stdout.take().unwrap();
-
-        let mut read_half = Command::new("cat")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        let read_stdout = read_half.stdout.take().unwrap();
-        let read_stdin = read_half.stdin.take().unwrap();
-
-        let transport = LspTransport::new(write_stdin, read_stdout);
-        let client = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport);
-
+        let (transport, server) = fake_lsp_transport();
         (
-            client,
-            FakeServer {
-                _write_half: write_half,
-                _read_half: read_half,
-                _read_half_stdin: read_stdin,
-                write_stdout,
-            },
+            LspClient::from_transport(LspServerConfig::rust_analyzer(), transport),
+            server,
         )
     }
 
     /// An `LspClient` whose notifications succeed, discarding the
     /// `FakeServer` guard the tracker tests do not read back from.
     ///
-    /// The guard owns two `cat` children with `kill_on_drop`, so it is
-    /// returned alongside the client and the caller must hold it for as
-    /// long as it uses the client.
+    /// Dropping the guard closes the client's pipes, so it is returned
+    /// alongside the client and the caller must hold it for as long as it
+    /// uses the client.
     fn fake_client() -> (LspClient, FakeServer) {
         fake_lsp_client()
     }

@@ -15,7 +15,7 @@
 //! between phases a server that is already talking has started, not the
 //! silence before a slower one has said anything at all.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -49,6 +49,12 @@ pub struct ServerSettle {
 #[derive(Debug)]
 struct SettleState {
     outstanding: HashSet<(ServerId, String)>,
+    server_progress: HashMap<ServerId, ServerProgress>,
+    diagnostics_owners: HashSet<ServerId>,
+    owners_installed: bool,
+    pending_owners: HashSet<ServerId>,
+    replacement_pending: HashSet<ServerId>,
+    retired_servers: HashSet<ServerId>,
     /// When the outstanding set last became empty. `None` until the first
     /// operation ends, so a process that has not yet heard from a server is
     /// not mistaken for one whose servers have finished.
@@ -57,6 +63,13 @@ struct SettleState {
     deadline: Instant,
     /// How many long-running operations have ever begun.
     epoch: u64,
+}
+
+#[derive(Debug, Default)]
+struct ServerProgress {
+    outstanding: HashSet<String>,
+    quiet_since: Option<Instant>,
+    progress_seen: bool,
 }
 
 impl ServerSettle {
@@ -70,6 +83,12 @@ impl ServerSettle {
         Self {
             state: Mutex::new(SettleState {
                 outstanding: HashSet::new(),
+                server_progress: HashMap::new(),
+                diagnostics_owners: HashSet::new(),
+                owners_installed: false,
+                pending_owners: HashSet::new(),
+                replacement_pending: HashSet::new(),
+                retired_servers: HashSet::new(),
                 quiet_since: None,
                 deadline: Instant::now() + deadline_after,
                 epoch: 0,
@@ -77,6 +96,69 @@ impl ServerSettle {
             quiet_for,
             deadline_after,
         }
+    }
+
+    /// Set the diagnostics owners whose startup silence needs its own grace.
+    pub fn set_diagnostics_owners(&self, owners: impl IntoIterator<Item = ServerId>) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let owners: HashSet<_> = owners.into_iter().collect();
+        state.pending_owners.retain(|owner| owners.contains(owner));
+        let replacement_owners = owners
+            .iter()
+            .filter(|owner| state.replacement_pending.contains(*owner))
+            .cloned()
+            .collect::<Vec<_>>();
+        state.pending_owners.extend(replacement_owners);
+        state.diagnostics_owners = owners
+            .into_iter()
+            .filter(|owner| !state.retired_servers.contains(owner))
+            .collect();
+        state.owners_installed = true;
+    }
+
+    /// Re-install a diagnostics owner after a server replacement completed.
+    pub(crate) fn register_diagnostics_owner(&self, server: &ServerId) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        state.retired_servers.remove(server);
+        state.pending_owners.remove(server);
+        state.replacement_pending.remove(server);
+        state.diagnostics_owners.insert(server.clone());
+        let progress = state.server_progress.entry(server.clone()).or_default();
+        if progress.outstanding.is_empty() && progress.quiet_since.is_none() {
+            progress.quiet_since = Some(Instant::now());
+        }
+    }
+
+    /// Keep a retiring diagnostics owner in the startup wait until its replacement is installed.
+    pub(crate) fn begin_diagnostics_replacement(&self, server: &ServerId) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        state.replacement_pending.insert(server.clone());
+        if state.diagnostics_owners.contains(server) {
+            state.pending_owners.insert(server.clone());
+        }
+    }
+
+    /// Clear an unfinished replacement and retire its old owner state.
+    pub(crate) fn abort_diagnostics_replacement(&self, server: &ServerId) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        state.replacement_pending.remove(server);
+        state.pending_owners.remove(server);
+        let before = state.outstanding.len();
+        state.outstanding.retain(|(id, _)| id != server);
+        if state.outstanding.len() != before && state.outstanding.is_empty() {
+            state.quiet_since = Some(Instant::now());
+        }
+        state.server_progress.remove(server);
+        state.diagnostics_owners.remove(server);
+        state.retired_servers.insert(server.clone());
     }
 
     /// Measure the deadline from now instead of from construction.
@@ -106,6 +188,13 @@ impl ServerSettle {
         if state.outstanding.is_empty() && state.quiet_since.is_none() {
             state.quiet_since = Some(now);
         }
+        let owners = state.diagnostics_owners.clone();
+        for owner in owners {
+            let progress = state.server_progress.entry(owner).or_default();
+            if progress.outstanding.is_empty() && progress.quiet_since.is_none() {
+                progress.quiet_since = Some(now);
+            }
+        }
     }
 
     /// Record that `server` started a long-running operation.
@@ -116,9 +205,12 @@ impl ServerSettle {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
-        state
-            .outstanding
-            .insert((server.clone(), token.to_string()));
+        let token = token.to_string();
+        state.outstanding.insert((server.clone(), token.clone()));
+        let progress = state.server_progress.entry(server.clone()).or_default();
+        progress.outstanding.insert(token);
+        progress.progress_seen = true;
+        progress.quiet_since = None;
         state.quiet_since = None;
         state.epoch += 1;
     }
@@ -134,11 +226,15 @@ impl ServerSettle {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
-        if !state
-            .outstanding
-            .remove(&(server.clone(), token.to_string()))
-        {
+        let token = token.to_string();
+        if !state.outstanding.remove(&(server.clone(), token.clone())) {
             return;
+        }
+        if let Some(progress) = state.server_progress.get_mut(server) {
+            progress.outstanding.remove(&token);
+            if progress.outstanding.is_empty() {
+                progress.quiet_since = Some(now);
+            }
         }
         if state.outstanding.is_empty() {
             state.quiet_since = Some(now);
@@ -160,6 +256,12 @@ impl ServerSettle {
         if state.outstanding.len() != before && state.outstanding.is_empty() {
             state.quiet_since = Some(Instant::now());
         }
+        state.server_progress.remove(server);
+        let was_owner = state.diagnostics_owners.remove(server);
+        if was_owner && state.replacement_pending.contains(server) {
+            state.pending_owners.insert(server.clone());
+        }
+        state.retired_servers.insert(server.clone());
     }
 
     /// How many long-running operations have ever begun.
@@ -211,18 +313,43 @@ impl ServerSettle {
         if now >= state.deadline {
             return true;
         }
-        if !state.outstanding.is_empty() {
+        if !state.owners_installed {
+            if !state.outstanding.is_empty() {
+                return false;
+            }
+            let Some(since) = state.quiet_since else {
+                return false;
+            };
+            let required = if state.epoch == 0 {
+                NO_PROGRESS_GRACE
+            } else {
+                self.quiet_for
+            };
+            return now.duration_since(since) >= required;
+        }
+        if !state.pending_owners.is_empty() {
             return false;
         }
-        let Some(since) = state.quiet_since else {
-            return false;
-        };
-        let required = if state.epoch == 0 {
-            NO_PROGRESS_GRACE
-        } else {
-            self.quiet_for
-        };
-        now.duration_since(since) >= required
+        for owner in &state.diagnostics_owners {
+            let Some(progress) = state.server_progress.get(owner) else {
+                return false;
+            };
+            if !progress.outstanding.is_empty() {
+                return false;
+            }
+            let Some(owner_quiet_since) = progress.quiet_since else {
+                return false;
+            };
+            let required = if progress.progress_seen {
+                self.quiet_for
+            } else {
+                NO_PROGRESS_GRACE
+            };
+            if now.duration_since(owner_quiet_since) < required {
+                return false;
+            }
+        }
+        true
     }
 
     /// [`Self::should_settle_at`] as of now.
@@ -561,5 +688,125 @@ mod tests {
 
         settle.begin(&rust, &json!("flycheck"));
         assert_eq!(settle.progress_epoch(), before + 1);
+    }
+
+    #[test]
+    fn i1_t5_owner_progress_uses_the_exact_quiet_boundary() {
+        let quiet_for = Duration::from_millis(10);
+        let settle = ServerSettle::new(quiet_for, Duration::from_secs(60));
+        let owner = ServerId::from("owner");
+        settle.set_diagnostics_owners([owner.clone()]);
+        settle.restart_deadline();
+        settle.begin(&owner, &json!("indexing"));
+        let quiet_started = Instant::now();
+        settle.end_at(&owner, &json!("indexing"), quiet_started);
+
+        assert!(
+            !settle.should_settle_at(
+                (quiet_started + quiet_for)
+                    .checked_sub(Duration::from_nanos(1))
+                    .unwrap()
+            )
+        );
+        assert!(settle.should_settle_at(quiet_started + quiet_for));
+    }
+
+    #[test]
+    fn i1_t5_pre_registration_progress_keeps_its_quiet_state() {
+        let quiet_for = Duration::from_millis(10);
+        let settle = ServerSettle::new(quiet_for, Duration::from_secs(60));
+        let owner = ServerId::from("owner");
+        settle.begin(&owner, &json!("indexing"));
+        let quiet_started = Instant::now();
+        settle.end_at(&owner, &json!("indexing"), quiet_started);
+
+        settle.set_diagnostics_owners([owner]);
+        settle.restart_deadline();
+
+        assert!(!settle.should_settle_at(quiet_started + quiet_for / 2));
+        assert!(settle.should_settle_at(quiet_started + quiet_for * 2));
+    }
+
+    #[test]
+    fn i1_t5_excluded_progress_does_not_delay_empty_owner_set() {
+        let settle = ServerSettle::new(Duration::from_millis(10), Duration::from_secs(60));
+        let excluded = ServerId::from("excluded");
+        settle.begin(&excluded, &json!("indexing"));
+        settle.set_diagnostics_owners(std::iter::empty());
+        settle.restart_deadline();
+
+        assert!(settle.should_settle_at(Instant::now()));
+    }
+
+    #[test]
+    fn i1_t5_excluded_progress_does_not_delay_nonempty_owner_set() {
+        let quiet_for = Duration::from_millis(10);
+        let settle = ServerSettle::new(quiet_for, Duration::from_secs(60));
+        let owner = ServerId::from("owner");
+        let excluded = ServerId::from("excluded");
+        settle.begin(&owner, &json!("indexing"));
+        settle.begin(&excluded, &json!("indexing"));
+        let owner_quiet_started = Instant::now();
+        settle.end_at(&owner, &json!("indexing"), owner_quiet_started);
+        settle.set_diagnostics_owners([owner]);
+        settle.restart_deadline();
+
+        assert!(!settle.should_settle_at(owner_quiet_started + quiet_for / 2));
+        assert!(settle.should_settle_at(owner_quiet_started + quiet_for));
+    }
+
+    #[test]
+    fn i1_t5_retiring_one_owner_preserves_another_owner() {
+        let quiet_for = Duration::from_millis(10);
+        let settle = ServerSettle::new(quiet_for, Duration::from_secs(60));
+        let rust = ServerId::from("rust");
+        let python = ServerId::from("python");
+        settle.set_diagnostics_owners([rust.clone(), python.clone()]);
+        settle.restart_deadline();
+        settle.begin(&rust, &json!("indexing"));
+        settle.begin(&python, &json!("indexing"));
+        let python_quiet_started = Instant::now();
+        settle.end_at(&python, &json!("indexing"), python_quiet_started);
+        settle.forget_server(&rust);
+
+        assert!(settle.should_settle_at(python_quiet_started + quiet_for * 2));
+    }
+
+    #[test]
+    fn i1_t5_retired_before_owner_installation_does_not_create_wait() {
+        let quiet_for = Duration::from_millis(10);
+        let settle = ServerSettle::new(quiet_for, Duration::from_secs(60));
+        let retired = ServerId::from("retired");
+        let surviving = ServerId::from("surviving");
+        settle.begin(&surviving, &json!("indexing"));
+        let surviving_quiet_started = Instant::now();
+        settle.end_at(&surviving, &json!("indexing"), surviving_quiet_started);
+        settle.forget_server(&retired);
+
+        settle.set_diagnostics_owners([retired, surviving]);
+        settle.restart_deadline();
+
+        assert!(settle.should_settle_at(surviving_quiet_started + quiet_for));
+    }
+
+    #[test]
+    fn i1_t5_aborted_replacement_is_not_resurrected_by_delayed_owner_installation() {
+        let quiet_for = Duration::from_millis(10);
+        let settle = ServerSettle::new(quiet_for, Duration::from_secs(60));
+        let replacement = ServerId::from("replacement");
+        let surviving = ServerId::from("surviving");
+        settle.set_diagnostics_owners([replacement.clone(), surviving.clone()]);
+        settle.restart_deadline();
+        settle.begin(&replacement, &json!("indexing"));
+        settle.begin(&surviving, &json!("indexing"));
+        let surviving_quiet_started = Instant::now();
+        settle.end_at(&surviving, &json!("indexing"), surviving_quiet_started);
+        settle.begin_diagnostics_replacement(&replacement);
+        settle.forget_server(&replacement);
+        settle.abort_diagnostics_replacement(&replacement);
+
+        settle.set_diagnostics_owners([replacement, surviving]);
+
+        assert!(settle.should_settle_at(surviving_quiet_started + quiet_for));
     }
 }

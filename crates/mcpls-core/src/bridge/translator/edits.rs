@@ -2144,7 +2144,7 @@ mod tests {
         let next = dir.path().join("next.rs");
         fs::write(&stale, "fn old() {}\n").expect("write the stale fixture");
         fs::write(&next, "fn other() {}\n").expect("write the second fixture");
-        let stale_canonical = stale.canonicalize().expect("stale.rs exists");
+        let stale_canonical = dunce::canonicalize(&stale).expect("stale.rs exists");
         let stale_uri =
             crate::bridge::path_to_uri(&stale_canonical).expect("uri for the stale fixture");
 
@@ -2262,7 +2262,7 @@ mod tests {
             let mut canonical = Vec::new();
             for path in [&first, &second] {
                 fs::write(path, "fn old() {}\n").expect("write the fixture");
-                canonical.push(path.canonicalize().expect("the fixture exists"));
+                canonical.push(dunce::canonicalize(path).expect("the fixture exists"));
 
                 let opening = {
                     let translator = Arc::clone(&translator);
@@ -2459,7 +2459,7 @@ mod tests {
         let other = dir.path().join("other.rs");
         fs::write(&anchor, "fn caller() {}\n").expect("write the anchor fixture");
         fs::write(&other, "fn old() {}\n").expect("write the other fixture");
-        let other_canonical = other.canonicalize().expect("the other fixture exists");
+        let other_canonical = dunce::canonicalize(&other).expect("the other fixture exists");
         let other_uri = crate::bridge::path_to_uri(&other_canonical).expect("uri for other.rs");
 
         let mut wire = BufReader::new(&mut server.write_stdout);

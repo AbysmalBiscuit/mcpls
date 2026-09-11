@@ -9,10 +9,10 @@
 //! ```
 
 use std::collections::HashMap;
+use std::fmt;
 
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{ChildStdin, ChildStdout};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tracing::{debug, trace, warn};
 
 use crate::error::{Error, Result};
@@ -21,14 +21,16 @@ use crate::lsp::types::{InboundMessage, JsonRpcNotification, JsonRpcRequest, Jso
 /// Maximum allowed Content-Length (10 MB)
 const MAX_CONTENT_LENGTH: usize = 10 * 1024 * 1024;
 
+type Writer = Box<dyn AsyncWrite + Send + Unpin>;
+type Reader = Box<dyn AsyncRead + Send + Unpin>;
+
 /// LSP transport layer handling header-content format.
 ///
 /// This transport handles the LSP protocol's header-content message format,
 /// parsing Content-Length headers and reading exact message content.
-#[derive(Debug)]
 pub struct LspTransport {
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    stdin: Writer,
+    stdout: BufReader<Reader>,
     // Outbound commands can cancel receive between any two reads.
     receive_state: ReceiveState,
 }
@@ -54,18 +56,30 @@ impl Default for ReceiveState {
     }
 }
 
+impl fmt::Debug for LspTransport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LspTransport")
+            .field("receive_state", &self.receive_state)
+            .finish_non_exhaustive()
+    }
+}
+
 impl LspTransport {
-    /// Create transport from child process stdio.
+    /// Create transport from a server's stdio, or any byte streams standing
+    /// in for it.
     ///
     /// # Arguments
     ///
-    /// * `stdin` - The child process's stdin handle for sending messages
-    /// * `stdout` - The child process's stdout handle for receiving messages
+    /// * `stdin` - Where messages to the server are written
+    /// * `stdout` - Where messages from the server are read
     #[must_use]
-    pub fn new(stdin: ChildStdin, stdout: ChildStdout) -> Self {
+    pub fn new(
+        stdin: impl AsyncWrite + Send + Unpin + 'static,
+        stdout: impl AsyncRead + Send + Unpin + 'static,
+    ) -> Self {
         Self {
-            stdin,
-            stdout: BufReader::new(stdout),
+            stdin: Box::new(stdin),
+            stdout: BufReader::new(Box::new(stdout)),
             receive_state: ReceiveState::default(),
         }
     }
@@ -148,7 +162,7 @@ impl LspTransport {
     /// Headers are in the format "Key: Value\r\n" and are terminated by
     /// a blank line ("\r\n").
     async fn read_headers(
-        stdout: &mut BufReader<ChildStdout>,
+        stdout: &mut BufReader<Reader>,
         headers: &mut HashMap<String, String>,
         line_buffer: &mut Vec<u8>,
     ) -> Result<usize> {
@@ -194,7 +208,7 @@ impl LspTransport {
 
     /// Read the remaining content bytes and convert the complete message to UTF-8.
     async fn read_content(
-        stdout: &mut BufReader<ChildStdout>,
+        stdout: &mut BufReader<Reader>,
         content: &mut Vec<u8>,
         read: &mut usize,
     ) -> Result<String> {
@@ -426,17 +440,15 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     mod fragmented_frames {
-        use std::process::Stdio;
         use std::time::Duration;
 
-        use tokio::process::Command;
         use tokio::sync::mpsc;
 
         use super::*;
         use crate::config::LspServerConfig;
         use crate::lsp::{LspClient, LspNotification};
+        use crate::test_support::{FakeServer, fake_lsp_transport};
 
         enum Boundary {
             HeaderLine,
@@ -445,24 +457,12 @@ mod tests {
         }
 
         async fn assert_fragment_survives_outbound_response(boundary: Boundary) {
-            let mut outbound = Command::new("cat")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()
-                .unwrap();
-            let mut inbound = Command::new("cat")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()
-                .unwrap();
-            let mut server_writer = inbound.stdin.take().unwrap();
-            let mut server_reader = BufReader::new(outbound.stdout.take().unwrap());
-            let mut transport = LspTransport::new(
-                outbound.stdin.take().unwrap(),
-                inbound.stdout.take().unwrap(),
-            );
+            let (mut transport, server) = fake_lsp_transport();
+            let FakeServer {
+                read_half_stdin: mut server_writer,
+                write_stdout,
+            } = server;
+            let mut server_reader = BufReader::new(write_stdout);
 
             let request = serde_json::json!({
                 "jsonrpc": "2.0", "id": 99,

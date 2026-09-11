@@ -1,6 +1,6 @@
 # Diagnostics injection
 
-Status: stages A, B and C shipped.
+Status: stages A, B and C shipped; final validation is recorded in the dated completion note.
 
 Revised twice after adversarial review, each round verifying claims against the source rather than against the previous draft. The second round found that B3's original wait could not fire for the case it existed to serve, that B1's split between committing a version and sending the notification would desync a server permanently on a cancelled request, that a footer flushing before the baseline landed would flood the session, that stage C's socket arbitration let two instances both believe they owned it, and that the footer's cap was shorter than this repository's own `cargo check`. Those are fixed here. Where a claim now rests on a measurement, the measurement is named so it can be re-run.
 
@@ -70,6 +70,8 @@ Four semantics are settled explicitly rather than left to discover:
 
 Dropping a built-in was free under replace semantics and needs a spelling under merge: `enabled = false` on an entry removes that server. This is a deliberate breaking change. A config that lists one server in order to suppress the rest must now disable the rest by name.
 
+The generated config is a sparse template. Omitted workspace mappings and LSP-server entries continue to resolve through the built-in defaults; the template does not turn those defaults into user-owned overrides. A custom server that serves any document-scoped tool must have an effective extension mapping for its language, supplied by `file_patterns` or a matching workspace language mapping. A server restricted to `workspace_symbols` is exempt because that route has no document to map.
+
 ### A2: the deduplication core
 
 A new module under `bridge`, not an addition to `notifications.rs`, which is already long enough that adding a second responsibility to it would be the wrong shape.
@@ -86,6 +88,8 @@ Deduplication is per file rather than per diagnostic. This needs far less state,
 
 Gate the baseline on servers settling instead. `diagnostics_pump` already receives `$/progress` and discards it (`lib.rs:194-200`); tracking end-of-progress per server gives the signal, and rust-analyzer names its tokens `rustAnalyzer/Indexing` and `rustAnalyzer/Flycheck`. A session's baseline is the cache as of the moment its servers went quiet.
 
+Successful registration defines the startup boundary. The diagnostics floor table is built from the servers applicable to the workspace after heuristics, and each applicable server may override the global floor; an inapplicable server cannot affect the active route. Each active diagnostics owner then gets its own readiness check: an owner that has not reported progress receives the existing two-second no-progress grace, while an owner that has reported progress must reach the normal quiet debounce. Failed and non-diagnostics servers do not add an owner wait. If every applicable server fails, routing is rebound to the empty set, the expected-server state is cleared, and an empty baseline is adopted so later flushes return an ordinary settled empty report.
+
 **Stale publishes.** `diagnostics_pump` (`lib.rs:162`) already receives `p.version` and hands it to `store_diagnostics` (`bridge/notifications.rs:606`). It gains a `DocumentTracker` handle in `PumpShared` (`lib.rs:120-135`) so a publish whose version is below the tracked version is dropped rather than stored. Without that, a late publish describing pre-edit text overwrites the current entry, flips the file's hash, shows the agent errors for text that no longer exists, and flips back on the next publish.
 
 Two rules keep the check from eating what it should pass. A publish carrying no version, or naming a path with no tracked entry, is stored rather than dropped: untracked fanout files are precisely what this feature exists to deliver, and rust-analyzer publishes for them without a version. And the check only bites once stage B stops closing documents on apply, because `close` removes the tracker entry (`bridge/translator/mod.rs:363`) and a reopen restarts at version 1, leaving nothing to compare a late version 7 against. Landing the check in stage A is still right; it is inert until B, and B is where it matters.
@@ -98,7 +102,7 @@ What the check cannot catch, after B1, is worth stating so a later reader does n
 
 `get_new_diagnostics` (`mcp/server.rs:736`). Always present, no configuration. The agent calls it and gets everything new since its last flush. Every later mention of "the flush" in this document means this tool, or the socket op that shares its record.
 
-The record is keyed by session id from the start rather than retrofitted in stage C. Claude Code exports `CLAUDE_CODE_SESSION_ID` into the environment of the stdio MCP servers it spawns, confirmed against a running process, so the in-process door and the later hook door key on the same value and share one record. Where that variable is absent, a per-process constant serves, which is correct for one-process-per-client stdio.
+The record is keyed by session id from the start rather than retrofitted in stage C. A nonempty `CLAUDE_CODE_SESSION_ID` is deliberately shared by the stdio MCP process and hook process, so both doors use one record. An unset or empty variable uses a stable process-local fallback, keeping separate stdio processes from inheriting one another's records.
 
 ### Configuration
 
@@ -141,7 +145,7 @@ The core is pure, so it takes unit tests directly: a changed file is returned on
 
 A1 gets its own: a partial entry keeps the built-in's other fields, an entry overriding `command` drops the built-in's `args`, an entry with an unmatched id and no command is rejected naming the id, `enabled = false` removes a built-in, `args = []` produces empty arguments rather than the built-in's, and adding a `name` to a built-in `language_id` collides the way `ToolRouter::from_configs` already enforces.
 
-End to end, `tests/ra_e2e.rs` already drives a real rust-analyzer against `tests/fixtures/rust_workspace`. It gains a test that breaks a caller and asserts the fanout file appears in a later flush.
+End to end, `tests/ra_e2e.rs` drives a real rust-analyzer against `tests/fixtures/rust_workspace`. The apply scenario breaks a caller, captures the enclosing file together with the delivered rustc `E0428`, and then performs a settled follow-up flush that scans every changed file and diagnostic for the same source, code, message, and range. Unrelated diagnostics remain allowed.
 
 ## Stage B
 
@@ -200,7 +204,7 @@ Only some servers need this. Ten were checked against their own source at the co
 - **pyrefly** registers `FileSystemWatcher` patterns with the client (`pyrefly/lib/lsp/non_wasm/server.rs:5811`); the `notify`-based watcher elsewhere in that codebase belongs to the CLI `check` command. Measured against pyrefly 1.2.0, it acts on the notification but publishes only for documents it holds open, so watching buys it analysis currency for open documents rather than diagnostic delivery for unopened ones: `docs/superpowers/notes/2026-09-07-stage-b-measurements.md`, "Pyrefly on an unopened file". **ty** gates registration on the same client capability (`crates/ty_server/src/session.rs:955-975`, inside ruff's checkout rather than ty's).
 - **taplo** and **marksman** handle no watched-files notification at all. Nothing here changes that, and nothing can.
 
-So the payoff is gopls at default settings, tsgo on Linux, pyrefly, and ty. That is narrower than it first looked and still worth building, since two of the four are the fork owner's likely second and third languages.
+So the potential payoff is gopls at default settings, tsgo on Linux, pyrefly, and ty. That is narrower than it first looked and still worth building, since two of the four are the fork owner's likely second and third languages. The watcher path remains server-specific: this list describes source-checked behavior, not a claim that each server delivers diagnostics for every unopened file. Runtime e2e evidence in this repository covers rust-analyzer's resync path.
 
 The servers configured beyond these ten (bash, yaml, json, css, dockerfile, latex, nushell) were not checked. Check them before claiming this stage covers them.
 
@@ -237,7 +241,7 @@ The footer belongs here rather than in stage A because before B1 an apply ends b
 
 **It runs under the same guard the tool runs under.** `get_new_diagnostics` returns `starting_up()` without calling `flush` while `has_baseline()` is false (`mcp/server.rs:737-743`), and that guard is load-bearing rather than cosmetic: `flush` seeds a session's record from `baseline.clone().unwrap_or_default()` (`bridge/delivery.rs:162-165`), and `set_baseline` does not rewrite records that already exist. A footer that flushed before the baseline landed would create an empty record permanently, and the next flush would then report every warning in the workspace. Since the settle deadline is 300 seconds, the first rename of a session is squarely inside that window. So a footer is silent while `has_baseline()` is false, and it says nothing rather than saying "still starting up".
 
-**Where it lives.** The flush machinery is on `McplsServer`'s context, and `apply_locked` is on `Translator`, which cannot reach any of it. The footer therefore runs in the `#[tool]` handlers after the translator call returns, and its clock starts there rather than at the resync. Results are serialised as JSON (`mcp/server.rs:54-62`), so "append" means a field, not trailing text: one wrapper type at the MCP layer carrying `#[serde(flatten)] result: T` plus `#[serde(skip_serializing_if = "Option::is_none")] new_diagnostics: Option<NewDiagnosticsResult>`, used at all three call sites. That leaves the bridge's own DTOs untouched and keeps `NewDiagnosticsResult` where it already is.
+**Where it lives.** The flush machinery is on `McplsServer`'s context, and `apply_locked` is on `Translator`, which cannot reach any of it. The `#[tool]` handlers capture the current progress epoch before entering the translator write, then run the footer only after the write returns. If no progress begins after the captured epoch, the footer can finish after grace. If new progress begins, it waits for all outstanding work to become quiet or reaches the cap. Results are serialised as JSON (`mcp/server.rs:54-62`), so "append" means a field, not trailing text: one wrapper type at the MCP layer carrying `#[serde(flatten)] result: T` plus `#[serde(skip_serializing_if = "Option::is_none")] new_diagnostics: Option<NewDiagnosticsResult>`, used at all three call sites. That leaves the bridge's own DTOs untouched and keeps `NewDiagnosticsResult` where it already is.
 
 A footer fires only when the call actually wrote. `RenameResult::applied` (`bridge/translator/dto.rs:118`) is the test; a rename with `apply: false` changed nothing and has nothing to report.
 
@@ -246,7 +250,7 @@ A footer fires only when the call actually wrote. `RenameResult::applied` (`brid
 So the footer waits on the same `$/progress` signal the baseline uses, in three parts:
 
 1. Hold for `footer_grace_ms` (250) before looking at anything. The measurement below puts flycheck's start about 90 ms after `didSave`, and a footer that checks before then sees a quiet workspace and reports the pre-edit state.
-2. Then wait for quiet: nothing outstanding, held for `footer_quiet_ms` (200). Only progress that **began after the resync** counts, so an indexing run already in flight when the rename landed does not eat the whole cap.
+2. Then wait for quiet: nothing outstanding, held for `footer_quiet_ms` (200). If no progress begins after the captured epoch, the footer can finish after grace. If new progress begins, it waits for all outstanding work to become quiet or reaches the cap.
 3. Give up at `footer_wait_ms` (15000) and report whatever has landed.
 
 **Quiet has to be defined for a workspace that never reports progress.** `should_settle_at` requires `quiet_since` to have been stamped, and `quiet_since` is `None` until the first `end` ever arrives (`bridge/settle.rs:31-34`, `:110-113`). Under that judgment a workspace whose servers send no `$/progress` at all is never quiet, so every footer would burn the full cap. The footer's own judgment is therefore `outstanding.is_empty() && quiet_since.map_or(true, |since| now - since >= quiet)`: after the grace period, nothing outstanding and nothing ever reported counts as quiet. That is a second method on `ServerSettle`, not a change to the baseline's.
@@ -305,7 +309,7 @@ The first mcpls instance in a project binds. A later instance becomes passive an
 
 **Arbitration is a lock, not a probe.** Deciding ownership by connecting, and treating `ECONNREFUSED` as "the socket is stale, take it", cannot be made exclusive. `rename(2)` is atomic but not exclusive either: two passives that both saw the refusal both bind a temporary name and both rename over the final path, and both succeed. The second rename unlinks the first's inode from the path, leaving a listener nobody can reach that still believes it owns the session, serving its own record to its own flush tool while every hook reaches the other process. Nothing in that design lets the loser notice, so no test can catch it.
 
-So ownership is an advisory lock on `<hash>.lock`, held by the owner for its whole life: `LOCK_EX | LOCK_NB` on Unix, `first_pipe_instance(true)` on Windows, which fails when the pipe already exists. Whoever holds the lock owns the socket path and is the one who unlinks a stale file before binding. A passive instance retries the lock every 5 seconds rather than probing the socket. Stale detection stops being a connect attempt, which is what made it racy.
+So ownership is an advisory lock on `<hash>.lock`, held by the owner for its whole life: `LOCK_EX | LOCK_NB` on Unix, `first_pipe_instance(true)` on Windows, which fails when the pipe already exists. Whoever holds the lock owns the socket path and is the one who unlinks a stale file before binding. A passive instance retries the lock every 5 seconds rather than probing the socket. If an owner can no longer prove that it still holds the lock, it demotes to passive before serving local footer or flush delivery; it can promote again only after reacquiring the lock. Stale detection stops being a connect attempt, which is what made it racy.
 
 A passive instance's flush tool forwards to the owner over the socket rather than reading its own record, so one session has one record no matter which process the agent is talking to. **A passive instance also disables its footer**, and forwards a `changed` for its apply targets to the owner before returning the tool result. Otherwise the two doors read different records: the footer would consume from the passive's record while the next flush reads the owner's, delivering the same diagnostics twice, and the passive's own apply would never reach the owner's servers at all except by way of a `FileChanged` event.
 
@@ -357,7 +361,9 @@ Paths arriving from tool inputs are bounded by what the agent actually edited, s
 
 **The sweep stats every path and never trusts the host's event kind.** A hook process is spawned per event and arrives late, and an atomic save through a temporary file and a rename, which mcpls itself performs (`bridge/apply/journal.rs:204-227`), produces `unlink` followed by `add` or a bare `change` depending on how the watcher handles it. Acting on `unlink` would close a document that is alive again by the time the hook connects, drop its tracker entry, and tell every matching server the file was deleted, so gopls or pyrefly lose it until something reopens it. The kind is derived from the filesystem at sweep time: absent is a delete, present and tracked is a resync, present and untracked is a create if the tracker has never held it and a change otherwise. Servers tolerate either of the last two. The kind the host sent is a hint that the path is worth looking at, nothing more. This is the same rule B1 already applies to the apply queue.
 
-**The document ceiling is checked before the sweep opens anything, not discovered by hitting it.** Opening untracked paths to get build diagnostics spends slots against `workspace.max_documents`, and a wide external change can want more slots than remain. The sweep compares the current open count against the ceiling, opens as many of its untracked paths as fit, and reports the shortfall as a line in the flush output naming how many files it did not check and why. It never fails, and it never leaves the tracker so full that the next unrelated tool call dies with `DocumentLimitExceeded`. The paths it skipped are not remembered: the next change to any of them brings it back through the same filters.
+**The document ceiling is checked before the sweep opens anything, not discovered by hitting it.** Opening untracked paths to get build diagnostics spends slots against `workspace.max_documents`, and a wide external change can want more slots than remain. For a finite ceiling, the sweep reserves one slot for an ordinary request and uses only the remaining headroom for background opens; `max_documents = 0` means unlimited and makes no reservation. It reports any shortfall as a line in the flush output naming how many files it did not check and why. It never fails, and it never leaves the tracker so full that the next unrelated tool call dies with `DocumentLimitExceeded`. The paths it skipped are not remembered: the next change to any of them brings it back through the same filters.
+
+The shortfall is the latest sweep's status. A flush may carry it until the next sweep completes, at which point the status is replaced by that sweep's result or cleared when coverage is complete. It is not a diagnostic record and is not repeated as a new file on every flush.
 
 ### Hook set
 
@@ -419,15 +425,19 @@ The socket gets integration tests over a temporary directory: bind, a second ins
 
 The watcher filters get unit tests: a `target/` artifact dropped, a gitignored file dropped, a path matching a registered glob forwarded to that server and not to a server that did not register it, and the sweep deriving a delete from an absent file rather than from the event kind it was handed.
 
+The lock-loss test uses one process-global test-pause slot. Concurrent in-process libtest execution can make tests contend for that slot, so the configured nextest selectors isolate the cases in separate test processes. The limitation remains visible for final review.
+
 Every test that builds a path for one of these must build it with a drive letter on Windows, the way `mcp/server.rs:1736` already does. `Url::from_file_path` fails without one, and a test that silently skips its own assertion proves nothing on the platform this fork is installed on.
 
-Windows CI compiles and executes the unit and integration suites and runs native Clippy. Real named-pipe tests cover ownership, concurrent requests, saturated-pipe classification, and isolated namespace scans. These do not establish live plugin wiring or cross-user access control; execution evidence and remaining gates are recorded in the [follow-up validation note](../notes/2026-09-08-diagnostics-followup-validation.md).
+Windows CI compiles and executes the unit and integration suites and runs native Clippy. Real named-pipe tests cover ownership, concurrent requests, saturated-pipe classification, and isolated namespace scans. These do not establish live plugin wiring, cross-user access control, or manual Windows behavior; those issue #6 gates remain qualified in the [completion validation note](../notes/2026-09-10-diagnostics-completion-validation.md). The original artifact-equivalence comparison remains an issue #7 gate.
 
-**What no test in this repository can prove.** Whether Claude Code actually invokes `mcpls hook`, whether `mcpls` is on the hook process's `PATH`, and whether the two directory hashes agree on a given machine are all properties of a live host session. The tests above cover the socket, the protocol, and the filters; they say nothing about the wiring. `mcpls hook doctor` against a real session is the gate, and stage C is not done until it has been run. This is stated rather than papered over with a test that would only prove the mock agrees with itself.
+**What no test in this repository can prove.** Whether Claude Code actually invokes `mcpls hook`, whether `mcpls` is on the hook process's `PATH`, and whether the two directory hashes agree on a given machine are all properties of a live host session. The tests above cover the socket, the protocol, and the filters; they say nothing about the wiring. `mcpls hook doctor` against a real session remains the issue #6 gate. Stage C source behavior is shipped, while live host wiring and manual Windows behavior remain external validation.
 
 ## Multiple agents in one project directory
 
 Each session spawns its own mcpls over stdio. Whichever takes the lock owns the socket and serves every session's hooks; the rest stay passive and retry. Per-session records are keyed by `CLAUDE_CODE_SESSION_ID`, which both the hook payload and the MCP server's environment carry, so two agents get independent deduplication state from one warm set of servers and neither sees the other's already-delivered diagnostics.
+
+When `CLAUDE_CODE_SESSION_ID` is unset or empty, each stdio process uses its own stable fallback identity instead of sharing a record with another process.
 
 A passive instance's servers are warm but nobody is feeding them, so it routes both its doors to the owner: the flush forwards, the footer stays off, and an apply made through it sends its targets to the owner as a `changed`. The alternative is two records disagreeing about what has been delivered, which reads to the agent as duplicated diagnostics from one door and missing ones from the other.
 
@@ -464,21 +474,16 @@ Measured `cargo check` timings for the footer's cap live in B3 rather than here,
 
 ## Deferred from stage A
 
-Stage A's whole-branch review left a register of findings. Three of them land in B4 above because stage C's traffic makes them matter. These are the rest, recorded here so they survive the review workspace, each with the location that proves it:
+Stage A's whole-branch review left a register of findings. The completion work resolved the routing, generated-template, startup, floor, owner-readiness, session-identity, sweep-admission, lock-loss, and footer-timing entries. The real-RA follow-up in `tests/ra_e2e.rs` closes the remaining evidence gap for delivery deduplication. These items remain outside this completion scope:
 
-- A file whose visible set exceeds the whole total budget is deferred forever whenever any other file is delivered first in the same flush (`delivery.rs:203`). Unreachable at the defaults, reachable the moment `max_per_file = 0` is set.
-- The settle debounce takes one server's quiet for the workspace's quiet, so a configured server that reports no `$/progress` can still be analysing when the baseline is captured (`bridge/settle.rs:110`). Every built-in reports progress, so this waits on a configuration that adds one that does not.
-- `enabled = false` followed by a redefinition of the same id produces a server with no `file_patterns` and no `heuristics`, which loads without error and routes nothing (`config/server.rs:693-708`, `:780-804`). Separately, any entry with a novel `language_id` and no `file_patterns` is unroutable for the same reason.
-- The e2e's deduplication assertion is vacuous: the fixture's one error lands in the baseline, so the first real report is empty and the second being empty proves nothing (`ra_e2e.rs:1441-1520`). The sub-case still earns its place on reachability and on ruling out the deadline backstop, but it is not end-to-end coverage of dedup. B1's new e2e is the place to fix this.
-- `create_default_config_file` serialises `Self::default()`, freezing every built-in server into a new user's config file (`config/mod.rs:895-897`). It should write a commented template instead.
-- `SeverityFloor` serialises `lowercase` where `ToolKind` uses `snake_case` (`config/mod.rs:21`, `config/routing.rs:82`). Identical today for every existing variant; a bug the moment either gains a multi-word one.
-- `uri_to_path` is computed twice in the `PublishDiagnostics` arm, now on the hot path for every versioned publish (`lib.rs:140`, `:164`).
-- When every server fails to spawn, the early return at `lib.rs:986-1003` reaches neither the baseline task nor the settle deadline restart, so the flush tool answers "still starting up" for the life of the process. Pre-existing, and the empty-config path at `lib.rs:731-739` already shows the fix.
+- The `SeverityFloor` wire spelling still uses `lowercase`, while `ToolKind` uses `snake_case` (`config/mod.rs:21`, `config/routing.rs:82`). The spellings are identical for the current variants; a future multi-word variant would need an explicit serialization review.
+- `relativePatternSupport` remains deliberately unclaimed. A server that sends a relative watcher pattern is logged and skipped until support is added.
+- HTTP transport still needs a transport-level session id; the one-process-per-client record identity described here covers stdio.
 
 ## Risks
 
 - Advertising `didChangeWatchedFiles.dynamic_registration` changes what gopls and tsgo do at init. Both abandon their current behaviour on the strength of the advertisement. Land the advertisement and the notification together, in one commit.
-- Replacing forget-on-apply with a resync changes what servers see after every apply, which is the shipped feature's most-used path. The content comparison is what keeps it from cancelling flycheck repeatedly, and it needs the e2e test to prove it.
+- Replacing forget-on-apply with a resync changes what servers see after every apply, which is the shipped feature's most-used path. The content comparison is what keeps it from cancelling flycheck repeatedly, and the real rust-analyzer apply scenario covers that path and its delivery deduplication.
 - Claude Code's `FileChanged` watcher spawns a hook process per event and passes no ignore list. The `watchPaths` computation is the only thing bounding it, so it needs measuring on a repository mid-build rather than at rest.
 - Opening externally changed files to get build diagnostics consumes tracker slots against `workspace.max_documents`, and a wide external change can consume many at once. The filters and the debounce bound it, and the sweep checks the ceiling before opening rather than after.
 - The footer's cap trades latency against a delivered result, and the first value chosen for it (5 seconds) was already too low for this repository's own `cargo check`. The measurement in B3 is what 15 seconds rests on, and it drifts with the codebase. Re-run it rather than trusting the number.
