@@ -691,14 +691,14 @@ Whether a write tool appends the diagnostics its own edit caused to its result, 
 **Type**: Integer (milliseconds)
 **Default**: `250`
 
-How long a footer waits before it starts looking for quiet. The write handler captures a progress epoch before the write and the footer waits after the write returns, considering only progress that began after that epoch. A footer that checks too soon after a write can catch the language servers before they have reacted to it at all, and report the state from before the edit as if it were the result. Bounded by `footer_wait_ms`, which is the whole wait: a grace set above it is spent only up to it.
+How long a footer waits before it starts looking for quiet. The write handler captures a progress epoch before the write and the footer waits after the write returns. If no progress begins after the captured epoch, the footer can finish after grace. If new progress begins, it waits for all outstanding work to become quiet or reaches the cap. A footer that checks too soon after a write can catch the language servers before they have reacted to it at all, and report the state from before the edit as if it were the result. Bounded by `footer_wait_ms`, which is the whole wait: a grace set above it is spent only up to it.
 
 ### `diagnostics.footer_quiet_ms`
 
 **Type**: Integer (milliseconds)
 **Default**: `200`
 
-How long nothing may be outstanding before a footer calls it done. Only work that began after the pre-write progress epoch is considered. This is shorter than `settle_quiet_ms`, which bridges gaps between startup phases a footer never sees; what a footer bridges instead is the cancel-and-restart between two writes landing back to back.
+How long nothing may be outstanding before a footer calls it done. If no progress begins after the captured epoch, the footer can finish after grace. If new progress begins, it waits for all outstanding work to become quiet or reaches the cap. This is shorter than `settle_quiet_ms`, which bridges gaps between startup phases a footer never sees; what a footer bridges instead is the cancel-and-restart between two writes landing back to back.
 
 ### `diagnostics.footer_wait_ms`
 
