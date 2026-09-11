@@ -955,17 +955,23 @@ fn test_doctor_identity_rejects_socket_path_that_cannot_bind() {
     assert!(stdout.contains("socket path exceeds"), "{stdout}");
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn test_hook_context_outputs_name_the_triggering_event_through_cli() {
-    use mcpls_core::hooks::{HookListener, Request, Response, SocketIdentity, identity_hash};
+    use mcpls_core::hooks::{HookListener, Request, Response};
     let project = TempDir::new().unwrap();
     let runtime = TempDir::new().unwrap();
-    let hash = identity_hash(project.path()).unwrap();
-    let identity = SocketIdentity {
-        socket: runtime.path().join("mcpls").join(format!("{hash}.sock")),
-        lock: runtime.path().join("mcpls").join(format!("{hash}.lock")),
-        hash,
+    #[cfg(windows)]
+    let identity = mcpls_core::hooks::identity_for(project.path()).unwrap();
+    // The child derives its socket from the XDG_RUNTIME_DIR set below,
+    // which `identity_for` in this process would not read.
+    #[cfg(not(windows))]
+    let identity = {
+        let hash = mcpls_core::hooks::identity_hash(project.path()).unwrap();
+        mcpls_core::hooks::SocketIdentity {
+            socket: runtime.path().join("mcpls").join(format!("{hash}.sock")),
+            lock: runtime.path().join("mcpls").join(format!("{hash}.lock")),
+            hash,
+        }
     };
     let listener = HookListener::acquire(&identity).await.unwrap().unwrap();
     let (cancel, rx) = tokio::sync::watch::channel(false);
