@@ -22,8 +22,8 @@ use serde::Deserialize;
 /// carry no context back and are never worth stalling an edit for.
 const SOCKET_TIMEOUT: Duration = Duration::from_millis(50);
 
-/// Bounds the request batch that supplies context; acknowledgement has a separate allowance.
-/// A shorter bound would cut off work still inside the owner's default operation deadline.
+/// The client timeout tracks the owner's default operation deadline.
+/// The acknowledgement has a separate allowance.
 const FLUSH_SOCKET_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// The hook payload Claude Code writes to stdin, keeping only the fields
@@ -764,6 +764,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
+    use mcpls_core::config::HooksConfig;
     use serde_json::json;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
@@ -1349,7 +1350,7 @@ mod tests {
     fn test_the_flush_timeout_tracks_the_op_deadline_default() {
         assert_eq!(
             FLUSH_SOCKET_TIMEOUT,
-            Duration::from_millis(1500),
+            Duration::from_millis(HooksConfig::default().op_deadline_ms),
             "a client timeout tighter than the server's own op_deadline_ms \
              default is never right; if the spec's default changes, this \
              constant must change deliberately alongside it"

@@ -150,6 +150,18 @@ impl ServerSettle {
         self.end_at(server, token, Instant::now());
     }
 
+    /// Retire outstanding work owned by an exited server without resetting the session.
+    pub(crate) fn forget_server(&self, server: &ServerId) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let before = state.outstanding.len();
+        state.outstanding.retain(|(id, _)| id != server);
+        if state.outstanding.len() != before && state.outstanding.is_empty() {
+            state.quiet_since = Some(Instant::now());
+        }
+    }
+
     /// How many long-running operations have ever begun.
     ///
     /// The footer captures this before its resync and compares afterwards,
@@ -231,6 +243,27 @@ mod tests {
 
     fn settle() -> ServerSettle {
         ServerSettle::new(Duration::from_secs(1), Duration::from_secs(600))
+    }
+
+    #[test]
+    fn test_settle_retirement_preserves_other_server_and_epoch() {
+        let settle = settle();
+        let rust = ServerId::from("rust");
+        let python = ServerId::from("python");
+        settle.begin(&rust, &json!("check"));
+        settle.begin(&python, &json!("check"));
+        settle.forget_server(&rust);
+        assert!(!settle.is_quiet_at(
+            Instant::now() + Duration::from_secs(2),
+            Duration::from_secs(1)
+        ));
+        assert_eq!(settle.progress_epoch(), 2);
+        settle.end(&python, &json!("check"));
+        assert!(settle.should_settle_at(Instant::now() + Duration::from_secs(2)));
+        settle.begin(&rust, &json!("replacement"));
+        settle.forget_server(&rust);
+        assert!(settle.should_settle_at(Instant::now() + Duration::from_secs(2)));
+        assert_eq!(settle.progress_epoch(), 3);
     }
 
     #[test]

@@ -41,6 +41,9 @@ pub mod error;
 pub mod hooks;
 pub mod lsp;
 pub mod mcp;
+mod notification_lifecycle;
+#[cfg(all(test, unix))]
+mod recovery_tests;
 pub mod transport;
 mod util;
 
@@ -59,7 +62,7 @@ use lsp::{LspNotification, LspServer, ServerInitConfig};
 use lsp_types::Uri;
 use rmcp::model::ResourceUpdatedNotificationParam;
 use tokio::sync::{Mutex, OnceCell};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 #[cfg(feature = "transport-http")]
 pub use transport::HttpConfig;
@@ -276,11 +279,8 @@ async fn handle_publish_diagnostics(
         .is_err()
 }
 
-/// Result of [`register_servers`]: everything the caller needs to start the
-/// per-server diagnostics pump tasks.
+/// Diagnostics ownership after registration, used to divide the cache budget.
 pub(crate) struct RegisteredServers {
-    /// Notification receivers extracted from each server before registration.
-    pub(crate) receivers: HashMap<ServerId, tokio::sync::mpsc::Receiver<lsp::LspNotification>>,
     /// Whether each server is the one the (rebound) router resolves
     /// `ToolKind::Diagnostics` to for its language -- see #174 §8. Computed
     /// here, right after the rebind, so it always reflects the post-rebind
@@ -289,14 +289,8 @@ pub(crate) struct RegisteredServers {
 }
 
 /// Register initialized LSP servers with the translator, rebind the router to
-/// the set that actually registered, and extract notification receivers.
-///
-/// Takes ownership of the `ServerInitResult`, extracts `notification_rx` from
-/// each server before registration. Registration itself is a sequence of
-/// short, independently-locked map inserts (see `Translator`'s field docs),
-/// so no external synchronization is required here; the rebind that follows
-/// relies only on all of *this* function's inserts having completed, which
-/// the sequential code below guarantees.
+/// the set that actually initialized, and install notification pumps before
+/// publishing clients that can trigger a replacement.
 ///
 /// `configs` supplies the `ServerInitConfig` each surviving server was
 /// spawned from, keyed by routing identity, so the translator can respawn it
@@ -306,47 +300,44 @@ pub(crate) fn register_servers(
     translator: &bridge::Translator,
     configs: &HashMap<ServerId, ServerInitConfig>,
 ) -> RegisteredServers {
-    let mut receivers = HashMap::new();
+    let registered: HashSet<ServerId> = result.servers.keys().cloned().collect();
+    translator.rebind_router(&registered);
+    let diagnostics_flags: HashMap<_, _> = result
+        .servers
+        .iter()
+        .map(|(id, server)| {
+            (
+                id.clone(),
+                translator.is_diagnostics_route(server.client().language_id(), id),
+            )
+        })
+        .collect();
     for (id, server) in &mut result.servers {
-        receivers.insert(id.clone(), server.take_notification_rx());
+        let rx = server.take_notification_rx();
+        if let Some(pumps) = translator.notification_pumps.get() {
+            pumps.install(id.clone(), rx, diagnostics_flags[id]);
+        }
     }
 
-    let registered: HashSet<ServerId> = result.servers.keys().cloned().collect();
-
-    let mut language_by_id = HashMap::new();
     for (id, server) in result.servers {
         let client = server.client().clone();
-        language_by_id.insert(id.clone(), client.language_id().to_string());
-        translator.register_client(id.clone(), client);
         if let Some(config) = configs.get(&id) {
             translator.register_server_config(id.clone(), config.clone());
         } else {
-            // Would silently turn auto-respawn into a no-op for this server
-            // (surfacing as `Error::ServerUnavailable` instead of actually
-            // recovering) -- the keys are derived identically on both sides
-            // (`LspServerConfig::id()`), so this should never happen; warn
-            // rather than fail, since the server is otherwise usable.
             warn!(
                 "No respawn config registered for LSP server '{id}'; auto-respawn on crash will be unavailable for it"
             );
         }
+        #[cfg(all(test, unix))]
+        let registration_client = client.clone();
+        // Workspace searches can respawn before looking up the client.
+        translator.register_client(id.clone(), client);
+        #[cfg(all(test, unix))]
+        recovery_tests::pause_registration(translator, &id, registration_client);
         translator.register_server(id, server);
     }
 
-    translator.rebind_router(&registered);
-
-    let diagnostics_flags = language_by_id
-        .into_iter()
-        .map(|(id, language)| {
-            let is_diagnostics_server = translator.is_diagnostics_route(&language, &id);
-            (id, is_diagnostics_server)
-        })
-        .collect();
-
-    RegisteredServers {
-        receivers,
-        diagnostics_flags,
-    }
+    RegisteredServers { diagnostics_flags }
 }
 
 /// Resolve workspace roots against an absolute base directory.
@@ -990,11 +981,9 @@ fn build_translator(
 /// Bounds how long [`shutdown`] waits for the background LSP init task
 /// (see [`spawn_lsp_servers_background`]) to finish after cancellation is
 /// signaled. Deliberately shorter than [`Translator`]'s own per-server
-/// shutdown timeout: by the time `shutdown_servers` returns, every
-/// registered server's notification channel has closed, so the init task's
-/// diagnostics pumps should already be draining. This bound only matters
-/// for the rarer case where the init task is still mid-`initialize` (never
-/// registered anything for `shutdown_servers` to act on).
+/// shutdown timeout. Registered servers and their notification pumps are
+/// stopped separately; this bound covers initialization that has not yet
+/// registered its servers and cancellation of baseline processing.
 const LSP_INIT_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Awaits the background LSP init task's `JoinHandle` with a bounded
@@ -1064,10 +1053,11 @@ const fn should_escalate(repeat_signals: u32) -> bool {
 /// Signals background pump tasks to exit, then gracefully shuts down every
 /// LSP server registered on `translator` (see
 /// [`Translator::shutdown_servers`] for what "gracefully" bounds and falls
-/// back to). Finally, if the background LSP init task (see
+/// back to). The translator also terminates its owned notification pumps.
+/// Finally, if the background LSP init task (see
 /// [`spawn_lsp_servers_background`]) is still running, awaits it via
-/// [`await_lsp_init_handle`], giving its diagnostics pump tasks a chance to
-/// finish draining before `serve_with` returns. Extracted from
+/// [`await_lsp_init_handle`], so startup and baseline processing finish before
+/// `serve_with` returns. Extracted from
 /// [`serve_with`] so this sequence is exercised directly in tests without
 /// needing a full stdio/HTTP transport round trip.
 ///
@@ -1154,16 +1144,17 @@ async fn shutdown(
 /// retry. If every server fails, the "expected servers" set is cleared so those
 /// calls fall back to a plain "no server configured" error instead.
 ///
-/// Returns the task's `JoinHandle` so [`shutdown`] can await it: previously
-/// this handle was dropped, silently swallowing panics from
-/// `LspServer::spawn_batch`, `register_servers`, or a diagnostics pump task
-/// (see #196).
+/// Returns the task's `JoinHandle` so [`shutdown`] can await startup and
+/// baseline processing. Notification pumps are owned by the translator.
 fn spawn_lsp_servers_background(
     applicable_configs: Vec<ServerInitConfig>,
     translator: Arc<Translator>,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
     shared: PumpShared,
 ) -> JoinHandle<()> {
+    translator.notification_pumps.get_or_init(|| {
+        notification_lifecycle::NotificationPumps::new(shared.clone(), cancel_rx.clone())
+    });
     tokio::spawn(async move {
         let configs_by_id: HashMap<ServerId, ServerInitConfig> = applicable_configs
             .iter()
@@ -1233,30 +1224,14 @@ fn spawn_lsp_servers_background(
         // no event to hang the restart on.
         shared.settle.restart_deadline();
 
-        // Start diagnostics pump tasks now that servers are registered.
-        let mut pumps: JoinSet<()> = JoinSet::new();
-        for (id, rx) in registered.receivers {
-            let caches_diagnostics = registered
-                .diagnostics_flags
-                .get(&id)
-                .copied()
-                .unwrap_or(false);
-            pumps.spawn(diagnostics_pump(
-                id,
-                rx,
-                cancel_rx.clone(),
-                caches_diagnostics,
-                shared.clone(),
-            ));
-        }
-        pumps.spawn(baseline_task(
+        baseline_task(
             Arc::clone(&shared.settle),
             Arc::clone(&shared.notification_cache),
             Arc::clone(&shared.delivery),
             Arc::clone(&shared.floors),
             cancel_rx.clone(),
-        ));
-        while pumps.join_next().await.is_some() {}
+        )
+        .await;
     })
 }
 

@@ -55,7 +55,7 @@ impl Translator {
     /// should react to -- and for any `try_wait` error, on the conservative
     /// assumption that a health check that itself failed should not trigger
     /// a respawn.
-    fn is_server_dead(&self, id: &ServerId) -> bool {
+    pub(crate) fn is_server_dead(&self, id: &ServerId) -> bool {
         lock_std(&self.lsp_servers)
             .get_mut(id)
             .and_then(|server| server.has_exited().ok())
@@ -205,13 +205,9 @@ impl Translator {
     /// [`Self::with_notification_cache`]) rather than left to be merged into
     /// fresh pulls as if still current.
     ///
-    /// Diagnostics and other push notifications from the new process itself
-    /// are drained and discarded rather than wired into the existing pump
-    /// task: the pump's remaining dependencies (resource subscriptions, peer
-    /// handle) live in `serve_with`'s scope, not the translator's, so
-    /// reconnecting live push for a respawned server is out of scope for
-    /// this fix -- it does not resume until the whole mcpls process
-    /// restarts, but stale data is no longer served as current.
+    /// The old notification task is terminated before its cache is invalidated.
+    /// The replacement resumes the session's notification processing and preserves
+    /// the original delivery baseline.
     ///
     /// A crash-looping server (repeated respawn failures) backs off
     /// exponentially (`RESPAWN_BACKOFF_BASE` up to `RESPAWN_BACKOFF_MAX`)
@@ -270,55 +266,34 @@ impl Translator {
         // notify calls to a connection nobody is reading.
         self.forget_watch_registrations(id);
         let mut new_server = match LspServer::spawn(config).await {
-            Ok(server) => {
-                self.record_respawn_success(id);
-                server
-            }
+            Ok(server) => server,
             Err(err) => {
                 self.record_respawn_failure(id);
                 return Err(err);
             }
         };
         let new_client = new_server.client().clone();
-        let mut notification_rx = new_server.take_notification_rx();
-        tokio::spawn(async move { while notification_rx.recv().await.is_some() {} });
-
-        let old_client = lock_std(&self.lsp_clients).insert(id.clone(), new_client);
-        let old_server = lock_std(&self.lsp_servers).insert(id.clone(), new_server);
-        drop(old_server); // dropped after the `lsp_servers` guard, not under it
-
-        self.document_tracker.forget_server(id);
-
-        // Only the diagnostics-route server for this language ever writes
-        // to the cache (see `diagnostics_pump`'s `caches_diagnostics` gate
-        // in the crate root) -- clearing a non-route server's synced URIs
-        // would delete the *healthy* diagnostics server's valid entries for
-        // those same files instead. And the route server's own cache
-        // entries are not limited to documents mcpls ever opened (it
-        // publishes workspace-wide, e.g. `cargo check` diagnostics), so a
-        // per-URI clear scoped to synced documents would miss most of what
-        // needs invalidating.
-        //
-        // `clear_server_diagnostics` scopes the clear to just this server's
-        // own entries, tracked via `NotificationCache`'s per-server
-        // ownership map (#266) -- a crashed rust-analyzer no longer wipes a
-        // healthy pyright's cached diagnostics for Python files in the same
-        // workspace.
-        //
-        // This clear is not atomic with the swap above: a caller that reads
-        // `lsp_clients` between the swap and this point sees the new client
-        // and could read a not-yet-cleared cache entry. In practice
-        // `handle_diagnostics` only reads the cache after a full LSP pull
-        // round-trip, so this window is negligible.
-        if self.is_diagnostics_route(&language_id, id)
-            && let Some(cache) = &self.notification_cache
-        {
-            cache.lock().await.clear_server_diagnostics(id);
-        }
-
+        let notification_rx = new_server.take_notification_rx();
+        let old_client = lock_std(&self.lsp_clients).get(id).cloned();
         if let Some(old_client) = old_client {
             old_client.fail_pending_requests().await;
         }
+        if let Some(pumps) = self.notification_pumps.get() {
+            pumps.retire(id).await;
+        }
+        let caches_diagnostics = self.is_diagnostics_route(&language_id, id);
+        if caches_diagnostics && let Some(cache) = &self.notification_cache {
+            cache.lock().await.clear_server_diagnostics(id);
+        }
+
+        self.document_tracker.forget_server(id);
+        if let Some(pumps) = self.notification_pumps.get() {
+            pumps.install(id.clone(), notification_rx, caches_diagnostics);
+        }
+        let old_server = lock_std(&self.lsp_servers).insert(id.clone(), new_server);
+        lock_std(&self.lsp_clients).insert(id.clone(), new_client);
+        drop(old_server);
+        self.record_respawn_success(id);
 
         tracing::info!("LSP server '{id}' respawned successfully");
         Ok(())

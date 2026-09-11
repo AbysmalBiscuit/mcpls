@@ -101,7 +101,12 @@ fn stage_workspace() -> TempDir {
 
     let lib_path = tmp.path().join("src/lib.rs");
     let mut lib_content = fs::read_to_string(&lib_path).expect("failed to read lib.rs");
-    lib_content.push_str("\npub mod broken;\n");
+    lib_content.push_str("\npub mod broken;\npub mod resync_unopened;\npub fn resync_caller() -> i32 { resync_unopened::tally() }\n");
+    fs::copy(
+        fixture_dir.join("extras/resync_unopened.rs"),
+        tmp.path().join("src/resync_unopened.rs"),
+    )
+    .expect("copy unopened resync module");
     fs::write(&lib_path, lib_content).expect("failed to append pub mod broken");
 
     // Copy bad_format.rs into src/ — NOT added to lib.rs (no mod declaration).
@@ -1683,6 +1688,99 @@ fn sc_resync_delivers_a_build_error_after_an_apply(
     }
 }
 
+/// The rename starts in the open caller; only the write drain may open the module.
+fn sc_resync_delivers_a_build_error_in_an_unopened_module(
+    client: &mut McpClient,
+    workspace: &Path,
+) -> Result<(), String> {
+    let lib = dunce::canonicalize(workspace.join("src/lib.rs")).map_err(|e| e.to_string())?;
+    let module =
+        dunce::canonicalize(workspace.join("src/resync_unopened.rs")).map_err(|e| e.to_string())?;
+    let uri = mcpls_core::bridge::path_to_uri(&module).map_err(|e| e.to_string())?;
+    let diagnostic_for_module = |report: &Value| {
+        report["changed"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|file| {
+                file["file_path"]
+                    .as_str()
+                    .and_then(|path| dunce::canonicalize(Path::new(path)).ok())
+                    .and_then(|path| mcpls_core::bridge::path_to_uri(&path).ok())
+                    .as_ref()
+                    == Some(&uri)
+            })
+            .flat_map(|file| file["diagnostics"].as_array().into_iter().flatten())
+            .any(|diagnostic| diagnostic["source"] == "rustc" && diagnostic["code"] == "E0428")
+    };
+    let baseline = client
+        .call_tool("get_new_diagnostics", &json!({}))
+        .map_err(|e| format!("baseline flush failed: {e}"))?;
+    let baseline: Value =
+        serde_json::from_str(&assertions::assert_tool_ok(&baseline)).map_err(|e| e.to_string())?;
+    if diagnostic_for_module(&baseline) {
+        return Err(format!(
+            "unopened module already has rustc E0428 before the rename: {baseline}"
+        ));
+    }
+    let source = fs::read_to_string(&lib).map_err(|e| e.to_string())?;
+    let line = find_line(&lib, "pub fn resync_caller()");
+    let caller = source
+        .lines()
+        .find(|line| line.contains("pub fn resync_caller()"))
+        .unwrap();
+    let character = caller.find("::tally").unwrap() + 3;
+    let resp = client
+        .call_tool(
+            "rename_symbol",
+            &json!({
+                "file_path": lib, "line": line, "character": character,
+                "new_name": "total", "apply": true,
+            }),
+        )
+        .map_err(|e| format!("rename failed: {e}"))?;
+    let result: Value =
+        serde_json::from_str(&assertions::assert_tool_ok(&resp)).map_err(|e| e.to_string())?;
+    if result["applied"] != true {
+        return Err(format!("rename did not apply: {result}"));
+    }
+    let written = result["files_written"]
+        .as_array()
+        .ok_or_else(|| format!("missing written paths: {result}"))?;
+    for path in [&lib, &module] {
+        if !written.contains(&json!(path)) {
+            return Err(format!("rename did not write {}: {result}", path.display()));
+        }
+    }
+    let module_text = fs::read_to_string(&module).map_err(|e| e.to_string())?;
+    if module_text.matches("pub fn total()").count() != 2
+        || !fs::read_to_string(&lib)
+            .map_err(|e| e.to_string())?
+            .contains("resync_unopened::total()")
+    {
+        return Err(format!(
+            "rename did not create the expected disk collision: {module_text}"
+        ));
+    }
+    let deadline = Instant::now() + Duration::from_millis(settle_deadline_ms());
+    loop {
+        let raw = client
+            .call_tool("get_new_diagnostics", &json!({}))
+            .map_err(|e| format!("flush failed: {e}"))?;
+        let report: Value =
+            serde_json::from_str(&assertions::assert_tool_ok(&raw)).map_err(|e| e.to_string())?;
+        if diagnostic_for_module(&report) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "no rustc E0428 for {uri:?} after unopened-module rename; last report: {report}"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
 /// The first `rustc`-sourced `E0428` anywhere in a flush report, or `None`.
 fn find_rustc_e0428(report: &Value) -> Option<Value> {
     report["changed"]
@@ -1779,6 +1877,7 @@ fn ra_e2e_suite() {
         // symbols nothing else in the suite touches, so whether the rename
         // sub-case below runs before or after it changes nothing.
         sub_case!(sc_resync_delivers_a_build_error_after_an_apply),
+        sub_case!(sc_resync_delivers_a_build_error_in_an_unopened_module),
         // Last: this one writes to the staged workspace, and every anchor
         // above it looks for text this rename moves.
         sub_case!(sc_rename_symbol_apply),

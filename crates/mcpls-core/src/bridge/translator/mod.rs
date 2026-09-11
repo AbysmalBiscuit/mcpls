@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use tokio::sync::Mutex;
 
@@ -58,6 +58,9 @@ pub use routing::validate_path_against_roots;
 /// `textDocument/didOpen`/`didChange` notify.
 #[derive(Debug)]
 pub struct Translator {
+    #[cfg(all(test, unix))]
+    pub(crate) registration_pause: StdMutex<Option<crate::recovery_tests::RegistrationPause>>,
+    pub(crate) notification_pumps: OnceLock<crate::notification_lifecycle::NotificationPumps>,
     /// LSP clients indexed by routing identity. Locked only for the map
     /// lookup/insert itself, never across an LSP request.
     lsp_clients: Arc<StdMutex<HashMap<ServerId, LspClient>>>,
@@ -126,7 +129,7 @@ pub struct Translator {
     /// present; a translator that may not write carries one whose
     /// `ApplyConfig` permits nothing.
     applier: Arc<Applier>,
-    /// Paths an apply changed that are still tracked as open documents.
+    /// Applied paths whose content and save notifications are still pending.
     ///
     /// The applier fills this before it writes, so an apply whose caller
     /// stopped awaiting it -- the user pressing Esc, a
@@ -170,12 +173,15 @@ impl Drop for PendingDrain<'_> {
 /// what [`Translator::resync_changed_documents`] should do next because of
 /// it.
 enum ResyncStep {
-    /// Fully resynchronized, or gone, or not tracked: leave the queue.
+    /// Content is synchronized; saves still need the captured version and processes.
+    NeedsSave {
+        version: i32,
+        servers: Vec<(ServerId, u64)>,
+    },
+    /// Fully resynchronized, gone, or not routable: leave the queue.
     Done,
-    /// The stat or the read of this path itself failed. That says nothing
-    /// about any other path, so the drain leaves this one queued and moves
-    /// on to the next.
-    ReadFailed,
+    /// A failed open/read or a stale save leaves this path queued for retry.
+    Deferred,
     /// A notify failed on this path's connection to a server. Every other
     /// path still queued for that same server is behind the same broken
     /// connection, so the drain stops here instead of failing through the
@@ -219,6 +225,9 @@ impl Translator {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            #[cfg(all(test, unix))]
+            registration_pause: StdMutex::new(None),
+            notification_pumps: OnceLock::new(),
             lsp_clients: Arc::new(StdMutex::new(HashMap::new())),
             lsp_servers: Arc::new(StdMutex::new(HashMap::new())),
             document_tracker: Arc::new(DocumentTracker::new(
@@ -431,9 +440,9 @@ impl Translator {
     /// anchored in one file rewrites every file referencing the symbol. LSP
     /// makes the client authoritative for a document it has opened, so a
     /// server ignores the change on disk until it is told. Telling it means
-    /// two notifications, not one: a `didChange` carrying the new text, and
-    /// a `didSave`, because a server whose diagnostics come from a build
-    /// runs nothing on the change alone.
+    /// synchronizing the entire batch's content before any `didSave` can
+    /// start a build. Unopened routed files receive `didOpen`; tracked
+    /// files receive `didChange` when their content changed.
     ///
     /// A path leaves the queue only once every server holding it is caught
     /// up on both. Content matching disk is not the completion test: after
@@ -450,34 +459,66 @@ impl Translator {
             queue: &self.pending_invalidations,
             remaining: self.pending_invalidations.take(),
         };
+        let mut saves = Vec::new();
         let mut index = 0;
         while index < drain.remaining.len() {
             let path = drain.remaining[index].clone();
             match self.resync_one_document(&path).await {
+                ResyncStep::NeedsSave { version, servers } => {
+                    saves.push((path, version, servers));
+                    index += 1;
+                }
                 ResyncStep::Done => {
                     drain.remaining.remove(index);
                 }
-                // A bad stat or a bad read of this path says nothing about
-                // any other, so it stays queued for a later drain and this
-                // one moves on rather than blocking behind it forever.
-                ResyncStep::ReadFailed => index += 1,
-                // A rejected notification came back over this path's own
-                // connection, which every path still queued for the same
-                // server would hit too, so stop rather than spend the rest
-                // of the drain on failures just as certain.
+                ResyncStep::Deferred => index += 1,
+                ResyncStep::NotifyFailed => return,
+            }
+        }
+        for (path, version, servers) in saves {
+            match self.save_resynced_document(&path, version, &servers).await {
+                ResyncStep::Done => drain.remaining.retain(|pending| pending != &path),
                 ResyncStep::NotifyFailed => break,
+                ResyncStep::Deferred | ResyncStep::NeedsSave { .. } => {}
             }
         }
     }
 
-    /// Resynchronize one path.
+    /// Synchronize one path's content before the batch sends any saves.
     ///
-    /// `_path_guard` is held for the whole call, across every notify below,
-    /// deliberately: dropping it early would let a concurrent `ensure_open`
-    /// commit a version this resync has already decided against, leaving
-    /// the tracker unable to tell a server it still needs the resync.
+    /// Opening precedes the path lock because `ensure_open` acquires that
+    /// same lock. The subsequent refresh and changes hold it together so a
+    /// concurrent open cannot replace the version being synchronized.
     #[allow(clippy::significant_drop_tightening, clippy::used_underscore_binding)]
     async fn resync_one_document(&self, path: &Path) -> ResyncStep {
+        let routed_server = self
+            .get_client_for_file(path, ToolKind::Diagnostics)
+            .ok()
+            .map(|(server, _)| {
+                let generation = self.document_tracker.generation_for(&server);
+                (server, generation)
+            });
+        let needs_open = routed_server.as_ref().is_none_or(|(server, _)| {
+            self.document_tracker
+                .get(path)
+                .is_none_or(|state| state.synced_version(server).is_none())
+        });
+        if matches!(path.try_exists(), Ok(true)) && needs_open {
+            match self.open_untracked_document(path, true).await {
+                OpenOutcome::Opened => {}
+                OpenOutcome::NoRoute if self.document_tracker.is_open(path) => {}
+                OpenOutcome::NoRoute => {
+                    self.notify_watched_files(path, &[lsp_types::FileChangeType::CHANGED])
+                        .await;
+                    return ResyncStep::Done;
+                }
+                OpenOutcome::NoHeadroom | OpenOutcome::Failed => {
+                    self.notify_watched_files(path, &[lsp_types::FileChangeType::CHANGED])
+                        .await;
+                    return ResyncStep::Deferred;
+                }
+            }
+        }
         let _path_guard = self.document_tracker.lock_path(path).await;
 
         match path.try_exists() {
@@ -498,7 +539,7 @@ impl Translator {
                     %error,
                     "could not stat an applied file; leaving it queued"
                 );
-                return ResyncStep::ReadFailed;
+                return ResyncStep::Deferred;
             }
         }
 
@@ -519,14 +560,50 @@ impl Translator {
                     %error,
                     "could not re-read an applied file; leaving it queued"
                 );
-                return ResyncStep::ReadFailed;
+                return ResyncStep::Deferred;
             }
         };
 
-        for server in &resync.needs_change {
-            let generation = self.document_tracker.generation_for(server);
+        let Some(state) = self.document_tracker.get(path) else {
+            return ResyncStep::Deferred;
+        };
+        let mut servers: Vec<_> = state
+            .synced_servers()
+            .into_iter()
+            .map(|server| {
+                let generation = self.document_tracker.generation_for(&server);
+                (server, generation)
+            })
+            .collect();
+        if let Some((server, generation)) = routed_server {
+            servers.retain(|(synced, _)| synced != &server);
+            servers.push((server, generation));
+        }
+        if servers.is_empty() {
+            return ResyncStep::Deferred;
+        }
+        if !self.send_resync_changes(path, &resync, &servers).await {
+            return ResyncStep::NotifyFailed;
+        }
+        ResyncStep::NeedsSave {
+            version: resync.version,
+            servers,
+        }
+    }
+
+    /// Send the disk snapshot using the generations captured for this content phase.
+    async fn send_resync_changes(
+        &self,
+        path: &Path,
+        resync: &crate::bridge::state::Resync,
+        servers: &[(ServerId, u64)],
+    ) -> bool {
+        for (server, generation) in servers
+            .iter()
+            .filter(|(server, _)| resync.needs_change.contains(server))
+        {
             let Some(client) = lock_std(&self.lsp_clients).get(server).cloned() else {
-                continue;
+                return false;
             };
             let params = lsp_types::DidChangeTextDocumentParams {
                 text_document: lsp_types::VersionedTextDocumentIdentifier {
@@ -541,20 +618,45 @@ impl Translator {
             };
             if let Err(error) = client.notify("textDocument/didChange", params).await {
                 tracing::warn!(%server, path = %path.display(), %error, "resync didChange failed");
-                return ResyncStep::NotifyFailed;
+                return false;
             }
             self.document_tracker
-                .mark_change_sent(path, server, resync.version, generation);
+                .mark_change_sent(path, server, resync.version, *generation);
         }
+        true
+    }
 
-        for server in &resync.needs_save {
-            let generation = self.document_tracker.generation_for(server);
-            let Some(client) = lock_std(&self.lsp_clients).get(server).cloned() else {
+    /// A concurrent document open or server replacement invalidates a prepared save.
+    #[allow(clippy::significant_drop_tightening)]
+    async fn save_resynced_document(
+        &self,
+        path: &Path,
+        version: i32,
+        servers: &[(ServerId, u64)],
+    ) -> ResyncStep {
+        let _guard = self.document_tracker.lock_path(path).await;
+        for (server, generation) in servers {
+            let Some(state) = self.document_tracker.get(path) else {
+                return ResyncStep::Deferred;
+            };
+            if state.version() != version
+                || state.synced_version(server) != Some(version)
+                || self.document_tracker.generation_for(server) != *generation
+            {
+                return ResyncStep::Deferred;
+            }
+            if state
+                .saved_version(server)
+                .is_some_and(|saved| saved >= version)
+            {
                 continue;
+            }
+            let Some(client) = lock_std(&self.lsp_clients).get(server).cloned() else {
+                return ResyncStep::NotifyFailed;
             };
             let params = lsp_types::DidSaveTextDocumentParams {
                 text_document: lsp_types::TextDocumentIdentifier {
-                    uri: resync.uri.clone(),
+                    uri: state.uri().clone(),
                 },
                 text: None,
             };
@@ -563,9 +665,11 @@ impl Translator {
                 return ResyncStep::NotifyFailed;
             }
             self.document_tracker
-                .mark_save_sent(path, server, resync.version, generation);
+                .mark_save_sent(path, server, version, *generation);
+            if self.document_tracker.generation_for(server) != *generation {
+                return ResyncStep::Deferred;
+            }
         }
-
         self.notify_watched_files(path, &[lsp_types::FileChangeType::CHANGED])
             .await;
         ResyncStep::Done
@@ -873,6 +977,9 @@ impl Translator {
     /// points at the now-shut-down servers, so in-flight tool calls would
     /// resolve to a client whose server is gone.
     pub(crate) async fn shutdown_servers(&self) {
+        if let Some(pumps) = self.notification_pumps.get() {
+            pumps.shutdown().await;
+        }
         let servers: Vec<(ServerId, LspServer)> = lock_std(&self.lsp_servers).drain().collect();
         if servers.is_empty() {
             return;
@@ -1198,31 +1305,145 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_an_untracked_path_produces_no_notification() {
+    async fn test_resync_opens_an_untracked_routed_path() {
         let harness = TranslatorHarness::with_one_server("rust").await;
         let path = harness.write_file("a.rs", "fn a() {}");
         harness.queue_invalidation(&path);
 
         harness.translator.resync_changed_documents().await;
 
-        assert!(harness.notifications_for("rust").is_empty());
+        assert_eq!(
+            harness.notifications_for("rust"),
+            vec!["textDocument/didOpen", "textDocument/didSave"]
+        );
+        assert!(harness.translator.document_tracker().is_open(&path));
     }
 
-    /// A drain cancelled between its `didChange` and its `didSave` leaves
-    /// the tracker with the change marked sent and the save still owed.
-    ///
-    /// Genuine mid-call cancellation cannot be induced from outside: a
-    /// `notify` call's success means only that its message was enqueued,
-    /// the two enqueues here are separated by nothing but synchronous
-    /// bookkeeping (`mark_change_sent`, `generation_for`), and observing
-    /// the first frame on the wire is itself a cross-thread round trip that
-    /// always loses that race -- confirmed empirically: spawning the exact
-    /// two-notify shape and aborting on the first frame's arrival stopped
-    /// the second notify zero times out of twenty. So this constructs the
-    /// exact post-cancellation tracker state directly, through the same
-    /// `resync_from_disk`/`mark_change_sent` calls `resync_one_document`
-    /// itself would have made, and proves that state actually needs both
-    /// before relying on it.
+    #[tokio::test]
+    async fn test_resync_retains_unopened_targets_at_the_document_limit() {
+        let harness = TranslatorHarness::with_one_server_and_limits(
+            "rust",
+            ResourceLimits {
+                max_documents: 1,
+                max_file_size: 0,
+            },
+        )
+        .await;
+        let anchor = harness.write_file("anchor.rs", "fn a() {}");
+        let target = harness.write_file("target.rs", "fn b() {}");
+        harness.open(&anchor, "rust").await;
+        harness.register_watcher("rust", "sources", "**/*.rs");
+        harness.queue_invalidation(&target);
+        harness.translator.resync_changed_documents().await;
+        assert_eq!(
+            harness.translator.pending_invalidations.take(),
+            vec![target.clone()]
+        );
+        assert!(!harness.translator.document_tracker().is_open(&target));
+        assert_eq!(
+            harness.notifications_for("rust"),
+            vec!["workspace/didChangeWatchedFiles"]
+        );
+        harness.translator.document_tracker().close(&anchor);
+        harness.queue_invalidation(&target);
+        harness.translator.resync_changed_documents().await;
+        assert!(harness.translator.document_tracker().is_open(&target));
+        assert!(harness.translator.pending_invalidations.take().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_resync_reopens_the_reset_route_with_a_healthy_other_owner() {
+        use tokio::io::BufReader;
+        use tokio::time::{Duration, timeout};
+
+        for reset_under_lock in [false, true] {
+            let harness = TranslatorHarness::with_one_server("rust").await;
+            let path = harness.write_file("shared.rs", "fn a() {}");
+            harness.open(&path, "rust").await;
+            let (healthy_client, mut healthy_wire) = testing::fake_lsp_client();
+            let healthy = ServerId::from("healthy");
+            harness
+                .translator
+                .register_client(healthy.clone(), healthy_client.clone());
+            let tracker = harness.translator.document_tracker();
+            tracker
+                .ensure_open(&path, &healthy, &healthy_client)
+                .await
+                .unwrap();
+            let mut wire = BufReader::new(&mut healthy_wire.write_stdout);
+            assert_eq!(
+                timeout(
+                    Duration::from_secs(5),
+                    crate::test_support::read_framed_message(&mut wire)
+                )
+                .await
+                .unwrap()["method"],
+                "textDocument/didOpen"
+            );
+            assert_eq!(
+                tracker.get(&path).unwrap().synced_version(&healthy),
+                Some(1)
+            );
+            harness.queue_invalidation(&path);
+            if reset_under_lock {
+                let guard = tracker.lock_path(&path).await;
+                let drain = harness.translator.resync_changed_documents();
+                tokio::pin!(drain);
+                assert!(futures::poll!(&mut drain).is_pending());
+                tracker.forget_server(&ServerId::from("rust"));
+                drop(guard);
+                drain.await;
+                assert_eq!(
+                    harness.translator.pending_invalidations.take(),
+                    vec![path.clone()],
+                    "a route reset while waiting for the content lock must retain its save"
+                );
+                harness.queue_invalidation(&path);
+            } else {
+                tracker.forget_server(&ServerId::from("rust"));
+            }
+            harness.translator.resync_changed_documents().await;
+            let state = tracker.get(&path).unwrap();
+            assert_eq!(
+                state.synced_version(&ServerId::from("rust")),
+                Some(1),
+                "the reset route must reopen even while another owner remains synced"
+            );
+            assert_eq!(state.synced_version(&healthy), Some(1));
+            assert_eq!(
+                harness.notifications_for("rust"),
+                vec!["textDocument/didOpen", "textDocument/didSave"]
+            );
+            let saved = timeout(
+                Duration::from_secs(5),
+                crate::test_support::read_framed_message(&mut wire),
+            )
+            .await
+            .unwrap();
+            assert_eq!(saved["method"], "textDocument/didSave");
+            assert_eq!(saved["params"]["textDocument"]["uri"], state.uri().as_str());
+            assert_eq!(state.saved_version(&healthy), Some(1));
+            assert!(harness.translator.pending_invalidations.take().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resync_keeps_watches_for_non_routable_paths() {
+        let harness = TranslatorHarness::with_one_server("rust").await;
+        let path = harness.write_file("Cargo.toml", "[package]");
+        harness.register_watcher("rust", "manifest", "**/Cargo.toml");
+        harness.queue_invalidation(&path);
+        harness.translator.resync_changed_documents().await;
+        assert_eq!(
+            harness.notifications_for("rust"),
+            vec!["workspace/didChangeWatchedFiles"]
+        );
+        assert!(!harness.translator.document_tracker().is_open(&path));
+        assert!(harness.translator.pending_invalidations.take().is_empty());
+    }
+
+    /// Matching disk content does not discharge the save owed after an
+    /// interrupted drain has already recorded its change notification.
     #[tokio::test]
     async fn test_a_second_drain_sends_the_save_a_cancellation_lost() {
         let harness = TranslatorHarness::with_one_server("rust").await;
