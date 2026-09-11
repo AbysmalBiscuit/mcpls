@@ -292,17 +292,17 @@ struct LockLossPause {
 #[cfg(test)]
 static LOCK_LOSS_PAUSE: std::sync::Mutex<Option<LockLossPause>> = std::sync::Mutex::new(None);
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 struct LockLossPauseGuard;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl Drop for LockLossPauseGuard {
     fn drop(&mut self) {
         install_lock_loss_pause(None);
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn install_lock_loss_pause(pause: Option<LockLossPause>) {
     *lock_std(&LOCK_LOSS_PAUSE) = pause;
 }
@@ -429,20 +429,29 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    #[cfg(unix)]
     use rmcp::ServiceExt as _;
+    #[cfg(unix)]
     use serde_json::json;
     use tempfile::TempDir;
+    #[cfg(unix)]
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, BufStream};
     use tokio::sync::Mutex;
 
     use super::*;
+    #[cfg(unix)]
     use crate::bridge::apply::Applier;
     use crate::bridge::{
-        DiagnosticsDelivery, FakeServer, FloorTable, NotificationCache, ResourceLimits,
-        ResourceSubscriptions, ServerSettle, Translator, TranslatorHarness, read_framed_reply,
-        translator_with_capabilities, write_response,
+        DiagnosticsDelivery, FloorTable, NotificationCache, ResourceLimits, ResourceSubscriptions,
+        ServerSettle, Translator, TranslatorHarness,
     };
-    use crate::config::{ApplyConfig, DiagnosticsConfig, ServerId};
+    #[cfg(unix)]
+    use crate::bridge::{
+        FakeServer, read_framed_reply, translator_with_capabilities, write_response,
+    };
+    #[cfg(unix)]
+    use crate::config::ApplyConfig;
+    use crate::config::{DiagnosticsConfig, ServerId};
     use crate::hooks::{ChangeEvent, HookListener, PathFilter, Request, Response, SocketIdentity};
     use crate::mcp::McplsServer;
 
@@ -616,6 +625,7 @@ mod tests {
             harness
         }
 
+        #[cfg(unix)]
         async fn owner_with_write_diagnostic(
             diagnostics: DiagnosticsConfig,
             message: &str,
@@ -976,6 +986,7 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
     async fn server_with_diagnostic(
         root: &std::path::Path,
         role: Arc<HookRole>,
@@ -1613,6 +1624,7 @@ mod tests {
         panic!("nobody answered a status request on {:?}", identity.socket);
     }
 
+    #[cfg(unix)]
     async fn mcp_request(
         wire: &mut BufStream<tokio::io::DuplexStream>,
         request: serde_json::Value,
@@ -1635,6 +1647,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     async fn apply_rename_over_mcp(
         server: Arc<McplsServer>,
         fake: &mut FakeServer,
@@ -1648,6 +1661,7 @@ mod tests {
         tool_result
     }
 
+    #[cfg(unix)]
     async fn apply_rename_over_mcp_result(
         server: Arc<McplsServer>,
         fake: &mut FakeServer,

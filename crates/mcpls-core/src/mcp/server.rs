@@ -583,7 +583,7 @@ impl McplsServer {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn install_footer_pause(
         &self,
         entered: tokio::sync::oneshot::Sender<()>,
