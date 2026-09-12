@@ -67,7 +67,7 @@ The hash covers the process working directory, and the hook side hashes the proj
 
 1. The frontend connects. If that succeeds, it is done.
 2. Otherwise it takes the spawn lock and holds it until the endpoint accepts.
-3. The winner spawns a detached backend, `setsid` on Unix and a detached process on Windows, so the backend outlives the session that started it. It then waits for the endpoint to accept.
+3. The winner starts a detached backend, `setsid` on Unix and a request the next hook invocation honours on Windows, for the reasons below. It then waits for the endpoint to accept.
 4. Everyone else waits on the lock and retries the connect, so a loser attaches to the winner's backend instead of spawning a second one.
 
 There is no runtime election left. The only race is which frontend spawns the backend, and the lock settles it at startup instead of through role transitions during service.
@@ -78,13 +78,19 @@ The backend's standard streams decide whether detaching works at all. The fronte
 
 Leaving the frontend's process group matters as much. Codex launches a stdio server with `process_group(0)` and sends `SIGTERM` to that whole group on cleanup, then `SIGKILL` two seconds later (`codex-rs/rmcp-client/src/stdio_server_launcher.rs:274,354`). `setsid` puts the backend in a new session and group, so the group signal does not reach it.
 
-Windows under Codex cannot spawn the backend as an ordinary child. Codex creates a job object per server launch, with kill-on-close and without breakaway, and assigns the suspended server before resuming it (`codex-rs/rmcp-client/src/stdio_server_launcher.rs:290`; `codex-rs/utils/pty/src/win/job.rs:62`). A process already in such a job cannot leave it, and `CREATE_BREAKAWAY_FROM_JOB` is refused, so anything the frontend spawns normally stays inside and dies with it. Wrapping the spawn in another executable changes nothing, because the wrapper is in the job too.
+Windows under Codex cannot spawn the backend as an ordinary child. Codex creates a job object per server launch, with kill-on-close and without breakaway, and assigns the suspended server before resuming it (`codex-rs/rmcp-client/src/stdio_server_launcher.rs:290`; `codex-rs/utils/pty/src/win/job.rs:62`), so anything the frontend spawns normally stays inside and dies with it. Wrapping the spawn in another executable changes nothing, because the wrapper is in the job too.
+
+That is measured, not only read. A `codex exec` session's MCP server, a detached grandchild of it, and a grandchild spawned with `CREATE_BREAKAWAY_FROM_JOB` all stopped within a second of the host exiting, with `features.experimental_use_rmcp_client` set either way, so containment does not depend on which MCP client Codex uses. The measurement went through `codex exec` rather than the interactive interface; both use the same server launcher, so the containment should be the same, but that is untested.
+
+`CREATE_BREAKAWAY_FROM_JOB` is neither an escape hatch nor a probe. It returned no error under either host, and the child it created still died under Codex, so a spawn that succeeds says nothing about whether the backend will outlive the session.
 
 The job is per launch rather than per session or per Codex process, so a backend started by something already outside it survives. A hook invocation is that something. Codex launches command hooks from a permissive job that allows breakaway, and its runner disables kill-on-close for descendants once the command finishes (`codex-rs/utils/pty/src/win/job.rs:41`; `codex-rs/hooks/src/engine/command_runner.rs:228,286`), so `mcpls hook` already runs outside the MCP server's job. On Windows the frontend therefore does not spawn the backend at all: it asks, and the next hook invocation starts it.
 
-That reuses a door the design already has rather than adding one. `Win32_Process.Create` over WMI is the alternative, since a process it creates does not inherit the caller's job, but it is a platform-specific dependency for one case.
+Claude Code does not contain descendants at all. Measured the same way, its MCP server process died with the host while both grandchildren kept writing, in a headless session and in an interactive one closed with `/exit`. A direct spawn would work there. Both hosts still go through the hook, because nothing the frontend can ask at runtime tells it which host contains it. On the measuring machine a security product had assigned every process a single-member job carrying kill-on-close, a process created through WMI outside any agent's tree included, so the flags a process reads about its own job describe that job rather than the host's. Behaviour separates the two hosts and job introspection does not, which is also why the doctor must not try to read containment off a job's flags.
 
-Asking rather than spawning costs latency: the backend appears when a hook next fires rather than at connect time. The frontend reports the wait the same way it reports any unreachable backend, and a session that never fires a hook never gets one, which is the honest cost of the platform.
+The hook reuses a door the design already has rather than adding one. `Win32_Process.Create` over WMI is the alternative, since a process it creates does not inherit the caller's job, but it is a platform-specific dependency for one case.
+
+Asking rather than spawning costs latency: the backend appears when a hook next fires rather than at connect time. The frontend reports the wait the same way it reports any unreachable backend. Both hosts fire a session-start hook, which lands before the first tool call, so the wait is usually invisible. A session with no mcpls hooks installed never gets a backend on Windows, which makes the plugin a prerequisite there rather than a convenience, and `--no-backend` the answer for a checkout without it.
 
 The fallback when job creation fails is harmless here: it holds a handle to the server process and calls `TerminateProcess`, which reaches no descendants. An older Codex used `taskkill /T`, which killed the tree.
 
@@ -124,7 +130,7 @@ Configurable, defaulting to 10 seconds after the last `mcp` connection closes. H
 
 The order on exit matters more than the timer. The backend stops accepting and closes every open stream first, then drains its language servers. A frontend arriving during the drain therefore fails to connect, takes the spawn lock, and starts a fresh backend, instead of handshaking with a process that is on its way out.
 
-Closing every stream rather than only stopping `accept` is what Windows needs. A named pipe exists while any server-side instance handle is open, connected ones included, and `accept` creates the replacement instance before handing out the ready one so the count never reaches zero (`crates/mcpls-core/src/hooks/listener.rs:915-965`). A new backend's `first_pipe_instance` fails until the old process has dropped every instance, not merely stopped accepting. On Unix nothing unlinks the socket file on exit, so connect refuses as soon as the listener descriptor closes.
+Closing every stream rather than only stopping `accept` is what Windows needs. A named pipe exists while any server-side instance handle is open, connected ones included, and `accept` creates the replacement instance before handing out the ready one so the count never reaches zero (`crates/mcpls-core/src/hooks/listener.rs:915-965`). A new backend's `first_pipe_instance` fails until the old process has dropped every instance, not merely stopped accepting. Measurement bounds that: binding the same name while the holder's connected stream was open failed with `ERROR_PIPE_BUSY`, with and without `first_pipe_instance` and against a one-instance limit, and succeeded once the holder dropped that stream while the holder itself kept running. Dropping the handles is enough, so the ordering asks for no more than it needs. On Unix nothing unlinks the socket file on exit, so connect refuses as soon as the listener descriptor closes.
 
 The cost is honest and worth naming: close the last session, wait past the timer, open a new one, and rust-analyzer reindexes from cold. The timer is the knob for people who alternate sessions quickly.
 
@@ -201,8 +207,6 @@ Plugin packaging is a separate document. It depends on this one only through whi
 
 ## Open decisions
 
-**Whether Claude Code on Windows also uses a job.** The hook route is chosen on the strength of Codex's source. If Claude Code contains a session's MCP servers the same way, the same route has to work from its hooks too, and if its hook runner is not similarly permissive the route needs rethinking. This wants measuring on Windows rather than reading.
-
 **Whether the project identity keeps hashing the working directory.** Codex gives a stdio server the `cwd` its configuration names, or the thread's local working directory, with no normalization toward a repository root (`codex-rs/rmcp-client/src/stdio_server_launcher.rs:270`; `codex-rs/core/src/session/mcp_runtime.rs:88,115`). Two ordinary sessions in one checkout agree, but sessions started in different subdirectories do not, and an explicit `cwd` in the server's entry can point anywhere. Resolving a checkout root instead would make the sharing hold in those cases, at the cost of teaching the hook side the same rule.
 
 ## Rejected alternatives
@@ -232,4 +236,6 @@ Plugin packaging is a separate document. It depends on this one only through whi
 - Two sessions subscribed to different files: each is notified about its own and neither about the other's, and one of them disconnecting does not stop the other's diagnostics.
 - A session whose connection drops and comes back inside the grace: its already-delivered diagnostics stay delivered.
 - A Codex connection whose first tool call names a thread the backend already holds records for: those records carry over rather than starting empty.
+- On Windows, a session that fires no hook: the frontend says why there is no backend rather than appearing to work.
+- The interactive Codex interface on Windows: it contains a server's descendants the way `codex exec` does, so the hook route is still the one that works.
 - The same suite on Windows over the named pipe, since the endpoint code is shared.
