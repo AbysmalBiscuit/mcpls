@@ -149,7 +149,6 @@ pub(crate) struct PumpShared {
 /// The task exits when:
 /// - The LSP notification channel closes (`rx.recv()` returns `None`).
 /// - The cancellation watch fires (or the sender is dropped).
-/// - `notify_resource_updated` returns an error (peer disconnect / transport closed).
 ///
 /// # Lock independence
 /// Cache writes acquire only `Arc<Mutex<NotificationCache>>`, a lock entirely
@@ -183,9 +182,7 @@ pub(crate) async fn diagnostics_pump(
                 let Some(notif) = msg else { break };
                 match notif {
                     LspNotification::PublishDiagnostics(p) => {
-                        if handle_publish_diagnostics(&server_id, caches_diagnostics, p, &shared).await {
-                            break;
-                        }
+                        handle_publish_diagnostics(&server_id, caches_diagnostics, p, &shared).await;
                     }
                     LspNotification::LogMessage(m) => {
                         let mut cache = shared.notification_cache.lock().await;
@@ -213,14 +210,13 @@ pub(crate) async fn diagnostics_pump(
 /// owns the diagnostics route) and notify a subscribed peer.
 ///
 /// Split out of [`diagnostics_pump`] to keep that function under clippy's
-/// line-count lint. Returns `true` when the pump should stop (peer
-/// disconnected).
+/// line-count lint.
 async fn handle_publish_diagnostics(
     server_id: &ServerId,
     caches_diagnostics: bool,
     p: lsp_types::PublishDiagnosticsParams,
     shared: &PumpShared,
-) -> bool {
+) {
     // Only the server the router resolves `Diagnostics` to for this
     // notification's language caches (and notifies subscribers of) it --
     // see #174 §8. A server that was never the diagnostics route, or lost
@@ -228,14 +224,14 @@ async fn handle_publish_diagnostics(
     // source for this language's diagnostics; skip publishing so it doesn't
     // overwrite (or spuriously notify about) another server's cache entry.
     if !caches_diagnostics {
-        return false;
+        return;
     }
     if !diagnostic_path_in_workspace(&p.uri, &shared.workspace_roots) {
         debug!(
             "dropping diagnostics for out-of-workspace URI: {}",
             p.uri.as_str()
         );
-        return false;
+        return;
     }
     if let Some(version) = p.version
         && let Some(path) = bridge::uri_to_path(&p.uri)
@@ -246,7 +242,7 @@ async fn handle_publish_diagnostics(
             "dropping diagnostics for {} at version {version}, tracker holds {tracked_version}",
             p.uri.as_str()
         );
-        return false;
+        return;
     }
     {
         let mut cache = shared.notification_cache.lock().await;
@@ -255,28 +251,30 @@ async fn handle_publish_diagnostics(
 
     // Fast path: skip URI construction when nothing is subscribed.
     if shared.subs.is_empty().await {
-        return false;
+        return;
     }
 
     // Notify only when peer is ready and URI is subscribed.
     let Some(peer) = shared.peer_cell.get() else {
-        return false;
+        return;
     };
     let Some(path) = bridge::uri_to_path(&p.uri) else {
-        return false;
+        return;
     };
     let Ok(mcp_uri) = make_uri(&path) else {
-        return false;
+        return;
     };
 
     if !shared.subs.contains(&mcp_uri).await {
-        return false;
+        return;
     }
 
-    // `true` (pump stops) means the peer disconnected.
-    peer.notify_resource_updated(ResourceUpdatedNotificationParam::new(mcp_uri))
+    if let Err(error) = peer
+        .notify_resource_updated(ResourceUpdatedNotificationParam::new(mcp_uri))
         .await
-        .is_err()
+    {
+        tracing::debug!(%error, "a subscriber could not be notified");
+    }
 }
 
 /// Diagnostics ownership after registration, used to divide the cache budget.
@@ -2701,6 +2699,94 @@ mod tests {
         /// pump-mechanics tests don't need to construct real workspace paths.
         fn no_workspace_roots() -> Arc<[PathBuf]> {
             Arc::from([])
+        }
+
+        /// A bare handler, to obtain a real peer. Every `ServerHandler`
+        /// method has a default, so this needs no body.
+        #[derive(Debug)]
+        struct BarePeerHandler;
+
+        impl rmcp::ServerHandler for BarePeerHandler {}
+
+        /// A peer whose service has already stopped, so every notification
+        /// it sends fails.
+        async fn broken_peer() -> rmcp::Peer<rmcp::RoleServer> {
+            let (server_io, _client_io) = tokio::io::duplex(1024);
+            let running = rmcp::service::serve_directly(BarePeerHandler, server_io, None);
+            let peer = running.peer().clone();
+            running.cancel().await.expect("the bare service stops");
+            peer
+        }
+
+        /// A peer that cannot be notified is one connection's problem. The
+        /// pump carries every connection's diagnostics caching, so it keeps
+        /// running and keeps caching after a notify fails.
+        #[tokio::test]
+        async fn test_pump_keeps_caching_after_a_failed_notify() {
+            let cache = make_cache();
+            let subs = make_subs();
+            let peer_cell = make_peer_cell();
+            peer_cell
+                .set(broken_peer().await)
+                .expect("peer cell is empty");
+
+            let first: Uri = "file:///test/first.rs".parse().unwrap();
+            let second: Uri = "file:///test/second.rs".parse().unwrap();
+            // Subscribed, so the pump reaches the notify rather than
+            // returning at the subscription check.
+            subs.subscribe(make_uri(std::path::Path::new("/test/first.rs")).unwrap())
+                .await
+                .expect("subscribe");
+
+            let (tx, rx) = mpsc::channel(8);
+            let (_cancel_tx, cancel_rx) = watch::channel(false);
+            let c = Arc::clone(&cache);
+            tokio::spawn(diagnostics_pump(
+                ServerId::from("rust"),
+                rx,
+                cancel_rx,
+                true,
+                PumpShared {
+                    notification_cache: c,
+                    subs: Arc::clone(&subs),
+                    peer_cell: Arc::clone(&peer_cell),
+                    workspace_roots: no_workspace_roots(),
+                    document_tracker: make_tracker(),
+                    settle: make_settle(),
+                    delivery: make_delivery(),
+                    floors: make_floors(),
+                },
+            ));
+
+            for uri in [&first, &second] {
+                tx.send(LspNotification::PublishDiagnostics(
+                    PublishDiagnosticsParams {
+                        uri: uri.clone(),
+                        diagnostics: vec![],
+                        version: None,
+                    },
+                ))
+                .await
+                .unwrap();
+            }
+            drop(tx);
+
+            let cached = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    tokio::task::yield_now().await;
+                    let found = {
+                        let guard = cache.lock().await;
+                        guard.get_diagnostics(second.as_str()).is_some()
+                    };
+                    if found {
+                        return true;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the pump stopped after the first notify failed");
+            assert!(cached, "the publish after a failed notify was not cached");
         }
 
         /// `PublishDiagnostics` is cached even when the peer is not yet connected.
