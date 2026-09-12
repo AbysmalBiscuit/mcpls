@@ -31,6 +31,41 @@ fn clear_ambient_env(cmd: &mut Command) -> &mut Command {
         .env_remove("MCPLS_LOG_JSON")
 }
 
+/// A session started in a subdirectory of a checkout derives the endpoint
+/// the checkout's own root derives, which is what lets the two share one
+/// backend.
+#[test]
+fn hook_doctor_reports_the_checkout_root_from_a_subdirectory() {
+    let project = TempDir::new().unwrap();
+    let runtime = TempDir::new().unwrap();
+    let root = dunce::canonicalize(project.path()).unwrap();
+    fs::create_dir(root.join(".git")).unwrap();
+    let nested = root.join("crates").join("core");
+    fs::create_dir_all(&nested).unwrap();
+
+    let root_hash = mcpls_core::hooks::identity_hash(&root).unwrap();
+
+    let mut cmd = Command::cargo_bin("mcpls").unwrap();
+    let output = clear_ambient_env(&mut cmd)
+        .env("CLAUDE_PROJECT_DIR", &nested)
+        .env_remove("XDG_RUNTIME_DIR")
+        .env("TMPDIR", runtime.path())
+        .env("USER", "mcpls-test")
+        .args(["hook", "doctor"])
+        .output()
+        .unwrap();
+    let report = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        report.contains(&root_hash),
+        "doctor reported a hash other than the checkout root's: {report}"
+    );
+    assert!(
+        report.contains(&format!("root: {}", root.display())),
+        "doctor did not name the checkout root: {report}"
+    );
+}
+
 #[test]
 fn test_help_flag() {
     let mut cmd = Command::cargo_bin("mcpls").unwrap();

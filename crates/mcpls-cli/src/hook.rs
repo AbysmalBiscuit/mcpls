@@ -244,9 +244,12 @@ pub async fn doctor(project_dir: &Path, identity: &SocketIdentity) -> String {
 /// an actual mcpls running on the developer's own machine, not only the
 /// one the test bound itself.
 async fn doctor_scanning(project_dir: &Path, identity: &SocketIdentity, prefix: &str) -> String {
+    let root =
+        mcpls_core::hooks::project_root(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
     let mut lines = vec![
         format!("socket: {}", identity.socket.display()),
-        format!("hook sees: {} -> {}", project_dir.display(), identity.hash),
+        format!("hook sees: {}", project_dir.display()),
+        format!("root: {} -> {}", root.display(), identity.hash),
     ];
 
     match probe(identity, &Request::Status, SOCKET_TIMEOUT).await {
@@ -2043,28 +2046,27 @@ mod tests {
 
         let (out, identity) = doctor_with_own_owner(project.path(), 3).await;
         let hash = mcpls_core::hooks::identity_hash(project.path()).expect("hash");
+        let root = mcpls_core::hooks::project_root(project.path()).expect("root");
 
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 7, "expected exactly seven lines: {out}");
+        assert_eq!(lines.len(), 8, "expected exactly eight lines: {out}");
         assert_eq!(
-            lines[6],
+            lines[7],
             "watch scan: no eligible top-level paths; hidden entries excluded by default; ignore rules applied; host registration unverified"
         );
         assert_eq!(lines[0], format!("socket: {}", identity.socket.display()));
+        assert_eq!(lines[1], format!("hook sees: {}", project.path().display()));
+        assert_eq!(lines[2], format!("root: {} -> {hash}", root.display()));
         assert_eq!(
-            lines[1],
-            format!("hook sees: {} -> {hash}", project.path().display())
-        );
-        assert_eq!(
-            lines[2],
+            lines[3],
             format!("server sees: {} -> {hash}", project.path().display())
         );
-        assert_eq!(lines[3], format!("owner pid: {}", std::process::id()));
+        assert_eq!(lines[4], format!("owner pid: {}", std::process::id()));
         assert_eq!(
-            lines[4],
+            lines[5],
             "hooks seen: 3 request(s) since this owner started"
         );
-        assert!(lines[5].starts_with("mcpls on PATH: "));
+        assert!(lines[6].starts_with("mcpls on PATH: "));
     }
 
     /// A `Status` that does not claim ownership describes some other
@@ -2089,13 +2091,13 @@ mod tests {
         .await;
 
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 6, "expected exactly six lines: {out}");
+        assert_eq!(lines.len(), 7, "expected exactly seven lines: {out}");
         assert_eq!(
-            lines[5],
+            lines[6],
             "watch scan: no eligible top-level paths; hidden entries excluded by default; ignore rules applied; host registration unverified"
         );
         assert_eq!(
-            lines[2],
+            lines[3],
             format!(
                 "server sees: an owner answered, but not with its own status: {:?}",
                 Response::Status {
@@ -2108,7 +2110,7 @@ mod tests {
                 }
             )
         );
-        assert_eq!(lines[3], super::OWNER_PID_UNKNOWN);
+        assert_eq!(lines[4], super::OWNER_PID_UNKNOWN);
     }
 
     /// `SessionStart` never touches the socket by design, so a server
@@ -2150,24 +2152,23 @@ mod tests {
 
         let (out, identity) = doctor_with_nothing_running(project.path()).await;
         let hash = mcpls_core::hooks::identity_hash(project.path()).expect("hash");
+        let root = mcpls_core::hooks::project_root(project.path()).expect("root");
 
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 6, "expected exactly six lines: {out}");
+        assert_eq!(lines.len(), 7, "expected exactly seven lines: {out}");
         assert_eq!(
-            lines[5],
+            lines[6],
             "watch scan: no eligible top-level paths; hidden entries excluded by default; ignore rules applied; host registration unverified"
         );
         assert_eq!(lines[0], format!("socket: {}", identity.socket.display()));
+        assert_eq!(lines[1], format!("hook sees: {}", project.path().display()));
+        assert_eq!(lines[2], format!("root: {} -> {hash}", root.display()));
         assert_eq!(
-            lines[1],
-            format!("hook sees: {} -> {hash}", project.path().display())
-        );
-        assert_eq!(
-            lines[2],
+            lines[3],
             "server sees: no owner; nothing is listening on this project's socket"
         );
-        assert_eq!(lines[3], "owner pid: none");
-        assert!(lines[4].starts_with("mcpls on PATH: "));
+        assert_eq!(lines[4], "owner pid: none");
+        assert!(lines[5].starts_with("mcpls on PATH: "));
     }
 
     /// The runtime location only exists once an owner has bound there,

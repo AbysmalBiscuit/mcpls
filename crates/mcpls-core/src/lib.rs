@@ -587,18 +587,15 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     serve_with_identity(config, transport, None).await
 }
 
-/// This process's own canonicalized working directory and the socket
-/// identity derived from it, from one canonicalization rather than two, so
+/// The checkout root enclosing this process's working directory, and the
+/// socket identity derived from it, from one resolution rather than two, so
 /// a `Status` answer's `root` and `hash` describe the same directory by
 /// construction rather than by coincidence.
-fn canonicalized_cwd_identity() -> Result<(hooks::SocketIdentity, PathBuf), Error> {
+fn canonicalized_root_identity() -> Result<(hooks::SocketIdentity, PathBuf), Error> {
     let dir = std::env::current_dir().map_err(Error::Io)?;
-    let canonical = dunce::canonicalize(&dir).map_err(|e| Error::FileIo {
-        path: dir,
-        source: e,
-    })?;
-    let identity = hooks::identity_for(&canonical)?;
-    Ok((identity, canonical))
+    let root = hooks::project_root(&dir)?;
+    let identity = hooks::identity_for(&root)?;
+    Ok((identity, root))
 }
 
 /// [`serve_with`], with the project's hook socket identity supplied rather
@@ -761,12 +758,12 @@ pub(crate) async fn serve_with_identity(
     // must not turn an unreadable working directory into a startup failure.
     //
     // The identity and the root a `Status` answer reports both come from
-    // one canonicalization, not two independent ones: a directory that
-    // canonicalizes for `identity_for` but not for a second, separate call
+    // one root resolution, not independent resolutions: a directory that
+    // resolves for `identity_for` but not for a second, separate call
     // would otherwise leave `root` silently blank while `hash` is fine.
     let (mut hook_identity, hook_root) = if config.diagnostics.hooks.enabled {
         identity_override.map_or_else(
-            || match canonicalized_cwd_identity() {
+            || match canonicalized_root_identity() {
                 Ok((identity, root)) => (Some(identity), Some(root)),
                 Err(error) => {
                     warn!(

@@ -46,14 +46,16 @@ async fn main() {
                 // today's relative-path behaviour as the floor rather than
                 // turning it into a hard error.
                 let project_dir = dunce::canonicalize(&raw_project_dir).unwrap_or(raw_project_dir);
+                let root = mcpls_core::hooks::project_root(&project_dir)
+                    .unwrap_or_else(|_| project_dir.clone());
                 // A failed `identity_for` (an unreachable directory, or an
                 // over-long socket path) must not suppress `SessionStart`:
                 // that arm never touches the socket, which is the entire
                 // reason it exists, so every socket-using arm degrades on
                 // its own when `identity` is `None` rather than the whole
                 // dispatch short-circuiting here.
-                let identity = mcpls_core::hooks::identity_for(&project_dir).ok();
-                let out = hook::dispatch_payload(&stdin, &project_dir, identity.as_ref()).await;
+                let identity = mcpls_core::hooks::identity_for(&root).ok();
+                let out = hook::dispatch_payload(&stdin, &root, identity.as_ref()).await;
                 // `print!` panics on a write failure (a closed stdout pipe
                 // reached past the `LineWriter`'s buffer), which would
                 // break the exit-0 guarantee this whole command exists to
@@ -72,7 +74,9 @@ async fn main() {
                 let raw_project_dir = std::env::var_os("CLAUDE_PROJECT_DIR")
                     .map_or_else(|| std::path::PathBuf::from("."), std::path::PathBuf::from);
                 let project_dir = dunce::canonicalize(&raw_project_dir).unwrap_or(raw_project_dir);
-                let out = match mcpls_core::hooks::identity_for(&project_dir) {
+                let root = mcpls_core::hooks::project_root(&project_dir)
+                    .unwrap_or_else(|_| project_dir.clone());
+                let out = match mcpls_core::hooks::identity_for(&root) {
                     Ok(identity) => hook::doctor(&project_dir, &identity).await,
                     Err(error) => hook::doctor_without_identity(&project_dir, &error),
                 };
