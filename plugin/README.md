@@ -63,7 +63,7 @@ mcpls on PATH: /home/lev/.cargo/bin/mcpls; launch not checked
 watch scan: selected 4 top-level path(s); hidden entries excluded by default; ignore rules applied; host registration unverified
 ```
 
-This is a different failure from a missing owner: there, a socket exists and nothing answers it; here, no socket could ever exist for this directory on either side. Fix the reported reason, for example moving the project or `XDG_RUNTIME_DIR` to a shorter path, then run the doctor again.
+This is a different failure from a missing owner: there, a socket exists and nothing answers it; here, no socket could ever exist for this directory on either side. Fix the reported reason, for example moving the project or `TMPDIR` to a shorter path, then run the doctor again.
 
 ## Configuration
 

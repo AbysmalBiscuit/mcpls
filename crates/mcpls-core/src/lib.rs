@@ -606,8 +606,8 @@ fn canonicalized_root_identity() -> Result<(hooks::SocketIdentity, PathBuf), Err
 /// one machine-global lock. A test that wants to observe the socket passes
 /// a temporary identity instead, which is also what keeps a test run from
 /// answering a real agent's hooks. An env override would not do: the
-/// derivation already reads `XDG_RUNTIME_DIR`, and a process-wide variable
-/// races between tests sharing a process.
+/// derivation already reads `TMPDIR`, and a process-wide variable races
+/// between tests sharing a process.
 ///
 /// # Errors
 ///

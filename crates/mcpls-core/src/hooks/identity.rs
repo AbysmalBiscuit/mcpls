@@ -243,17 +243,19 @@ fn user_component(raw: Option<std::ffi::OsString>) -> Option<String> {
         .filter(|name| !name.is_empty())
 }
 
-/// Where sockets go on this platform.
+/// Where sockets go on this platform: the system temporary directory,
+/// `$TMPDIR` on macOS and `/tmp` on Linux, in a directory carrying the user.
 ///
-/// `$XDG_RUNTIME_DIR/mcpls` where that is set, which is the tmpfs a session
-/// owns and which is cleaned when the session ends. Otherwise the system
-/// temporary directory, which is shared between everyone on the machine and
-/// so needs the user in its name.
+/// `XDG_RUNTIME_DIR` would be the better directory, being a tmpfs the user
+/// owns and cleaned when the session ends, and it cannot be used. Codex
+/// launches a stdio MCP server with a cleared environment and a fixed list
+/// that omits it, while its hook commands inherit the whole environment
+/// (`codex-rs/rmcp-client/src/utils.rs:122-134`;
+/// `codex-rs/hooks/src/engine/command_runner.rs:191`), so a server and a
+/// hook of one project would look for the socket in two different places on
+/// any host that sets it.
 #[cfg(not(windows))]
 fn runtime_dir() -> PathBuf {
-    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
-        return PathBuf::from(runtime).join("mcpls");
-    }
     shared_temp_runtime_dir(current_user())
 }
 
@@ -280,6 +282,16 @@ fn shared_temp_runtime_dir(user: Option<String>) -> PathBuf {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// The runtime directory reads only variables every host passes, so a
+    /// server and a hook of one project agree on where the socket lives.
+    /// `XDG_RUNTIME_DIR` is not one of them: one host drops it for an MCP
+    /// server and keeps it for a hook command.
+    #[cfg(not(windows))]
+    #[test]
+    fn test_runtime_dir_ignores_the_xdg_variable() {
+        assert_eq!(runtime_dir(), shared_temp_runtime_dir(current_user()));
+    }
 
     #[test]
     fn test_a_username_cannot_carry_a_separator_into_a_socket_path() {
