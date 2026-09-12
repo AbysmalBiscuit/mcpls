@@ -60,6 +60,53 @@ pub fn identity_hash(dir: &Path) -> Result<String> {
     Ok(format!("{:016x}", hasher.finish()))
 }
 
+/// The checkout root enclosing `dir`: the nearest directory at or above it
+/// holding an entry named `.git`, or `dir` itself when none does.
+///
+/// Both sides of the socket resolve this before hashing, so two sessions in
+/// one checkout reach one endpoint however deep in it they started. The test
+/// is an entry named `.git` rather than anything git reports, because that
+/// entry marks a working tree: a linked worktree and a submodule each hold
+/// one, so each is its own root, while `git rev-parse --git-common-dir`
+/// would collapse every worktree of a repository onto one endpoint and serve
+/// one tree's contents under another tree's name.
+///
+/// # Errors
+///
+/// Returns an error if `dir` cannot be canonicalized, which means it does
+/// not exist or is not reachable.
+pub fn project_root(dir: &Path) -> Result<PathBuf> {
+    let canonical = dunce::canonicalize(dir).map_err(|e| Error::FileIo {
+        path: dir.to_path_buf(),
+        source: e,
+    })?;
+    let home = dirs::home_dir().map(|home| dunce::canonicalize(&home).unwrap_or(home));
+    Ok(root_from(&canonical, home.as_deref()))
+}
+
+/// The walk itself, over an already canonical path.
+///
+/// Takes the home directory rather than reading it, for the same reason
+/// [`user_component`] takes its raw value: the rule can then be exercised
+/// without a test setting a process-global variable, which this workspace
+/// cannot do at all.
+///
+/// Home and the filesystem root are never tested, only stopped at. A
+/// dotfiles repository in the home directory would otherwise become the root
+/// of every directory beneath it, which points a language server at the
+/// whole of home.
+fn root_from(canonical: &Path, home: Option<&Path>) -> PathBuf {
+    for candidate in canonical.ancestors() {
+        if candidate.parent().is_none() || home.is_some_and(|home| candidate == home) {
+            break;
+        }
+        if candidate.join(".git").exists() {
+            return candidate.to_path_buf();
+        }
+    }
+    canonical.to_path_buf()
+}
+
 /// The prefix every named pipe this user's mcpls binds on Windows carries.
 ///
 /// The pipe namespace is machine-global rather than per-user the way the
@@ -359,5 +406,109 @@ mod tests {
             message.contains(socket.to_str().expect("a utf8 path")),
             "names the offending path: {message}"
         );
+    }
+
+    /// A `.git` entry marks a working tree, so a directory inside one
+    /// resolves to the tree rather than to itself.
+    #[test]
+    fn test_root_from_finds_the_nearest_git_entry() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dunce::canonicalize(dir.path()).expect("canonical");
+        std::fs::create_dir(root.join(".git")).expect("git dir");
+        let nested = root.join("crates").join("core");
+        std::fs::create_dir_all(&nested).expect("nested dirs");
+
+        assert_eq!(root_from(&nested, None), root);
+    }
+
+    /// A linked worktree holds a `.git` file rather than a directory, and it
+    /// is its own root: two worktrees of one repository hold different files
+    /// and must never share an endpoint.
+    #[test]
+    fn test_root_from_accepts_a_git_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dunce::canonicalize(dir.path()).expect("canonical");
+        std::fs::write(root.join(".git"), "gitdir: /elsewhere/.git/worktrees/w").expect("git file");
+        let nested = root.join("src");
+        std::fs::create_dir(&nested).expect("nested dir");
+
+        assert_eq!(root_from(&nested, None), root);
+    }
+
+    /// With no marker anywhere, the start directory is the root, which is
+    /// the behaviour of a hash taken straight from the working directory.
+    #[test]
+    fn test_root_from_falls_back_to_the_start() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let start = dunce::canonicalize(dir.path()).expect("canonical");
+
+        assert_eq!(root_from(&start, None), start);
+    }
+
+    /// The walk stops before the home directory, so a dotfiles repository
+    /// there never becomes the root of a project beneath it, which would
+    /// point a language server at the whole of home.
+    #[test]
+    fn test_root_from_stops_before_home() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let home = dunce::canonicalize(dir.path()).expect("canonical");
+        std::fs::create_dir(home.join(".git")).expect("git dir");
+        let project = home.join("notes");
+        std::fs::create_dir(&project).expect("project dir");
+
+        assert_eq!(root_from(&project, Some(&home)), project);
+    }
+
+    /// The nearest marker wins, so a session inside a submodule gets the
+    /// submodule rather than the repository containing it.
+    #[test]
+    fn test_root_from_prefers_the_nearest_marker() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let outer = dunce::canonicalize(dir.path()).expect("canonical");
+        std::fs::create_dir(outer.join(".git")).expect("outer git");
+        let inner = outer.join("vendor").join("dep");
+        std::fs::create_dir_all(&inner).expect("inner dirs");
+        std::fs::write(inner.join(".git"), "gitdir: ../../.git/modules/dep")
+            .expect("inner git file");
+
+        assert_eq!(root_from(&inner, None), inner);
+    }
+
+    /// Resolving a root that is already a root returns it unchanged, which
+    /// is what lets a process re-derive its own identity from the directory
+    /// it was started in.
+    #[test]
+    fn test_root_from_is_idempotent() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dunce::canonicalize(dir.path()).expect("canonical");
+        std::fs::create_dir(root.join(".git")).expect("git dir");
+        let nested = root.join("src");
+        std::fs::create_dir(&nested).expect("nested dir");
+
+        let once = root_from(&nested, None);
+        assert_eq!(root_from(&once, None), once);
+    }
+
+    /// `project_root` canonicalizes, so a start directory reached through a
+    /// symlink resolves to the same root as the real path.
+    #[test]
+    fn test_project_root_canonicalizes_its_start() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dunce::canonicalize(dir.path()).expect("canonical");
+        std::fs::create_dir(root.join(".git")).expect("git dir");
+        let nested = root.join("src");
+        std::fs::create_dir(&nested).expect("nested dir");
+
+        assert_eq!(project_root(&nested).expect("root"), root);
+    }
+
+    /// A start directory that does not exist is an error rather than a
+    /// silently different endpoint.
+    #[test]
+    fn test_project_root_rejects_a_missing_start() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let missing = dir.path().join("absent");
+
+        assert!(project_root(&missing).is_err());
     }
 }
