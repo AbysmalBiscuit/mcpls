@@ -1167,12 +1167,12 @@ mod runtime_dir_tests {
     fn test_open_private_dir_rejects_fifo_without_waiting_for_a_writer() {
         let parent = tempfile::tempdir().expect("temp dir");
         let fifo = parent.path().join("runtime.fifo");
-        rustix::fs::mkfifoat(
-            rustix::fs::CWD,
-            &fifo,
-            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
-        )
-        .expect("create FIFO");
+        let status = std::process::Command::new("mkfifo")
+            .args(["-m", "600"])
+            .arg(&fifo)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo must create the FIFO fixture");
         let (sender, receiver) = std::sync::mpsc::channel();
         let opener = std::thread::spawn(move || {
             let _ = sender.send(open_private_dir(&fifo));
