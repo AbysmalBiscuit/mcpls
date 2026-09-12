@@ -19,7 +19,8 @@
 - Comments are timeless: no reference to this plan, no issue numbers, no "now we" or "used to", no TDD narration.
 - Commits follow Conventional Commits, subject at most 50 characters including the type prefix, imperative, lowercase after the colon, no trailing period. Body wrapped at 72. Every commit ends with a trailer naming the model that wrote it, per `AGENTS.md`.
 - Commits are GPG signed. If signing fails, stop and report rather than passing `--no-gpg-sign`.
-- Run `devrun task verify` before each commit. For a single test during the loop, `cargo nextest run -p mcpls-core <filter>` is faster.
+- A CLI test that spawns `mcpls` isolates the child's runtime directory with `env_remove("XDG_RUNTIME_DIR")`, `env("TMPDIR", <temp>)` and `env("USER", <fixed name>)`. Setting `XDG_RUNTIME_DIR` is how those tests isolate today and stops working in Task 4; `TMPDIR` works before and after it. Every such test also calls `clear_ambient_env` first (`crates/mcpls-cli/tests/cli_integration.rs:27-32`).
+- Run `devrun task verify` before each commit. For a single test during the loop, `cargo nextest run -p mcpls-core <filter>` is faster. `devrun task verify` runs on Linux and cannot see a Windows-only compile failure, so check every new `#[cfg]` against the gate on what it calls.
 
 ---
 
@@ -29,7 +30,7 @@
 |---|---|
 | `crates/mcpls-core/src/hooks/identity.rs` | Resolves a checkout root from any directory inside it, derives the hash, and names the socket or pipe. Owns the rule both sides follow. |
 | `crates/mcpls-core/src/hooks/listener.rs` | Binds the endpoint and owns the runtime directory's mode. |
-| `crates/mcpls-core/src/lib.rs` | Resolves the root once at startup for both the endpoint and the workspace base. Fans diagnostics notifications out to every subscribed connection. |
+| `crates/mcpls-core/src/lib.rs` | Resolves the checkout root for the workspace base and, separately, for the endpoint. Keeps the diagnostics pump running when one connection's notify fails. |
 | `crates/mcpls-cli/src/main.rs` | Resolves the root on the hook side from the directory the host names. |
 | `crates/mcpls-cli/src/hook.rs` | Prints the start directory, the root and the hash in the doctor report. |
 
@@ -40,8 +41,8 @@ Tasks 1 to 5 are the identity and runtime directory group. Task 6 is the pump. T
 ### Task 1: resolve a checkout root
 
 **Files:**
-- Modify: `crates/mcpls-core/src/hooks/identity.rs` (add after `identity_hash`, which ends at line 141)
-- Test: `crates/mcpls-core/src/hooks/identity.rs`, the existing `#[cfg(test)] mod tests` at line 262
+- Modify: `crates/mcpls-core/src/hooks/identity.rs` (add after `identity_hash`, which ends at line 61)
+- Test: `crates/mcpls-core/src/hooks/identity.rs`, the existing `#[cfg(test)] mod tests` at line 232
 
 **Interfaces:**
 - Consumes: `crate::error::{Error, Result}`, already imported at line 18.
@@ -245,6 +246,7 @@ git commit -m "feat(hooks): resolve a checkout root for identity"
 - Modify: `crates/mcpls-cli/src/main.rs:40-56` and `crates/mcpls-cli/src/main.rs:72-79`
 - Modify: `crates/mcpls-cli/src/hook.rs:234-260` (`doctor` and `doctor_scanning`'s first report line)
 - Test: `crates/mcpls-cli/tests/cli_integration.rs`
+- Comment to update: `crates/mcpls-core/src/hooks/identity.rs:3-6`, the module doc, which says mcpls hashes its own startup working directory and the hook hashes `CLAUDE_PROJECT_DIR`. Both hash the checkout root enclosing those directories after this task, and the agreement stops resting on the host's choice of working directory.
 
 **Interfaces:**
 - Consumes: `project_root` from Task 1, re-exported through `crates/mcpls-core/src/hooks/mod.rs:17`.
@@ -268,19 +270,24 @@ Add to `crates/mcpls-cli/tests/cli_integration.rs`:
 /// backend.
 #[test]
 fn hook_doctor_reports_the_checkout_root_from_a_subdirectory() {
-    let project = tempfile::tempdir().expect("temp dir");
-    let root = dunce::canonicalize(project.path()).expect("canonical");
-    std::fs::create_dir(root.join(".git")).expect("git dir");
+    let project = TempDir::new().unwrap();
+    let runtime = TempDir::new().unwrap();
+    let root = dunce::canonicalize(project.path()).unwrap();
+    fs::create_dir(root.join(".git")).unwrap();
     let nested = root.join("crates").join("core");
-    std::fs::create_dir_all(&nested).expect("nested dirs");
+    fs::create_dir_all(&nested).unwrap();
 
-    let root_hash = mcpls_core::hooks::identity_hash(&root).expect("hash");
+    let root_hash = mcpls_core::hooks::identity_hash(&root).unwrap();
 
-    let output = Command::new(bin())
-        .args(["hook", "doctor"])
+    let mut cmd = Command::cargo_bin("mcpls").unwrap();
+    let output = clear_ambient_env(&mut cmd)
         .env("CLAUDE_PROJECT_DIR", &nested)
+        .env_remove("XDG_RUNTIME_DIR")
+        .env("TMPDIR", runtime.path())
+        .env("USER", "mcpls-test")
+        .args(["hook", "doctor"])
         .output()
-        .expect("doctor runs");
+        .unwrap();
     let report = String::from_utf8_lossy(&output.stdout);
 
     assert!(
@@ -294,7 +301,7 @@ fn hook_doctor_reports_the_checkout_root_from_a_subdirectory() {
 }
 ```
 
-`bin()` is the existing helper this file uses to locate the built binary; reuse it rather than adding another.
+`Command::cargo_bin("mcpls")` is how every test in this file reaches the built binary, and `clear_ambient_env` (`crates/mcpls-cli/tests/cli_integration.rs:27-32`) is mandatory: without it a developer's `MCPLS_CONFIG` changes the outcome. The three runtime-directory variables keep the doctor's foreign scan, which probes up to sixteen sockets with a timeout each (`crates/mcpls-cli/src/hook.rs:225`), away from the sockets of live mcpls processes on the machine.
 
 - [ ] **Step 3: Run the test to verify it fails**
 
@@ -320,6 +327,8 @@ fn canonicalized_root_identity() -> Result<(hooks::SocketIdentity, PathBuf), Err
 ```
 
 Update the caller at `crates/mcpls-core/src/lib.rs:769` to the new name. `project_root` canonicalizes, so the `dunce::canonicalize` call this body replaced is not lost.
+
+The root this returns also reaches the hook sweeper, built from `HookLocation { identity, root }` (`crates/mcpls-core/src/lib.rs:897`), so sweeps cover the checkout rather than the subdirectory a session started in. That is the intent, not a side effect of renaming.
 
 - [ ] **Step 5: Resolve the root on the hook side**
 
@@ -380,11 +389,12 @@ git commit -m "feat: hash the checkout root on both sides"
 
 **Files:**
 - Modify: `crates/mcpls-core/src/lib.rs:663-673` (the workspace base)
-- Test: `crates/mcpls-core/src/lib.rs`, the existing `#[cfg(test)] mod tests`
 
 **Interfaces:**
 - Consumes: `hooks::project_root` from Task 1.
-- Produces: `fn workspace_base(start: &Path) -> Result<PathBuf, Error>`, the directory relative workspace roots resolve against.
+- Produces: nothing. The change is one call site.
+
+This task adds no test. The behaviour it changes is `project_root`, tested in Task 1; what it adds is the decision to call it here, and the only test that could observe that decision would have to run `serve_with` with a mutated process working directory, spawning real language servers to read back a value the call site states in two lines. It stays its own commit because it changes which files a session can ask about, and a reviewer bisecting a report of servers rooted in the wrong place wants that change alone in one diff.
 
 - [ ] **Step 1: Read what the base is today**
 
@@ -401,82 +411,36 @@ The base is `std::env::current_dir()` at `crates/mcpls-core/src/lib.rs:666`, rea
 
 An empty `roots` therefore defaults to the working directory. A backend rooted at whichever subdirectory its spawning frontend sat in would put a second session's files outside every workspace root, which is why the base moves with the identity rather than after it.
 
-- [ ] **Step 2: Write the failing test**
+- [ ] **Step 2: Anchor the base on the checkout**
 
-Add to the `mod tests` in `crates/mcpls-core/src/lib.rs`:
-
-```rust
-    /// Relative workspace roots and the empty default anchor on the checkout
-    /// rather than on the directory a session started in, so a session
-    /// started in a subdirectory sees the files a session started at the
-    /// root sees.
-    #[test]
-    fn test_workspace_base_is_the_checkout_root() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let root = dunce::canonicalize(dir.path()).expect("canonical");
-        std::fs::create_dir(root.join(".git")).expect("git dir");
-        let nested = root.join("crates").join("core");
-        std::fs::create_dir_all(&nested).expect("nested dirs");
-
-        assert_eq!(workspace_base(&nested).expect("base"), root);
-    }
-
-    /// A start directory outside any checkout is its own base, which is the
-    /// behaviour of a base taken straight from the working directory.
-    #[test]
-    fn test_workspace_base_falls_back_to_the_start() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let start = dunce::canonicalize(dir.path()).expect("canonical");
-
-        assert_eq!(workspace_base(&start).expect("base"), start);
-    }
-```
-
-- [ ] **Step 3: Run the tests to verify they fail**
-
-Run: `cargo nextest run -p mcpls-core workspace_base`
-
-Expected: compilation fails with `cannot find function workspace_base in this scope`.
-
-- [ ] **Step 4: Write the implementation**
-
-Add beside `canonicalized_root_identity` in `crates/mcpls-core/src/lib.rs`:
+Replace the two lines inside that branch:
 
 ```rust
-/// The directory relative workspace roots resolve against: the checkout
-/// enclosing `start`.
-///
-/// An empty `workspace.roots` defaults to this directory, so it decides
-/// which files a session can ask about. Resolving the checkout rather than
-/// taking `start` as it comes is what lets two sessions in one checkout,
-/// started at different depths, see the same files.
-fn workspace_base(start: &Path) -> Result<PathBuf, Error> {
-    hooks::project_root(start)
-}
-```
-
-Then replace the base at line 666 with a call to it:
-
-```rust
-        let workspace_base = workspace_base(&std::env::current_dir().map_err(Error::Io)?)?;
+        let cwd = std::env::current_dir().map_err(Error::Io)?;
+        let workspace_base = hooks::project_root(&cwd)?;
         resolve_workspace_roots(&config.workspace.roots, &workspace_base)?
 ```
 
-Rewrite the comment above that branch. Its first sentence, that `current_dir()` always returns an absolute path, no longer describes the code; the rest, about relative roots in a TOML file already being rebased and about absolute roots not paying for a lookup, still does. Keep what is still true and drop the sentence that is not.
+Then rewrite the comment above the branch. Its first sentence, that `current_dir()` always returns an absolute path, no longer describes the code, and the behaviour that replaces it needs stating:
 
-- [ ] **Step 5: Run the tests to verify they pass**
+```rust
+    // Relative roots and the empty default anchor on the checkout enclosing
+    // the working directory rather than on the working directory itself, so
+    // two sessions of one checkout, started at different depths, see the
+    // same files. Configs loaded from a TOML file ...
+```
 
-Run: `cargo nextest run -p mcpls-core workspace_base`
+Keep the rest of the comment, about relative roots in a TOML file already being rebased and about a fully-absolute `workspace.roots` not paying for a `current_dir()` that may be unreadable.
 
-Expected: both PASS.
+Resist adding a `workspace_base` wrapper around `project_root`. A private function whose body is one call to a public function one module over is the one-line cast the project's instructions rule out, and its tests would re-run Task 1's under new names.
 
-- [ ] **Step 6: Run the full suite**
+- [ ] **Step 3: Run the full suite**
 
 Run: `devrun task verify`
 
-Expected: PASS. A failure here most likely means an existing test asserts roots resolve against the working directory. Rewrite it to the new rule rather than deleting it, and check `crates/mcpls-core/src/lib.rs:1387` and `:1613`, which save and restore the process working directory around a test and are the likeliest places to find that assumption.
+Expected: PASS. The config tests that mutate the working directory (`crates/mcpls-core/src/config/mod.rs:2387` onward, through `crate::test_support::CwdGuard`) enter temporary directories, which hold no `.git` entry and sit outside the home directory, so `project_root` returns the start directory and their expectations do not move. If one of them fails, check whether the temporary directory it entered lies inside a checkout on this machine before changing the test. A failure in `crates/mcpls-core/src/lib.rs:1613` means the same thing.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
 git add crates/mcpls-core/src/lib.rs
@@ -489,7 +453,9 @@ git commit -m "feat: anchor workspace roots on the checkout"
 
 **Files:**
 - Modify: `crates/mcpls-core/src/hooks/identity.rs:199-211` (`runtime_dir`)
+- Modify: `crates/mcpls-cli/tests/cli_integration.rs`, every test that isolates a child's runtime directory (see Step 6)
 - Test: `crates/mcpls-core/src/hooks/identity.rs`, the existing `mod tests`
+- Comments to update: `crates/mcpls-core/src/lib.rs:611-613`, which says an env override would not do because the derivation already reads `XDG_RUNTIME_DIR`, and `plugin/README.md:66`, which tells a user with an over-long socket path to move `XDG_RUNTIME_DIR`. `TMPDIR` is the variable in both after this task.
 
 **Interfaces:**
 - Consumes: `shared_temp_runtime_dir(user: Option<String>) -> PathBuf`, already present at `identity.rs:225-230`.
@@ -506,17 +472,20 @@ Codex launches a stdio MCP server with `env_clear()` and a fixed list that carri
     /// server and a hook of one project agree on where the socket lives.
     /// `XDG_RUNTIME_DIR` is not one of them: one host drops it for an MCP
     /// server and keeps it for a hook command.
+    #[cfg(not(windows))]
     #[test]
     fn test_runtime_dir_ignores_the_xdg_variable() {
         assert_eq!(runtime_dir(), shared_temp_runtime_dir(current_user()));
     }
 ```
 
+The gate is not optional: `runtime_dir` and `shared_temp_runtime_dir` are both `#[cfg(not(windows))]` (`crates/mcpls-core/src/hooks/identity.rs:205`, `:224`), and this test module gates per test rather than as a whole (`:253`, `:278`), so an ungated test fails to compile on the Windows test job.
+
 - [ ] **Step 3: Run the test to verify it fails**
 
 Run: `cargo nextest run -p mcpls-core test_runtime_dir_ignores_the_xdg_variable`
 
-Expected: FAIL on any machine with `XDG_RUNTIME_DIR` set, which includes this one, where it is `/run/user/1000`. If it passes, the variable is unset in the test environment: confirm the failure by reading `runtime_dir` rather than trusting the run.
+Expected: FAIL on a machine where `XDG_RUNTIME_DIR` is set, which includes this one. PASS anywhere it is unset, including GitHub's Ubuntu runners. The test guards against the branch returning; it cannot prove the branch was there, so confirm the failure by reading `runtime_dir` rather than trusting a green run.
 
 - [ ] **Step 4: Delete the branch**
 
@@ -550,12 +519,20 @@ Expected: PASS.
 
 Run: `devrun task verify`
 
-Expected: PASS. Watch for a test asserting the socket path lies under `XDG_RUNTIME_DIR`; rewrite it rather than deleting it.
+Expected: FAIL in every `cli_integration.rs` test that sets `XDG_RUNTIME_DIR` to isolate a spawned child's runtime directory (`:143`, `:220`, `:259`, `:296`, `:358`, `:719`, `:749`, `:945`, `:1000`). The variable was never the subject of those tests. It was how they kept child processes off the developer's live sockets, and the replacement is the pair `std::env::temp_dir()` reads:
+
+```rust
+        .env_remove("XDG_RUNTIME_DIR")
+        .env("TMPDIR", runtime.path())
+        .env("USER", "mcpls-test")
+```
+
+Where a test builds the child's identity by hand (`:965-975`), change `runtime.path().join("mcpls")` to `runtime.path().join("mcpls-mcpls-test")` so the listener binds where the child now looks. The socket-length test at `:945` sets `TMPDIR` to its over-long path instead of `XDG_RUNTIME_DIR`, or its assertion on `socket: none; could not derive an identity` starts failing for want of a long directory. `test_doctor_identity_uses_current_user_without_xdg_runtime_dir` at `:915` keeps its assertion and loses an `env_remove` that is now a no-op. `crates/mcpls-core/tests/ra_e2e.rs:230` forwards the variable to a compiler wrapper rather than to mcpls and stays as it is.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/mcpls-core/src/hooks/identity.rs
+git add crates/mcpls-core/src/hooks/identity.rs crates/mcpls-core/src/lib.rs crates/mcpls-cli/tests/cli_integration.rs plugin/README.md
 git commit -m "fix(hooks): drop XDG_RUNTIME_DIR from the socket path"
 ```
 
@@ -565,11 +542,13 @@ git commit -m "fix(hooks): drop XDG_RUNTIME_DIR from the socket path"
 
 **Files:**
 - Modify: `crates/mcpls-core/src/hooks/listener.rs:223-235` (where the runtime directory is created)
-- Test: `crates/mcpls-core/src/hooks/listener.rs`, the existing `#[cfg(test)] mod tests`
+- Test: `crates/mcpls-core/src/hooks/listener.rs`, a new `#[cfg(all(test, not(windows)))] mod runtime_dir_tests` beside `probe_tests` at line 1126
 
 **Interfaces:**
 - Consumes: nothing new.
-- Produces: `fn ensure_private_dir(dir: &Path) -> std::io::Result<()>`, which creates a directory and, on Unix, sets it to `0o700`.
+- Produces: `fn ensure_private_dir(dir: &Path) -> std::io::Result<()>`, Unix only, which creates a directory and sets it to `0o700`.
+
+The file's `mod tests` at line 984 carries `#[cfg(windows)]` as well as `#[cfg(test)]`, so tests added there run nowhere on Linux and the RED step would report zero tests rather than a missing function. `probe_tests` at line 1126 is already gated `#[cfg(all(test, not(windows)))]` and is the pattern to copy.
 
 - [ ] **Step 1: Read the current creation**
 
@@ -578,10 +557,14 @@ Read `crates/mcpls-core/src/hooks/listener.rs:220-260`. The directory is created
 - [ ] **Step 2: Write the failing test**
 
 ```rust
+#[cfg(all(test, not(windows)))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod runtime_dir_tests {
+    use super::*;
+
     /// The runtime directory is private to its user. Nothing else keeps one
     /// user's socket out of another's reach on a shared temporary directory,
     /// and the design's cross-user non-goal rests on this.
-    #[cfg(unix)]
     #[test]
     fn test_ensure_private_dir_sets_owner_only_mode() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -605,6 +588,7 @@ Read `crates/mcpls-core/src/hooks/listener.rs:220-260`. The directory is created
         ensure_private_dir(&dir).expect("first create");
         ensure_private_dir(&dir).expect("second create");
     }
+}
 ```
 
 - [ ] **Step 3: Run the tests to verify they fail**
@@ -618,22 +602,25 @@ Expected: FAIL, with `cannot find function ensure_private_dir`.
 Add to `crates/mcpls-core/src/hooks/listener.rs`:
 
 ```rust
-/// Create `dir` if it is missing and, on Unix, make it owner-only.
+/// Create `dir` if it is missing and make it owner-only.
 ///
 /// The socket lives in a directory every user on the machine shares, and its
 /// name carrying the user is not on its own a boundary: another user can
 /// pre-create the name, and a permissive umask leaves the socket connectable
-/// by anyone. The mode is what makes the name's scoping hold.
+/// by anyone. The mode is what makes the name's scoping hold. Setting it on
+/// every call is deliberate: `chmod` on a directory this user owns is
+/// idempotent, and a directory another user pre-created fails here with
+/// `EPERM` rather than being bound into silently.
+#[cfg(not(windows))]
 fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
     std::fs::create_dir_all(dir)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
 }
 ```
+
+The gate is on the function rather than inside it because its only caller, `lock_file`, is itself `#[cfg(not(windows))]` (`crates/mcpls-core/src/hooks/listener.rs:220`). An ungated function is dead code on Windows, and the Windows clippy job runs with `-D warnings` (`.github/workflows/ci.yml:95`), so it would fail the push while `devrun task verify` stayed green.
 
 Then replace the `create_dir_all` call at line 230 with `ensure_private_dir`, keeping its existing error mapping.
 
@@ -661,8 +648,9 @@ git commit -m "fix(hooks): make the runtime directory owner-only"
 ### Task 6: a failed notify does not stop the pump
 
 **Files:**
-- Modify: `crates/mcpls-core/src/lib.rs:184-186` (the pump's `PublishDiagnostics` arm) and `crates/mcpls-core/src/lib.rs:249-278` (`handle_publish_diagnostics`)
+- Modify: `crates/mcpls-core/src/lib.rs:184-186` (the pump's `PublishDiagnostics` arm) and `crates/mcpls-core/src/lib.rs:218-278` (`handle_publish_diagnostics`)
 - Test: `crates/mcpls-core/src/lib.rs`, the pump tests beginning at line 2662
+- Comment to update: `crates/mcpls-core/src/lib.rs:148-151`, the `diagnostics_pump` doc, which lists a failing `notify_resource_updated` among the reasons the task exits. Two reasons remain after this task.
 
 **Interfaces:**
 - Consumes: the existing `PumpShared` at `crates/mcpls-core/src/lib.rs:120-130` and the test helpers `make_cache`, `make_subs`, `make_peer_cell`, `make_tracker`, `make_settle`, `make_delivery`, `make_floors` and `no_workspace_roots` at `crates/mcpls-core/src/lib.rs:2662-2703`.
@@ -682,27 +670,27 @@ One process serving one session can get away with that, because the peer leaving
 
 - [ ] **Step 2: Write the failing test**
 
-The failure path needs a real peer whose notify fails, which `make_peer_cell` cannot give: an empty cell returns early and never notifies. Build one the way `crates/mcpls-core/src/mcp/server.rs:2641` does, by serving over `tokio::io::duplex` and dropping the client half. Add to the pump tests in `crates/mcpls-core/src/lib.rs`:
+The failure path needs a real peer whose notify fails, which `make_peer_cell` cannot give: an empty cell returns early and never notifies. Build one by starting a service with `serve_directly` and cancelling it, which leaves the peer holding a channel nobody receives on.
+
+Do not reach for `ServiceExt::serve` here. For `RoleServer` it loops awaiting an `initialize` request before it returns (`rmcp-3.1.4/src/service/server.rs:497-500`), and this test sends none, so `serve(...).await` would never resolve and the step would hang rather than fail. `serve_directly` skips initialization and returns a `RunningService` directly, not a future and not a `Result` (`rmcp-3.1.4/src/service.rs:1265`). After `cancel()`, `Peer::send_notification` fails with `ServiceError::TransportClosed` because the receiver its channel feeds is gone (`rmcp-3.1.4/src/service.rs:826-832`).
+
+Add to the pump tests in `crates/mcpls-core/src/lib.rs`:
 
 ```rust
         /// A bare handler, to obtain a real peer. Every `ServerHandler`
         /// method has a default, so this needs no body.
-        #[derive(Debug, Clone)]
+        #[derive(Debug)]
         struct BarePeerHandler;
 
         impl rmcp::ServerHandler for BarePeerHandler {}
 
-        /// A peer whose transport is gone, so every notification it sends
-        /// fails.
+        /// A peer whose service has already stopped, so every notification
+        /// it sends fails.
         async fn broken_peer() -> rmcp::Peer<rmcp::RoleServer> {
-            let (server_io, client_io) = tokio::io::duplex(1024);
-            let running = BarePeerHandler
-                .serve(server_io)
-                .await
-                .expect("a bare handler serves");
+            let (server_io, _client_io) = tokio::io::duplex(1024);
+            let running = rmcp::service::serve_directly(BarePeerHandler, server_io, None);
             let peer = running.peer().clone();
-            drop(client_io);
-            drop(running);
+            running.cancel().await.expect("the bare service stops");
             peer
         }
 
@@ -722,7 +710,7 @@ The failure path needs a real peer whose notify fails, which `make_peer_cell` ca
             let second: Uri = "file:///test/second.rs".parse().unwrap();
             // Subscribed, so the pump reaches the notify rather than
             // returning at the subscription check.
-            subs.add(&make_uri(std::path::Path::new("/test/first.rs")).unwrap())
+            subs.subscribe(make_uri(std::path::Path::new("/test/first.rs")).unwrap())
                 .await
                 .expect("subscribe");
 
@@ -778,7 +766,7 @@ The failure path needs a real peer whose notify fails, which `make_peer_cell` ca
         }
 ```
 
-Confirm two names against the code before running: the subscription set's insert method, which the file's own subscription tests already call, and the import path for `ServerHandler` and `serve`, which the `use rmcp::` lines near the top of `crates/mcpls-core/src/mcp/server.rs` already spell out. Adjust the test to what is there rather than adding an import that does not resolve.
+`ResourceSubscriptions::subscribe` takes an owned `String` and returns `Result<bool, String>` (`crates/mcpls-core/src/bridge/resources.rs:146`); `make_uri` returns `Result<String, ResourceUriError>` (`:68`) and is already imported at `crates/mcpls-core/src/lib.rs:56`. No pump test subscribes anything today, so this is the first one that does.
 
 - [ ] **Step 3: Run the test to verify it fails**
 
@@ -831,6 +819,8 @@ git commit -m "fix: keep the pump alive when a notify fails"
 ## What this plan does not cover
 
 **Per-connection resource subscriptions.** One subscription set and one write-once peer serve the whole process today (`crates/mcpls-core/src/bridge/resources.rs:123`; `crates/mcpls-core/src/lib.rs:127`, set at `crates/mcpls-core/src/transport.rs:339`), so a process serving many connections has one shared set and can notify only whichever connection arrived first. Fixing it means a registry keyed by connection, a fan-out in the pump, and threading a connection id into the `resources/subscribe` handlers in a file of five thousand lines. That is a plan of its own rather than a task, and it belongs with the split, which is what first makes a second connection possible. Task 6 above is the half of it that stands alone, because a pump that stops on one peer's failure is a defect whether or not anything else changes.
+
+**Project configuration is still found at the working directory.** `ServerConfig::load_with_trust` looks for `./mcpls.toml` relative to the process working directory (`crates/mcpls-core/src/config/mod.rs:956`), and Task 3 does not move it. A user who starts a session in a subdirectory therefore gets servers anchored on the checkout while the `mcpls.toml` at that checkout goes unread, which is exactly the file the identity ruling points a monorepo user at for `workspace.roots`. Until discovery moves, the global config is the place for those roots. Moving it is a change to upstream code with its own trust implications and gets a task in the split plan.
 
 **The split itself.** The frontend and its stub service, the detached backend, the frozen handshake line and the configuration fingerprint it carries, the spawn lock, idle shutdown and its ordering, `--no-backend`, the doctor's backend report, session identity arriving from the handshake, and the deletion of the owner, passive, demotion and forwarding paths. None of it is startable until the endpoint's name and the runtime directory are settled, which is what the six tasks above settle.
 
