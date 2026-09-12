@@ -2847,6 +2847,25 @@ mod tests {
         );
     }
 
+    /// The reason a scan failed is the whole difference between "could not
+    /// scan" and the clean "nothing is listening", so it has to reach the
+    /// line. The permission fixture below drives the same wording end to
+    /// end but runs on Unix only, and the Windows pipe namespace cannot be
+    /// made to fail from a test, so this is the wording's only coverage
+    /// there.
+    #[test]
+    fn test_a_failed_scan_reports_its_reason_rather_than_a_clean_negative() {
+        let line = super::no_owner_line(super::ForeignOwners::ScanFailed(
+            "Access is denied. (os error 5)".to_string(),
+        ));
+
+        assert_eq!(
+            line,
+            "server sees: no owner for this directory; could not scan for other mcpls \
+             instances: Access is denied. (os error 5)"
+        );
+    }
+
     /// A directory the scan cannot read (permissions, most plausibly) is
     /// not the same fact as an empty one: the scan never got to look, so
     /// it must say so rather than claiming the clean "nothing is
