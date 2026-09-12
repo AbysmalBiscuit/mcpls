@@ -97,12 +97,24 @@ fn ensure_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
         ));
     }
 
-    let directory = std::fs::File::open(dir)?;
+    let directory = open_private_dir(dir)?;
     let opened = directory.metadata()?;
     if (metadata.dev(), metadata.ino()) != (opened.dev(), opened.ino()) {
         return Err(io::Error::other("runtime directory changed while opening"));
     }
     directory.set_permissions(std::fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(windows))]
+fn open_private_dir(dir: &std::path::Path) -> io::Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags};
+
+    Ok(rustix::fs::open(
+        dir,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?
+    .into())
 }
 
 /// Why [`HookListener::serve`] stopped serving.
@@ -1150,6 +1162,28 @@ mod client_rule_tests {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod runtime_dir_tests {
     use super::*;
+
+    #[test]
+    fn test_open_private_dir_rejects_fifo_without_waiting_for_a_writer() {
+        let parent = tempfile::tempdir().expect("temp dir");
+        let fifo = parent.path().join("runtime.fifo");
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .expect("create FIFO");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let opener = std::thread::spawn(move || {
+            let _ = sender.send(open_private_dir(&fifo));
+        });
+
+        let result = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("runtime directory open must return without waiting for a FIFO writer");
+        opener.join().expect("open thread");
+        assert!(result.is_err(), "a FIFO must not open as a directory");
+    }
 
     #[tokio::test]
     async fn test_acquire_rejects_a_symlink_runtime_dir_without_chmod() {

@@ -1034,6 +1034,7 @@ dependencies = [
  "lsp-types",
  "rmcp",
  "rstest",
+ "rustix 1.1.4",
  "schemars",
  "serde",
  "serde_json",
