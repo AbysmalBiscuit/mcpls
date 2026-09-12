@@ -79,19 +79,30 @@ pub struct HookListener {
 
 /// Create `dir` if it is missing and make it owner-only.
 ///
-/// The socket lives in a directory every user on the machine shares, and its
-/// name carrying the user is not on its own a boundary: another user can
-/// pre-create the name, and a permissive umask leaves the socket connectable
-/// by anyone. The mode is what makes the name's scoping hold. Setting it on
-/// every call is deliberate: `chmod` on a directory this user owns is
-/// idempotent, and a directory another user pre-created fails here with
-/// `EPERM` rather than being bound into silently.
+/// Reject symlinks and change permissions through a verified directory
+/// handle so a path replacement cannot redirect the permission change.
 #[cfg(not(windows))]
 fn ensure_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
 
-    std::fs::create_dir_all(dir)?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    let metadata = std::fs::symlink_metadata(dir)?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "runtime directory must be a directory, not a symlink or file",
+        ));
+    }
+
+    let directory = std::fs::File::open(dir)?;
+    let opened = directory.metadata()?;
+    if (metadata.dev(), metadata.ino()) != (opened.dev(), opened.ino()) {
+        return Err(io::Error::other("runtime directory changed while opening"));
+    }
+    directory.set_permissions(std::fs::Permissions::from_mode(0o700))
 }
 
 /// Why [`HookListener::serve`] stopped serving.
@@ -1140,6 +1151,39 @@ mod client_rule_tests {
 mod runtime_dir_tests {
     use super::*;
 
+    #[tokio::test]
+    async fn test_acquire_rejects_a_symlink_runtime_dir_without_chmod() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let parent = tempfile::tempdir().expect("temp dir");
+        let target = parent.path().join("unrelated");
+        std::fs::create_dir(&target).expect("target dir");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
+            .expect("target permissions");
+        let dir = parent.path().join("mcpls-someone");
+        symlink(&target, &dir).expect("runtime symlink");
+        let identity = SocketIdentity {
+            socket: dir.join("test.sock"),
+            lock: dir.join("test.lock"),
+            hash: "test".to_string(),
+        };
+
+        let result = HookListener::acquire(&identity).await;
+
+        assert_eq!(
+            std::fs::metadata(&target)
+                .expect("target metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "the symlink target's permissions must stay unchanged"
+        );
+        assert!(result.is_err(), "a runtime symlink must be rejected");
+        assert!(!target.join("test.lock").exists());
+        assert!(!target.join("test.sock").exists());
+    }
+
     /// The runtime directory is private to its user. Nothing else keeps one
     /// user's socket out of another's reach on a shared temporary directory,
     /// and the design's cross-user non-goal rests on this.
@@ -1163,11 +1207,24 @@ mod runtime_dir_tests {
     /// processes of one project race to create it.
     #[test]
     fn test_ensure_private_dir_accepts_an_existing_dir() {
+        use std::os::unix::fs::PermissionsExt as _;
+
         let parent = tempfile::tempdir().expect("temp dir");
         let dir = parent.path().join("mcpls-someone");
 
+        std::fs::create_dir(&dir).expect("existing dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+            .expect("permissive mode");
         ensure_private_dir(&dir).expect("first create");
         ensure_private_dir(&dir).expect("second create");
+        assert_eq!(
+            std::fs::metadata(&dir)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
     }
 }
 
