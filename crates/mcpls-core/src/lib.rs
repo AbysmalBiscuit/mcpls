@@ -2723,11 +2723,15 @@ mod tests {
                 .set(broken_peer().await)
                 .expect("peer cell is empty");
 
-            let first: Uri = "file:///test/first.rs".parse().unwrap();
-            let second: Uri = "file:///test/second.rs".parse().unwrap();
+            let project = tempfile::tempdir().expect("project dir");
+            let root = dunce::canonicalize(project.path()).expect("canonical root");
+            let first_path = root.join("first.rs");
+            let second_path = root.join("second.rs");
+            let first = bridge::path_to_uri(&first_path).expect("first file URI");
+            let second = bridge::path_to_uri(&second_path).expect("second file URI");
             // Subscribed, so the pump reaches the notify rather than
             // returning at the subscription check.
-            subs.subscribe(make_uri(std::path::Path::new("/test/first.rs")).unwrap())
+            subs.subscribe(make_uri(&first_path).expect("subscription URI"))
                 .await
                 .expect("subscribe");
 
