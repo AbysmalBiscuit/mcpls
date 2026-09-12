@@ -80,7 +80,11 @@ Leaving the frontend's process group matters as much. Codex launches a stdio ser
 
 Windows under Codex cannot spawn the backend as an ordinary child. Codex creates a job object per server launch, with kill-on-close and without breakaway, and assigns the suspended server before resuming it (`codex-rs/rmcp-client/src/stdio_server_launcher.rs:290`; `codex-rs/utils/pty/src/win/job.rs:62`). A process already in such a job cannot leave it, and `CREATE_BREAKAWAY_FROM_JOB` is refused, so anything the frontend spawns normally stays inside and dies with it. Wrapping the spawn in another executable changes nothing, because the wrapper is in the job too.
 
-The job is per launch rather than per session or per Codex process, so a backend started by something already outside it survives. Two routes exist. `Win32_Process.Create` over WMI is documented not to put the new process in the caller's job. And Codex's own command hooks are launched from a permissive job that allows breakaway and whose runner disables kill-on-close for descendants when the command finishes (`codex-rs/utils/pty/src/win/job.rs:41`; `codex-rs/hooks/src/engine/command_runner.rs:228,286`), so a hook invocation of mcpls is itself outside the MCP frontend's job.
+The job is per launch rather than per session or per Codex process, so a backend started by something already outside it survives. A hook invocation is that something. Codex launches command hooks from a permissive job that allows breakaway, and its runner disables kill-on-close for descendants once the command finishes (`codex-rs/utils/pty/src/win/job.rs:41`; `codex-rs/hooks/src/engine/command_runner.rs:228,286`), so `mcpls hook` already runs outside the MCP server's job. On Windows the frontend therefore does not spawn the backend at all: it asks, and the next hook invocation starts it.
+
+That reuses a door the design already has rather than adding one. `Win32_Process.Create` over WMI is the alternative, since a process it creates does not inherit the caller's job, but it is a platform-specific dependency for one case.
+
+Asking rather than spawning costs latency: the backend appears when a hook next fires rather than at connect time. The frontend reports the wait the same way it reports any unreachable backend, and a session that never fires a hook never gets one, which is the honest cost of the platform.
 
 The fallback when job creation fails is harmless here: it holds a handle to the server process and calls `TerminateProcess`, which reaches no descendants. An older Codex used `taskkill /T`, which killed the tree.
 
@@ -197,7 +201,7 @@ Plugin packaging is a separate document. It depends on this one only through whi
 
 ## Open decisions
 
-**Windows under Codex: which launcher.** The frontend cannot spawn the backend itself there. The candidates are `Win32_Process.Create` over WMI, or having a hook invocation do the spawning, since hooks run outside the MCP server's job. Whether Claude Code on Windows also uses a job is still unchecked, and if it does the chosen route has to serve both hosts.
+**Whether Claude Code on Windows also uses a job.** The hook route is chosen on the strength of Codex's source. If Claude Code contains a session's MCP servers the same way, the same route has to work from its hooks too, and if its hook runner is not similarly permissive the route needs rethinking. This wants measuring on Windows rather than reading.
 
 **Whether the project identity keeps hashing the working directory.** Codex gives a stdio server the `cwd` its configuration names, or the thread's local working directory, with no normalization toward a repository root (`codex-rs/rmcp-client/src/stdio_server_launcher.rs:270`; `codex-rs/core/src/session/mcp_runtime.rs:88,115`). Two ordinary sessions in one checkout agree, but sessions started in different subdirectories do not, and an explicit `cwd` in the server's entry can point anywhere. Resolving a checkout root instead would make the sharing hold in those cases, at the cost of teaching the hook side the same rule.
 
