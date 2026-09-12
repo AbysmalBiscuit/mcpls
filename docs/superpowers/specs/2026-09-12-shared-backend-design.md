@@ -87,6 +87,8 @@ Updating the plugin leaves a backend of the old build running for as long as ses
 
 The message is addressed to the user through the agent, in the imperative, so the agent relays it rather than trying to work around it.
 
+**The frontend is older than the backend:** the same mismatch pointed the other way, which happens when two installs of mcpls serve one project, or when a build is rolled back while a backend from the newer one is still attached. The older frontend never evicts the backend. It attaches to nothing and reports the mismatch exactly as above. Allowing the eviction would let two hosts on different builds take turns killing each other's backend, and all the user would see is an unexplained reindex.
+
 ### Configuration and trust
 
 The backend's configuration is whatever the frontend that started it had. A later frontend with different configuration is a real possibility, and silence would be the wrong answer.
@@ -124,7 +126,9 @@ A session's records live as long as its connections, counted rather than assumed
 - `SessionEnd` while a connection is still open marks the session, and the drop happens when the last one closes.
 - A connection closing with no `SessionEnd` starts a grace timer instead of dropping anything, so a session whose MCP server the host restarted keeps its delivery history and does not get every diagnostic again as new.
 
-The grace only has to outlive a restart, because a backend holding no sessions at all exits on the idle timer and takes every record with it.
+The grace defaults to 60 seconds and is configurable. It only has to outlive a restart, because a backend holding no sessions at all exits on the idle timer and takes every record with it. A grace longer than the idle timer therefore only has effect while some other session holds the backend open.
+
+Records live in memory and leave with the backend. Persisting them would buy one case: the last session's connection drops, the backend times out mid-grace, and the session returns to hear its diagnostics again as new. A repeated diagnostic is cheaper than a file format to version, migrate and garbage collect.
 
 ### The watcher moves into the backend
 
@@ -163,11 +167,6 @@ Plugin packaging is a separate document. It depends on this one only through whi
 - Two frontends racing from nothing: one backend, no error on either side.
 - A newer frontend against an idle older backend: the old one exits, the new one serves, and nothing reaches the agent about it.
 - The same with another session attached: every tool call carries the upgrade message naming both versions, and the attached session keeps working.
+- An older frontend against a newer backend: the backend keeps serving its sessions, and the older frontend reports the mismatch instead of taking over.
 - A session whose connection drops and comes back inside the grace: its already-delivered diagnostics stay delivered.
 - The same suite on Windows over the named pipe, since the endpoint code is shared.
-
-## Open questions
-
-1. How long is the record grace after a connection closes with no `SessionEnd`? It has to outlive a host restarting a failed MCP server and nothing more, so it is a small number of seconds, but the number wants a measurement rather than a guess.
-2. Should a frontend that finds a *newer* backend also take over, or only an older one? Taking over in both directions makes downgrades work the same way as upgrades; refusing in that direction keeps an old frontend from evicting a backend the rest of the machine is using.
-3. Does anything need to survive the backend exiting between sessions, or is a cold index the honest price? Persisting delivery records to disk would keep a session's history across an idle exit, at the cost of a format to maintain.
