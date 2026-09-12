@@ -30,7 +30,7 @@ One shape of sharing already exists and does not solve this. `Transport::Http` s
 
 - Sharing across projects. Two worktrees hold different files and get a backend each.
 - Surviving a reboot, or running as a user service. The backend is started on demand by the first frontend and exits on its own.
-- Cross-user sharing. The socket's permissions and the Windows pipe name already scope an endpoint to one user (`crates/mcpls-core/src/hooks/identity.rs:92-124`), and that stays true.
+- Cross-user sharing. The Windows pipe name carries the user and so does the Unix runtime directory (`crates/mcpls-core/src/hooks/identity.rs:92-124,225-230`). A name is the whole of it today, because nothing sets a mode on that directory (`crates/mcpls-core/src/hooks/listener.rs:230`), so the listener sets it to `0o700` when it creates it and the scoping stops resting on the umask.
 - Upstreaming.
 
 ## Shape
@@ -59,9 +59,25 @@ Every connection opens with a single-line handshake before either protocol start
 
 After the handshake the stream speaks one protocol for its lifetime.
 
-### Identity stays the working directory
+### Identity is the checkout root
 
-The hash covers the process working directory, and the hook side hashes the project directory the host names. Keeping both is the cheaper option: hooks derive their identity from a directory rather than from a config, so a rule that resolves workspace roots has to be taught to both sides at once. The price is that sessions started in different subdirectories of one repository get a backend each, and that a host free to name the server's working directory can send two sessions in one checkout to different endpoints. Whether that price is acceptable is an open decision below.
+Both sides hash one directory: the nearest checkout root enclosing the directory the host hands them. The frontend starts from its working directory, which is where both hosts launch a stdio server (`crates/mcpls-core/src/lib.rs:594-601`; `codex-rs/rmcp-client/src/stdio_server_launcher.rs:273,282`). The hook starts from the directory the host names: `CLAUDE_PROJECT_DIR` under Claude Code (`crates/mcpls-cli/src/main.rs:40-48`), and the payload's `cwd` under Codex, which carries the turn's working directory and is also the directory the hook command runs in (`codex-rs/hooks/src/schema.rs:283`; `codex-rs/core/src/hook_runtime.rs:133`; `codex-rs/hooks/src/engine/command_runner.rs:62`). The Codex adapter ignores `CLAUDE_PROJECT_DIR`, which a Codex run started from a Claude Code shell inherits. Neither side reads a config: the resolution needs only the directory.
+
+The resolution is a walk, not a git invocation. The start directory is canonicalized through `dunce` as it is today (`crates/mcpls-core/src/hooks/identity.rs:49-53`). Then the directory and each of its ancestors are tried in turn, and the first one holding an entry named `.git`, whether a directory or a file, is the root. The walk stops before the home directory and never reaches the filesystem root, so a dotfiles repository in the home directory is never the root of a project beneath it. When nothing matches, the start directory itself is the root, which is today's behaviour. The walk is idempotent, so a backend spawned with the root as its working directory derives the same identity its spawner did.
+
+The hash covers the canonical root, the handshake carries it, and the backend's workspace base is the root rather than the working directory of whichever frontend spawned it (`crates/mcpls-core/src/lib.rs:662-672`). A session started in a subdirectory therefore gets the servers a session started at the root gets, and its files fall inside the workspace. A monorepo's sub-project that a language server cannot discover from the checkout root is named in `workspace.roots`, which keeps its meaning: it scopes the servers inside a backend and plays no part in the endpoint name.
+
+An entry named `.git` is the test because it marks a working tree rather than a repository. A linked worktree holds a `.git` file pointing into the main checkout, and so does a submodule, so each is its own root, and several worktrees of one repository never share a backend. `git rev-parse --git-common-dir` would collapse them, which is why nothing here resolves through git. Nested repositories fall the same way: the nearest entry wins, a session in a submodule gets the submodule's backend, and a session at the outer root gets the outer one, whose servers may also index the submodule's files. That is a split, never a merge. A directory with no `.git` anywhere beneath home splits by subdirectory as it does today.
+
+Where the two sides can still disagree, a directory rule cannot help. A Codex server entry whose `cwd` names a directory outside the checkout puts the frontend at that directory's root while every hook resolves to the checkout, so that backend serves the session and hears no hooks; `mcpls hook doctor` prints the start directory, the root and the hash on each side for exactly this case.
+
+The rule is not configurable. Two processes on different rules derive different names and never open a handshake, so the fingerprint refusal above cannot report the mismatch, and a hook process has no mcpls configuration to read a knob from. `--no-backend` remains the escape for a checkout the rule serves badly. The walk costs a stat per ancestor on each hook invocation, adds no dependency, and lives in a file upstream does not have.
+
+### Addition to "The endpoint"
+
+Place after the paragraph that names `identity_for`:
+
+The runtime directory reads only variables both hosts pass. Codex launches a stdio server with a cleared environment and a fixed list that carries `HOME`, `USER`, `LOGNAME` and `TMPDIR` but not `XDG_RUNTIME_DIR` (`codex-rs/rmcp-client/src/utils.rs:122-134`), while its hook commands inherit the whole environment (`codex-rs/hooks/src/engine/command_runner.rs:191`). A runtime directory chosen from `XDG_RUNTIME_DIR` (`crates/mcpls-core/src/hooks/identity.rs:206-211`) therefore puts a Codex frontend and a Codex hook in different directories on Linux whenever the variable is set, and they never meet. The socket lives under the system temporary directory in a directory carrying the user on every Unix host, which is the fallback that already exists, and the listener sets that directory to `0o700` when it creates it. On Windows the pipe prefix reads `USERNAME`, which Codex passes (`codex-rs/protocol/src/shell_environment.rs:129`).
 
 ### Starting the backend
 
@@ -119,7 +135,7 @@ The message is addressed to the user through the agent, in the imperative, so th
 
 The backend's configuration is whatever the frontend that started it had. A later frontend with different configuration is a real possibility, and silence would be the wrong answer.
 
-- **Different fingerprint, same source:** the backend serves the session, names both fingerprints in its instructions, and the doctor reports the mismatch. This is the ordinary case rather than the edge, because each host's own configuration decides what reaches mcpls: Claude Code's `.mcp.json` sets environment variables directly, while Codex clears the environment and passes only what the server's own entry names (`codex-rs/rmcp-client/src/stdio_server_launcher.rs:269`).
+- **Different fingerprint, same source:** the backend serves the session, names both fingerprints in its instructions, and the doctor reports the mismatch. This is the ordinary case rather than the edge, because each host's own configuration decides what reaches mcpls: Claude Code's `.mcp.json` sets environment variables directly, while Codex clears the environment and passes a fixed list plus what the server's own entry names (`codex-rs/rmcp-client/src/stdio_server_launcher.rs:269`; `codex-rs/rmcp-client/src/utils.rs:122-134`).
 - **Different trust:** the backend refuses, in both directions. One that loaded a project-local `mcpls.toml` refuses a frontend without `--trust-project-config` (`crates/mcpls-cli/src/args.rs:56-67`), and one that ignored that file for want of trust refuses a frontend that passes the flag. Project config can name the command mcpls spawns, so the two sides either agree about trusting it or they do not share a backend. The refusal carries the same shape of message as a version mismatch: both states named, and the action that reconciles them.
 
 Whether the project file was ignored is currently a per-process fact reported through `get_info` (`crates/mcpls-core/src/mcp/handlers.rs:47-53`; `crates/mcpls-core/src/mcp/server.rs:1762-1768`). In a shared backend it describes the backend's own load, and each frontend's trust state is reported beside it.
@@ -151,7 +167,7 @@ Records are keyed by session and agent. A diagnostic goes to exactly one of them
 
 Keeping the recipient list to the file's own writers is the point. A shared record would let a subagent hear about a file another subagent is still editing, and a broadcast would have every agent in a workflow racing to fix the same error. Two agents writing one file in a turn is a conflict they both need to see, so both are told rather than only the later one; tooling that hands out file claims makes this case rare in the first place. Where a host names no agent, the session tree shares one record, which is the behaviour today.
 
-Codex has a hook door too, and mcpls does not speak it. Hooks are enabled by default at this version, load from `.codex/hooks.json` among other places, and a synchronous `PostToolUse` hook returns the same `hookSpecificOutput.additionalContext` shape mcpls already emits for Claude Code (`codex-rs/hooks/src/schema.rs:228`; `codex-rs/core/src/tools/registry.rs:674`). mcpls cannot read it yet because the hooks file is Claude-only and the parser expects Claude's payload (`plugin/hooks/hooks.json`; `crates/mcpls-cli/src/hook.rs:31-56`). An adapter is feasible rather than speculative, with one real obstacle: Codex has no changed-files field. `apply_patch` hands over the raw patch as `tool_input.command` (`codex-rs/core/src/tools/handlers/apply_patch.rs:458`), so an adapter has to parse the patch to learn which files were touched.
+Codex has a hook door too, and mcpls does not speak it. Hooks are enabled by default at this version, load from `.codex/hooks.json` among other places, and a synchronous `PostToolUse` hook returns the same `hookSpecificOutput.additionalContext` shape mcpls already emits for Claude Code (`codex-rs/hooks/src/schema.rs:228`; `codex-rs/core/src/tools/registry.rs:674`). mcpls cannot read it yet because the hooks file is Claude-only and the parser expects Claude's payload (`plugin/hooks/hooks.json`; `crates/mcpls-cli/src/hook.rs:31-56`). An adapter is feasible rather than speculative, with two obstacles. Codex has no changed-files field: `apply_patch` hands over the raw patch as `tool_input.command` (`codex-rs/core/src/tools/handlers/apply_patch.rs:458`), so an adapter has to parse the patch to learn which files were touched. It also has no `CLAUDE_PROJECT_DIR`, so it reads its project directory from the payload's `cwd`, which every Codex hook payload carries as a required field (`codex-rs/hooks/src/schema.rs:283`).
 
 Claude Code names an agent on one door only. Hook payloads carry `agent_id`, `agent_type` and `caller_session_id`, while a subagent's own tool call arrives on the session's connection with no agent marker. Per-agent records therefore key off the hook door, and a tool call with no agent reads the session's record, which is the fallback the rules above already describe.
 
@@ -197,6 +213,8 @@ Each stage lands on main in a working state.
 
 Session identity belongs to this stage rather than the next one. `SessionId::from_env_or_process` reads the process environment and falls back to one token per process (`crates/mcpls-core/src/bridge/delivery.rs:17,41-59`), and the backend inherits the environment of whichever frontend spawned it. Left in place it would hand every session the spawner's record: one session's `get_new_diagnostics` would consume another's, while the hook door kept keying correctly off the payload's session id, which is the split-record failure the diagnostics design built forwarding to prevent. So `McplsServer` carries the session its connection named in the handshake, the two remaining call sites read that field, and the backend never asks its own environment.
 
+The identity rule lands here too, because the endpoint's name is the first thing the two sides have to agree on. Both call `project_root` before hashing, the backend's workspace base moves to the root, and the Unix runtime directory stops reading `XDG_RUNTIME_DIR`. That last part is not a refinement: without it a Codex frontend and a Codex hook sit in different runtime directories on any Linux host that sets the variable, and no identity rule brings them together.
+
 **Stage 2: the rest of identity.** The Codex `_meta` lookup, which is what remains once Stage 1 holds the handshake id and the connection fallback.
 
 **Stage 3: the watcher.** Backend-side watching, and `FileChanged`, `watchPaths` and the `SessionStart` hook removed from the Claude plugin.
@@ -207,7 +225,7 @@ Plugin packaging is a separate document. It depends on this one only through whi
 
 ## Open decisions
 
-**Whether the project identity keeps hashing the working directory.** Codex gives a stdio server the `cwd` its configuration names, or the thread's local working directory, with no normalization toward a repository root (`codex-rs/rmcp-client/src/stdio_server_launcher.rs:270`; `codex-rs/core/src/session/mcp_runtime.rs:88,115`). Two ordinary sessions in one checkout agree, but sessions started in different subdirectories do not, and an explicit `cwd` in the server's entry can point anywhere. Resolving a checkout root instead would make the sharing hold in those cases, at the cost of teaching the hook side the same rule.
+None at present.
 
 ## Rejected alternatives
 
@@ -220,6 +238,9 @@ Plugin packaging is a separate document. It depends on this one only through whi
 ## Verification
 
 - Two sessions in one project: exactly one backend process and one rust-analyzer for the pair, and the second session answers a hover before a cold index could have finished.
+- One of those two started in a subdirectory: the same backend, and its files fall inside a workspace root rather than outside every one.
+- Two worktrees of one repository: a backend each, and neither answers about the other's files.
+- A Codex frontend and a Codex hook on a Linux host that sets `XDG_RUNTIME_DIR`: both reach the same endpoint.
 - Kill the backend with a session attached: the frontend reports the failure through its instructions and does not start language servers of its own.
 - Close the last session: the backend and its language servers are gone shortly after the timer, with no orphans.
 - Connect during the drain: the arriving frontend gets a new backend, not the dying one.
