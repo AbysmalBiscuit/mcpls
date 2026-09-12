@@ -77,6 +77,23 @@ pub struct HookListener {
     lock_path: std::path::PathBuf,
 }
 
+/// Create `dir` if it is missing and make it owner-only.
+///
+/// The socket lives in a directory every user on the machine shares, and its
+/// name carrying the user is not on its own a boundary: another user can
+/// pre-create the name, and a permissive umask leaves the socket connectable
+/// by anyone. The mode is what makes the name's scoping hold. Setting it on
+/// every call is deliberate: `chmod` on a directory this user owns is
+/// idempotent, and a directory another user pre-created fails here with
+/// `EPERM` rather than being bound into silently.
+#[cfg(not(windows))]
+fn ensure_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::create_dir_all(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+}
+
 /// Why [`HookListener::serve`] stopped serving.
 ///
 /// Named for what happened, not for what a caller should do about it,
@@ -227,7 +244,7 @@ impl HookListener {
         // rather than assuming either one covers the other.
         for path in [&identity.socket, &identity.lock] {
             if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
+                ensure_private_dir(parent)?;
             }
         }
 
@@ -1115,6 +1132,42 @@ mod client_rule_tests {
             panic!("a client bound that elapsed is a transport failure");
         };
         assert_eq!(message, "the hook socket did not answer within 1500ms");
+    }
+}
+
+#[cfg(all(test, not(windows)))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod runtime_dir_tests {
+    use super::*;
+
+    /// The runtime directory is private to its user. Nothing else keeps one
+    /// user's socket out of another's reach on a shared temporary directory,
+    /// and the design's cross-user non-goal rests on this.
+    #[test]
+    fn test_ensure_private_dir_sets_owner_only_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let parent = tempfile::tempdir().expect("temp dir");
+        let dir = parent.path().join("mcpls-someone");
+
+        ensure_private_dir(&dir).expect("dir created");
+
+        let mode = std::fs::metadata(&dir)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700, "mode was {:o}", mode & 0o777);
+    }
+
+    /// Creating a directory that already exists is not an error, because two
+    /// processes of one project race to create it.
+    #[test]
+    fn test_ensure_private_dir_accepts_an_existing_dir() {
+        let parent = tempfile::tempdir().expect("temp dir");
+        let dir = parent.path().join("mcpls-someone");
+
+        ensure_private_dir(&dir).expect("first create");
+        ensure_private_dir(&dir).expect("second create");
     }
 }
 
