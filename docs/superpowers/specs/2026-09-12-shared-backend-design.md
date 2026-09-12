@@ -61,7 +61,7 @@ After the handshake the stream speaks one protocol for its lifetime.
 
 ### Identity stays the working directory
 
-The hash covers the process working directory, and the hook side hashes the project directory the host names. Both keep doing that. Hashing resolved workspace roots instead would let sessions started in subdirectories share a backend, but hooks derive their identity from a directory, not from a config, and splitting the rule across the two sides is worse than the sharing it buys. Sessions started in different subdirectories of one repository therefore get a backend each. If that shows up in practice, it is a later change to both sides at once.
+The hash covers the process working directory, and the hook side hashes the project directory the host names. Keeping both is the cheaper option: hooks derive their identity from a directory rather than from a config, so a rule that resolves workspace roots has to be taught to both sides at once. The price is that sessions started in different subdirectories of one repository get a backend each, and that a host free to name the server's working directory can send two sessions in one checkout to different endpoints. Whether that price is acceptable is an open decision below.
 
 ### Starting the backend
 
@@ -78,7 +78,11 @@ The backend's standard streams decide whether detaching works at all. The fronte
 
 Leaving the frontend's process group matters as much. Codex launches a stdio server with `process_group(0)` and sends `SIGTERM` to that whole group on cleanup, then `SIGKILL` two seconds later (`codex-rs/rmcp-client/src/stdio_server_launcher.rs:274,354`). `setsid` puts the backend in a new session and group, so the group signal does not reach it.
 
-Windows under Codex is the one platform where this does not work. Since `0.148.0` Codex assigns a stdio server to a job object with kill-on-close, created without allowing breakaway, before the child resumes (`codex-rs/rmcp-client/src/stdio_server_launcher.rs:290`; `codex-rs/utils/pty/src/win/job.rs:62`). A grandchild cannot escape such a job, so a backend spawned by a Codex frontend dies with it. Whether Claude Code on Windows does the same has not been checked, and the answer decides whether this needs a general mechanism or only a Codex fallback. Until it is settled this design does not deliver a shared backend to Codex on Windows.
+Windows under Codex cannot spawn the backend as an ordinary child. Codex creates a job object per server launch, with kill-on-close and without breakaway, and assigns the suspended server before resuming it (`codex-rs/rmcp-client/src/stdio_server_launcher.rs:290`; `codex-rs/utils/pty/src/win/job.rs:62`). A process already in such a job cannot leave it, and `CREATE_BREAKAWAY_FROM_JOB` is refused, so anything the frontend spawns normally stays inside and dies with it. Wrapping the spawn in another executable changes nothing, because the wrapper is in the job too.
+
+The job is per launch rather than per session or per Codex process, so a backend started by something already outside it survives. Two routes exist. `Win32_Process.Create` over WMI is documented not to put the new process in the caller's job. And Codex's own command hooks are launched from a permissive job that allows breakaway and whose runner disables kill-on-close for descendants when the command finishes (`codex-rs/utils/pty/src/win/job.rs:41`; `codex-rs/hooks/src/engine/command_runner.rs:228,286`), so a hook invocation of mcpls is itself outside the MCP frontend's job.
+
+The fallback when job creation fails is harmless here: it holds a handle to the server process and calls `TerminateProcess`, which reaches no descendants. An older Codex used `taskkill /T`, which killed the tree.
 
 A backend that loses its lock or its socket file keeps serving the sessions it already holds and exits on the idle timer. It does not try to rebind. An age-based cleaner deleting either one costs one extra backend for as long as the old sessions last, which is cheaper than two processes racing for one endpoint.
 
@@ -126,6 +130,7 @@ The process stops being the session, so the session can no longer come from the 
 
 - **Codex** identifies the caller by thread, not by session. A spawned subagent shares its root's `session_id`, so the discriminator is the thread: `params._meta["x-codex-turn-metadata"].thread_id`, or the simpler top-level `params._meta.threadId`, both naming the issuing thread on every model-issued tool call (`codex-rs/core/src/mcp_tool_call.rs:1238,506`). Subagents also carry `parent_thread_id` and `subagent_kind`, which a root thread omits. Keying on `session_id` would merge a root and all of its subagents into one record. Codex exports no session variable at all: it clears the environment and rebuilds it from a fixed list plus what the server's own entry names (`codex-rs/rmcp-client/src/stdio_server_launcher.rs:269`), so per-request metadata is the only route. Calls issued by hooks rather than by the model guarantee `threadId` but not the turn metadata (`codex-rs/core/src/hook_mcp_executor.rs:19`), so a missing key is a fallback rather than an error.
 - **Claude Code** exports `CLAUDE_CODE_SESSION_ID` to the frontend, which passes it in the handshake. Calls on that connection inherit it.
+- **A Codex connection starts anonymous.** `initialize` carries no thread id, so the frontend has nothing to put in the handshake and the backend holds the connection under its own id until the first identified tool call arrives (`codex-rs/codex-mcp/src/rmcp_client.rs:1049`). A connection therefore adopts an identity mid-life and its records merge into that thread's at that point. This is also how a session recovers its history after a refresh: the replacement process presents the same thread id, since Codex keeps it on the session rather than deriving it from the connection (`codex-rs/core/src/session/mcp_runtime.rs:322`; `codex-rs/core/src/mcp_tool_call.rs:512`), but only once a call reveals it. A connection that never makes an identified call keeps its own records and loses them on close.
 - **Neither:** the connection's own id, which keeps two anonymous sessions apart. This is where the HTTP transport lands, which is already better than the process-wide key it uses today.
 
 Records are keyed by session and agent. A diagnostic goes to exactly one of them:
@@ -146,7 +151,9 @@ A session's records live as long as its connections, counted rather than assumed
 - `SessionEnd` while a connection is still open marks the session, and the drop happens when the last one closes.
 - A connection closing with no `SessionEnd` starts a grace timer instead of dropping anything, so a session whose MCP server the host restarted keeps its delivery history and does not get every diagnostic again as new.
 
-Those rules are written for Claude Code, which is the host that names both events. On Codex `SessionEnd` is root-only and a spawned child's teardown is `SubagentStop` instead (`codex-rs/core/src/hook_runtime.rs:124,455`), so a subagent's records drop on that event and the root's on `SessionEnd`.
+Those rules are written for Claude Code, which is the host that names both events. Codex names neither for a subagent. Its `SessionEnd` is root-only, and `SubagentStop` is a turn-stop hook rather than a lifetime one: it fires after a child's turn settles, can fire again when the child takes more work, can itself block stopping, and is skipped on interrupt, on a sampling error, on parent cancellation and on a crash (`codex-rs/core/src/session/turn.rs:552,615`; `codex-rs/core/src/tasks/mod.rs:900`; `codex-rs/core/src/hook_runtime.rs:464,486`).
+
+So no event is authoritative. Closing a connection plus the grace is what expires a record, and a host event only accelerates it where the host offers one. Treating `SubagentStop` as a teardown would both leak records for children that never fire it and delete records for children still working.
 
 The grace defaults to 60 seconds and is configurable. Claude Code is the reason it exists; Codex has no crash-to-relaunch supervisor for a stdio server at all, only an explicit MCP refresh that preserves the owning identities (`codex-rs/core/src/session/handlers.rs:237`), so on Codex the grace covers a deliberate refresh rather than a crash. It only has to outlive either, because a backend holding no sessions at all exits on the idle timer and takes every record with it. A grace longer than the idle timer therefore only has effect while some other session holds the backend open.
 
@@ -190,7 +197,9 @@ Plugin packaging is a separate document. It depends on this one only through whi
 
 ## Open decisions
 
-**Windows under Codex.** Codex's job object has kill-on-close and forbids breakaway, so a backend spawned by a Codex frontend cannot outlive it. Whether Claude Code on Windows does the same decides the shape of the answer, so that check comes first. The options after it are spawning the backend through something outside the job, or declaring that Codex on Windows runs in-process and saying so in its instructions.
+**Windows under Codex: which launcher.** The frontend cannot spawn the backend itself there. The candidates are `Win32_Process.Create` over WMI, or having a hook invocation do the spawning, since hooks run outside the MCP server's job. Whether Claude Code on Windows also uses a job is still unchecked, and if it does the chosen route has to serve both hosts.
+
+**Whether the project identity keeps hashing the working directory.** Codex gives a stdio server the `cwd` its configuration names, or the thread's local working directory, with no normalization toward a repository root (`codex-rs/rmcp-client/src/stdio_server_launcher.rs:270`; `codex-rs/core/src/session/mcp_runtime.rs:88,115`). Two ordinary sessions in one checkout agree, but sessions started in different subdirectories do not, and an explicit `cwd` in the server's entry can point anywhere. Resolving a checkout root instead would make the sharing hold in those cases, at the cost of teaching the hook side the same rule.
 
 ## Rejected alternatives
 
@@ -218,4 +227,5 @@ Plugin packaging is a separate document. It depends on this one only through whi
 - A Codex session ending: the backend outlives the group cleanup that kills the frontend.
 - Two sessions subscribed to different files: each is notified about its own and neither about the other's, and one of them disconnecting does not stop the other's diagnostics.
 - A session whose connection drops and comes back inside the grace: its already-delivered diagnostics stay delivered.
+- A Codex connection whose first tool call names a thread the backend already holds records for: those records carry over rather than starting empty.
 - The same suite on Windows over the named pipe, since the endpoint code is shared.
