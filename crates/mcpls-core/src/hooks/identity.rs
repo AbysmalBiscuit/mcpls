@@ -1,11 +1,11 @@
 //! Where a project's hook socket lives, and how the two sides agree on it.
 //!
-//! mcpls hashes its own startup working directory; the hook hashes
-//! `CLAUDE_PROJECT_DIR`. Those agree because a host spawns a stdio MCP
-//! server in the project directory, which is a property of the host rather
-//! than a guarantee, which is why `mcpls hook doctor` prints both.
+//! mcpls and the hook both resolve the checkout root enclosing their start
+//! directories through [`project_root`] and hash that shared root. Sessions
+//! started anywhere in one checkout therefore reach the same socket without
+//! relying on the host's working-directory choice.
 //!
-//! Both sides canonicalize here, through `dunce`. `Path::canonicalize`
+//! `project_root` canonicalizes through `dunce`. `Path::canonicalize`
 //! returns a `\\?\C:\...` extended-length path on Windows, so a design
 //! where one side used the standard library and the other used `dunce`
 //! would disagree on every Windows install, permanently and with nothing
