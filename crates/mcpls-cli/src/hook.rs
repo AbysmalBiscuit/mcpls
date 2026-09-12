@@ -312,7 +312,7 @@ async fn doctor_scanning(project_dir: &Path, identity: &SocketIdentity, prefix: 
     }
 
     lines.push(on_path_line(mcpls_on_path().as_deref()));
-    lines.push(watch_scan_line(project_dir));
+    lines.push(watch_scan_line(&root));
 
     lines.join("\n")
 }
@@ -2043,6 +2043,7 @@ mod tests {
     #[tokio::test]
     async fn test_doctor_reports_the_live_owners_root_pid_and_hook_activity() {
         let project = tempfile::tempdir().expect("a temp dir");
+        std::fs::create_dir(project.path().join(".git")).expect("checkout marker");
 
         let (out, identity) = doctor_with_own_owner(project.path(), 3).await;
         let hash = mcpls_core::hooks::identity_hash(project.path()).expect("hash");
@@ -2078,6 +2079,7 @@ mod tests {
     #[tokio::test]
     async fn test_doctor_does_not_read_a_non_owner_answer_as_this_projects_owner() {
         let project = tempfile::tempdir().expect("a temp dir");
+        std::fs::create_dir(project.path().join(".git")).expect("checkout marker");
         let other = tempfile::tempdir().expect("a temp dir");
         let socket_dir = tempfile::tempdir().expect("a temp dir");
         let identity = local_identity_for(project.path(), socket_dir.path());
@@ -2149,6 +2151,7 @@ mod tests {
     #[tokio::test]
     async fn test_doctor_reports_no_owner_when_nothing_is_reachable_anywhere() {
         let project = tempfile::tempdir().expect("a temp dir");
+        std::fs::create_dir(project.path().join(".git")).expect("checkout marker");
 
         let (out, identity) = doctor_with_nothing_running(project.path()).await;
         let hash = mcpls_core::hooks::identity_hash(project.path()).expect("hash");
@@ -2169,6 +2172,34 @@ mod tests {
         );
         assert_eq!(lines[4], "owner pid: none");
         assert!(lines[5].starts_with("mcpls on PATH: "));
+    }
+
+    #[tokio::test]
+    async fn test_doctor_scans_the_checkout_root_from_a_nested_start() {
+        let project = tempfile::tempdir().expect("project dir");
+        let root = dunce::canonicalize(project.path()).expect("canonical root");
+        std::fs::create_dir(root.join(".git")).expect("git dir");
+        let nested = root.join("src");
+        std::fs::create_dir(&nested).expect("start dir");
+        std::fs::write(root.join("README.md"), "project").expect("root file");
+        let socket_dir = tempfile::tempdir().expect("socket dir");
+        let identity = local_identity_for(&root, socket_dir.path());
+
+        let out =
+            super::doctor_scanning(&nested, &identity, &test_pipe_prefix(socket_dir.path())).await;
+
+        let lines: Vec<_> = out.lines().collect();
+        assert_eq!(lines[1], format!("hook sees: {}", nested.display()));
+        assert_eq!(
+            lines[2],
+            format!("root: {} -> {}", root.display(), identity.hash)
+        );
+        assert_eq!(
+            lines.last().copied(),
+            Some(
+                "watch scan: selected 2 top-level path(s); hidden entries excluded by default; ignore rules applied; host registration unverified"
+            )
+        );
     }
 
     /// The runtime location only exists once an owner has bound there,
