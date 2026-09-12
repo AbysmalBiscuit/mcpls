@@ -648,9 +648,11 @@ pub(crate) async fn serve_with_identity(
     config.validate()?;
 
     let project_config_ignored = config.project_config_ignored;
-    // `current_dir()` always returns an absolute path. Configs loaded from a
-    // TOML file have already had relative roots rebased to that file's
-    // directory in `ServerConfig::load_from`; this second pass covers
+    // Relative roots and the empty default anchor on the checkout enclosing
+    // the working directory rather than on the working directory itself, so
+    // two sessions of one checkout, started at different depths, see the
+    // same files. Configs loaded from a TOML file have already had relative roots
+    // rebased to that file's directory in `ServerConfig::load_from`; this second pass covers
     // caller-built `ServerConfig`s, whose relative roots are defined against
     // the process cwd. Only actually called when a root needs it (empty
     // `roots`, which defaults to cwd, or at least one relative root): a
@@ -659,7 +661,8 @@ pub(crate) async fn serve_with_identity(
     let workspace_roots = if config.workspace.roots.is_empty()
         || config.workspace.roots.iter().any(|root| root.is_relative())
     {
-        let workspace_base = std::env::current_dir().map_err(Error::Io)?;
+        let cwd = std::env::current_dir().map_err(Error::Io)?;
+        let workspace_base = hooks::project_root(&cwd)?;
         resolve_workspace_roots(&config.workspace.roots, &workspace_base)?
     } else {
         // Every root is absolute already, so `base_dir` is never joined
