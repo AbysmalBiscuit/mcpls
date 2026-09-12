@@ -243,8 +243,9 @@ fn user_component(raw: Option<std::ffi::OsString>) -> Option<String> {
         .filter(|name| !name.is_empty())
 }
 
-/// Where sockets go on this platform: the system temporary directory,
-/// `$TMPDIR` on macOS and `/tmp` on Linux, in a directory carrying the user.
+/// Where sockets go on this platform: the system temporary directory, which
+/// honors `$TMPDIR` when set and otherwise falls back to the platform default,
+/// in a directory carrying the user.
 ///
 /// `XDG_RUNTIME_DIR` would be the better directory, being a tmpfs the user
 /// owns and cleaned when the session ends, and it cannot be used. Codex
@@ -283,14 +284,35 @@ fn shared_temp_runtime_dir(user: Option<String>) -> PathBuf {
 mod tests {
     use super::*;
 
-    /// The runtime directory reads only variables every host passes, so a
-    /// server and a hook of one project agree on where the socket lives.
-    /// `XDG_RUNTIME_DIR` is not one of them: one host drops it for an MCP
-    /// server and keeps it for a hook command.
+    /// A child with distinct runtime variables must still derive its socket
+    /// directory from `TMPDIR` and `USER`, rather than `XDG_RUNTIME_DIR`.
     #[cfg(not(windows))]
     #[test]
     fn test_runtime_dir_ignores_the_xdg_variable() {
-        assert_eq!(runtime_dir(), shared_temp_runtime_dir(current_user()));
+        const SENTINEL: &str = "MCPLS_TEST_RUNTIME_DIR_SENTINEL";
+        const TEST_NAME: &str = "hooks::identity::tests::test_runtime_dir_ignores_the_xdg_variable";
+
+        if std::env::var_os(SENTINEL).is_some() {
+            assert_eq!(runtime_dir(), shared_temp_runtime_dir(current_user()));
+            return;
+        }
+
+        let runtime = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME])
+            .env(SENTINEL, "1")
+            .env("XDG_RUNTIME_DIR", runtime.path().join("xdg-runtime"))
+            .env("TMPDIR", runtime.path().join("temp-runtime"))
+            .env("USER", "mcpls-runtime-dir-test")
+            .env_remove("LOGNAME")
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "child test failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
