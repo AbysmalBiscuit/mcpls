@@ -355,6 +355,7 @@ fn test_trust_project_config_env_false_does_not_grant_trust() {
         .env_remove("MCPLS_NO_BACKEND");
     let output = cmd
         .current_dir(temp_dir.path())
+        .arg("--no-backend")
         // Isolate the hook socket when startup proceeds past config loading.
         .env_remove("XDG_RUNTIME_DIR")
         .env("TMPDIR", temp_dir.path())
@@ -419,6 +420,7 @@ fn test_trust_project_config_env_0_does_not_grant_trust() {
         .env_remove("MCPLS_NO_BACKEND");
     let output = cmd
         .current_dir(temp_dir.path())
+        .arg("--no-backend")
         // See test_trust_project_config_env_false_does_not_grant_trust
         // above for why this redirects the real hook socket.
         .env_remove("XDG_RUNTIME_DIR")

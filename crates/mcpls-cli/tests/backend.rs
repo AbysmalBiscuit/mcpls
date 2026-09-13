@@ -182,6 +182,10 @@ impl Frontend {
         stdin.flush().unwrap();
     }
 
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     fn initialize(&mut self) -> Value {
         let answer = self.request(
             "initialize",
@@ -254,11 +258,16 @@ impl Drop for Project {
 fn closing_the_last_session_removes_the_backend() {
     let project = Project::new(300);
     let mut frontend = project.frontend();
-    let pid = project.backend_pid().unwrap();
+    let frontend_pid = frontend.pid();
+    let backend_pid = project.backend_pid().unwrap();
+    assert_ne!(
+        backend_pid, frontend_pid,
+        "the frontend and backend must be separate processes"
+    );
     assert!(
         frontend.close(Duration::from_secs(5)),
         "the host did not see EOF"
     );
     project.wait_for("the backend to exit", |p| p.backend_pid().is_none());
-    assert!(!alive(pid));
+    assert!(!alive(backend_pid));
 }
