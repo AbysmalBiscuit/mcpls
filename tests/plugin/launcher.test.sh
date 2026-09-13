@@ -180,5 +180,32 @@ check "the default store lives under HOME" yes \
     "$([ -x "${WORK}/case-${case_seq}/home/.local/share/mcpls/bin/mcpls-${VERSION}" ] && echo yes || echo no)"
 check "the default store ignores XDG_DATA_HOME" no "$([ -e "${WORK}/xdg" ] && echo yes || echo no)"
 
+# The Codex MCP entry cannot use a plugin-root placeholder, so it finds the
+# installed copy of the plugin under CODEX_HOME and execs its launcher. Codex
+# keeps one version of a plugin in its cache and deletes the old one on
+# upgrade (core-plugins/src/store.rs), so the fixture installs one.
+entry=$(jq -r '.mcpServers.mcpls.args[1]' "${REPO_ROOT}/plugin/.codex-plugin/plugin.json" 2>/dev/null)
+check "the Codex entry is readable from the manifest" yes "$([ -n "$entry" ] && echo yes || echo no)"
+
+codex_home="${WORK}/codex-home"
+installed="${codex_home}/plugins/cache/mcpls/mcpls/${VERSION}"
+mkdir -p "${installed}/bin"
+printf '#!/usr/bin/env bash\necho installed-plugin "$@"\n' >"${installed}/bin/mcpls"
+chmod +x "${installed}/bin/mcpls"
+
+codex_out=$(env -i HOME="${WORK}/nohome" PATH="/usr/bin:/bin" CODEX_HOME="$codex_home" sh -c "$entry" 2>/dev/null)
+check "the Codex entry runs the installed plugin" "installed-plugin" "$codex_out"
+
+mkdir -p "${WORK}/home-default/.codex"
+cp -R "${codex_home}/plugins" "${WORK}/home-default/.codex/plugins"
+codex_out=$(env -i HOME="${WORK}/home-default" PATH="/usr/bin:/bin" sh -c "$entry" 2>/dev/null)
+check "the Codex entry defaults CODEX_HOME to ~/.codex" "installed-plugin" "$codex_out"
+
+codex_out=$(env -i HOME="${WORK}/nohome" PATH="/usr/bin:/bin" CODEX_HOME="${WORK}/empty" sh -c "$entry" 2>"${WORK}/err")
+codex_exit=$?
+check "the Codex entry fails with no installed plugin" 1 "$codex_exit"
+check "the Codex entry prints nothing on stdout when it fails" "" "$codex_out"
+check "the Codex entry says where it looked" yes "$(stderr_has "plugins/cache")"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

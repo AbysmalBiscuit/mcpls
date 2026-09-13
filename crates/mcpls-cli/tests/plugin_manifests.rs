@@ -45,6 +45,10 @@ fn test_every_manifest_pins_the_workspace_version() {
             json("plugin/.claude-plugin/plugin.json")["version"].clone(),
         ),
         (
+            "plugin/.codex-plugin/plugin.json",
+            json("plugin/.codex-plugin/plugin.json")["version"].clone(),
+        ),
+        (
             ".claude-plugin/marketplace.json",
             json(".claude-plugin/marketplace.json")["plugins"][0]["version"].clone(),
         ),
@@ -64,17 +68,42 @@ fn test_every_entry_runs_the_launcher_for_its_harness() {
         "${CLAUDE_PLUGIN_ROOT}/bin/mcpls"
     );
 
-    let harnesses: [(&str, &str, &[&str]); 1] = [(
-        "plugin/hooks/hooks.json",
-        "\"${CLAUDE_PLUGIN_ROOT}/bin/mcpls\" hook",
-        &[
-            "FileChanged",
-            "PostToolBatch",
-            "SessionEnd",
-            "SessionStart",
-            "UserPromptSubmit",
-        ],
-    )];
+    let codex = json("plugin/.codex-plugin/plugin.json");
+    assert_eq!(codex["hooks"], "./hooks/hooks-codex.json");
+    assert_eq!(codex["mcpServers"]["mcpls"]["command"], "sh");
+    assert_eq!(
+        codex["mcpServers"]["mcpls"]["env_vars"],
+        serde_json::json!(["CODEX_HOME", "MCPLS_BIN", "MCPLS_HOME"]),
+        "Codex starts an MCP server with none of these unless the entry names them"
+    );
+    assert_eq!(
+        codex["mcpServers"]["mcpls"]["startup_timeout_sec"], 300,
+        "Codex kills a server still starting after 30 seconds, and a cold start downloads for up to 300"
+    );
+
+    let harnesses: [(&str, &str, &[&str]); 2] = [
+        (
+            "plugin/hooks/hooks.json",
+            "\"${CLAUDE_PLUGIN_ROOT}/bin/mcpls\" hook",
+            &[
+                "FileChanged",
+                "PostToolBatch",
+                "SessionEnd",
+                "SessionStart",
+                "UserPromptSubmit",
+            ],
+        ),
+        (
+            "plugin/hooks/hooks-codex.json",
+            "\"${PLUGIN_ROOT}/bin/mcpls\" hook --host codex",
+            &[
+                "PostToolUse",
+                "SessionEnd",
+                "SubagentStop",
+                "UserPromptSubmit",
+            ],
+        ),
+    ];
     for (file, command, events) in harnesses {
         let hooks = json(file);
         let hooks = hooks["hooks"].as_object().unwrap();

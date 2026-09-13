@@ -1,0 +1,13 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "apply_patch",
+        "hooks": [{ "type": "command", "command": "\"${PLUGIN_ROOT}/bin/mcpls\" hook --host codex" }]
+      }
+    ],
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "\"${PLUGIN_ROOT}/bin/mcpls\" hook --host codex" }] }],
+    "SubagentStop": [{ "hooks": [{ "type": "command", "command": "\"${PLUGIN_ROOT}/bin/mcpls\" hook --host codex" }] }],
+    "SessionEnd": [{ "hooks": [{ "type": "command", "command": "\"${PLUGIN_ROOT}/bin/mcpls\" hook --host codex" }] }]
+  }
+}
