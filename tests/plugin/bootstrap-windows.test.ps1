@@ -168,6 +168,8 @@ exit ([int]$env:MCPLS_TEST_EXIT)
             & "$env:SystemRoot\System32\cmd.exe" /d /c "`"$work\run-hook.cmd`" probe codex"
             Check ($LASTEXITCODE -eq $status) "cmd fallback must return PowerShell exit $status, got $LASTEXITCODE"
         }
+        # The runner exits with the last native exit code, which the 23 case left behind.
+        $global:LASTEXITCODE = 0
         Write-Output '2 native cmd fallback cases passed'
     } else {
         Write-Output 'SKIP native cmd fallback cases: requires Windows'
