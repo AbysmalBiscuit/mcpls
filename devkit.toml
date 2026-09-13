@@ -72,6 +72,31 @@ description = "Run workspace documentation tests"
 run = ["cargo", "test", "--doc", "--workspace", "--all-features", "--locked"]
 guard = true
 
+[tasks.build-bin]
+description = "Build the mcpls binary the end-to-end suite drives"
+run = ["cargo", "build", "--bin", "mcpls", "--locked"]
+guard = true
+
+[tasks.test-e2e-run]
+description = "Run the ignored end-to-end tests against the built binary"
+run = [
+    "cargo",
+    "nextest",
+    "run",
+    "--workspace",
+    "--all-features",
+    "--locked",
+    "--run-ignored",
+    "ignored-only",
+    "-E",
+    "kind(test) and test(e2e)",
+]
+guard = true
+
+[tasks.test-e2e]
+description = "Build mcpls and run the ignored end-to-end tests"
+steps = [{ task = "build-bin" }, { task = "test-e2e-run" }]
+
 [tasks.fmt]
 description = "Format the workspace with nightly rustfmt"
 run = ["cargo", "+nightly", "fmt", "--all"]
