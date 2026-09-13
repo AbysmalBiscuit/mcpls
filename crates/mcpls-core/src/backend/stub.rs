@@ -1,6 +1,5 @@
 //! What the frontend answers when no backend is attached: the frozen tool
 //! surface, and the reason every tool call fails.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::sync::OnceLock;
 

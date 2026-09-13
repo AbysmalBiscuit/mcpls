@@ -11,6 +11,7 @@ pub mod spawn;
 mod stub;
 
 pub use endpoint::serve_backend;
+pub use frontend::{FrontendOptions, run_frontend};
 pub use handshake::{
     ConfigStamp, ConnectionKind, Handshake, HandshakeReply, PROTOCOL, Refusal, VERSION,
     compare_builds,

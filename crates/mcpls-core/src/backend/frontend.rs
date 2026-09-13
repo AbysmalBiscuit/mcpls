@@ -1,17 +1,27 @@
 //! The process a host launches: attach to the project's backend and relay
 //! MCP traffic, or explain why there is no backend.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::BoxFuture;
+use serde_json::Value;
+use tokio::io::{AsyncBufReadExt as _, AsyncRead, AsyncWrite, AsyncWriteExt as _, BufReader};
+use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-use crate::backend::handshake::{self, Handshake, HandshakeReply, Refusal, compare_builds};
+use crate::backend::handshake::{
+    self, ConfigStamp, Handshake, HandshakeReply, Refusal, compare_builds,
+};
+use crate::backend::spawn::{BackendLaunch, SpawnLock};
+use crate::backend::stub;
+use crate::bridge::SessionId;
 use crate::hooks::listener::HookStream;
+use crate::hooks::{self, SocketIdentity};
 
 /// How long one connect attempt may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -30,6 +40,7 @@ pub(crate) enum Start {
     /// A backend process was spawned.
     Spawned,
     /// A hook was asked to spawn one.
+    #[cfg_attr(not(windows), allow(dead_code))]
     Requested,
 }
 
@@ -44,6 +55,8 @@ pub(crate) struct Place {
 pub(crate) struct Timing {
     /// How long a spawned backend has to answer.
     pub(crate) start: Duration,
+    /// How often a waiting frontend tries again.
+    pub(crate) retry: Duration,
     /// How long an evicted backend has to release the endpoint.
     pub(crate) gone: Duration,
 }
@@ -52,6 +65,7 @@ impl Default for Timing {
     fn default() -> Self {
         Self {
             start: Duration::from_secs(10),
+            retry: Duration::from_millis(500),
             gone: Duration::from_secs(5),
         }
     }
@@ -62,6 +76,380 @@ pub(crate) enum Outcome {
     Attached(#[cfg_attr(test, allow(dead_code))] Box<dyn HookStream>),
     Waiting(String),
     Failed(String),
+}
+
+/// What the host launches mcpls with.
+pub struct FrontendOptions {
+    /// How to start a backend, including the checkout root.
+    pub launch: BackendLaunch,
+    /// This process's configuration.
+    pub stamp: ConfigStamp,
+}
+
+/// Relay this process's stdio to the project's backend until the host
+/// closes stdin.
+pub async fn run_frontend(options: FrontendOptions) {
+    let request = Handshake::mcp(
+        options.launch.root.clone(),
+        SessionId::from_host_env().map(|session| session.to_string()),
+        options.stamp,
+    );
+    let door: Arc<dyn Door> = match (
+        hooks::identity_for(&options.launch.root),
+        std::env::current_exe(),
+    ) {
+        (Ok(identity), Ok(exe)) => Arc::new(ProcessDoor {
+            identity,
+            launch: options.launch,
+            exe,
+        }),
+        (Err(error), _) => Arc::new(Unreachable(options.launch.root, error.to_string())),
+        (_, Err(error)) => Arc::new(Unreachable(options.launch.root, error.to_string())),
+    };
+    relay(
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+        door,
+        request,
+        Timing::default(),
+    )
+    .await;
+}
+
+struct ProcessDoor {
+    identity: SocketIdentity,
+    launch: BackendLaunch,
+    #[cfg_attr(windows, allow(dead_code))]
+    exe: PathBuf,
+}
+
+impl Door for ProcessDoor {
+    fn connect(&self) -> BoxFuture<'_, io::Result<Box<dyn HookStream>>> {
+        Box::pin(hooks::listener::connect(&self.identity))
+    }
+
+    fn lock(&self, wait: Duration) -> BoxFuture<'_, io::Result<Option<Box<dyn Send>>>> {
+        Box::pin(async move {
+            Ok(SpawnLock::acquire(&self.identity.spawn_lock(), wait)
+                .await?
+                .map(|lock| Box::new(lock) as Box<dyn Send>))
+        })
+    }
+
+    fn start(&self) -> BoxFuture<'_, io::Result<Start>> {
+        Box::pin(async move {
+            #[cfg(windows)]
+            {
+                crate::backend::spawn::request_start(&self.identity, &self.launch)?;
+                Ok(Start::Requested)
+            }
+            #[cfg(not(windows))]
+            {
+                crate::backend::spawn::spawn_detached(
+                    &self.exe,
+                    &self.launch,
+                    &self.identity.log_file(),
+                )?;
+                Ok(Start::Spawned)
+            }
+        })
+    }
+
+    fn place(&self) -> Place {
+        Place {
+            root: self.launch.root.clone(),
+            log: self.identity.log_file(),
+        }
+    }
+}
+
+/// A frontend that cannot derive its endpoint at all.
+struct Unreachable(PathBuf, String);
+
+impl Door for Unreachable {
+    fn connect(&self) -> BoxFuture<'_, io::Result<Box<dyn HookStream>>> {
+        Box::pin(async { Err(io::ErrorKind::NotFound.into()) })
+    }
+
+    fn lock(&self, _wait: Duration) -> BoxFuture<'_, io::Result<Option<Box<dyn Send>>>> {
+        let reason = self.1.clone();
+        Box::pin(async move { Err(io::Error::other(reason)) })
+    }
+
+    fn start(&self) -> BoxFuture<'_, io::Result<Start>> {
+        let reason = self.1.clone();
+        Box::pin(async move { Err(io::Error::other(reason)) })
+    }
+
+    fn place(&self) -> Place {
+        Place {
+            root: self.0.clone(),
+            log: PathBuf::new(),
+        }
+    }
+}
+
+/// The id a replayed `initialize` goes out under, whose answer the host
+/// already had from the stub.
+const REPLAY_ID: &str = "mcpls-frontend-replay";
+
+enum Event {
+    Host(String),
+    HostClosed,
+    Attach(Outcome),
+    /// A line from the backend stream the numbered attach opened.
+    Backend(u64, String),
+    BackendClosed(u64),
+}
+
+enum State {
+    Connecting,
+    Attached,
+    Waiting(String),
+    Failed(String),
+}
+
+/// Relay `host_in` and `host_out` to the project's backend.
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn relay<R, W>(
+    host_in: R,
+    mut host_out: W,
+    door: Arc<dyn Door>,
+    request: Handshake,
+    timing: Timing,
+) where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send,
+{
+    let (events, mut inbox) = mpsc::unbounded_channel();
+    spawn_lines(host_in, events.clone(), Event::Host, Event::HostClosed);
+    spawn_attach(
+        Arc::clone(&door),
+        request.clone(),
+        timing,
+        events.clone(),
+        Duration::ZERO,
+    );
+
+    let place = door.place();
+    let mut state = State::Connecting;
+    let mut backend: Option<tokio::io::WriteHalf<Box<dyn HookStream>>> = None;
+    // Events from any backend stream but the latest one are stale.
+    let mut generation = 0u64;
+    let mut pending: HashSet<String> = HashSet::new();
+    let mut deferred: Vec<(String, Value)> = Vec::new();
+    // What the host sent the current backend before it sent anything back.
+    let mut unheard: Vec<(String, Value)> = Vec::new();
+    let mut heard = false;
+    let mut reattached = false;
+    let mut init: Option<String> = None;
+    let mut initialized: Option<String> = None;
+    let mut init_answered = false;
+
+    while let Some(event) = inbox.recv().await {
+        match event {
+            Event::HostClosed => return,
+            Event::Host(line) => {
+                let Ok(message) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                match message.get("method").and_then(Value::as_str) {
+                    Some("initialize") => init = Some(line.clone()),
+                    Some("notifications/initialized") => initialized = Some(line.clone()),
+                    _ => {}
+                }
+                match &state {
+                    State::Connecting => deferred.push((line, message)),
+                    State::Attached => {
+                        if let Some(writer) = backend.as_mut() {
+                            track(&mut pending, &message);
+                            if write_line(writer, &line).await.is_err() {
+                                let _ = events.send(Event::BackendClosed(generation));
+                            }
+                            if !heard {
+                                unheard.push((line, message));
+                            }
+                        }
+                    }
+                    State::Waiting(reason) | State::Failed(reason) => {
+                        if let Some(reply) = stub::answer(&message, reason) {
+                            init_answered |= message["method"] == "initialize";
+                            write_value(&mut host_out, &reply).await;
+                        }
+                    }
+                }
+            }
+            Event::Attach(Outcome::Attached(stream)) => {
+                generation += 1;
+                let current = generation;
+                let (reader, mut writer) = tokio::io::split(stream);
+                spawn_lines(
+                    reader,
+                    events.clone(),
+                    move |line| Event::Backend(current, line),
+                    Event::BackendClosed(current),
+                );
+                heard = false;
+                if init_answered {
+                    if let Some(line) = &init
+                        && let Ok(mut replay) = serde_json::from_str::<Value>(line)
+                    {
+                        replay["id"] = Value::from(REPLAY_ID);
+                        let _ = write_line(&mut writer, &replay.to_string()).await;
+                    }
+                    if let Some(line) = &initialized {
+                        let _ = write_line(&mut writer, line).await;
+                    }
+                }
+                for (line, message) in std::mem::take(&mut deferred) {
+                    track(&mut pending, &message);
+                    let _ = write_line(&mut writer, &line).await;
+                    unheard.push((line, message));
+                }
+                backend = Some(writer);
+                state = State::Attached;
+            }
+            Event::Attach(Outcome::Waiting(reason)) => {
+                answer_from_stub(&mut host_out, &mut deferred, &reason, &mut init_answered).await;
+                state = State::Waiting(reason);
+                spawn_attach(
+                    Arc::clone(&door),
+                    request.clone(),
+                    timing,
+                    events.clone(),
+                    timing.retry,
+                );
+            }
+            Event::Attach(Outcome::Failed(reason)) => {
+                answer_from_stub(&mut host_out, &mut deferred, &reason, &mut init_answered).await;
+                state = State::Failed(reason);
+            }
+            Event::Backend(from, line) => {
+                if from != generation {
+                    continue;
+                }
+                heard = true;
+                unheard.clear();
+                let Ok(message) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                if message.get("method").is_none()
+                    && let Some(id) = message.get("id")
+                {
+                    if id.as_str() == Some(REPLAY_ID) {
+                        continue;
+                    }
+                    pending.remove(&id.to_string());
+                }
+                write_raw(&mut host_out, &line).await;
+            }
+            Event::BackendClosed(from) => {
+                if from != generation || !matches!(state, State::Attached) {
+                    continue;
+                }
+                backend = None;
+                if !heard && !reattached {
+                    reattached = true;
+                    pending.clear();
+                    deferred = std::mem::take(&mut unheard);
+                    state = State::Connecting;
+                    spawn_attach(
+                        Arc::clone(&door),
+                        request.clone(),
+                        timing,
+                        events.clone(),
+                        Duration::ZERO,
+                    );
+                    continue;
+                }
+                unheard.clear();
+                let reason = messages::backend_stopped(&place);
+                for id in pending.drain() {
+                    let Ok(id) = serde_json::from_str::<Value>(&id) else {
+                        continue;
+                    };
+                    let reply = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {"code": -32603, "message": reason},
+                    });
+                    write_value(&mut host_out, &reply).await;
+                }
+                state = State::Failed(reason);
+            }
+        }
+    }
+}
+
+/// Record `message`'s id as awaiting the backend's answer, if it is a
+/// request.
+fn track(pending: &mut HashSet<String>, message: &Value) {
+    if let (Some(id), Some(_)) = (message.get("id"), message.get("method")) {
+        pending.insert(id.to_string());
+    }
+}
+
+async fn answer_from_stub<W: AsyncWrite + Unpin>(
+    host: &mut W,
+    deferred: &mut Vec<(String, Value)>,
+    reason: &str,
+    init_answered: &mut bool,
+) {
+    for (_, message) in deferred.drain(..) {
+        if let Some(reply) = stub::answer(&message, reason) {
+            *init_answered |= message["method"] == "initialize";
+            write_value(host, &reply).await;
+        }
+    }
+}
+
+fn spawn_attach(
+    door: Arc<dyn Door>,
+    request: Handshake,
+    timing: Timing,
+    events: mpsc::UnboundedSender<Event>,
+    after: Duration,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(after).await;
+        let outcome = attach(door.as_ref(), &request, &timing).await;
+        let _ = events.send(Event::Attach(outcome));
+    });
+}
+
+fn spawn_lines<R>(
+    reader: R,
+    events: mpsc::UnboundedSender<Event>,
+    line: impl Fn(String) -> Event + Send + 'static,
+    closed: Event,
+) where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(reader).lines();
+        while let Ok(Some(text)) = lines.next_line().await {
+            if events.send(line(text)).is_err() {
+                return;
+            }
+        }
+        let _ = events.send(closed);
+    });
+}
+
+async fn write_line<W: AsyncWrite + Unpin + ?Sized>(writer: &mut W, line: &str) -> io::Result<()> {
+    writer.write_all(line.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await
+}
+
+async fn write_raw<W: AsyncWrite + Unpin>(host: &mut W, line: &str) {
+    if let Err(error) = write_line(host, line).await {
+        tracing::debug!(%error, "the host's stdout closed");
+    }
+}
+
+async fn write_value<W: AsyncWrite + Unpin>(host: &mut W, value: &Value) {
+    write_raw(host, &value.to_string()).await;
 }
 
 async fn handshake_with(
@@ -271,6 +659,16 @@ mod messages {
         )
     }
 
+    pub(super) fn backend_stopped(place: &Place) -> String {
+        format!(
+            "Tell the user: the mcpls backend for {} stopped while this session was attached, so \
+             this session has no mcpls tools. Restart the session to start a new one. Its log is \
+             {}.",
+            place.root.display(),
+            place.log.display()
+        )
+    }
+
     fn trust_state(stamp: &ConfigStamp) -> &'static str {
         if stamp.source == ConfigSource::Project {
             "loaded the project's mcpls.toml as trusted"
@@ -332,6 +730,8 @@ mod fake {
 
     use futures::future::BoxFuture;
     use rmcp::ServiceExt as _;
+    use serde_json::{Value, json};
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 
     use super::{Door, Place, Start, Timing};
     use crate::backend::handshake::{
@@ -357,6 +757,11 @@ mod fake {
         Close,
         /// Close after reading the request and before sending a reply.
         CloseBeforeReply,
+        /// Close as soon as the first MCP line arrives, having sent nothing.
+        CloseOnFirstLine,
+        /// Answer the first MCP line as an `initialize`, then close as soon
+        /// as the next line arrives.
+        AnswerOnceThenClose,
     }
 
     /// A door whose connect attempts follow a script, and which counts the
@@ -416,6 +821,25 @@ mod fake {
                         }
                         Then::Close => {}
                         Then::CloseBeforeReply => unreachable!(),
+                        Then::CloseOnFirstLine => {
+                            let mut lines = BufReader::new(server).lines();
+                            let _ = lines.next_line().await;
+                        }
+                        Then::AnswerOnceThenClose => {
+                            let (reader, mut writer) = tokio::io::split(server);
+                            let mut lines = BufReader::new(reader).lines();
+                            let Ok(Some(first)) = lines.next_line().await else {
+                                return;
+                            };
+                            let first: Value = serde_json::from_str(&first).unwrap();
+                            let answer = json!({"jsonrpc":"2.0","id":first["id"],"result":{
+                                "protocolVersion":"2025-11-25",
+                                "capabilities":{},
+                                "serverInfo":{"name":"mcpls","version":"0"},
+                            }});
+                            let _ = writer.write_all(format!("{answer}\n").as_bytes()).await;
+                            let _ = lines.next_line().await;
+                        }
                     }
                 });
                 Ok(Box::new(client) as Box<dyn HookStream>)
@@ -478,6 +902,7 @@ mod fake {
     pub(super) fn fast() -> Timing {
         Timing {
             start: Duration::from_millis(300),
+            retry: Duration::from_millis(20),
             gone: Duration::from_millis(300),
         }
     }
@@ -686,5 +1111,278 @@ mod attach_tests {
         let text = failure(attach(door.as_ref(), &request, &fast()).await);
         assert!(text.contains("loaded the project's mcpls.toml"), "{text}");
         assert!(text.contains("ignored the project's mcpls.toml"), "{text}");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod relay_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use serde_json::{Value, json};
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, DuplexStream, Lines};
+    use tokio::time::Instant;
+
+    use super::fake::{FakeDoor, Script, Then, accepted, fast, refused, request};
+    use super::{Door, Start, Timing, relay};
+    use crate::backend::handshake::{self, Handshake, Refusal};
+
+    struct Host {
+        input: DuplexStream,
+        output: Lines<BufReader<DuplexStream>>,
+        relay: tokio::task::JoinHandle<()>,
+    }
+
+    impl Host {
+        fn start(door: Arc<dyn Door>, request: Handshake, timing: Timing) -> Self {
+            let (input, relay_in) = tokio::io::duplex(1 << 20);
+            let (relay_out, output) = tokio::io::duplex(1 << 20);
+            let relay = tokio::spawn(relay(relay_in, relay_out, door, request, timing));
+            Self {
+                input,
+                output: BufReader::new(output).lines(),
+                relay,
+            }
+        }
+
+        async fn send(&mut self, message: Value) {
+            self.input
+                .write_all(format!("{message}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+
+        async fn response(&mut self, id: i64) -> Value {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let line = self
+                        .output
+                        .next_line()
+                        .await
+                        .unwrap()
+                        .expect("the relay closed");
+                    let message: Value = serde_json::from_str(&line).unwrap();
+                    if message["id"] == id {
+                        return message;
+                    }
+                }
+            })
+            .await
+            .expect("a response arrived")
+        }
+
+        async fn initialize(&mut self) -> Value {
+            self.send(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"t","version":"1"}}})).await;
+            let answer = self.response(1).await;
+            self.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
+                .await;
+            answer
+        }
+
+        async fn call_tool(&mut self, id: i64) -> Value {
+            self.send(json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"get_server_logs","arguments":{}}})).await;
+            self.response(id).await
+        }
+    }
+
+    fn initialize_request() -> Value {
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"t","version":"1"}}})
+    }
+
+    #[tokio::test]
+    async fn test_an_attached_session_is_answered_by_the_backend() {
+        let door = FakeDoor::new(
+            Start::Spawned,
+            vec![Script::Server(accepted(), Then::Serve)],
+        );
+        let mut host = Host::start(door, request(), fast());
+        let init = host.initialize().await;
+        assert_eq!(
+            init["result"]["instructions"],
+            crate::mcp::INSTRUCTIONS,
+            "{init}"
+        );
+        let call = host.call_tool(2).await;
+        assert_ne!(call["result"]["isError"], true, "{call}");
+    }
+
+    #[tokio::test]
+    async fn test_a_refusal_is_repeated_in_initialize_and_every_tool_call() {
+        let door = FakeDoor::new(
+            Start::Spawned,
+            vec![Script::Server(
+                refused("0.0.1", 2, Refusal::Build),
+                Then::Close,
+            )],
+        );
+        let mut host = Host::start(door, request(), fast());
+        let init = host.initialize().await;
+        let text = init["result"]["instructions"].as_str().unwrap().to_string();
+        assert!(
+            text.contains("0.0.1") && text.contains(handshake::VERSION),
+            "{text}"
+        );
+        for id in [2, 3] {
+            let call = host.call_tool(id).await;
+            assert_eq!(call["result"]["isError"], true, "{call}");
+            assert!(
+                call["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("0.0.1"),
+                "{call}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_backend_dying_mid_request_fails_that_request_and_the_rest() {
+        let door = FakeDoor::new(
+            Start::Spawned,
+            vec![Script::Server(accepted(), Then::AnswerOnceThenClose)],
+        );
+        let mut host = Host::start(door, request(), fast());
+        host.send(initialize_request()).await;
+        let init = host.response(1).await;
+        assert_eq!(init["result"]["serverInfo"]["name"], "mcpls", "{init}");
+        host.send(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_server_logs","arguments":{}}})).await;
+        let failed = host.response(2).await;
+        assert!(
+            failed["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("stopped"),
+            "{failed}"
+        );
+        let call = host.call_tool(3).await;
+        assert_eq!(call["result"]["isError"], true, "{call}");
+    }
+
+    /// A backend that accepts the handshake and closes before sending
+    /// anything was exiting as the frontend attached. The frontend attaches
+    /// again and the host never sees the first backend.
+    #[tokio::test]
+    async fn test_a_backend_closing_before_its_first_line_is_attached_again() {
+        let door = FakeDoor::new(
+            Start::Spawned,
+            vec![
+                Script::Server(accepted(), Then::CloseOnFirstLine),
+                Script::Server(accepted(), Then::Serve),
+            ],
+        );
+        let mut host = Host::start(Arc::clone(&door) as Arc<dyn Door>, request(), fast());
+        let init = host.initialize().await;
+        assert_eq!(
+            init["result"]["instructions"],
+            crate::mcp::INSTRUCTIONS,
+            "{init}"
+        );
+        let call = host.call_tool(2).await;
+        assert_ne!(call["result"]["isError"], true, "{call}");
+        assert_eq!(*door.starts.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_a_second_silent_close_fails_the_session() {
+        let door = FakeDoor::new(
+            Start::Spawned,
+            vec![
+                Script::Server(accepted(), Then::CloseOnFirstLine),
+                Script::Server(accepted(), Then::CloseOnFirstLine),
+            ],
+        );
+        let mut host = Host::start(door, request(), fast());
+        host.send(initialize_request()).await;
+        let failed = host.response(1).await;
+        assert!(
+            failed["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("stopped"),
+            "{failed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_waiting_tool_call_fails_at_once() {
+        let door = FakeDoor::new(Start::Requested, vec![]);
+        let mut host = Host::start(door, request(), fast());
+        host.initialize().await;
+        let started = Instant::now();
+        let call = host.call_tool(2).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the call waited for a backend"
+        );
+        assert_eq!(call["result"]["isError"], true, "{call}");
+        assert!(
+            call["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("hook"),
+            "{call}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_waiting_session_replays_initialize_when_the_backend_arrives() {
+        let door = FakeDoor::new(
+            Start::Requested,
+            vec![
+                Script::Nobody,
+                Script::Nobody,
+                Script::Nobody,
+                Script::Server(accepted(), Then::Serve),
+            ],
+        );
+        let timing = Timing {
+            retry: Duration::from_millis(200),
+            ..fast()
+        };
+        let mut host = Host::start(door, request(), timing);
+        let init = host.initialize().await;
+        assert!(
+            init["result"]["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("hook"),
+            "{init}"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut id = 2;
+        loop {
+            let call = host.call_tool(id).await;
+            if call["result"]["isError"] != true {
+                break;
+            }
+            assert!(
+                call["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("hook"),
+                "{call}"
+            );
+            assert!(Instant::now() < deadline, "no backend attached: {call}");
+            id += 1;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_the_relay_ends_when_the_host_closes() {
+        let door = FakeDoor::new(
+            Start::Spawned,
+            vec![Script::Server(accepted(), Then::Serve)],
+        );
+        let mut host = Host::start(door, request(), fast());
+        host.initialize().await;
+        let Host { input, relay, .. } = host;
+        drop(input);
+        tokio::time::timeout(Duration::from_secs(5), relay)
+            .await
+            .expect("the relay returned after host EOF")
+            .unwrap();
     }
 }
