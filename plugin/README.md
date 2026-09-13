@@ -4,13 +4,33 @@ Registers `mcpls` as an MCP server, wires it into Claude Code's hook events so d
 
 ## Install
 
-`mcpls` itself has to be on `PATH` first; see the [top-level README](../README.md#installation) for install methods. Then load the plugin directory for the session:
+The plugin downloads the mcpls release matching its own version on first use, into `~/.local/share/mcpls/bin` (set `MCPLS_HOME` to move it). Language servers such as `rust-analyzer` are not installed; mcpls drives whichever ones are already on `PATH`.
+
+Claude Code:
 
 ```fish
-claude --plugin-dir /path/to/mcpls/plugin
+claude plugin marketplace add AbysmalBiscuit/mcpls
+claude plugin install mcpls@mcpls
 ```
 
-`--plugin-dir` loads a plugin for that session only. To make it permanent, wrap the command in a shell alias or function, or add `--plugin-dir` to whatever launches your interactive sessions.
+Codex:
+
+```fish
+codex plugin marketplace add AbysmalBiscuit/mcpls
+codex plugin add mcpls@mcpls
+```
+
+Restart the session once after installing. The first session can start the MCP server while the binary is still downloading, and Codex asks you to trust the plugin's hooks on first load.
+
+Codex waits for the first download to finish before giving up on the server. If Claude Code gives up on the server during the first download, raise its MCP startup timeout (`MCP_TIMEOUT`, in milliseconds) or restart once the download finishes.
+
+On Codex, edits made outside Codex's own `apply_patch` tool (a terminal, another agent, a `git checkout`) reach mcpls only once the shared backend's file watcher lands (#23).
+
+To run a local build instead of the release, point `MCPLS_BIN` at it:
+
+```fish
+set -gx MCPLS_BIN /path/to/mcpls/target/debug/mcpls
+```
 
 ## One backend per checkout
 
@@ -61,7 +81,7 @@ Line by line:
   When an owner does answer but the exchange itself fails, the line reports the specific fault instead: an owner answering with an error message, answering with something other than its own status, a socket that accepted the connection but whose reply this build could not parse, or a socket that answered nothing within the probe window. Each of those pairs with `backend pid: unknown` below. The doctor names no cause for any of them, because an accepted connection and a failed exchange are the whole of what it established; what it prints instead is the answer or the error itself, and that is the thing to act on.
 - **`backend pid:`** the process id holding the socket, `none` if nothing does, or `unknown` if an owner exists but the exchange did not get far enough to learn its pid (see the fault messages above). When it does print a pid, confirm it names a live `mcpls` process; a pid that no longer exists or belongs to something else means the socket is orphaned: delete the socket file at the path in `socket:` above (a Windows named pipe clears on its own once nothing holds it) so a new mcpls can bind it.
 - **`hooks seen:`** how many `Changed`, `Flush`, or `EndSession` requests this owner has served since it started; a `Status` probe, including the doctor's own, is never counted. Zero is not by itself a fault: `SessionStart` never touches the socket, so an owner that just started, or just took over from a previous one, looks identical to one that has never received a hook. The line's own wording says what to do about a zero.
-- **`mcpls on PATH:`** the absolute path of a candidate found on `PATH`, or `not found`. The doctor does not execute it: a text file named `mcpls.exe` on Windows is still a candidate, not a verified installation. Hooks invoke `mcpls` by name, so check the `PATH` the hook process inherits, not just your interactive shell's.
+- **`mcpls on PATH:`** the absolute path of a candidate found on `PATH`, or `not found`. The doctor does not execute it: a text file named `mcpls.exe` on Windows is still a candidate, not a verified installation. The plugin's hooks and MCP server run the launcher at `bin/mcpls` inside the plugin, not a `PATH` lookup, so this line only matters for an mcpls you run yourself. Claude Code puts the plugin's `bin/` on the Bash tool's `PATH`, so there it finds the launcher.
 - **`watch scan:`** what a fresh local scan can select for `SessionStart`. An empty successful scan says `no eligible top-level paths`; traversal or ignore-rule failures say `incomplete` and include their causes. A selected path does not prove the host registered it or can read its descendants. Hidden top-level files and directories, including `.github`, are excluded by default. Explicit allow rules in ignore files can include them; for example, `!.github/` in a Git repository's `.gitignore` includes `.github` in the watch scan. After fixing scan errors, restart the session to register a fresh watch list.
 
 An operation that exceeds the owner's response deadline keeps running in the background. Hook clients remain silent on that response; the deadline does not establish whether the work will succeed or whether a later report will contain diagnostics. The doctor reports a deadline response if it receives one during its probe window.
@@ -93,6 +113,7 @@ Setting `enabled = false` disables the hook listener, so mcpls binds no socket a
 
 ## What's included
 
-- `.mcp.json` registers `mcpls` as an MCP server.
-- `hooks/hooks.json` wires the hook events mcpls needs into `mcpls hook`.
-- [`skills/mcpls`](skills/mcpls/) is the same agent skill previously shipped from the repository's top-level `skills/` directory, now installed alongside the server and hooks that make use of it.
+- `bin/mcpls` resolves the mcpls binary this plugin version pins, downloading it on first use, and every entry below runs through it.
+- `.mcp.json` and `hooks/hooks.json` register the server and hooks with Claude Code.
+- `.codex-plugin/plugin.json` and `hooks/hooks-codex.json` register them with Codex. There is deliberately no `plugin.json` at this directory's root: Codex would load one as an Agent Plugins manifest, start mcpls inside the plugin cache instead of the project, and load no hooks.
+- [`skills/mcpls`](skills/mcpls/) is the agent skill that explains the tools.
