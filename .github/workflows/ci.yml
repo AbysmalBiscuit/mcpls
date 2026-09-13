@@ -338,7 +338,7 @@ jobs:
   plugin-bootstrap:
     name: Plugin bootstrap (${{ matrix.os }})
     needs: detect-changes
-    if: needs.detect-changes.outputs.plugin == 'true'
+    if: needs.detect-changes.outputs.plugin == 'true' || needs.detect-changes.outputs.release == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 5
     strategy:
@@ -352,6 +352,17 @@ jobs:
       - name: Bootstrap tests
         shell: bash
         run: bash tests/plugin/bootstrap-binaries.test.sh
+      - name: Install dist for Windows bootstrap tests
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: irm https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.ps1 | iex
+      - name: Generate the pinned installer for Windows bootstrap tests
+        if: runner.os == 'Windows'
+        run: dist build --artifacts=global
+      - name: Windows PowerShell bootstrap tests
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: tests/plugin/bootstrap-windows.test.ps1 -DistInstaller target/distrib/mcpls-installer.ps1
 
   security:
     name: Security Audit

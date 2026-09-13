@@ -34,10 +34,31 @@ finish() {
     if [ -n "${1:-}" ]; then
         local note="${1//\\/\\\\}"
         note="${note//\"/\\\"}"
+        local code octal char escaped
+        for ((code = 1; code < 32; code++)); do
+            printf -v octal '%03o' "$code"
+            printf -v char '%b' "\\${octal}"
+            printf -v escaped '\\u%04x' "$code"
+            note="${note//"$char"/"$escaped"}"
+        done
         printf '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"mcpls plugin: %s"}}\n' "$note"
     fi
     exit 0
 }
+
+case "$(uname -s 2>/dev/null || echo unknown)" in
+    MINGW* | MSYS* | CYGWIN*)
+        state_root="${XDG_STATE_HOME:-${HOME}/.local/state}"
+        if command -v cygpath >/dev/null 2>&1; then
+            state_root=$(cygpath -w "$state_root") || exit 0
+        fi
+        XDG_STATE_HOME="$state_root" powershell.exe -NoProfile -ExecutionPolicy Bypass \
+            -File "${SCRIPT_DIR}/bootstrap-binaries.ps1" "$harness"
+        exit 0
+        ;;
+esac
+
+read_marker() { tr -d '\r' <"$1" 2>/dev/null; }
 
 version=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$MANIFEST" 2>/dev/null | head -n 1)
 if [ -z "$version" ]; then
@@ -53,7 +74,7 @@ lock="${state_dir}/install-${harness}.lock"
 
 installed="mcpls is not on PATH"
 if command -v mcpls >/dev/null 2>&1; then
-    recorded=$(cat "$stamp" 2>/dev/null || true)
+    recorded=$(read_marker "$stamp" 2>/dev/null || true)
     [ "$recorded" = "$version" ] && exit 0
     current=$(mcpls --version 2>/dev/null | sed -n 's/^mcpls \([^[:space:]]*\).*/\1/p' | head -n 1)
     installed="the mcpls on PATH is ${current:-an unknown version}"
@@ -69,7 +90,7 @@ else
     action="installing mcpls ${version}"
 fi
 
-if [ "$(cat "$failed" 2>/dev/null || true)" = "$version" ]; then
+if [ "$(read_marker "$failed" 2>/dev/null || true)" = "$version" ]; then
     warn "install of ${version} failed previously; remove ${failed} to retry"
     finish "installing mcpls ${version} failed in an earlier session, and ${installed}. Tell the user to run the installer from ${release}, or delete ${failed} and restart the session to retry."
 fi
@@ -89,18 +110,9 @@ fi
 
 warn "$action"
 
-case "$(uname -s 2>/dev/null || echo unknown)" in
-    MINGW* | MSYS* | CYGWIN*)
-        installer="${REPO_URL}/releases/download/v${version}/mcpls-installer.ps1"
-        powershell.exe -NoProfile -ExecutionPolicy Bypass \
-            -Command "irm ${installer} | iex" >&2
-        ;;
-    *)
-        installer="${REPO_URL}/releases/download/v${version}/mcpls-installer.sh"
-        curl --proto '=https' --tlsv1.2 -LsSf \
-            --connect-timeout 10 --max-time 300 "$installer" | sh >&2
-        ;;
-esac
+installer="${REPO_URL}/releases/download/v${version}/mcpls-installer.sh"
+curl --proto '=https' --tlsv1.2 -LsSf \
+    --connect-timeout 10 --max-time 300 "$installer" | sh >&2
 status=$?
 
 if [ "$status" -ne 0 ]; then

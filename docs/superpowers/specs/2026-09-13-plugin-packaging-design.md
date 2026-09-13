@@ -63,7 +63,7 @@ The bootstrap takes the harness name, `claude` or `codex`, as its argument, and 
 4. When `mcpls` is missing, installs.
 5. Skips the install when `bootstrap-failed` in the same directory already names this version, so a broken release or a machine with no network does not retry every session. It tells the agent what is on `PATH` and how to retry.
 6. Takes the harness's install lock, `install-<harness>.lock` in the same directory. When another session of the same harness holds it, the hook skips its own install and tells the agent to restart once that one finishes.
-7. Installs by piping `releases/download/v<version>/mcpls-installer.sh` into `sh`, or running `mcpls-installer.ps1` through PowerShell on Windows. The installer verifies the archive's checksum, places `mcpls` in `$CARGO_HOME/bin`, and adds that directory to `PATH` for new shells.
+7. Installs by piping `releases/download/v<version>/mcpls-installer.sh` into `sh`, or running `mcpls-installer.ps1` in a child PowerShell process on Windows. The shell installer verifies the archive's checksum. The pinned cargo-dist PowerShell template does not, so the Windows bootstrap inserts SHA256 verification immediately after its archive download and before extraction. It requires the matching `<archive>.sha256` release asset, checks both its filename and hash, and rejects an unrecognized download call. cargo-dist still selects the target, places `mcpls` in `$CARGO_HOME/bin`, and adds that directory to `PATH` for new shells. Git Bash on Windows delegates to this same PowerShell bootstrap.
 8. Writes the version to the stamp on success, or to `bootstrap-failed` on failure, releases the lock, and tells the agent either way.
 
 Every path exits 0, because a session must start with no network. Installer output goes to stderr, because both harnesses read a `SessionStart` hook's stdout. Stdout carries at most one JSON object, `{"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "..."}}`, which both harnesses add to the model's context (Codex: `hooks/src/schema.rs`, `SessionStartHookSpecificOutputWire`). That note is how a user learns the binary does not match the plugin: the agent reads the installed and expected versions and what to do about them, and relays it.
@@ -161,6 +161,8 @@ A Rust test over the manifests asserts that every MCP and hook entry runs bare `
 The hook side needs its own tests: a Codex `SessionStart` payload prints nothing, a Codex `PostToolUse` payload for `apply_patch` yields the right file list, and a Claude payload keeps behaving as it does now. Assert on exact key names, since the whole interface is untyped JSON from another project.
 
 CI runs the bootstrap test on Linux, macOS and Windows. The Windows leg runs under Git Bash, the path Windows users with Git for Windows take.
+
+Windows CI also runs the PowerShell bootstrap against the pinned installer's generated download function with offline archive and checksum fixtures. Valid archives must extract; missing, malformed, mismatched, or misnamed checksums must fail before extraction. Installer failure must leave a failure marker, release the lock, and emit context while the hook exits zero. The native cmd fallback is tested with its fixed Git probes relocated to absent fixture paths. Regenerate the installer with `dist build --artifacts=global`, then run `tests/plugin/bootstrap-windows.test.ps1 -DistInstaller target/distrib/mcpls-installer.ps1` in PowerShell when changing the dist version or its archive contract.
 
 ## Verification
 

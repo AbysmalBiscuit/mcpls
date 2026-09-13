@@ -103,13 +103,37 @@ try {
 Write-Note $action
 
 $status = 0
+$installerFile = $null
 try {
     $installer = "$repoUrl/releases/download/v$version/mcpls-installer.ps1"
     $script = Invoke-RestMethod -Uri $installer -TimeoutSec 300 -ErrorAction Stop
-    Invoke-Expression $script *>&1 | ForEach-Object { [Console]::Error.WriteLine("$_") }
+    # cargo-dist 0.32 downloads this archive without verifying its checksum.
+    $download = 'Invoke-DownloadFile -client $wc -url $url -path $dir_path'
+    if ([regex]::Matches($script, [regex]::Escape($download)).Count -ne 1) {
+        throw 'unrecognized cargo-dist archive download; refusing an unchecked install'
+    }
+    $verifiedDownload = @'
+Invoke-DownloadFile -client $wc -url $url -path $dir_path
+    $checksum = $wc.DownloadString("$url.sha256").Trim()
+    $pattern = '\A([a-fA-F0-9]{64})[ \t]+\*?' + [regex]::Escape($artifact_name) + '\z'
+    if ($checksum -notmatch $pattern) { throw "invalid checksum for $artifact_name" }
+    $expected = $Matches[1]
+    $actual = (Get-FileHash -LiteralPath $dir_path -Algorithm SHA256 -ErrorAction Stop).Hash
+    if ($actual -ne $expected) { throw "checksum mismatch for $artifact_name" }
+'@
+    $script = $script.Replace($download, $verifiedDownload)
+    $installerFile = Join-Path ([IO.Path]::GetTempPath()) "mcpls-installer-$([guid]::NewGuid()).ps1"
+    New-Item -ItemType File -Path $installerFile -ErrorAction Stop | Out-Null
+    Set-Content -LiteralPath $installerFile -Value $script -Encoding UTF8 -ErrorAction Stop
+    $engine = (Get-Process -Id $PID -ErrorAction Stop).Path
+    & $engine -NoProfile -ExecutionPolicy Bypass -File $installerFile *>&1 |
+        ForEach-Object { [Console]::Error.WriteLine("$_") }
+    $status = $LASTEXITCODE
 } catch {
     $status = 1
     Write-Note "installer failed: $($_.Exception.Message)"
+} finally {
+    if ($installerFile) { Remove-Item -LiteralPath $installerFile -Force -ErrorAction SilentlyContinue }
 }
 
 if ($status -eq 0) {

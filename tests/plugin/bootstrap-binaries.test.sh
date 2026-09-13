@@ -1,11 +1,5 @@
 #!/usr/bin/env bash
-# Behavioural tests for plugin/hooks/bootstrap-binaries.
-#
-# The hook installs mcpls from a GitHub release, so every case runs it against
-# stubbed curl, uname and powershell.exe on a stubbed PATH. Nothing is
-# downloaded and nothing outside the test's temporary directory is touched.
-#
-# Run: bash tests/plugin/bootstrap-binaries.test.sh
+# Offline behavioural tests for plugin/hooks/bootstrap-binaries.
 
 set -uo pipefail
 
@@ -43,7 +37,7 @@ EOF
 cat >"${STUB}/powershell.exe" <<'EOF'
 #!/usr/bin/env bash
 echo "powershell $*" >>"$CURL_LOG"
-echo powershell-progress
+echo '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"mcpls plugin: restart the session"}}'
 EOF
 
 cat >"${STUB}/uname" <<'EOF'
@@ -159,6 +153,39 @@ check "the current version is a no-op" NONE "$(calls)"
 check "the current version keeps the stamp" "$VERSION" "$(stamp)"
 check "the current version says nothing" "" "$(out)"
 
+new_state
+set_stamp $'external\r'
+run_hook with-mcpls claude
+check "a CRLF external stamp skips the network" NONE "$(calls)"
+check "a CRLF external stamp stays external" external "$(stamp)"
+
+new_state
+set_stamp "${VERSION}"$'\r'
+run_hook with-mcpls claude
+check "a CRLF current stamp skips the network" NONE "$(calls)"
+check "a CRLF current stamp says nothing" "" "$(out)"
+
+new_state
+printf '%s\r\n' "$VERSION" >"${state}/mcpls/bootstrap-failed"
+run_hook without-mcpls claude
+check "a CRLF failure suppresses the retry" NONE "$(calls)"
+check "a CRLF failure tells the agent" yes "$(context_says "failed in an earlier session")"
+
+new_state
+controls=""
+for ((code = 1; code < 32; code++)); do
+    printf -v octal '%03o' "$code"
+    printf -v char '%b' "\\${octal}"
+    controls+="$char"
+done
+state="${state}/${controls}"
+run_hook without-mcpls claude CURL_FAIL=1
+check "control characters keep context on one line" yes "$(context_says "failed")"
+for ((code = 1; code < 32; code++)); do
+    printf -v escaped '\\u%04x' "$code"
+    check "context escapes control $code" yes "$(context_says "$escaped")"
+done
+
 # A plugin update moves plugin.json's version past the stamp.
 new_state
 set_stamp 0.0.1
@@ -201,8 +228,8 @@ check "a stale lock is taken over" "$EXPECTED_CURL" "$(calls)"
 new_state
 run_hook without-mcpls codex FAKE_UNAME=MINGW64_NT-10.0
 check "windows exits 0" 0 "$last_exit"
-check "windows runs the PowerShell installer" \
-    "powershell -NoProfile -ExecutionPolicy Bypass -Command irm ${RELEASE}/mcpls-installer.ps1 | iex" \
+check "windows delegates to the checksum-verifying PowerShell bootstrap" \
+    "powershell -NoProfile -ExecutionPolicy Bypass -File ${REPO_ROOT}/plugin/hooks/bootstrap-binaries.ps1 codex" \
     "$(calls)"
 check "windows keeps installer output off stdout" yes "$(context_says "restart the session")"
 
