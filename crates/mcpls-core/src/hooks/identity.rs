@@ -159,12 +159,10 @@ pub fn identity_for(dir: &Path) -> Result<SocketIdentity> {
     {
         // The pipe namespace is machine-global, so the project hash is not
         // a whole identity on its own: two users with the same project
-        // path on one host would derive one pipe name, and the second
-        // process to start would read as passive and forward its flushes
-        // and the files it wrote into the first user's mcpls, which would
-        // then answer user B's `get_new_diagnostics` from user A's
-        // delivery record. The user goes into the name for the same reason
-        // the Unix runtime directory carries it. This keeps two users'
+        // path on one host would derive one pipe name and mix the second
+        // user's hooks and diagnostics with the first user's mcpls. The user
+        // goes into the name for the same reason the Unix runtime directory
+        // carries it. This keeps two users'
         // sessions apart wherever the environment names them, and falls back
         // to the bare hash where it names nobody; what stops one user
         // reaching the other's pipe at all is that pipe's own access
@@ -340,10 +338,9 @@ mod tests {
     }
 
     /// Unix only: `/tmp` is shared between everyone on the machine, so two
-    /// users at the same project path would otherwise bind one socket, and
-    /// the second would forward its flushes and its writes into the first
-    /// user's process -- the collision the Windows pipe name closes on the
-    /// other platform.
+    /// users at the same project path would otherwise bind one socket and mix
+    /// the second user's hooks and diagnostics with the first user's process,
+    /// the collision the Windows pipe name closes on the other platform.
     #[test]
     #[cfg(not(windows))]
     fn test_a_shared_temp_runtime_dir_carries_the_user() {
@@ -366,9 +363,8 @@ mod tests {
     }
 
     /// Windows only: the pipe namespace is machine-global, so two users at
-    /// the same project path would otherwise derive one identity, and the
-    /// second would forward its flushes and its writes into the first
-    /// user's process.
+    /// the same project path would otherwise derive one identity and mix the
+    /// second user's hooks and diagnostics with the first user's process.
     #[test]
     #[cfg(windows)]
     fn test_a_windows_pipe_name_carries_the_user() {

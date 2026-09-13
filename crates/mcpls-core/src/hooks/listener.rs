@@ -33,24 +33,6 @@ trait HookStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
 
 impl<T> HookStream for T where T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
 
-/// Why a listener can no longer prove it holds the lock it acquired.
-///
-/// The two call for different responses, which is why they are not
-/// flattened into one: `Replaced` means a competitor holds the lock for its
-/// whole life and this process will not win it back, while `Missing` means
-/// nothing has taken this listener's place and the next attempt succeeds.
-/// Never produced on Windows, which has no lock file to lose; the type is
-/// unconditional so [`ServeExit`] has one shape on every platform.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LockLoss {
-    /// The path now names a different inode: a competitor created its own
-    /// lock file there and may now believe it owns this session.
-    Replaced,
-    /// The path no longer exists: nothing has taken this listener's place
-    /// yet, but the file it relied on to prove ownership is gone.
-    Missing,
-}
-
 /// A bound listener, and the lock proving this process owns it.
 ///
 /// Ownership is exactly this value's lifetime, not the process's. [`serve`]
@@ -69,12 +51,9 @@ pub struct HookListener {
     transport: Box<dyn HookTransport>,
     /// Held for as long as `Self` lives; dropping it (including on process
     /// exit) releases ownership. Never unlocked explicitly.
+    #[allow(dead_code)]
     #[cfg(not(windows))]
     lock: std::fs::File,
-    /// `identity.lock`'s path, kept so [`Self::lock_loss`] can re-`stat`
-    /// it against `lock`'s own `fstat`.
-    #[cfg(not(windows))]
-    lock_path: std::path::PathBuf,
 }
 
 /// Create `dir` if it is missing and make it owner-only.
@@ -107,21 +86,11 @@ fn open_private_dir(dir: &std::path::Path) -> io::Result<std::fs::File> {
 /// Why [`HookListener::serve`] stopped serving.
 ///
 /// Named for what happened, not for what a caller should do about it,
-/// because that decision belongs to the caller. In particular,
-/// [`ServeExit::LockLost`] is not itself a reason to give up: the file a
-/// lock lives in can be recreated, so the ordinary response is to try
-/// acquiring the socket again rather than exit.
+/// because that decision belongs to the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServeExit {
     /// The `cancel` watch fired, or its sender was dropped.
     Cancelled,
-    /// Unix only: the lock file this listener held is no longer the file
-    /// it holds a lock on. The payload says whether the file was replaced
-    /// (a competitor may now believe it owns this session) or simply
-    /// removed (no competitor has appeared, only a missing file), which is
-    /// what decides whether a caller can expect to win the lock back.
-    /// Never returned on Windows, which has no lock file to lose.
-    LockLost(LockLoss),
     /// The transport hit an error it can never recover from by retrying
     /// (currently: a poisoned Windows pipe-transport lock).
     TransportUnrecoverable,
@@ -165,49 +134,7 @@ impl HookListener {
         Ok(Some(Self {
             transport: Box::new(UnixTransport { listener }),
             lock,
-            lock_path: identity.lock.clone(),
         }))
-    }
-
-    /// How often [`Self::serve`] re-`stat`s its own lock file to notice a
-    /// replacement (see [`Self::lock_loss`]). Unconditional (rather than
-    /// Unix-only, like the check itself) because [`Self::serve`]
-    /// constructs its ownership-check timer on every platform and gates
-    /// the check at runtime instead, so the timer's type does not depend
-    /// on `cfg`.
-    const OWNERSHIP_CHECK_INTERVAL: Duration = Duration::from_millis(200);
-
-    /// Whether `identity.lock` no longer names the inode this listener
-    /// holds a lock on, and if not, why not.
-    ///
-    /// This is the owner-side half of detecting an externally deleted lock
-    /// file (see [`Self::lock_file`]'s doc comment for why the newcomer's
-    /// side cannot detect it at all). Compares `lock`'s own `fstat`
-    /// against a fresh `stat` of the path it was opened from -- an
-    /// `fstat` on an open handle keeps working after its path is
-    /// unlinked, it just stops matching anything reachable by name --
-    /// and distinguishes the path naming a different inode now (something
-    /// replaced it, and that something may believe it owns this session)
-    /// from the path not existing at all (nothing has taken this
-    /// listener's place, but it can no longer prove it owns the session
-    /// either). Those are different situations: only the first means a
-    /// competitor exists.
-    #[cfg(not(windows))]
-    fn lock_loss(&self) -> Option<LockLoss> {
-        use std::os::unix::fs::MetadataExt as _;
-
-        let Ok(locked) = self.lock.metadata() else {
-            // `fstat` on a handle this call itself still has open should
-            // not fail; if it somehow does, there is no path comparison
-            // left to make, so this is treated the same as the path
-            // having vanished.
-            return Some(LockLoss::Missing);
-        };
-        match std::fs::metadata(&self.lock_path) {
-            Ok(current) if current.ino() == locked.ino() && current.dev() == locked.dev() => None,
-            Ok(_) => Some(LockLoss::Replaced),
-            Err(_) => Some(LockLoss::Missing),
-        }
     }
 
     /// The most attempts [`Self::lock_file`] makes before giving up on a
@@ -224,20 +151,10 @@ impl HookListener {
     /// *during this call*, between its own `open` and `try_lock_exclusive`
     /// succeeding: comparing this handle's `fstat` against a fresh `stat`
     /// of the path catches that, and retries against whatever is at the
-    /// path now, up to [`Self::LOCK_FILE_MAX_ATTEMPTS`] times. It says
-    /// nothing about a replacement that happens at any later point, once
-    /// a lock is already held stably -- an external cleaner (an age-based
-    /// `systemd-tmpfiles` policy over `/tmp/mcpls-<user>` is the realistic
-    /// case) can delete the file at any moment after this call has
-    /// already returned, and a newcomer that then opens the path creates
-    /// a fresh inode and locks it uncontended: exclusive at the inode
-    /// level, but no longer exclusive at the path, since this call cannot
-    /// see a replacement that happens after it. Nothing on the newcomer's
-    /// side can close that, because a replaced path is indistinguishable
-    /// from a clean start from the newcomer's own point of view.
-    /// [`Self::serve`] instead re-`stat`s the path periodically from the
-    /// side that actually knows something was taken from it (see
-    /// [`Self::lock_loss`]) and stands down when it no longer matches.
+    /// path now, up to [`Self::LOCK_FILE_MAX_ATTEMPTS`] times. A replacement
+    /// after this call returns goes unnoticed. The holder keeps serving the
+    /// connections it has, and a newcomer that locks the fresh file binds
+    /// its own socket.
     ///
     /// Windows has no equivalent: there is no lock *file* whose path an
     /// external cleaner could sever from the handle holding it, since
@@ -303,8 +220,7 @@ impl HookListener {
             })),
             Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
                 // Routine contention and a DACL denial both arrive as
-                // ERROR_ACCESS_DENIED. A passive instance retries every
-                // few seconds, so only the first denial in a process warns.
+                // ERROR_ACCESS_DENIED, so only the first denial in a process warns.
                 static DENIAL_WARNED: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(false);
                 if DENIAL_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -312,7 +228,7 @@ impl HookListener {
                 } else {
                     tracing::warn!(
                         "hook pipe creation denied for {:?}: {e}; another mcpls \
-                         likely owns this project's hooks, so this one waits to take over",
+                         likely holds this project's endpoint",
                         identity.socket
                     );
                 }
@@ -354,17 +270,6 @@ impl HookListener {
     /// life. The one exception is a poisoned Windows pipe-transport lock,
     /// which cannot recover by retrying at all: that stands down rather
     /// than retrying forever into a condition that can never clear.
-    ///
-    /// On Unix, also stands down if `Self::lock_loss` reports the lock
-    /// file no longer names the inode this listener holds: something
-    /// external took it while this process was still serving, and
-    /// continuing would risk a second process believing it owns the same
-    /// session. See `Self::lock_file`'s doc comment for why this has to
-    /// be checked from here rather than at acquisition. This includes the
-    /// case where nothing has actually taken the lock's place -- the file
-    /// was simply removed -- because this listener can no longer prove it
-    /// owns the session either way; the `tracing::warn!` this emits names
-    /// which of the two happened.
     pub async fn serve<H>(
         self,
         handler: H,
@@ -377,12 +282,6 @@ impl HookListener {
         let handler = Arc::new(handler);
         let mut accept_backoff = Self::ACCEPT_BACKOFF_FLOOR;
         let mut consecutive_accept_errors: u32 = 0;
-        // Unconditionally constructed so its type does not depend on
-        // platform, and gated off on Windows (where there is no lock file
-        // to lose) with the `if` precondition below rather than `cfg`.
-        let has_lock_file = cfg!(not(windows));
-        let mut ownership_check = tokio::time::interval(Self::OWNERSHIP_CHECK_INTERVAL);
-        ownership_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
@@ -390,28 +289,6 @@ impl HookListener {
                     // Err means the sender was dropped; treat as cancellation.
                     if result.is_err() || *cancel.borrow() {
                         return ServeExit::Cancelled;
-                    }
-                }
-                _ = ownership_check.tick(), if has_lock_file => {
-                    #[cfg(not(windows))]
-                    if let Some(loss) = self.lock_loss() {
-                        match loss {
-                            LockLoss::Replaced => tracing::warn!(
-                                "the lock at {} now names a different inode than the \
-                                 one this listener holds; something else has taken \
-                                 it and may now believe it owns this session, so \
-                                 this listener is standing down rather than risk two \
-                                 owners",
-                                self.lock_path.display()
-                            ),
-                            LockLoss::Missing => tracing::warn!(
-                                "the lock at {} no longer exists; nothing has taken \
-                                 this listener's place yet, but it can no longer \
-                                 prove it owns the session, so it is standing down",
-                                self.lock_path.display()
-                            ),
-                        }
-                        return ServeExit::LockLost(loss);
                     }
                 }
                 accepted = self.transport.accept() => {

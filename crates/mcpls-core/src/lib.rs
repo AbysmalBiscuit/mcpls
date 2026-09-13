@@ -742,7 +742,7 @@ pub(crate) async fn serve_with_identity(
     // one root resolution, not independent resolutions: a directory that
     // resolves for `identity_for` but not for a second, separate call
     // would otherwise leave `root` silently blank while `hash` is fine.
-    let (mut hook_identity, hook_root) = if config.diagnostics.hooks.enabled {
+    let (hook_identity, hook_root) = if config.diagnostics.hooks.enabled {
         identity_override.map_or_else(
             || match canonicalized_root_identity() {
                 Ok((identity, root)) => (Some(identity), Some(root)),
@@ -771,39 +771,27 @@ pub(crate) async fn serve_with_identity(
         (None, None)
     };
 
-    // Acquired before the context is built, so the role is known before the
-    // context is frozen into an `Arc`: a process that loses the lock is
-    // constructed passive and only ever moves to owner.
-    //
-    // A failure to acquire is not a failure to start, for the same reason a
-    // failure to derive the identity is not. `acquire` creates a runtime
-    // directory, opens and locks a file, unlinks a stale socket and binds,
-    // and on Windows it reports every pipe-creation error but a busy one;
-    // aborting the MCP server over any of those would trade a working
-    // bridge for a missing optimization.
-    let ownership = match &hook_identity {
+    // A failure to acquire is not a failure to start: this process still
+    // answers every MCP tool, and only the hooks go unanswered.
+    let listener = match &hook_identity {
         Some(identity) => match hooks::HookListener::acquire(identity).await {
-            Ok(ownership) => ownership,
-            Err(error) => {
+            Ok(Some(listener)) => Some(listener),
+            Ok(None) => {
                 warn!(
-                    "the hook ownership lock could not be taken, so no socket is served: {error}"
+                    "another mcpls holds this project's endpoint, so its hooks are answered there \
+                     rather than here"
                 );
-                hook_identity = None;
+                None
+            }
+            Err(error) => {
+                warn!("the project's endpoint could not be bound, so no hooks are served: {error}");
                 None
             }
         },
         None => None,
     };
-    let role = match (&hook_identity, &ownership) {
-        (None, _) => hooks::HookRole::disabled(),
-        (Some(_), Some(_)) => hooks::HookRole::owner(),
-        (Some(identity), None) => hooks::HookRole::passive(identity.clone()),
-    };
 
-    // Built whether this process owns the socket or not. A passive
-    // instance's sweeper is idle until it takes over, and building it here
-    // means a takeover has nothing left to construct.
-    let sweeper = hook_identity.as_ref().map(|_| {
+    let sweeper = listener.as_ref().map(|_| {
         let sweeper = Arc::new(hooks::Sweeper::new(
             Arc::clone(&translator),
             hooks::PathFilter::new(
@@ -851,7 +839,7 @@ pub(crate) async fn serve_with_identity(
     };
 
     info!("Starting MCP server with rmcp...");
-    let mut context = mcp::BridgeContext::new(
+    let context = mcp::BridgeContext::new(
         Arc::clone(&translator),
         Arc::clone(&notification_cache),
         Arc::clone(&workspace_roots_snapshot),
@@ -862,44 +850,22 @@ pub(crate) async fn serve_with_identity(
         config.diagnostics,
         settle,
     );
-    context.hooks = Arc::new(role);
     let context = Arc::new(context);
-    // `run_stdio` takes an `McplsServer` by value while the socket handler
-    // needs one it can keep. Both are built over the same
-    // `Arc<BridgeContext>`, which is where all the state lives, so they are
-    // the same server in every sense that matters.
-    let hook_server = Arc::new(mcp::McplsServer::from_context(Arc::clone(&context)));
     let mcp_server = mcp::McplsServer::from_context(Arc::clone(&context));
 
-    if let (Some(identity), Some(sweeper), Some(root)) = (hook_identity, sweeper, hook_root) {
-        let location = hooks::HookLocation { identity, root };
+    if let (Some(listener), Some(identity), Some(sweeper), Some(root)) =
+        (listener, hook_identity, sweeper, hook_root)
+    {
+        let handler = hooks::build_handler(
+            Arc::new(mcp::McplsServer::from_context(Arc::clone(&context))),
+            sweeper,
+            hooks::HookLocation { identity, root },
+            Arc::new(hooks::HookStats::default()),
+            cancel_rx.clone(),
+        );
         let op_deadline = Duration::from_millis(config.diagnostics.hooks.op_deadline_ms);
-        let role = Arc::clone(&context.hooks);
-        let server = Arc::clone(&hook_server);
-        let cancel = cancel_rx.clone();
-        // Wrapped rather than spawned bare: a panic in either task drops the
-        // `HookListener` and so releases the ownership lock, while this
-        // process goes on believing it owns the session. Reporting it is the
-        // only thing that makes that state diagnosable.
         tokio::spawn(log_hook_task_panic(async move {
-            match ownership {
-                Some(listener) => {
-                    hooks::hook_owner_task(
-                        listener,
-                        location,
-                        role,
-                        server,
-                        sweeper,
-                        op_deadline,
-                        cancel,
-                    )
-                    .await;
-                }
-                None => {
-                    hooks::hook_takeover_task(location, role, server, sweeper, op_deadline, cancel)
-                        .await;
-                }
-            }
+            let _ = listener.serve(handler, op_deadline, cancel_rx).await;
         }));
     }
     info!("MCPLS server initialized successfully");
@@ -919,12 +885,9 @@ pub(crate) async fn serve_with_identity(
     result
 }
 
-/// Run one of the hook socket tasks, reporting a panic instead of losing
-/// it.
-///
-/// Both tasks own the `HookListener` that proves this process holds the
-/// ownership lock, and unwinding drops it, releasing the lock exactly as if
-/// the process had exited. Nothing else in the process notices.
+/// Run the hook socket task, reporting a panic instead of losing it. The
+/// task owns the listener, so a panic releases the endpoint while this
+/// process keeps running.
 async fn log_hook_task_panic<F: Future<Output = ()> + Send + 'static>(task: F) {
     if let Err(panic) = tokio::spawn(task).await {
         error!("the hook socket task stopped unexpectedly and hooks are now unserved: {panic}");
