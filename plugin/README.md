@@ -62,7 +62,7 @@ backend: mcpls 0.3.9, up 1m1s
 sessions: 2 attached (s1, connection-4)
 language servers: rust
 config: 00000000000000ff
-mcpls on PATH: /home/lev/.cargo/bin/mcpls; launch not checked
+mcpls on PATH: /path/to/mcpls; launch not checked
 watch scan: selected 4 top-level path(s); hidden entries excluded by default; ignore rules applied; host registration unverified
 ```
 
@@ -94,7 +94,7 @@ socket: none; could not derive an identity for this directory: socket path excee
 hook sees: /home/lev/project -> unknown
 server sees: nothing can run here; no socket exists to probe
 backend pid: none
-mcpls on PATH: /home/lev/.cargo/bin/mcpls; launch not checked
+mcpls on PATH: /path/to/mcpls; launch not checked
 watch scan: selected 4 top-level path(s); hidden entries excluded by default; ignore rules applied; host registration unverified
 ```
 
