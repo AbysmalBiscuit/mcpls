@@ -7,20 +7,15 @@
 //! has left the context window.
 
 use std::collections::HashMap;
-use std::collections::hash_map::RandomState;
-use std::hash::{BuildHasher, Hash, Hasher};
-use std::sync::OnceLock;
+use std::hash::{Hash, Hasher};
 
 use crate::config::{DiagnosticsConfig, LspServerConfig, ServerId, SeverityFloor};
 
-/// The session a process serves when the host names none.
-static PROCESS_DEFAULT_SESSION: OnceLock<SessionId> = OnceLock::new();
-
 /// Identity of one client session.
 ///
-/// Claude Code exports `CLAUDE_CODE_SESSION_ID` into the environment of the
-/// stdio MCP servers it spawns, so an in-process flush and a flush arriving
-/// later over a socket name the same record.
+/// A host that names its session names it for every connection it opens,
+/// so a hook and the agent's own tool call read one record. A connection
+/// whose host names nothing reads a record of its own.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SessionId(String);
 
@@ -31,32 +26,47 @@ impl From<String> for SessionId {
 }
 
 impl SessionId {
-    /// The session id the host exported, or a stable process-local token.
+    /// The session a host named, or `None` when the value is absent or
+    /// empty.
     ///
-    /// Nonempty `CLAUDE_CODE_SESSION_ID` values match the hook payload so
-    /// local and forwarded delivery use the same record. Absent and empty
-    /// values share one token within a process; its random nonce prevents
-    /// reused process IDs from inheriting another process's record.
     #[must_use]
-    pub fn from_env_or_process() -> Self {
-        Self::from_env_value(std::env::var("CLAUDE_CODE_SESSION_ID").ok())
+    pub fn named(value: Option<String>) -> Option<Self> {
+        value.filter(|id| !id.is_empty()).map(Self)
     }
 
-    /// [`Self::from_env_or_process`] over an already-read variable.
+    /// The record a connection whose host named no session reads.
+    #[must_use]
+    pub fn for_connection(connection: ConnectionId) -> Self {
+        Self(connection.to_string())
+    }
+
+    /// The session Claude Code exported to this process.
     ///
-    /// Allows tests to cover absent and empty values without mutating the
-    /// test runner's environment.
-    fn from_env_value(value: Option<String>) -> Self {
-        if let Some(id) = value.filter(|id| !id.is_empty()) {
-            return Self(id);
-        }
-        PROCESS_DEFAULT_SESSION
-            .get_or_init(|| {
-                let pid = std::process::id();
-                let nonce = RandomState::new().hash_one(pid);
-                Self(format!("process-{pid}-{nonce:016x}"))
-            })
-            .clone()
+    /// Only a process facing the host reads this. A backend serves every
+    /// session and learns each one from its connection's handshake.
+    #[must_use]
+    pub fn from_host_env() -> Option<Self> {
+        Self::named(std::env::var("CLAUDE_CODE_SESSION_ID").ok())
+    }
+}
+
+/// One MCP connection to this process, numbered in the order this process
+/// created them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ConnectionId(u64);
+
+impl ConnectionId {
+    /// A number no other connection in this process has.
+    #[must_use]
+    pub fn next() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+impl std::fmt::Display for ConnectionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "connection-{}", self.0)
     }
 }
 
@@ -422,31 +432,23 @@ mod tests {
     use crate::config::{DiagnosticsConfig, SeverityFloor};
 
     #[test]
-    fn test_an_exported_session_id_names_the_record() {
+    fn test_a_named_session_needs_a_nonempty_value() {
         assert_eq!(
-            SessionId::from_env_value(Some("abc-123".to_string())),
-            SessionId::from("abc-123".to_string()),
-            "the hook payload carries this same value, and both doors have to \
-             key on one record"
+            SessionId::named(Some("abc-123".to_string())),
+            Some(SessionId::from("abc-123".to_string()))
         );
+        assert_eq!(SessionId::named(Some(String::new())), None);
+        assert_eq!(SessionId::named(None), None);
     }
 
     #[test]
-    fn test_an_absent_or_empty_session_id_reuses_the_process_token() {
-        let fallback = SessionId::from_env_value(None);
-        assert!(!fallback.to_string().is_empty());
-        assert_eq!(SessionId::from_env_value(None), fallback);
-        assert_eq!(
-            SessionId::from_env_value(Some(String::new())),
-            fallback,
-            "unset and empty values use the same process identity"
-        );
-        assert_eq!(
-            std::thread::spawn(|| SessionId::from_env_value(None))
-                .join()
-                .expect("session lookup thread"),
-            fallback,
-            "local and forwarded delivery share one token across threads"
+    fn test_each_connection_gets_its_own_fallback_session() {
+        let first = ConnectionId::next();
+        let second = ConnectionId::next();
+        assert_ne!(first, second);
+        assert_ne!(
+            SessionId::for_connection(first),
+            SessionId::for_connection(second)
         );
     }
 

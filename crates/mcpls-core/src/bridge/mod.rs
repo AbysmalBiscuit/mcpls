@@ -15,7 +15,7 @@ mod state;
 mod translator;
 
 pub use delivery::{
-    ChangedFile, DiagnosticsDelivery, FileEntry, FloorTable, FlushReport, SessionId,
+    ChangedFile, ConnectionId, DiagnosticsDelivery, FileEntry, FloorTable, FlushReport, SessionId,
 };
 pub use encoding::{PositionEncoding, lsp_to_mcp_position, mcp_to_lsp_position};
 pub use notifications::{

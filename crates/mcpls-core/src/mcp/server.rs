@@ -32,10 +32,10 @@ use super::tools::{
 };
 use crate::bridge::resources::{make_uri, parse_uri};
 use crate::bridge::{
-    DefinitionResult, Diagnostic, DiagnosticInfo, DiagnosticSeverity, DiagnosticsDelivery,
-    DiagnosticsResult, DocumentSymbolsResult, FileEntry, FloorTable, FlushReport,
-    NotificationCache, PositionEncoding, ReferencesResult, ResourceSubscriptions, ServerSettle,
-    SessionId, Translator, uri_to_path, validate_path_against_roots,
+    ConnectionId, DefinitionResult, Diagnostic, DiagnosticInfo, DiagnosticSeverity,
+    DiagnosticsDelivery, DiagnosticsResult, DocumentSymbolsResult, FileEntry, FloorTable,
+    FlushReport, NotificationCache, PositionEncoding, ReferencesResult, ResourceSubscriptions,
+    ServerSettle, SessionId, Translator, uri_to_path, validate_path_against_roots,
 };
 use crate::config::{DiagnosticsConfig, ServerId, ToolKind};
 use crate::hooks::{self, ChangeEvent, Role, SocketIdentity};
@@ -44,6 +44,11 @@ use crate::hooks::{self, ChangeEvent, Role, SocketIdentity};
 #[derive(Clone)]
 pub struct McplsServer {
     context: Arc<BridgeContext>,
+    #[allow(dead_code)]
+    connection: ConnectionId,
+    session: SessionId,
+    /// Sentences appended to this connection's instructions.
+    notes: Arc<[String]>,
     #[cfg(test)]
     footer_pause: Arc<std::sync::Mutex<Option<FooterPause>>>,
 }
@@ -576,11 +581,44 @@ impl McplsServer {
     /// rather than through [`Self::new`].
     #[allow(clippy::missing_const_for_fn)]
     pub(crate) fn from_context(context: Arc<BridgeContext>) -> Self {
+        let connection = ConnectionId::next();
         Self {
             context,
+            connection,
+            session: SessionId::for_connection(connection),
+            notes: Arc::from(Vec::new()),
             #[cfg(test)]
             footer_pause: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// This server answering a new connection: the same shared state, a
+    /// fresh connection id, and `session` when the host named one or the
+    /// connection's own record when it did not.
+    #[must_use]
+    pub(crate) fn for_connection(&self, session: Option<SessionId>) -> Self {
+        let connection = ConnectionId::next();
+        Self {
+            context: Arc::clone(&self.context),
+            connection,
+            session: session.unwrap_or_else(|| SessionId::for_connection(connection)),
+            notes: Arc::clone(&self.notes),
+            #[cfg(test)]
+            footer_pause: Arc::clone(&self.footer_pause),
+        }
+    }
+
+    /// This server with `notes` appended to its instructions.
+    #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn with_notes(mut self, notes: Vec<String>) -> Self {
+        self.notes = Arc::from(notes);
+        self
+    }
+
+    #[allow(dead_code)]
+    pub(crate) const fn session(&self) -> &SessionId {
+        &self.session
     }
 
     #[cfg(all(test, unix))]
@@ -1114,7 +1152,7 @@ impl McplsServer {
             return to_tool_result(Ok(NewDiagnosticsResult::starting_up()));
         }
 
-        let session = SessionId::from_env_or_process();
+        let session = self.session.clone();
 
         // `delivery` first, then the cache. The flush borrows its entries
         // straight out of the cache guard, so both are held together; taking
@@ -1222,7 +1260,7 @@ impl McplsServer {
     /// edit must never fail on the socket does not apply.
     async fn flush_from_owner(&self, identity: &SocketIdentity) -> NewDiagnosticsResult {
         let request = hooks::Request::Flush {
-            session: SessionId::from_env_or_process().to_string(),
+            session: self.session.to_string(),
         };
         let timeout =
             Duration::from_millis(self.context.diagnostics.hooks.op_deadline_ms) + HOOK_FLUSH_GRACE;
@@ -1269,7 +1307,7 @@ impl McplsServer {
             return;
         }
         let request = hooks::Request::Changed {
-            session: SessionId::from_env_or_process().to_string(),
+            session: self.session.to_string(),
             paths: files_written.iter().map(PathBuf::from).collect(),
             event: ChangeEvent::Change,
         };
@@ -1397,7 +1435,7 @@ impl McplsServer {
         #[cfg(test)]
         self.pause_before_footer_flush().await;
 
-        let session = SessionId::from_env_or_process();
+        let session = self.session.clone();
         let mut report = self.flush_now_if_active(&session).await?;
         report.note = Some(report.note.take().map_or_else(
             || {
@@ -1767,6 +1805,10 @@ impl ServerHandler for McplsServer {
                  --trust-project-config (or MCPLS_TRUST_PROJECT_CONFIG=true) to load it.",
             );
         }
+        for note in self.notes.iter() {
+            instructions.push(' ');
+            instructions.push_str(note);
+        }
         server_info.instructions = Some(instructions);
 
         server_info
@@ -1804,6 +1846,125 @@ mod tests {
             Duration::from_secs(1),
             Duration::from_secs(300),
         ))
+    }
+
+    /// A server over one context, with an adopted empty baseline and one
+    /// error cached, so a flush has something to report.
+    async fn server_with_one_error() -> McplsServer {
+        let (delivery, floors) = default_delivery_and_floors();
+        let cache = Arc::new(Mutex::new(NotificationCache::new()));
+        let uri: lsp_types::Uri = if cfg!(windows) {
+            "file:///C:/workspace/broken.rs".parse().unwrap()
+        } else {
+            "file:///workspace/broken.rs".parse().unwrap()
+        };
+        cache.lock().await.store_diagnostics(
+            &ServerId::from("rust"),
+            &uri,
+            Some(1),
+            vec![lsp_types::Diagnostic {
+                severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+                message: "broken".to_string(),
+                ..lsp_types::Diagnostic::default()
+            }],
+        );
+        delivery.lock().await.set_baseline(HashMap::new());
+        McplsServer::new(
+            Arc::new(Translator::new()),
+            cache,
+            Arc::from(Vec::new()),
+            Arc::new(ResourceSubscriptions::new()),
+            false,
+            delivery,
+            floors,
+            crate::config::DiagnosticsConfig::default(),
+            test_settle(),
+        )
+    }
+
+    /// Two connections whose hosts named no session each read their own
+    /// record. A backend serves every session from one process, so a
+    /// process-wide fallback would let one session consume another's
+    /// report.
+    #[tokio::test]
+    async fn test_anonymous_connections_read_their_own_records() {
+        let server = server_with_one_error().await;
+        let first = server.for_connection(None);
+        let second = server.for_connection(None);
+
+        assert!(
+            first
+                .get_new_diagnostics()
+                .await
+                .unwrap()
+                .contains("broken.rs")
+        );
+        assert!(
+            second
+                .get_new_diagnostics()
+                .await
+                .unwrap()
+                .contains("broken.rs"),
+            "the first connection's flush consumed the second's report"
+        );
+        assert!(
+            !first
+                .get_new_diagnostics()
+                .await
+                .unwrap()
+                .contains("broken.rs")
+        );
+    }
+
+    /// Two connections naming one session share its record, which is how a
+    /// hook and the agent's own tool call agree on what was delivered.
+    #[tokio::test]
+    async fn test_connections_naming_one_session_share_its_record() {
+        let server = server_with_one_error().await;
+        let session = || SessionId::named(Some("s1".to_string()));
+        let first = server.for_connection(session());
+        let second = server.for_connection(session());
+
+        assert!(
+            first
+                .get_new_diagnostics()
+                .await
+                .unwrap()
+                .contains("broken.rs")
+        );
+        assert!(
+            !second
+                .get_new_diagnostics()
+                .await
+                .unwrap()
+                .contains("broken.rs")
+        );
+    }
+
+    #[test]
+    fn test_notes_reach_the_instructions() {
+        let (delivery, floors) = default_delivery_and_floors();
+        let server = McplsServer::new(
+            Arc::new(Translator::new()),
+            Arc::new(Mutex::new(NotificationCache::new())),
+            Arc::from(Vec::new()),
+            Arc::new(ResourceSubscriptions::new()),
+            false,
+            delivery,
+            floors,
+            crate::config::DiagnosticsConfig::default(),
+            test_settle(),
+        )
+        .with_notes(vec![
+            "NOTE: first.".to_string(),
+            "NOTE: second.".to_string(),
+        ]);
+
+        let instructions = server.get_info().instructions.unwrap();
+        assert!(
+            instructions.ends_with(" NOTE: first. NOTE: second."),
+            "{instructions}"
+        );
     }
 
     /// An `McplsServer` together with the `Arc`s it shares, so a test can

@@ -325,8 +325,10 @@ pub(crate) async fn run_stdio(
     peer_cell: &tokio::sync::OnceCell<rmcp::Peer<rmcp::RoleServer>>,
     mut shutdown_signal: ShutdownSignal,
 ) -> Result<(), crate::Error> {
+    use crate::bridge::SessionId;
+
     let service = tokio::select! {
-        result = mcp_server.serve(rmcp::transport::stdio()) => {
+        result = mcp_server.for_connection(SessionId::from_host_env()).serve(rmcp::transport::stdio()) => {
             result.map_err(|e| crate::Error::McpServer(format!("Failed to start MCP server: {e}")))?
         }
         () = shutdown_signal.recv() => {
@@ -452,7 +454,7 @@ pub(crate) async fn serve_http_on(
     http_cfg.max_request_body_bytes = cfg.max_request_body_bytes;
 
     let service = StreamableHttpService::new(
-        move || Ok::<_, std::io::Error>(mcp_for_factory.clone()),
+        move || Ok::<_, std::io::Error>(mcp_for_factory.for_connection(None)),
         session_manager,
         http_cfg,
     );
