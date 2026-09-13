@@ -32,47 +32,31 @@ use super::tools::{
 };
 use crate::bridge::resources::{make_uri, parse_uri};
 use crate::bridge::{
-    DefinitionResult, Diagnostic, DiagnosticInfo, DiagnosticSeverity, DiagnosticsDelivery,
-    DiagnosticsResult, DocumentSymbolsResult, FileEntry, FloorTable, FlushReport,
-    NotificationCache, PositionEncoding, ReferencesResult, ResourceSubscriptions, ServerSettle,
-    SessionId, Translator, uri_to_path, validate_path_against_roots,
+    ConnectionId, DefinitionResult, Diagnostic, DiagnosticInfo, DiagnosticSeverity,
+    DiagnosticsDelivery, DiagnosticsResult, DocumentSymbolsResult, FileEntry, FloorTable,
+    FlushReport, NotificationCache, PositionEncoding, ReferencesResult, ResourceSubscriptions,
+    ServerSettle, SessionId, Translator, uri_to_path, validate_path_against_roots,
 };
 use crate::config::{DiagnosticsConfig, ServerId, ToolKind};
-use crate::hooks::{self, ChangeEvent, Role, SocketIdentity};
+
+/// What every mcpls tells an agent about itself at `initialize`.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) const INSTRUCTIONS: &str = concat!(
+    "Universal MCP to LSP bridge. Exposes Language Server Protocol ",
+    "capabilities as MCP tools for semantic code intelligence. ",
+    "Supports hover, definition, references, diagnostics, rename, ",
+    "completions, symbols, and formatting."
+);
 
 /// MCP server that exposes LSP capabilities as tools.
 #[derive(Clone)]
 pub struct McplsServer {
     context: Arc<BridgeContext>,
-    #[cfg(test)]
-    footer_pause: Arc<std::sync::Mutex<Option<FooterPause>>>,
+    connection: ConnectionId,
+    session: SessionId,
+    /// Sentences appended to this connection's instructions.
+    notes: Arc<[String]>,
 }
-
-#[cfg(test)]
-struct FooterPause {
-    entered: tokio::sync::oneshot::Sender<()>,
-    release: tokio::sync::oneshot::Receiver<()>,
-}
-
-/// How long a fire-and-forget `changed` waits on the hook socket.
-///
-/// Nothing is read back and nothing is lost when it expires -- the owner
-/// picks the same paths up from its next hook -- so this is bounded well
-/// below anything an agent would notice rather than by the owner's own
-/// deadline.
-const HOOK_CHANGED_TIMEOUT: Duration = Duration::from_millis(50);
-
-/// How much longer than the owner's own op deadline a forwarded flush
-/// waits.
-///
-/// The owner answers *at* its deadline rather than before it, letting the
-/// work that overran keep running, so a client waiting exactly that long
-/// times out on the answer it asked for. This covers the connect and the
-/// round trip on top of it. A client bound tighter than the server's own is
-/// never right here: the owner consumes the session's report before it
-/// writes a byte back, so a client that gives up early loses a report
-/// nobody ever sees.
-const HOOK_FLUSH_GRACE: Duration = Duration::from_millis(250);
 
 /// The apply toggle a tool's writes answer to, for the tools that write.
 ///
@@ -272,39 +256,6 @@ impl NewDiagnosticsResult {
             cleared: Vec::new(),
             omitted: 0,
             note: Some("Language servers are still starting up; call again shortly.".to_string()),
-        }
-    }
-
-    /// The owner's already-rendered report, wrapped so a passive instance
-    /// answers the same JSON object every other instance does.
-    ///
-    /// The owner sends text because that is what a hook prints and what the
-    /// socket protocol carries. Returning that string bare would make the
-    /// tool's response type depend on which process won a lock race, and
-    /// flip back mid-session the moment a forward failed.
-    const fn from_owner(context: Option<String>) -> Self {
-        Self {
-            changed: Vec::new(),
-            cleared: Vec::new(),
-            omitted: 0,
-            note: context,
-        }
-    }
-
-    /// The response when the socket's owner could not answer.
-    ///
-    /// Says so rather than reporting an empty diff, which an agent would
-    /// read as a clean workspace.
-    fn owner_unreachable() -> Self {
-        Self {
-            changed: Vec::new(),
-            cleared: Vec::new(),
-            omitted: 0,
-            note: Some(
-                "Another mcpls process owns this project's diagnostics record and could not be \
-                 reached, so nothing is reported this call. Check the mcpls logs."
-                    .to_string(),
-            ),
         }
     }
 }
@@ -570,35 +521,52 @@ impl McplsServer {
 
     /// A server over an already-built context.
     ///
-    /// `serve_with` decides this process's hook role before the context is
-    /// frozen into an `Arc`, and the socket handler needs a server sharing
-    /// that same context, so both are built from one `Arc<BridgeContext>`
-    /// rather than through [`Self::new`].
+    /// The socket handler needs a server sharing the MCP server's context,
+    /// so both are built from one `Arc<BridgeContext>` rather than through
+    /// [`Self::new`].
     #[allow(clippy::missing_const_for_fn)]
     pub(crate) fn from_context(context: Arc<BridgeContext>) -> Self {
+        let connection = ConnectionId::next();
         Self {
             context,
-            #[cfg(test)]
-            footer_pause: Arc::new(std::sync::Mutex::new(None)),
+            connection,
+            session: SessionId::for_connection(connection),
+            notes: Arc::from(Vec::new()),
         }
     }
 
-    #[cfg(all(test, unix))]
-    pub(crate) fn install_footer_pause(
-        &self,
-        entered: tokio::sync::oneshot::Sender<()>,
-        release: tokio::sync::oneshot::Receiver<()>,
-    ) {
-        *crate::bridge::lock_std(&self.footer_pause) = Some(FooterPause { entered, release });
+    /// This server answering a new connection: the same shared state, a
+    /// fresh connection id, and `session` when the host named one or the
+    /// connection's own record when it did not.
+    #[must_use]
+    pub(crate) fn for_connection(&self, session: Option<SessionId>) -> Self {
+        let connection = ConnectionId::next();
+        Self {
+            context: Arc::clone(&self.context),
+            connection,
+            session: session.unwrap_or_else(|| SessionId::for_connection(connection)),
+            notes: Arc::clone(&self.notes),
+        }
     }
 
-    #[cfg(test)]
-    async fn pause_before_footer_flush(&self) {
-        let pause = crate::bridge::lock_std(&self.footer_pause).take();
-        if let Some(FooterPause { entered, release }) = pause {
-            let _ = entered.send(());
-            let _ = release.await;
-        }
+    /// This server with `notes` appended to its instructions.
+    #[must_use]
+    pub(crate) fn with_notes(mut self, notes: Vec<String>) -> Self {
+        self.notes = Arc::from(notes);
+        self
+    }
+
+    #[allow(dead_code)]
+    pub(crate) const fn session(&self) -> &SessionId {
+        &self.session
+    }
+
+    pub(crate) const fn connection(&self) -> ConnectionId {
+        self.connection
+    }
+
+    pub(crate) fn subscriptions(&self) -> &Arc<ResourceSubscriptions> {
+        &self.context.subscriptions
     }
 
     /// Router for every MCP tool, with the read-only classification applied
@@ -777,7 +745,6 @@ impl McplsServer {
             Ok(result) => result,
             Err(err) => return Err(McpError::internal_error(err.to_string(), None)),
         };
-        self.forward_apply_targets(&result.files_written).await;
         let footer = self.footer_if_written(result.applied, epoch_before).await;
         to_tool_result(Ok(WithDiagnostics {
             result,
@@ -860,7 +827,6 @@ impl McplsServer {
             Ok(result) => result,
             Err(err) => return Err(McpError::internal_error(err.to_string(), None)),
         };
-        self.forward_apply_targets(&result.files_written).await;
         let footer = self.footer_if_written(result.applied, epoch_before).await;
         to_tool_result(Ok(WithDiagnostics {
             result,
@@ -991,7 +957,6 @@ impl McplsServer {
             Ok(result) => result,
             Err(err) => return Err(McpError::internal_error(err.to_string(), None)),
         };
-        self.forward_apply_targets(&result.files_written).await;
         let footer = self.footer_if_written(result.applied, epoch_before).await;
         to_tool_result(Ok(WithDiagnostics {
             result,
@@ -1099,13 +1064,6 @@ impl McplsServer {
         )
     )]
     pub(crate) async fn get_new_diagnostics(&self) -> Result<String, McpError> {
-        // Ahead of the baseline check: a passive instance's own baseline
-        // says nothing about the record it is asking for, which lives in
-        // the owner.
-        if let Role::Passive { identity } = self.context.hooks.get() {
-            return to_tool_result(Ok(self.flush_from_owner(&identity).await));
-        }
-
         let baselined = {
             let delivery = self.context.delivery.lock().await;
             delivery.has_baseline()
@@ -1114,7 +1072,7 @@ impl McplsServer {
             return to_tool_result(Ok(NewDiagnosticsResult::starting_up()));
         }
 
-        let session = SessionId::from_env_or_process();
+        let session = self.session.clone();
 
         // `delivery` first, then the cache. The flush borrows its entries
         // straight out of the cache guard, so both are held together; taking
@@ -1160,22 +1118,6 @@ impl McplsServer {
         (self.new_diagnostics_payload(&report, &sources).await, token)
     }
 
-    #[allow(clippy::significant_drop_tightening)]
-    async fn flush_now_if_active(&self, session: &SessionId) -> Option<NewDiagnosticsResult> {
-        let (report, sources) = {
-            let mut delivery = self.context.delivery.lock().await;
-            let cache = self.context.notification_cache.lock().await;
-            let entries = routable_entries_borrowed(&cache, &self.context.floors);
-            let report = self
-                .context
-                .hooks
-                .with_active_role(|| delivery.flush(session, &entries))?;
-            let sources = source_map(&cache, &report);
-            (report, sources)
-        };
-        Some(self.new_diagnostics_payload(&report, &sources).await)
-    }
-
     /// `session`'s flush, rendered as the text a hook prints, with the
     /// token the hook acknowledges once it has that text.
     ///
@@ -1208,74 +1150,9 @@ impl McplsServer {
         self.context.delivery.lock().await.commit(session, token)
     }
 
-    /// The owner's flush for this session, in the shape every other
-    /// instance answers with, acknowledged once the answer is in hand.
-    ///
-    /// Never falls back to this process's own record. The owner's record
-    /// is the session's record; a diff against this process's own would
-    /// be against a baseline the session never agreed to, and would leave
-    /// the two permanently disagreeing about what this session has been
-    /// shown. A forward that fails costs nothing on the owner's side: its
-    /// staged report is unacknowledged and the next flush offers it
-    /// again. Saying the owner could not be reached is the honest answer,
-    /// and it is the MCP tool rather than a hook, so the rule that an
-    /// edit must never fail on the socket does not apply.
-    async fn flush_from_owner(&self, identity: &SocketIdentity) -> NewDiagnosticsResult {
-        let request = hooks::Request::Flush {
-            session: SessionId::from_env_or_process().to_string(),
-        };
-        let timeout =
-            Duration::from_millis(self.context.diagnostics.hooks.op_deadline_ms) + HOOK_FLUSH_GRACE;
-        let answer = hooks::send_and_acknowledge(identity, std::slice::from_ref(&request), timeout)
-            .await
-            .map(|mut responses| responses.remove(0));
-        match answer {
-            Ok(hooks::Response::Flush { context, .. }) => NewDiagnosticsResult::from_owner(context),
-            Ok(hooks::Response::Error { message }) => {
-                tracing::warn!(%message, "the hook socket's owner refused this session's flush");
-                NewDiagnosticsResult::owner_unreachable()
-            }
-            Ok(other) => {
-                tracing::warn!(
-                    ?other,
-                    "the hook socket's owner answered a flush with something else"
-                );
-                NewDiagnosticsResult::owner_unreachable()
-            }
-            Err(error) => {
-                tracing::warn!(%error, "could not reach the hook socket's owner for this session's flush");
-                NewDiagnosticsResult::owner_unreachable()
-            }
-        }
-    }
-
     /// Drop `session`'s delivery record.
     pub(crate) async fn end_session(&self, session: &SessionId) {
         self.context.delivery.lock().await.end_session(session);
-    }
-
-    /// Forward the paths an apply wrote to the socket's owner.
-    ///
-    /// A passive instance's language servers are warm but nobody is feeding
-    /// them, so a write made through this process would otherwise never
-    /// reach the servers the owner's flush reads. Silent on every failure,
-    /// for the same reason the hook is: a tool call must not fail because
-    /// the socket was unavailable.
-    pub(crate) async fn forward_apply_targets(&self, files_written: &[String]) {
-        let Role::Passive { identity } = self.context.hooks.get() else {
-            return;
-        };
-        if files_written.is_empty() {
-            return;
-        }
-        let request = hooks::Request::Changed {
-            session: SessionId::from_env_or_process().to_string(),
-            paths: files_written.iter().map(PathBuf::from).collect(),
-            event: ChangeEvent::Change,
-        };
-        if let Err(error) = hooks::send(&identity, &request, HOOK_CHANGED_TIMEOUT).await {
-            tracing::debug!(%error, "could not forward apply targets to the hook owner");
-        }
     }
 
     /// Build `get_new_diagnostics`'s payload from one flush's report.
@@ -1368,14 +1245,6 @@ impl McplsServer {
     /// call is that value plus at most one 50 ms sampling tick, never the
     /// grace and the cap stacked on top of each other.
     pub(crate) async fn footer_for_write(&self, epoch_before: u64) -> Option<NewDiagnosticsResult> {
-        // Ahead of the config check, so enabling the footer in a passive
-        // instance's config still produces nothing: this footer would
-        // consume from this process's own record while the next flush reads
-        // the owner's, delivering the same diagnostics twice from one door
-        // and never from the other.
-        if matches!(self.context.hooks.get(), Role::Passive { .. }) {
-            return None;
-        }
         if !self.context.diagnostics.footer {
             return None;
         }
@@ -1394,11 +1263,8 @@ impl McplsServer {
         )
         .await;
 
-        #[cfg(test)]
-        self.pause_before_footer_flush().await;
-
-        let session = SessionId::from_env_or_process();
-        let mut report = self.flush_now_if_active(&session).await?;
+        let session = self.session.clone();
+        let mut report = self.flush_now(&session, Advance::Now).await.0;
         report.note = Some(report.note.take().map_or_else(
             || {
                 "This footer is best effort; anything slower than the wait arrives in the \
@@ -1674,23 +1540,16 @@ impl ServerHandler for McplsServer {
         let validated_path = validate_path_against_roots(&path, &self.context.workspace_roots)
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
-        // Track and reply under the canonical resource URI, not the client's raw
-        // `request.uri`: `diagnostics_pump` derives `mcp_uri` from the canonical LSP
-        // path (see below), so a subscription keyed by a non-canonical but equivalent
-        // URI (symlink, macOS /var vs /private/var, ...) would never match its
-        // `subs.contains` check and silently stop receiving pushes.
+        // The pump derives its resource URI from the canonical LSP path, so
+        // subscriptions use the same canonical key.
         let canonical_uri =
             make_uri(&validated_path).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
-        // Record the subscription *before* checking the cache. This closes the race where
-        // a PublishDiagnostics notification lands between the cache check and the
-        // subscription being recorded: if diagnostics arrive before this point, the check
-        // below catches them; if they arrive after, `diagnostics_pump`'s own
-        // `subs.contains` check already sees this URI as subscribed and delivers the
-        // update through the normal push path.
+        // Record before checking the cache so diagnostics arriving between
+        // the two operations are either replayed or pushed by the pump.
         self.context
             .subscriptions
-            .subscribe(canonical_uri.clone())
+            .subscribe(self.connection, context.peer.clone(), canonical_uri.clone())
             .await
             .map_err(|e| McpError::invalid_params(e, None))?;
 
@@ -1734,7 +1593,10 @@ impl ServerHandler for McplsServer {
             .and_then(|validated_path| make_uri(&validated_path).ok())
             .unwrap_or_else(|| request.uri.clone());
 
-        self.context.subscriptions.unsubscribe(&key).await;
+        self.context
+            .subscriptions
+            .unsubscribe(self.connection, &key)
+            .await;
         Ok(())
     }
 
@@ -1751,13 +1613,7 @@ impl ServerHandler for McplsServer {
             .build();
         let mut server_info = ServerInfo::new(capabilities);
         server_info.server_info = implementation;
-        let mut instructions = concat!(
-            "Universal MCP to LSP bridge. Exposes Language Server Protocol ",
-            "capabilities as MCP tools for semantic code intelligence. ",
-            "Supports hover, definition, references, diagnostics, rename, ",
-            "completions, symbols, and formatting."
-        )
-        .to_string();
+        let mut instructions = INSTRUCTIONS.to_string();
 
         if self.context.project_config_ignored {
             instructions.push_str(
@@ -1766,6 +1622,10 @@ impl ServerHandler for McplsServer {
                  config instead. If this repository is trusted, restart mcpls with \
                  --trust-project-config (or MCPLS_TRUST_PROJECT_CONFIG=true) to load it.",
             );
+        }
+        for note in self.notes.iter() {
+            instructions.push(' ');
+            instructions.push_str(note);
         }
         server_info.instructions = Some(instructions);
 
@@ -1784,7 +1644,6 @@ mod tests {
         FakeServer, RenameResult, read_framed_reply, translator_with_capabilities, write_response,
     };
     use crate::config::ApplyConfig;
-    use crate::hooks::{HookRole, SocketIdentity};
 
     /// A `DiagnosticsDelivery`/`FloorTable` pair for tests that don't care
     /// about diagnostics config or per-server floors, just a working
@@ -1804,6 +1663,125 @@ mod tests {
             Duration::from_secs(1),
             Duration::from_secs(300),
         ))
+    }
+
+    /// A server over one context, with an adopted empty baseline and one
+    /// error cached, so a flush has something to report.
+    async fn server_with_one_error() -> McplsServer {
+        let (delivery, floors) = default_delivery_and_floors();
+        let cache = Arc::new(Mutex::new(NotificationCache::new()));
+        let uri: lsp_types::Uri = if cfg!(windows) {
+            "file:///C:/workspace/broken.rs".parse().unwrap()
+        } else {
+            "file:///workspace/broken.rs".parse().unwrap()
+        };
+        cache.lock().await.store_diagnostics(
+            &ServerId::from("rust"),
+            &uri,
+            Some(1),
+            vec![lsp_types::Diagnostic {
+                severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+                message: "broken".to_string(),
+                ..lsp_types::Diagnostic::default()
+            }],
+        );
+        delivery.lock().await.set_baseline(HashMap::new());
+        McplsServer::new(
+            Arc::new(Translator::new()),
+            cache,
+            Arc::from(Vec::new()),
+            Arc::new(ResourceSubscriptions::new()),
+            false,
+            delivery,
+            floors,
+            crate::config::DiagnosticsConfig::default(),
+            test_settle(),
+        )
+    }
+
+    /// Two connections whose hosts named no session each read their own
+    /// record. A backend serves every session from one process, so a
+    /// process-wide fallback would let one session consume another's
+    /// report.
+    #[tokio::test]
+    async fn test_anonymous_connections_read_their_own_records() {
+        let server = server_with_one_error().await;
+        let first = server.for_connection(None);
+        let second = server.for_connection(None);
+
+        assert!(
+            first
+                .get_new_diagnostics()
+                .await
+                .unwrap()
+                .contains("broken.rs")
+        );
+        assert!(
+            second
+                .get_new_diagnostics()
+                .await
+                .unwrap()
+                .contains("broken.rs"),
+            "the first connection's flush consumed the second's report"
+        );
+        assert!(
+            !first
+                .get_new_diagnostics()
+                .await
+                .unwrap()
+                .contains("broken.rs")
+        );
+    }
+
+    /// Two connections naming one session share its record, which is how a
+    /// hook and the agent's own tool call agree on what was delivered.
+    #[tokio::test]
+    async fn test_connections_naming_one_session_share_its_record() {
+        let server = server_with_one_error().await;
+        let session = || SessionId::named(Some("s1".to_string()));
+        let first = server.for_connection(session());
+        let second = server.for_connection(session());
+
+        assert!(
+            first
+                .get_new_diagnostics()
+                .await
+                .unwrap()
+                .contains("broken.rs")
+        );
+        assert!(
+            !second
+                .get_new_diagnostics()
+                .await
+                .unwrap()
+                .contains("broken.rs")
+        );
+    }
+
+    #[test]
+    fn test_notes_reach_the_instructions() {
+        let (delivery, floors) = default_delivery_and_floors();
+        let server = McplsServer::new(
+            Arc::new(Translator::new()),
+            Arc::new(Mutex::new(NotificationCache::new())),
+            Arc::from(Vec::new()),
+            Arc::new(ResourceSubscriptions::new()),
+            false,
+            delivery,
+            floors,
+            crate::config::DiagnosticsConfig::default(),
+            test_settle(),
+        )
+        .with_notes(vec![
+            "NOTE: first.".to_string(),
+            "NOTE: second.".to_string(),
+        ]);
+
+        let instructions = server.get_info().instructions.unwrap();
+        assert!(
+            instructions.ends_with(" NOTE: first. NOTE: second."),
+            "{instructions}"
+        );
     }
 
     /// An `McplsServer` together with the `Arc`s it shares, so a test can
@@ -2002,40 +1980,6 @@ mod tests {
         );
     }
 
-    /// A passive instance answers the same JSON object every other instance
-    /// does, whether the forward worked or not. The shape must not depend on
-    /// which process won a lock race.
-    #[test]
-    fn test_a_forwarded_flush_keeps_the_documented_object_shape() {
-        let forwarded =
-            NewDiagnosticsResult::from_owner(Some("a.rs:\n  1:1 error boom".to_string()));
-        let json = serde_json::to_value(&forwarded).expect("serialize");
-        assert_eq!(json["changed"], json!([]));
-        assert_eq!(json["cleared"], json!([]));
-        assert_eq!(json["omitted"], json!(0));
-        assert_eq!(json["note"], json!("a.rs:\n  1:1 error boom"));
-
-        let nothing =
-            serde_json::to_value(NewDiagnosticsResult::from_owner(None)).expect("serialize");
-        assert_eq!(
-            nothing,
-            json!({"changed": [], "cleared": [], "omitted": 0}),
-            "the owner having nothing to report is the documented empty answer, \
-             not an empty string"
-        );
-    }
-
-    /// An unreachable owner says so. Reporting an empty diff instead would
-    /// read as a clean workspace, and the owner has already consumed the
-    /// report that went missing.
-    #[test]
-    fn test_an_unreachable_owner_answers_with_a_note_rather_than_an_empty_diff() {
-        let note = NewDiagnosticsResult::owner_unreachable()
-            .note
-            .expect("a note");
-        assert!(note.contains("could not be reached"), "{note}");
-    }
-
     /// A rename result shaped the way `rename_symbol` returns one.
     fn sample_rename_result() -> RenameResult {
         RenameResult {
@@ -2181,10 +2125,9 @@ mod tests {
 
     /// The three tools that can write to the working tree.
     ///
-    /// Each of them forwards what it wrote to the socket owner and appends
-    /// the diagnostics its own edit produced, on two adjacent lines of its
-    /// own. Driving all three from one place is what keeps a fourth write
-    /// tool, or a refactor of one of these, from quietly losing either.
+    /// Each of them appends the diagnostics its own edit produced on two
+    /// adjacent lines. Driving all three from one place is what keeps a fourth
+    /// write tool, or a refactor of one of these, from quietly losing them.
     #[derive(Clone, Copy, Debug)]
     enum WriteTool {
         Rename,
@@ -2360,7 +2303,7 @@ mod tests {
     }
 
     impl WriteFixture {
-        fn new(tool: WriteTool, diagnostics: DiagnosticsConfig, hooks: Arc<HookRole>) -> Self {
+        fn new(tool: WriteTool, diagnostics: DiagnosticsConfig) -> Self {
             let dir = tempfile::tempdir().expect("a temp dir");
             let (translator, fake) =
                 translator_with_capabilities(&dir, &ServerId::from("rust"), tool.capabilities());
@@ -2374,7 +2317,7 @@ mod tests {
             let path = dunce::canonicalize(path).expect("the fixture exists");
             let uri = crate::bridge::path_to_uri(&path).expect("a uri for the fixture");
 
-            let mut context = BridgeContext::new(
+            let context = BridgeContext::new(
                 translator,
                 Arc::new(Mutex::new(NotificationCache::new())),
                 Arc::from(vec![dir.path().to_path_buf()]),
@@ -2385,7 +2328,6 @@ mod tests {
                 diagnostics,
                 test_settle(),
             );
-            context.hooks = hooks;
             let context = Arc::new(context);
 
             Self {
@@ -2455,7 +2397,6 @@ mod tests {
                     footer_wait_ms: 0,
                     ..DiagnosticsConfig::default()
                 },
-                Arc::new(HookRole::disabled()),
             )
             .with_one_error()
             .await;
@@ -2470,33 +2411,6 @@ mod tests {
                 "{tool:?} answered without the diagnostics its own write \
                  produced, so the agent has to ask for them in a second call \
                  and pays a turn for it: {result}"
-            );
-        }
-    }
-
-    /// Every write tool tells the socket's owner what it wrote.
-    ///
-    /// A passive instance's own language servers are warm but nobody feeds
-    /// them, so without this the owner's servers never learn the file
-    /// changed and every symptom reads as a slow language server.
-    #[tokio::test]
-    async fn test_every_write_tool_reports_its_writes_to_the_socket_owner() {
-        for tool in WRITE_TOOLS {
-            let owner = RecordingOwner::listening().await;
-            let mut fixture = WriteFixture::new(
-                tool,
-                DiagnosticsConfig::default(),
-                Arc::new(HookRole::passive(owner.identity.clone())),
-            );
-            let expected = fixture.path.clone();
-
-            fixture.apply(tool).await;
-
-            assert_eq!(
-                *owner.forwarded.lock().await,
-                vec![expected],
-                "{tool:?} wrote through a passive instance, whose servers no \
-                 flush ever reads"
             );
         }
     }
@@ -2601,7 +2515,6 @@ mod tests {
                 crate::PumpShared {
                     notification_cache: cache,
                     subs: subscriptions,
-                    peer_cell: Arc::new(tokio::sync::OnceCell::new()),
                     workspace_roots,
                     document_tracker: Arc::clone(translator.document_tracker()),
                     settle: Arc::clone(&settle),
@@ -2829,75 +2742,6 @@ mod tests {
         })
         .await
         .expect("bounded causal write transport scenarios");
-    }
-
-    /// An owner listening on its own temporary socket, recording the paths
-    /// every `Changed` request names.
-    struct RecordingOwner {
-        /// What a passive instance forwards to.
-        identity: SocketIdentity,
-        /// The paths every `Changed` request named, in arrival order.
-        forwarded: Arc<Mutex<Vec<PathBuf>>>,
-        /// Dropping this cancels the listener, so it is held for as long as
-        /// the owner is expected to answer.
-        _cancel: tokio::sync::watch::Sender<bool>,
-        /// The socket and its lock live in here.
-        _dir: tempfile::TempDir,
-    }
-
-    impl RecordingOwner {
-        async fn listening() -> Self {
-            let dir = tempfile::tempdir().expect("a temp dir");
-            let hash = format!("{:016x}", unique_suffix());
-            #[cfg(windows)]
-            let socket = PathBuf::from(format!(r"\\.\pipe\mcpls-forward-{hash}"));
-            #[cfg(not(windows))]
-            let socket = dir.path().join(format!("{hash}.sock"));
-            let identity = SocketIdentity {
-                socket,
-                lock: dir.path().join(format!("{hash}.lock")),
-                hash,
-            };
-
-            let forwarded = Arc::new(Mutex::new(Vec::new()));
-            let recorder = Arc::clone(&forwarded);
-            let listener = hooks::HookListener::acquire(&identity)
-                .await
-                .expect("acquire")
-                .expect("nothing else owns a socket in a fresh temp dir");
-            let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-            tokio::spawn(listener.serve(
-                move |request: hooks::Request| {
-                    let recorder = Arc::clone(&recorder);
-                    Box::pin(async move {
-                        if let hooks::Request::Changed { paths, .. } = request {
-                            recorder.lock().await.extend(paths);
-                        }
-                        hooks::Response::Changed { queued: 0 }
-                    }) as futures::future::BoxFuture<'static, hooks::Response>
-                },
-                Duration::from_secs(5),
-                cancel_rx,
-            ));
-
-            Self {
-                identity,
-                forwarded,
-                _cancel: cancel_tx,
-                _dir: dir,
-            }
-        }
-    }
-
-    /// A suffix no other socket in this test run carries. The Windows pipe
-    /// namespace is machine-global, so a name derived from the process
-    /// alone would collide with the next owner this test starts.
-    fn unique_suffix() -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        std::thread::current().id().hash(&mut hasher);
-        std::time::SystemTime::now().hash(&mut hasher);
-        hasher.finish()
     }
 
     #[test]
@@ -5043,34 +4887,6 @@ mod tests {
         let translator = Translator::new();
         let result = translator.validate_path(Path::new("/this/path/does/not/exist/at/all.rs"));
         assert!(result.is_err());
-    }
-
-    /// subscribe cap enforced: after `MAX_SUBSCRIPTIONS` entries, the next call returns `Err`.
-    #[tokio::test]
-    async fn test_subscription_cap_enforced_in_handler_context() {
-        use crate::bridge::resources::MAX_SUBSCRIPTIONS;
-
-        let subscriptions = Arc::new(ResourceSubscriptions::new());
-        for i in 0..MAX_SUBSCRIPTIONS {
-            subscriptions
-                .subscribe(format!("lsp-diagnostics:///file{i}.rs"))
-                .await
-                .unwrap();
-        }
-        let over = subscriptions
-            .subscribe("lsp-diagnostics:///overflow.rs".to_string())
-            .await;
-        assert!(over.is_err());
-    }
-
-    /// unsubscribing a URI that was never subscribed is a no-op (returns `false`, not an error).
-    #[tokio::test]
-    async fn test_unsubscribe_nonexistent_is_noop() {
-        let subscriptions = Arc::new(ResourceSubscriptions::new());
-        let removed = subscriptions
-            .unsubscribe("lsp-diagnostics:///nonexistent.rs")
-            .await;
-        assert!(!removed);
     }
 
     /// Server capabilities advertise resources support.

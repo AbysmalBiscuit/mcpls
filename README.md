@@ -362,7 +362,14 @@ flowchart TB
     subgraph AI["AI Agent (Claude)"]
     end
 
-    subgraph mcpls["mcpls Server"]
+    subgraph AI2["Another session, same checkout"]
+    end
+
+    FE1["mcpls frontend<br/>(stdio)"]
+    FE2["mcpls frontend<br/>(stdio)"]
+    Hooks["mcpls hook"]
+
+    subgraph Backend["mcpls backend (one per checkout)"]
         MCP["MCP Server<br/>(rmcp)"]
         Trans["Translation Layer"]
         LSP["LSP Clients<br/>Manager"]
@@ -376,9 +383,15 @@ flowchart TB
         Other["..."]
     end
 
-    AI <-->|"MCP Protocol<br/>(JSON-RPC 2.0)"| mcpls
-    mcpls <-->|"LSP Protocol<br/>(JSON-RPC 2.0)"| Servers
+    AI <-->|"MCP Protocol<br/>(JSON-RPC 2.0)"| FE1
+    AI2 <-->|"MCP Protocol"| FE2
+    FE1 <-->|"Unix socket or<br/>named pipe"| Backend
+    FE2 <--> Backend
+    Hooks <--> Backend
+    Backend <-->|"LSP Protocol<br/>(JSON-RPC 2.0)"| Servers
 ```
+
+Each MCP session runs a small stdio frontend that relays to the checkout's one backend, so sessions in the same checkout share language servers instead of indexing twice. The first session starts the backend, and it exits shortly after the last one closes. `mcpls --no-backend` runs a session in-process instead. See [Backend Section](docs/user-guide/configuration.md#backend-section).
 
 **Key design decisions:**
 - **Single binary** — No Node.js, Python, or other runtime dependencies

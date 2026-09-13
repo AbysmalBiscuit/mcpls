@@ -8,7 +8,6 @@ use std::time::{Duration, Instant};
 use std::{fs, thread};
 
 use anyhow::{Context, Result};
-use mcpls_core::hooks::{self, Request, Response, SocketIdentity};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -204,7 +203,18 @@ fn write_duplicate_floor_config(
 fn wait_for_diagnostics_baseline(client: &mut McpClient) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let response = client.call_tool("get_new_diagnostics", &json!({}))?;
+        // A frontend answers from its stub until it attaches to a backend,
+        // which on Windows only starts once a hook has fired.
+        let response = match client.call_tool("get_new_diagnostics", &json!({})) {
+            Err(error)
+                if error.to_string().contains("waiting for its backend")
+                    && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(25));
+                continue;
+            }
+            response => response?,
+        };
         let text = response["result"]["content"][0]["text"]
             .as_str()
             .with_context(|| format!("expected diagnostic text content, got {response}"))?;
@@ -351,141 +361,6 @@ fn run_duplicate_floor_case(active_first: bool) -> Result<String> {
         thread::sleep(Duration::from_millis(25));
     };
     Ok(report)
-}
-
-async fn owner_hooks_seen(identity: &SocketIdentity, pid: u32, workspace: &Path) -> Result<u64> {
-    let response = hooks::send(identity, &Request::Status, Duration::from_secs(5)).await?;
-    match response {
-        Response::Status {
-            hash,
-            socket,
-            pid: owner_pid,
-            owner,
-            root,
-            hooks_seen,
-        } => {
-            assert!(owner);
-            assert_eq!(owner_pid, pid);
-            assert_eq!(root, workspace);
-            assert_eq!(hash, identity.hash);
-            assert_eq!(socket, identity.socket);
-            Ok(hooks_seen)
-        }
-        other => anyhow::bail!("expected hook owner status, got {other:?}"),
-    }
-}
-
-async fn process_session_reports(
-    session: Option<&str>,
-    passive_first: bool,
-) -> Result<[serde_json::Value; 4]> {
-    let workspace = TempDir::new()?;
-    let root = dunce::canonicalize(workspace.path())?;
-    let script = diagnostics_fixture::write_diagnostics_server(&root)?;
-    let published_marker = root.join("published.marker");
-    let config_path = root.join("mcpls.toml");
-    let workspace_value = toml::Value::String(root.to_string_lossy().into_owned());
-    let args = toml_array(&[
-        script.to_string_lossy().into_owned(),
-        "process-session-probe".to_string(),
-        "process-session-hover".to_string(),
-        published_marker.to_string_lossy().into_owned(),
-    ]);
-    fs::write(
-        &config_path,
-        format!(
-            "[workspace]\nroots = [{workspace_value}]\n[diagnostics]\nsettle_quiet_ms = 50\nsettle_deadline_ms = 5000\n[diagnostics.hooks]\nenabled = true\n\n[[lsp_servers]]\nlanguage_id = \"python\"\ncommand = \"python3\"\nargs = [{args}]\nfile_patterns = [\"**/*.py\"]\ndiagnostics_severity = \"warning\"\n\n[lsp_servers.heuristics]\nproject_markers = [\"main.py\"]\n"
-        ),
-    )?;
-    let file_path = root.join("main.py");
-    fs::write(&file_path, "def fixture():\n    return 1\n")?;
-    let config_arg = config_path
-        .to_str()
-        .context("fixture config must be UTF-8")?;
-    let identity = hooks::identity_for(&root)?;
-
-    let mut owner = McpClient::spawn_in_workspace(&["--config", config_arg], &root, session)?;
-    owner.initialize()?;
-    wait_for_diagnostics_baseline(&mut owner)?;
-    let before = owner_hooks_seen(&identity, owner.pid(), &root).await?;
-
-    let mut passive = McpClient::spawn_in_workspace(&["--config", config_arg], &root, session)?;
-    passive.initialize()?;
-    wait_for_diagnostics_baseline(&mut passive)?;
-    assert!(
-        owner_hooks_seen(&identity, owner.pid(), &root).await? > before,
-        "the passive client's baseline flush must reach the owner"
-    );
-    assert!(!published_marker.exists());
-    eprintln!(
-        "i1_t6 session={session:?} passive_first={passive_first}: owner={}, passive={}, shared workspace and forwarding ready before publication",
-        owner.pid(),
-        passive.pid()
-    );
-
-    let hover = call_hover_when_ready(&mut owner, &file_path)?;
-    assert!(hover.to_string().contains("process-session-hover"));
-    wait_for_marker(&published_marker)?;
-
-    let (first, second) = if passive_first {
-        (&mut passive, &mut owner)
-    } else {
-        (&mut owner, &mut passive)
-    };
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let first_report = loop {
-        let report = first.call_tool("get_new_diagnostics", &json!({}))?;
-        if report.to_string().contains("process-session-probe") {
-            break report;
-        }
-        anyhow::ensure!(
-            Instant::now() < deadline,
-            "owner publication missing: {report}"
-        );
-        thread::sleep(Duration::from_millis(25));
-    };
-    let second_report = second.call_tool("get_new_diagnostics", &json!({}))?;
-    let first_repeat = first.call_tool("get_new_diagnostics", &json!({}))?;
-    let second_repeat = second.call_tool("get_new_diagnostics", &json!({}))?;
-    eprintln!(
-        "i1_t6 first_report={first_report}\nsecond_report={second_report}\nfirst_repeat={first_repeat}\nsecond_repeat={second_repeat}"
-    );
-    Ok([first_report, second_report, first_repeat, second_repeat])
-}
-
-#[rstest::rstest]
-#[case::unset_owner_first(None, false)]
-#[case::unset_passive_first(None, true)]
-#[case::empty_owner_first(Some(""), false)]
-#[case::empty_passive_first(Some(""), true)]
-#[tokio::test]
-#[ignore = "Requires mcpls binary built"]
-async fn i1_t6_process_fallbacks_are_independent(
-    #[case] session: Option<&str>,
-    #[case] passive_first: bool,
-) -> Result<()> {
-    let [first_report, second_report, first_repeat, second_repeat] =
-        process_session_reports(session, passive_first).await?;
-    assert!(first_report.to_string().contains("process-session-probe"));
-    assert!(second_report.to_string().contains("process-session-probe"));
-    assert!(!first_repeat.to_string().contains("process-session-probe"));
-    assert!(!second_repeat.to_string().contains("process-session-probe"));
-    Ok(())
-}
-
-#[rstest::rstest]
-#[case::owner_first(false)]
-#[case::passive_first(true)]
-#[tokio::test]
-#[ignore = "Requires mcpls binary built"]
-async fn i1_t6_explicit_same_session_shares_delivery(#[case] passive_first: bool) -> Result<()> {
-    let [first_report, second_report, first_repeat, second_repeat] =
-        process_session_reports(Some("process-session-shared"), passive_first).await?;
-    assert!(first_report.to_string().contains("process-session-probe"));
-    assert!(!second_report.to_string().contains("process-session-probe"));
-    assert!(!first_repeat.to_string().contains("process-session-probe"));
-    assert!(!second_repeat.to_string().contains("process-session-probe"));
-    Ok(())
 }
 
 #[test]
@@ -701,6 +576,85 @@ fn i1_t5_successful_non_diagnostics_progress_does_not_hold_baseline() -> Result<
     assert!(
         hover.to_string().contains("mixed-startup-fixture"),
         "the successful non-diagnostics server must remain routable for hover, got {hover}"
+    );
+    Ok(())
+}
+
+/// Two sessions in one project share one backend. Sessions naming no host
+/// session keep their own records; sessions naming one share it.
+#[rstest::rstest]
+#[case::anonymous(None, true)]
+#[case::named(Some("shared-backend-session"), false)]
+#[tokio::test]
+#[ignore = "Requires mcpls binary built"]
+async fn e2e_shared_backend_keeps_records_per_session(
+    #[case] session: Option<&str>,
+    #[case] both_see_it: bool,
+) -> Result<()> {
+    let workspace = TempDir::new()?;
+    let root = dunce::canonicalize(workspace.path())?;
+    let script = diagnostics_fixture::write_diagnostics_server(&root)?;
+    let published_marker = root.join("published.marker");
+    let config_path = root.join("mcpls.toml");
+    let workspace_value = toml::Value::String(root.to_string_lossy().into_owned());
+    let args = toml_array(&[
+        script.to_string_lossy().into_owned(),
+        "shared-backend-probe".to_string(),
+        "shared-backend-hover".to_string(),
+        published_marker.to_string_lossy().into_owned(),
+    ]);
+    fs::write(
+        &config_path,
+        format!(
+            "[workspace]\nroots = [{workspace_value}]\n[backend]\nidle_shutdown_ms = 500\n[diagnostics]\nsettle_quiet_ms = 50\nsettle_deadline_ms = 5000\n\n[[lsp_servers]]\nlanguage_id = \"python\"\ncommand = \"python3\"\nargs = [{args}]\nfile_patterns = [\"**/*.py\"]\ndiagnostics_severity = \"warning\"\n\n[lsp_servers.heuristics]\nproject_markers = [\"main.py\"]\n"
+        ),
+    )?;
+    let file_path = root.join("main.py");
+    fs::write(&file_path, "def fixture():\n    return 1\n")?;
+    let config_arg = config_path
+        .to_str()
+        .context("fixture config must be UTF-8")?;
+
+    let mut first = McpClient::spawn_in_workspace(&["--config", config_arg], &root, session)?;
+    first.initialize()?;
+    #[cfg(windows)]
+    McpClient::fire_hook(&root)?;
+    wait_for_diagnostics_baseline(&mut first)?;
+    let mut second = McpClient::spawn_in_workspace(&["--config", config_arg], &root, session)?;
+    second.initialize()?;
+    wait_for_diagnostics_baseline(&mut second)?;
+
+    let hover = call_hover_when_ready(&mut first, &file_path)?;
+    assert!(hover.to_string().contains("shared-backend-hover"));
+    wait_for_marker(&published_marker)?;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let first_report = loop {
+        let report = first.call_tool("get_new_diagnostics", &json!({}))?;
+        if report.to_string().contains("shared-backend-probe") {
+            break report;
+        }
+        anyhow::ensure!(Instant::now() < deadline, "publication missing: {report}");
+        thread::sleep(Duration::from_millis(25));
+    };
+    let second_report = second.call_tool("get_new_diagnostics", &json!({}))?;
+    let first_repeat = first.call_tool("get_new_diagnostics", &json!({}))?;
+
+    assert!(first_report.to_string().contains("shared-backend-probe"));
+    assert_eq!(
+        second_report.to_string().contains("shared-backend-probe"),
+        both_see_it,
+        "{second_report}"
+    );
+    assert!(!first_repeat.to_string().contains("shared-backend-probe"));
+    let backend_pid = McpClient::backend_pid(&root)?.context("shared backend did not start")?;
+    drop(second);
+    drop(first);
+    McpClient::wait_for_backend_exit(&root)?;
+    assert_eq!(
+        McpClient::backend_pid(&root)?,
+        None,
+        "backend {backend_pid} remained"
     );
     Ok(())
 }

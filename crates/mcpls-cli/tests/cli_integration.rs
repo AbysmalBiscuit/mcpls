@@ -29,6 +29,7 @@ fn clear_ambient_env(cmd: &mut Command) -> &mut Command {
         .env_remove("MCPLS_CONFIG")
         .env_remove("MCPLS_TRUST_PROJECT_CONFIG")
         .env_remove("MCPLS_LOG_JSON")
+        .env_remove("MCPLS_NO_BACKEND")
 }
 
 /// A session started in a subdirectory of a checkout derives the endpoint
@@ -76,6 +77,21 @@ fn test_help_flag() {
         .assert()
         .success()
         .stdout(predicate::str::contains("--config"));
+}
+
+#[test]
+fn test_help_hides_the_backend_subcommand() {
+    let mut cmd = Command::cargo_bin("mcpls").unwrap();
+    clear_ambient_env(&mut cmd)
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--no-backend"))
+        .stdout(
+            predicate::str::is_match(r"(?m)^\s+backend\s")
+                .unwrap()
+                .not(),
+        );
 }
 
 #[test]
@@ -175,6 +191,7 @@ fn test_config_with_empty_file() {
     clear_ambient_env(&mut cmd)
         .arg("--config")
         .arg(&config_path)
+        .arg("--no-backend")
         // Default config starts hook service, so isolate its runtime directory.
         .env_remove("XDG_RUNTIME_DIR")
         .env("TMPDIR", temp_dir.path())
@@ -205,6 +222,7 @@ command = "true"
         .env_remove("MCPLS_CONFIG")
         .env_remove("MCPLS_TRUST_PROJECT_CONFIG")
         .env_remove("MCPLS_LOG_JSON")
+        .env_remove("MCPLS_NO_BACKEND")
         .arg("--config")
         .arg(&config_path)
         .current_dir(temp_dir.path())
@@ -258,7 +276,8 @@ fn i1_t2_generated_config_inherits_builtins() {
         .env_remove("XDG_RUNTIME_DIR")
         .env("TMPDIR", first_runtime.path())
         .env("USER", "mcpls-test")
-        .current_dir(workspace.path());
+        .current_dir(workspace.path())
+        .arg("--no-backend");
     let first_output = assert_cmd::Command::from_std(cmd)
         .write_stdin(MCP_INPUT)
         .timeout(Duration::from_secs(5))
@@ -300,6 +319,7 @@ command = "custom-rust-analyzer"
         .env("TMPDIR", runtime.path())
         .env("USER", "mcpls-test")
         .current_dir(workspace.path())
+        .arg("--no-backend")
         .arg("--config")
         .arg(&config_path);
     let output = assert_cmd::Command::from_std(cmd)
@@ -331,9 +351,11 @@ fn test_trust_project_config_env_false_does_not_grant_trust() {
     let mut cmd = assert_cmd::Command::cargo_bin("mcpls").unwrap();
     cmd.env_remove("MCPLS_LOG")
         .env_remove("MCPLS_CONFIG")
-        .env_remove("MCPLS_TRUST_PROJECT_CONFIG");
+        .env_remove("MCPLS_TRUST_PROJECT_CONFIG")
+        .env_remove("MCPLS_NO_BACKEND");
     let output = cmd
         .current_dir(temp_dir.path())
+        .arg("--no-backend")
         // Isolate the hook socket when startup proceeds past config loading.
         .env_remove("XDG_RUNTIME_DIR")
         .env("TMPDIR", temp_dir.path())
@@ -394,9 +416,11 @@ fn test_trust_project_config_env_0_does_not_grant_trust() {
     let mut cmd = assert_cmd::Command::cargo_bin("mcpls").unwrap();
     cmd.env_remove("MCPLS_LOG")
         .env_remove("MCPLS_CONFIG")
-        .env_remove("MCPLS_TRUST_PROJECT_CONFIG");
+        .env_remove("MCPLS_TRUST_PROJECT_CONFIG")
+        .env_remove("MCPLS_NO_BACKEND");
     let output = cmd
         .current_dir(temp_dir.path())
+        .arg("--no-backend")
         // See test_trust_project_config_env_false_does_not_grant_trust
         // above for why this redirects the real hook socket.
         .env_remove("XDG_RUNTIME_DIR")
@@ -713,6 +737,7 @@ fn test_hook_session_start_emits_absolute_watch_paths() {
         .env_remove("MCPLS_CONFIG")
         .env_remove("MCPLS_TRUST_PROJECT_CONFIG")
         .env_remove("MCPLS_LOG_JSON")
+        .env_remove("MCPLS_NO_BACKEND")
         .env_remove("CLAUDE_PROJECT_DIR");
     let assert = cmd
         .arg("hook")

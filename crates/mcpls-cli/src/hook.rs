@@ -231,8 +231,20 @@ const MAX_FOREIGN_CANDIDATES: usize = 16;
 ///
 /// Socket failures are silent in hooks; this command reports their cause.
 /// `SessionStart` separately warns when its watch-path scan is incomplete.
-pub async fn doctor(project_dir: &Path, root: &Path, identity: &SocketIdentity) -> String {
-    doctor_scanning(project_dir, root, identity, &foreign_scan_prefix()).await
+pub async fn doctor(
+    project_dir: &Path,
+    root: &Path,
+    identity: &SocketIdentity,
+    local_fingerprint: Option<&str>,
+) -> String {
+    doctor_scanning(
+        project_dir,
+        root,
+        identity,
+        &foreign_scan_prefix(),
+        local_fingerprint,
+    )
+    .await
 }
 
 /// The checkout root enclosing `project_dir`, or `project_dir` itself when
@@ -254,6 +266,7 @@ async fn doctor_scanning(
     root: &Path,
     identity: &SocketIdentity,
     prefix: &str,
+    local_fingerprint: Option<&str>,
 ) -> String {
     let mut lines = vec![
         format!("socket: {}", identity.socket.display()),
@@ -268,12 +281,24 @@ async fn doctor_scanning(
             pid,
             root,
             hooks_seen,
+            version,
+            uptime_ms,
+            sessions,
+            servers,
+            config_fingerprint,
             owner: true,
             ..
         }) => {
             lines.push(format!("server sees: {} -> {hash}", root.display()));
-            lines.push(format!("owner pid: {pid}"));
+            lines.push(format!("backend pid: {pid}"));
             lines.push(hooks_seen_line(hooks_seen));
+            lines.push(format!(
+                "backend: mcpls {version}, up {}",
+                uptime(uptime_ms)
+            ));
+            lines.push(sessions_line(&sessions));
+            lines.push(servers_line(&servers));
+            lines.push(config_line(&config_fingerprint, local_fingerprint));
         }
         // An owner deliberately explained itself; print that rather than
         // discarding it behind a timing guess.
@@ -281,7 +306,7 @@ async fn doctor_scanning(
             lines.push(format!(
                 "server sees: an owner answered with an error: {message}"
             ));
-            lines.push(OWNER_PID_UNKNOWN.to_string());
+            lines.push(BACKEND_PID_UNKNOWN.to_string());
         }
         // Some other, unexpected answer to a Status request. An owner
         // exists, evidenced by the answer itself, so this is not a
@@ -290,7 +315,7 @@ async fn doctor_scanning(
             lines.push(format!(
                 "server sees: an owner answered, but not with its own status: {other:?}"
             ));
-            lines.push(OWNER_PID_UNKNOWN.to_string());
+            lines.push(BACKEND_PID_UNKNOWN.to_string());
         }
         // A connection was accepted and the exchange then failed, on the
         // write, the read, an early hang-up, or the parse. The error
@@ -301,7 +326,16 @@ async fn doctor_scanning(
                 "server sees: a socket is live but this build could not read its reply: \
                  {error}"
             ));
-            lines.push(OWNER_PID_UNKNOWN.to_string());
+            lines.push(BACKEND_PID_UNKNOWN.to_string());
+        }
+        ProbeOutcome::Refused(reply) => {
+            lines.push(format!(
+                "server sees: mcpls {} refused this build ({}): {}",
+                reply.version,
+                mcpls_core::backend::VERSION,
+                refusal_text(reply.refusal.as_ref())
+            ));
+            lines.push(format!("backend pid: {}", reply.pid));
         }
         // A connection was accepted but nothing came back at all: there
         // is an owner, so naming some other directory as the reason
@@ -311,12 +345,12 @@ async fn doctor_scanning(
                 "server sees: a socket answered nothing within {}ms; an owner may be busy",
                 SOCKET_TIMEOUT.as_millis()
             ));
-            lines.push(OWNER_PID_UNKNOWN.to_string());
+            lines.push(BACKEND_PID_UNKNOWN.to_string());
         }
         ProbeOutcome::NoOwner => {
             let foreign = find_foreign_owner(identity, project_dir, prefix).await;
             lines.push(no_owner_line(foreign));
-            lines.push("owner pid: none".to_string());
+            lines.push("backend pid: none".to_string());
         }
     }
 
@@ -324,6 +358,18 @@ async fn doctor_scanning(
     lines.push(watch_scan_line(root));
 
     lines.join("\n")
+}
+
+/// A refusal as the doctor prints it.
+fn refusal_text(refusal: Option<&mcpls_core::backend::Refusal>) -> String {
+    use mcpls_core::backend::Refusal;
+    match refusal {
+        Some(Refusal::Build) => "the two builds differ".to_string(),
+        Some(Refusal::HooksDisabled) => "its configuration turns hooks off".to_string(),
+        Some(Refusal::InProcess) => "it serves one session in-process".to_string(),
+        Some(other) => format!("{other:?}"),
+        None => "no reason given".to_string(),
+    }
 }
 
 /// The prefix the production scan filters Windows pipe names by: the one
@@ -359,6 +405,47 @@ fn hooks_seen_line(count: u64) -> String {
             .to_string()
     } else {
         format!("hooks seen: {count} request(s) since this owner started")
+    }
+}
+
+fn uptime(ms: u64) -> String {
+    let secs = ms / 1000;
+    match (secs / 3600, secs / 60 % 60, secs % 60) {
+        (0, 0, s) => format!("{s}s"),
+        (0, m, s) => format!("{m}m{s}s"),
+        (h, m, _) => format!("{h}h{m}m"),
+    }
+}
+
+fn sessions_line(sessions: &[String]) -> String {
+    if sessions.is_empty() {
+        "sessions: none attached".to_string()
+    } else {
+        format!(
+            "sessions: {} attached ({})",
+            sessions.len(),
+            sessions.join(", ")
+        )
+    }
+}
+
+fn servers_line(servers: &[String]) -> String {
+    if servers.is_empty() {
+        "language servers: none".to_string()
+    } else {
+        format!("language servers: {}", servers.join(", "))
+    }
+}
+
+/// The `config:` line: the backend's fingerprint, and whether the one this
+/// build loads for the checkout, the way a frontend would, agrees with it.
+fn config_line(backend: &str, local: Option<&str>) -> String {
+    match local {
+        None => format!("config: {backend}"),
+        Some(local) if local == backend => format!("config: {backend}, matches this build's"),
+        Some(local) => format!(
+            "config: {backend}, differs from this build's {local}; the backend's is in effect"
+        ),
     }
 }
 
@@ -603,7 +690,9 @@ async fn find_foreign_owner(
             // an older wire shape is the likeliest way to get here, so
             // counting it as an absence would report the one thing the
             // scan has evidence against.
-            ProbeOutcome::Busy | ProbeOutcome::Unintelligible(_) => unidentified += 1,
+            ProbeOutcome::Refused(_) | ProbeOutcome::Busy | ProbeOutcome::Unintelligible(_) => {
+                unidentified += 1;
+            }
             // A socket file with nothing behind it, and an answer that
             // parsed but claimed no ownership. Neither is evidence that
             // anything is running here.
@@ -711,7 +800,7 @@ pub fn doctor_without_identity(
         format!("socket: none; could not derive an identity for this directory: {error}"),
         format!("hook sees: {} -> unknown", project_dir.display()),
         "server sees: nothing can run here; no socket exists to probe".to_string(),
-        "owner pid: none".to_string(),
+        "backend pid: none".to_string(),
         on_path_line(mcpls_on_path().as_deref()),
         watch_scan_line(root),
     ];
@@ -722,7 +811,7 @@ pub fn doctor_without_identity(
 /// process it is. Distinct from `none`, which the doctor prints only when
 /// nothing holds the socket at all: the two send a reader to different
 /// places, and one token for both sends half of them to the wrong one.
-const OWNER_PID_UNKNOWN: &str = "owner pid: unknown";
+const BACKEND_PID_UNKNOWN: &str = "backend pid: unknown";
 
 /// The `mcpls on PATH` line for `found`.
 ///
@@ -928,6 +1017,7 @@ mod tests {
         /// represent (a previous version missing a field this build now
         /// requires). `None` by default.
         status_raw_line: Option<String>,
+        handshake_reply_raw: Option<String>,
         /// Whether the connection is closed right after a `Flush` is
         /// answered, before any acknowledgement can be read. `false` by
         /// default; one test sets it to prove a report already in hand is
@@ -948,6 +1038,7 @@ mod tests {
                 silent: false,
                 status_error: None,
                 status_raw_line: None,
+                handshake_reply_raw: None,
                 hang_up_after_flush: false,
             }
         }
@@ -985,6 +1076,11 @@ mod tests {
                     owner: behavior.status_owner,
                     root: behavior.status_root.clone(),
                     hooks_seen: behavior.status_hooks_seen,
+                    version: "0.3.9".to_string(),
+                    uptime_ms: 61_000,
+                    sessions: vec!["s1".to_string(), "connection-4".to_string()],
+                    servers: vec!["rust".to_string()],
+                    config_fingerprint: "00000000000000ff".to_string(),
                 },
                 |message| Response::Error {
                     message: message.clone(),
@@ -1205,6 +1301,21 @@ mod tests {
             )
         }
 
+        fn start_answering_handshake_with_raw_line(
+            identity: SocketIdentity,
+            raw_line: &str,
+        ) -> Self {
+            let dir = tempfile::tempdir().expect("a temp dir");
+            Self::start_on(
+                dir,
+                identity,
+                OwnerBehavior {
+                    handshake_reply_raw: Some(raw_line.to_string()),
+                    ..OwnerBehavior::default()
+                },
+            )
+        }
+
         /// The directory the dispatcher treats as `CLAUDE_PROJECT_DIR`.
         fn project_dir(&self) -> &Path {
             self.dir.path()
@@ -1231,12 +1342,15 @@ mod tests {
     /// over the stream type so the same loop body serves both a Unix
     /// socket and a Windows named pipe.
     async fn serve_connection<S>(
-        stream: S,
+        mut stream: S,
         requests: Arc<Mutex<Vec<Request>>>,
         behavior: OwnerBehavior,
     ) where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
     {
+        use mcpls_core::backend::{Handshake, HandshakeReply};
+        use tokio::io::AsyncReadExt as _;
+
         if behavior.silent {
             // Accepted, and then never read from or written to: a real
             // connection with a real owner on the other end of it, who
@@ -1244,6 +1358,33 @@ mod tests {
             // for as long as this future is polled, which is exactly as
             // long as the test that spawned it keeps its runtime alive.
             std::future::pending::<()>().await;
+        }
+
+        let mut line = Vec::new();
+        loop {
+            let Ok(byte) = stream.read_u8().await else {
+                return;
+            };
+            if byte == b'\n' {
+                break;
+            }
+            line.push(byte);
+        }
+        if serde_json::from_slice::<Handshake>(&line).is_err() {
+            return;
+        }
+        let raw_reply = behavior.handshake_reply_raw.is_some();
+        let mut reply = if let Some(raw) = &behavior.handshake_reply_raw {
+            raw.as_bytes().to_vec()
+        } else {
+            let Ok(reply) = serde_json::to_vec(&HandshakeReply::new(0, None)) else {
+                return;
+            };
+            reply
+        };
+        reply.push(b'\n');
+        if stream.write_all(&reply).await.is_err() || raw_reply {
+            return;
         }
 
         let (reader, mut writer) = tokio::io::split(stream);
@@ -1897,6 +2038,7 @@ mod tests {
             &checkout_root(project),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
+            None,
         )
         .await;
         (out, identity)
@@ -1911,6 +2053,7 @@ mod tests {
             &checkout_root(project),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
+            None,
         )
         .await;
         (out, identity)
@@ -1934,6 +2077,7 @@ mod tests {
             &checkout_root(project),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
+            None,
         )
         .await
     }
@@ -1956,6 +2100,7 @@ mod tests {
             &checkout_root(project),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
+            None,
         )
         .await
     }
@@ -2003,6 +2148,7 @@ mod tests {
             &checkout_root(project),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
+            None,
         )
         .await
     }
@@ -2032,6 +2178,7 @@ mod tests {
             &checkout_root(project),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
+            None,
         )
         .await
     }
@@ -2048,6 +2195,7 @@ mod tests {
             &checkout_root(project),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
+            None,
         )
         .await
     }
@@ -2064,6 +2212,7 @@ mod tests {
             &checkout_root(project),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
+            None,
         )
         .await
     }
@@ -2083,6 +2232,7 @@ mod tests {
             &checkout_root(project),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
+            None,
         )
         .await
     }
@@ -2098,6 +2248,7 @@ mod tests {
             &checkout_root(project),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
+            None,
         )
         .await
     }
@@ -2114,6 +2265,22 @@ mod tests {
             &checkout_root(project),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
+            None,
+        )
+        .await
+    }
+
+    async fn doctor_with_raw_handshake_reply(project: &Path, raw_line: &str) -> String {
+        let socket_dir = tempfile::tempdir().expect("a temp dir");
+        let identity = local_identity_for(project, socket_dir.path());
+        let _owner =
+            RecordingOwner::start_answering_handshake_with_raw_line(identity.clone(), raw_line);
+        super::doctor_scanning(
+            project,
+            &checkout_root(project),
+            &identity,
+            &test_pipe_prefix(socket_dir.path()),
+            None,
         )
         .await
     }
@@ -2134,9 +2301,9 @@ mod tests {
         let root = mcpls_core::hooks::project_root(project.path()).expect("root");
 
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 8, "expected exactly eight lines: {out}");
+        assert_eq!(lines.len(), 12, "expected exactly twelve lines: {out}");
         assert_eq!(
-            lines[7],
+            lines[11],
             "watch scan: no eligible top-level paths; hidden entries excluded by default; ignore rules applied; host registration unverified"
         );
         assert_eq!(lines[0], format!("socket: {}", identity.socket.display()));
@@ -2146,12 +2313,42 @@ mod tests {
             lines[3],
             format!("server sees: {} -> {hash}", project.path().display())
         );
-        assert_eq!(lines[4], format!("owner pid: {}", std::process::id()));
+        assert_eq!(lines[4], format!("backend pid: {}", std::process::id()));
         assert_eq!(
             lines[5],
             "hooks seen: 3 request(s) since this owner started"
         );
-        assert!(lines[6].starts_with("mcpls on PATH: "));
+        assert_eq!(lines[6], "backend: mcpls 0.3.9, up 1m1s");
+        assert_eq!(lines[7], "sessions: 2 attached (s1, connection-4)");
+        assert_eq!(lines[8], "language servers: rust");
+        assert_eq!(lines[9], "config: 00000000000000ff");
+        assert!(lines[10].starts_with("mcpls on PATH: "));
+    }
+
+    #[test]
+    fn test_backend_lines_for_an_idle_backend() {
+        assert_eq!(sessions_line(&[]), "sessions: none attached");
+        assert_eq!(servers_line(&[]), "language servers: none");
+        assert_eq!(uptime(0), "0s");
+        assert_eq!(uptime(3_725_000), "1h2m");
+    }
+
+    /// The doctor prints the backend's fingerprint beside the one this
+    /// build loads for the checkout, and says when they differ.
+    #[test]
+    fn test_the_config_line_marks_a_mismatch() {
+        assert_eq!(
+            config_line("00000000000000ff", None),
+            "config: 00000000000000ff"
+        );
+        assert_eq!(
+            config_line("00000000000000ff", Some("00000000000000ff")),
+            "config: 00000000000000ff, matches this build's"
+        );
+        assert_eq!(
+            config_line("00000000000000ff", Some("0000000000000001")),
+            "config: 00000000000000ff, differs from this build's 0000000000000001; the backend's is in effect"
+        );
     }
 
     /// A `Status` that does not claim ownership describes some other
@@ -2174,6 +2371,7 @@ mod tests {
             &checkout_root(project.path()),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
+            None,
         )
         .await;
 
@@ -2194,10 +2392,15 @@ mod tests {
                     owner: false,
                     root: other.path().to_path_buf(),
                     hooks_seen: 0,
+                    version: "0.3.9".to_string(),
+                    uptime_ms: 61_000,
+                    sessions: vec!["s1".to_string(), "connection-4".to_string()],
+                    servers: vec!["rust".to_string()],
+                    config_fingerprint: "00000000000000ff".to_string(),
                 }
             )
         );
-        assert_eq!(lines[4], super::OWNER_PID_UNKNOWN);
+        assert_eq!(lines[4], super::BACKEND_PID_UNKNOWN);
     }
 
     /// `SessionStart` never touches the socket by design, so a server
@@ -2255,7 +2458,7 @@ mod tests {
             lines[3],
             "server sees: no owner; nothing is listening on this project's socket"
         );
-        assert_eq!(lines[4], "owner pid: none");
+        assert_eq!(lines[4], "backend pid: none");
         assert!(lines[5].starts_with("mcpls on PATH: "));
     }
 
@@ -2275,6 +2478,7 @@ mod tests {
             &checkout_root(&nested),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
+            None,
         )
         .await;
 
@@ -2307,6 +2511,7 @@ mod tests {
             &checkout_root(project.path()),
             &identity,
             &test_pipe_prefix(&never_created),
+            None,
         )
         .await;
 
@@ -2351,8 +2556,8 @@ mod tests {
              nothing running at all: {out}"
         );
         assert!(
-            out.contains("owner pid: none"),
-            "the foreign pid belongs in the server-sees line; owner pid \
+            out.contains("backend pid: none"),
+            "the foreign pid belongs in the server-sees line; backend pid \
              reports whether THIS project's own socket has an owner, which \
              it does not: {out}"
         );
@@ -2480,6 +2685,7 @@ mod tests {
             &checkout_root(&project),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
+            None,
         )
         .await;
 
@@ -2540,6 +2746,7 @@ mod tests {
             &checkout_root(&project),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
+            None,
         )
         .await;
 
@@ -2576,9 +2783,9 @@ mod tests {
         for out in [&unreadable, &wrong_shape, &errored] {
             assert_eq!(
                 out.lines()
-                    .find(|line| line.starts_with("owner pid: "))
-                    .expect("an owner pid line is always printed"),
-                "owner pid: unknown",
+                    .find(|line| line.starts_with("backend pid: "))
+                    .expect("a backend pid line is always printed"),
+                "backend pid: unknown",
                 "something answered on this socket, so there is an owner; \
                  saying `none` here means the same word carries both \
                  'nobody is there' and 'somebody is there but did not say \
@@ -2658,26 +2865,36 @@ mod tests {
         let client = ClientOptions::new().open(&identity.socket).unwrap();
         server.connect().await.unwrap();
         let prefix = test_pipe_prefix(dir.path());
-        let out =
-            super::doctor_scanning(dir.path(), &checkout_root(dir.path()), &identity, &prefix)
-                .await;
+        let out = super::doctor_scanning(
+            dir.path(),
+            &checkout_root(dir.path()),
+            &identity,
+            &prefix,
+            None,
+        )
+        .await;
         assert!(
             out.contains(
                 "server sees: a socket answered nothing within 50ms; an owner may be busy"
             ),
             "{out}"
         );
-        assert!(out.contains("owner pid: unknown"), "{out}");
+        assert!(out.contains("backend pid: unknown"), "{out}");
         assert!(!out.contains("server sees: no owner"), "{out}");
         drop(client);
         drop(server);
         tokio::task::yield_now().await;
         let _owner = RecordingOwner::start_reporting_status(identity.clone(), dir.path(), 1);
-        let out =
-            super::doctor_scanning(dir.path(), &checkout_root(dir.path()), &identity, &prefix)
-                .await;
+        let out = super::doctor_scanning(
+            dir.path(),
+            &checkout_root(dir.path()),
+            &identity,
+            &prefix,
+            None,
+        )
+        .await;
         assert!(
-            out.contains(&format!("owner pid: {}", std::process::id())),
+            out.contains(&format!("backend pid: {}", std::process::id())),
             "{out}"
         );
         assert!(
@@ -2752,6 +2969,27 @@ mod tests {
              worth reading; without it the reader learns only that \
              something unexpected happened: {out}"
         );
+    }
+
+    /// A backend of another build refuses the doctor's handshake. Its reply
+    /// still names the build and pid, which is what a reader needs.
+    #[tokio::test]
+    async fn test_doctor_reports_a_refusing_backends_build_and_pid() {
+        use mcpls_core::backend::{HandshakeReply, Refusal};
+
+        let project = tempfile::tempdir().expect("a temp dir");
+        mark_checkout(project.path());
+        let mut reply = HandshakeReply::new(3, Some(Refusal::Build));
+        reply.version = "0.0.1".to_string();
+        reply.pid = 4242;
+        let raw = serde_json::to_string(&reply).expect("serialize");
+        let out = doctor_with_raw_handshake_reply(project.path(), &raw).await;
+
+        assert!(
+            out.contains("server sees: mcpls 0.0.1 refused this build"),
+            "{out}"
+        );
+        assert!(out.contains("backend pid: 4242"), "{out}");
     }
 
     /// The singular count had a test; the plural sentence did not, and
@@ -2833,6 +3071,7 @@ mod tests {
             &checkout_root(project.path()),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
+            None,
         )
         .await;
 
@@ -2892,9 +3131,9 @@ mod tests {
         );
         assert_eq!(
             out.lines()
-                .find(|line| line.starts_with("owner pid: "))
-                .expect("an owner pid line is always printed"),
-            "owner pid: unknown",
+                .find(|line| line.starts_with("backend pid: "))
+                .expect("a backend pid line is always printed"),
+            "backend pid: unknown",
             "a busy owner is an owner: it accepted the connection and then \
              did not say which process it is, which is not the same fact \
              as nothing holding the socket at all: {out}"
@@ -3035,6 +3274,7 @@ mod tests {
             &checkout_root(project.path()),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
+            None,
         )
         .await;
 
@@ -3212,8 +3452,8 @@ mod tests {
              computed: {out}"
         );
         assert_eq!(
-            lines[3], "owner pid: none",
-            "every doctor state prints an owner pid line, even this one, so \
+            lines[3], "backend pid: none",
+            "every doctor state prints a backend pid line, even this one, so \
              the two commands' output has one consistent shape: {out}"
         );
         assert!(lines[4].starts_with("mcpls on PATH: "));

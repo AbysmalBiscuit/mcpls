@@ -35,6 +35,7 @@
 //! }
 //! ```
 
+pub mod backend;
 pub mod bridge;
 pub mod config;
 pub mod error;
@@ -50,18 +51,18 @@ mod util;
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bridge::apply::Applier;
 use bridge::resources::make_uri;
 use bridge::{NotificationCache, ResourceSubscriptions, Translator};
-pub use config::{ProjectConfigTrust, ServerConfig};
+pub use config::{BackendConfig, ConfigSource, ProjectConfigTrust, ServerConfig};
 use config::{ServerId, ToolRouter};
 pub use error::Error;
 use lsp::{LspNotification, LspServer, ServerInitConfig};
 use lsp_types::Uri;
 use rmcp::model::ResourceUpdatedNotificationParam;
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 #[cfg(feature = "transport-http")]
@@ -124,7 +125,6 @@ fn diagnostic_path_in_workspace(uri: &Uri, workspace_roots: &[PathBuf]) -> bool 
 pub(crate) struct PumpShared {
     pub(crate) notification_cache: Arc<Mutex<NotificationCache>>,
     pub(crate) subs: Arc<ResourceSubscriptions>,
-    pub(crate) peer_cell: Arc<OnceCell<rmcp::Peer<rmcp::RoleServer>>>,
     /// Used to reject diagnostics for out-of-workspace URIs; see
     /// `diagnostic_path_in_workspace`.
     pub(crate) workspace_roots: Arc<[PathBuf]>,
@@ -139,12 +139,10 @@ pub(crate) struct PumpShared {
 }
 
 /// Background task that drains LSP notifications, writes them to the cache,
-/// and forwards `resources/updated` to the MCP peer when subscribed.
+/// and forwards `resources/updated` to subscribed MCP peers.
 ///
-/// The task operates in two phases without explicit state:
-/// - **Phase A** (before peer is set): caches every notification, skips peer notify.
-/// - **Phase B** (after peer is set): additionally fires `notify_resource_updated`
-///   for subscribed `PublishDiagnostics` URIs.
+/// Caches every notification, and notifies each connection subscribed to a
+/// published file's resource URI.
 ///
 /// The task exits when:
 /// - The LSP notification channel closes (`rx.recv()` returns `None`).
@@ -206,8 +204,8 @@ pub(crate) async fn diagnostics_pump(
     }
 }
 
-/// Handle one `PublishDiagnostics` notification: cache it (when this server
-/// owns the diagnostics route) and notify a subscribed peer.
+/// Handle one `PublishDiagnostics` notification: cache it when this server
+/// owns the diagnostics route, then notify subscribed connections.
 ///
 /// Split out of [`diagnostics_pump`] to keep that function under clippy's
 /// line-count lint.
@@ -249,31 +247,23 @@ async fn handle_publish_diagnostics(
         cache.store_diagnostics(server_id, &p.uri, p.version, p.diagnostics);
     }
 
-    // Fast path: skip URI construction when nothing is subscribed.
     if shared.subs.is_empty().await {
         return;
     }
-
-    // Notify only when peer is ready and URI is subscribed.
-    let Some(peer) = shared.peer_cell.get() else {
-        return;
-    };
     let Some(path) = bridge::uri_to_path(&p.uri) else {
         return;
     };
     let Ok(mcp_uri) = make_uri(&path) else {
         return;
     };
-
-    if !shared.subs.contains(&mcp_uri).await {
-        return;
-    }
-
-    if let Err(error) = peer
-        .notify_resource_updated(ResourceUpdatedNotificationParam::new(mcp_uri))
-        .await
-    {
-        tracing::debug!(%error, "a subscriber could not be notified");
+    for (connection, peer) in shared.subs.subscribers(&mcp_uri).await {
+        if let Err(error) = peer
+            .notify_resource_updated(ResourceUpdatedNotificationParam::new(mcp_uri.clone()))
+            .await
+        {
+            tracing::debug!(%error, %connection, "a subscriber could not be notified and was dropped");
+            shared.subs.remove_connection(connection).await;
+        }
     }
 }
 
@@ -585,15 +575,212 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     serve_with_identity(config, transport, None).await
 }
 
-/// The checkout root enclosing this process's working directory, and the
-/// socket identity derived from it, from one resolution rather than two, so
-/// a `Status` answer's `root` and `hash` describe the same directory by
-/// construction rather than by coincidence.
-fn canonicalized_root_identity() -> Result<(hooks::SocketIdentity, PathBuf), Error> {
-    let dir = std::env::current_dir().map_err(Error::Io)?;
-    let root = hooks::project_root(&dir)?;
-    let identity = hooks::identity_for(&root)?;
-    Ok((identity, root))
+/// Everything one mcpls process serves from, however many connections
+/// reach it: the language servers, the caches and every record.
+pub(crate) struct Runtime {
+    pub(crate) context: Arc<mcp::BridgeContext>,
+    pub(crate) sweeper: Arc<hooks::Sweeper>,
+    pub(crate) cancel_rx: tokio::sync::watch::Receiver<bool>,
+    translator: Arc<Translator>,
+    cancel_tx: tokio::sync::watch::Sender<bool>,
+    lsp_init_handle: Option<JoinHandle<()>>,
+    started: Instant,
+}
+
+impl Runtime {
+    /// Validate `config`, resolve its workspace against `root`, start the
+    /// language servers in the background, and build the shared state.
+    ///
+    /// `root` is only consulted when a workspace root is empty or
+    /// relative, so an unreadable working directory does not block a
+    /// configuration whose roots are all absolute.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) async fn start(
+        config: &ServerConfig,
+        root: Result<PathBuf, Error>,
+    ) -> Result<Self, Error> {
+        let started = Instant::now();
+        config.validate()?;
+
+        let project_config_ignored = config.project_config_ignored;
+        let workspace_roots = if config.workspace.roots.is_empty()
+            || config.workspace.roots.iter().any(|root| root.is_relative())
+        {
+            resolve_workspace_roots(&config.workspace.roots, &root?)?
+        } else {
+            canonicalize_workspace_roots(&config.workspace.roots, Path::new(""))?
+        };
+        let extension_map = Arc::new(config.build_effective_extension_map());
+        let max_depth = Some(config.workspace.heuristics_max_depth);
+
+        // One registry for the process. The clients write it from their
+        // `registerCapability` arms and the translator reads it to decide whom
+        // to notify, so both sides must hold the same `Arc`.
+        let watch_registry = Arc::new(lsp::WatchRegistry::new());
+
+        let applicable_configs =
+            applicable_server_configs(config, &workspace_roots, max_depth, &watch_registry);
+
+        info!(
+            "Attempting to spawn {} applicable LSP server(s)...",
+            applicable_configs.len()
+        );
+
+        // Built over the applicable (post-heuristics) configs only: this is where
+        // #174's workspace-scoped routing rules (duplicate ServerId, conflicting
+        // `handles` claims) are enforced -- a startup error naming the
+        // conflicting `[[lsp_servers]]` entries, not a silent drop.
+        let router = ToolRouter::from_configs(applicable_configs.iter().map(|c| &c.server_config))?;
+        let floor_configs = applicable_configs
+            .iter()
+            .map(|config| config.server_config.clone())
+            .collect::<Vec<_>>();
+
+        // Built here (rather than alongside `subscriptions` below) so
+        // it can be handed to the translator, which uses it to invalidate a
+        // respawned server's stale cached diagnostics -- see
+        // `Translator::with_notification_cache`. Independent of `translator`
+        // itself, which holds no outer lock: the pump only ever locks this
+        // cache, so it never contends with a request handler running an
+        // in-flight LSP round-trip.
+        let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
+
+        let translator = build_translator(
+            config,
+            workspace_roots.clone(),
+            (*extension_map).clone(),
+            router,
+            Arc::clone(&notification_cache),
+            Arc::clone(&watch_registry),
+        );
+
+        // Mark applicable servers as "expected" so a tool call that arrives while
+        // its server is still initializing gets a clear "still initializing" error
+        // (instead of "no server configured"), telling the caller to wait and retry.
+        let expected_servers: HashSet<ServerId> = applicable_configs
+            .iter()
+            .map(|c| c.server_config.id())
+            .collect();
+        translator.set_expected_servers(expected_servers);
+
+        // Shared state, built BEFORE LSP initialization so the MCP server can answer
+        // `initialize` immediately. LSP servers (which can take minutes to initialize
+        // on a large solution, e.g. a 130-project Unity .sln via OmniSharp) are spawned
+        // in a background task and registered into this shared translator once ready.
+        // Blocking the MCP handshake on LSP init makes slow servers exceed the client's
+        // initialize-request timeout (Claude Code: ~60s) -> "Request timed out".
+        // Fixed for the server's lifetime: shared as a lock-free snapshot so
+        // cache-only handlers (e.g. `get_cached_diagnostics`, `read_resource`) can
+        // validate a path without locking `translator` below.
+        //
+        // `resolve_workspace_roots` canonicalizes before any consumer sees these
+        // paths. The snapshot can therefore stay allocation-only while preserving
+        // `diagnostic_path_in_workspace`'s canonical-root precondition and avoiding
+        // filesystem I/O on the hot per-notification path.
+        let workspace_roots_snapshot: Arc<[PathBuf]> = Arc::from(workspace_roots.clone());
+
+        let translator = Arc::new(translator);
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
+
+        // Cancellation for pump tasks: send `true` to request shutdown.
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+        let settle = Arc::new(bridge::ServerSettle::new(
+            Duration::from_millis(config.diagnostics.settle_quiet_ms),
+            Duration::from_millis(config.diagnostics.settle_deadline_ms),
+        ));
+        let delivery = Arc::new(Mutex::new(bridge::DiagnosticsDelivery::new(
+            config.diagnostics,
+        )));
+        let floors = Arc::new(bridge::FloorTable::new(&config.diagnostics, &floor_configs));
+
+        let sweeper = Arc::new(hooks::Sweeper::new(
+            Arc::clone(&translator),
+            hooks::PathFilter::new(
+                Arc::clone(&workspace_roots_snapshot),
+                Arc::clone(&extension_map),
+                Some(Arc::clone(&watch_registry)),
+            ),
+            Duration::from_millis(config.diagnostics.hooks.sweep_quiet_ms),
+            config.workspace.max_documents,
+        ));
+        tokio::spawn(Arc::clone(&sweeper).run(cancel_rx.clone()));
+
+        let pump_shared = PumpShared {
+            notification_cache: Arc::clone(&notification_cache),
+            subs: Arc::clone(&subscriptions),
+            workspace_roots: Arc::clone(&workspace_roots_snapshot),
+            document_tracker: Arc::clone(translator.document_tracker()),
+            settle: Arc::clone(&settle),
+            delivery: Arc::clone(&delivery),
+            floors: Arc::clone(&floors),
+        };
+
+        let lsp_init_handle = if applicable_configs.is_empty() {
+            warn!("No applicable LSP servers configured — starting in protocol-only mode");
+            // No server will ever be spawned, so `baseline_task` never runs and
+            // `has_baseline()` would stay false for the process's whole life.
+            // Adopt an empty baseline now: there is nothing starting up and
+            // nothing to report, so `get_new_diagnostics` should say exactly
+            // that instead of advising a retry that could never succeed.
+            delivery.lock().await.set_baseline(HashMap::new());
+            None
+        } else {
+            info!(
+                "Spawning {} LSP server(s) in the background...",
+                applicable_configs.len()
+            );
+            Some(spawn_lsp_servers_background(
+                applicable_configs,
+                Arc::clone(&translator),
+                cancel_rx.clone(),
+                pump_shared,
+            ))
+        };
+
+        info!("Starting MCP server with rmcp...");
+        let context = mcp::BridgeContext::new(
+            Arc::clone(&translator),
+            Arc::clone(&notification_cache),
+            Arc::clone(&workspace_roots_snapshot),
+            Arc::clone(&subscriptions),
+            project_config_ignored,
+            delivery,
+            floors,
+            config.diagnostics,
+            settle,
+        );
+        Ok(Self {
+            context: Arc::new(context),
+            sweeper,
+            cancel_rx,
+            translator,
+            cancel_tx,
+            lsp_init_handle,
+            started,
+        })
+    }
+
+    pub(crate) fn status_source(
+        &self,
+        sessions: impl Fn() -> Vec<String> + Send + Sync + 'static,
+        config_fingerprint: String,
+    ) -> hooks::StatusSource {
+        let translator = Arc::clone(&self.translator);
+        let started = self.started;
+        Arc::new(move || hooks::StatusExtras {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            uptime_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            sessions: sessions(),
+            servers: translator.registered_server_ids(),
+            config_fingerprint: config_fingerprint.clone(),
+        })
+    }
+
+    /// Stop the background tasks and drain the language servers.
+    pub(crate) async fn shutdown(self) {
+        shutdown(&self.cancel_tx, &self.translator, self.lsp_init_handle).await;
+    }
 }
 
 /// [`serve_with`], with the project's hook socket identity supplied rather
@@ -610,7 +797,6 @@ fn canonicalized_root_identity() -> Result<(hooks::SocketIdentity, PathBuf), Err
 /// # Errors
 ///
 /// The same as [`serve_with`].
-#[allow(clippy::too_many_lines)]
 pub(crate) async fn serve_with_identity(
     config: ServerConfig,
     transport: Transport,
@@ -628,317 +814,103 @@ pub(crate) async fn serve_with_identity(
     // `ShutdownSignal`'s docs for why this must be a single instance carried
     // through by value rather than re-registered later.
     let shutdown_signal = ShutdownSignal::new();
-
-    // `ServerConfig::load`/`load_from` already validate the TOML-loading
-    // path; this covers the other one -- a caller building `ServerConfig`
-    // programmatically (e.g. a library embedder) previously hit no
-    // diagnosable error here, only silent clamping at accessor level (e.g.
-    // `LspClient::request_timeout`). `serve` delegates to this function, so
-    // one call site here covers both public entry points (`serve` and
-    // `serve_with`); note this does mean a config loaded via the CLI's
-    // `load_from` -> `serve` path is validated twice (harmless -- `validate`
-    // is a pure check with no side effects beyond a `tracing::warn!` for a
-    // non-fatal duplicate-name case, which will simply log twice).
-    //
-    // Considered wrapping this in a `Validated<ServerConfig>` marker type to
-    // make "already validated" a compile-time guarantee instead of a runtime
-    // check here; rejected as unnecessary ceremony for a pre-1.0 API (#282).
-    config.validate()?;
-
-    let project_config_ignored = config.project_config_ignored;
-    // `ServerConfig::load_from` already rebases TOML-relative roots;
-    // empty roots and caller-built relative roots use the enclosing checkout.
-    // Absolute roots need no cwd lookup, so an unreadable cwd cannot block them.
-    let workspace_roots = if config.workspace.roots.is_empty()
-        || config.workspace.roots.iter().any(|root| root.is_relative())
-    {
-        let cwd = std::env::current_dir().map_err(Error::Io)?;
-        let workspace_base = hooks::project_root(&cwd)?;
-        resolve_workspace_roots(&config.workspace.roots, &workspace_base)?
+    let root = std::env::current_dir()
+        .map_err(Error::Io)
+        .and_then(|dir| hooks::project_root(&dir));
+    let hook_root_error = if config.diagnostics.hooks.enabled && identity_override.is_none() {
+        root.as_ref().err().map(ToString::to_string)
     } else {
-        // Every root is absolute already, so `base_dir` is never joined
-        // against inside `canonicalize_workspace_roots` -- pass an
-        // arbitrary placeholder rather than paying for `current_dir()`.
-        canonicalize_workspace_roots(&config.workspace.roots, Path::new(""))?
-    };
-    let extension_map = Arc::new(config.build_effective_extension_map());
-    let max_depth = Some(config.workspace.heuristics_max_depth);
-
-    // One registry for the process. The clients write it from their
-    // `registerCapability` arms and the translator reads it to decide whom
-    // to notify, so both sides must hold the same `Arc`.
-    let watch_registry = Arc::new(lsp::WatchRegistry::new());
-
-    let applicable_configs =
-        applicable_server_configs(&config, &workspace_roots, max_depth, &watch_registry);
-
-    info!(
-        "Attempting to spawn {} applicable LSP server(s)...",
-        applicable_configs.len()
-    );
-
-    // Built over the applicable (post-heuristics) configs only: this is where
-    // #174's workspace-scoped routing rules (duplicate ServerId, conflicting
-    // `handles` claims) are enforced -- a startup error naming the
-    // conflicting `[[lsp_servers]]` entries, not a silent drop.
-    let router = ToolRouter::from_configs(applicable_configs.iter().map(|c| &c.server_config))?;
-    let floor_configs = applicable_configs
-        .iter()
-        .map(|config| config.server_config.clone())
-        .collect::<Vec<_>>();
-
-    // Built here (rather than alongside `subscriptions`/`peer_cell` below) so
-    // it can be handed to the translator, which uses it to invalidate a
-    // respawned server's stale cached diagnostics -- see
-    // `Translator::with_notification_cache`. Independent of `translator`
-    // itself, which holds no outer lock: the pump only ever locks this
-    // cache, so it never contends with a request handler running an
-    // in-flight LSP round-trip.
-    let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
-
-    let translator = build_translator(
-        &config,
-        workspace_roots.clone(),
-        (*extension_map).clone(),
-        router,
-        Arc::clone(&notification_cache),
-        Arc::clone(&watch_registry),
-    );
-
-    // Mark applicable servers as "expected" so a tool call that arrives while
-    // its server is still initializing gets a clear "still initializing" error
-    // (instead of "no server configured"), telling the caller to wait and retry.
-    let expected_servers: HashSet<ServerId> = applicable_configs
-        .iter()
-        .map(|c| c.server_config.id())
-        .collect();
-    translator.set_expected_servers(expected_servers);
-
-    // Shared state, built BEFORE LSP initialization so the MCP server can answer
-    // `initialize` immediately. LSP servers (which can take minutes to initialize
-    // on a large solution, e.g. a 130-project Unity .sln via OmniSharp) are spawned
-    // in a background task and registered into this shared translator once ready.
-    // Blocking the MCP handshake on LSP init makes slow servers exceed the client's
-    // initialize-request timeout (Claude Code: ~60s) -> "Request timed out".
-    // Fixed for the server's lifetime: shared as a lock-free snapshot so
-    // cache-only handlers (e.g. `get_cached_diagnostics`, `read_resource`) can
-    // validate a path without locking `translator` below.
-    //
-    // `resolve_workspace_roots` canonicalizes before any consumer sees these
-    // paths. The snapshot can therefore stay allocation-only while preserving
-    // `diagnostic_path_in_workspace`'s canonical-root precondition and avoiding
-    // filesystem I/O on the hot per-notification path.
-    let workspace_roots_snapshot: Arc<[PathBuf]> = Arc::from(workspace_roots.clone());
-
-    let translator = Arc::new(translator);
-    let subscriptions = Arc::new(ResourceSubscriptions::new());
-    // Peer cell is populated after the MCP transport is established (Phase B).
-    let peer_cell = Arc::new(OnceCell::new());
-
-    // Cancellation for pump tasks: send `true` to request shutdown.
-    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-
-    let settle = Arc::new(bridge::ServerSettle::new(
-        Duration::from_millis(config.diagnostics.settle_quiet_ms),
-        Duration::from_millis(config.diagnostics.settle_deadline_ms),
-    ));
-    let delivery = Arc::new(Mutex::new(bridge::DiagnosticsDelivery::new(
-        config.diagnostics,
-    )));
-    let floors = Arc::new(bridge::FloorTable::new(&config.diagnostics, &floor_configs));
-
-    // The hook socket is an optimization, not a requirement: a process that
-    // cannot derive its own identity still answers every MCP tool, so this
-    // must not turn an unreadable working directory into a startup failure.
-    //
-    // The identity and the root a `Status` answer reports both come from
-    // one root resolution, not independent resolutions: a directory that
-    // resolves for `identity_for` but not for a second, separate call
-    // would otherwise leave `root` silently blank while `hash` is fine.
-    let (mut hook_identity, hook_root) = if config.diagnostics.hooks.enabled {
-        identity_override.map_or_else(
-            || match canonicalized_root_identity() {
-                Ok((identity, root)) => (Some(identity), Some(root)),
-                Err(error) => {
-                    warn!(
-                        "hooks are configured on but this project's socket identity could not \
-                         be derived, so no socket is served: {error}"
-                    );
-                    (None, None)
-                }
-            },
-            |identity| {
-                // Test-only path (see this function's doc comment): there
-                // is no real startup directory tied to an injected
-                // identity, so this process's own cwd stands in. Nothing
-                // outside this crate's own tests reads `root` against a
-                // real directory on this path.
-                let root = std::env::current_dir()
-                    .ok()
-                    .and_then(|dir| dunce::canonicalize(&dir).ok())
-                    .unwrap_or_default();
-                (Some(identity), Some(root))
-            },
-        )
-    } else {
-        (None, None)
-    };
-
-    // Acquired before the context is built, so the role is known before the
-    // context is frozen into an `Arc`: a process that loses the lock is
-    // constructed passive and only ever moves to owner.
-    //
-    // A failure to acquire is not a failure to start, for the same reason a
-    // failure to derive the identity is not. `acquire` creates a runtime
-    // directory, opens and locks a file, unlinks a stale socket and binds,
-    // and on Windows it reports every pipe-creation error but a busy one;
-    // aborting the MCP server over any of those would trade a working
-    // bridge for a missing optimization.
-    let ownership = match &hook_identity {
-        Some(identity) => match hooks::HookListener::acquire(identity).await {
-            Ok(ownership) => ownership,
-            Err(error) => {
-                warn!(
-                    "the hook ownership lock could not be taken, so no socket is served: {error}"
-                );
-                hook_identity = None;
-                None
-            }
-        },
-        None => None,
-    };
-    let role = match (&hook_identity, &ownership) {
-        (None, _) => hooks::HookRole::disabled(),
-        (Some(_), Some(_)) => hooks::HookRole::owner(),
-        (Some(identity), None) => hooks::HookRole::passive(identity.clone()),
-    };
-
-    // Built whether this process owns the socket or not. A passive
-    // instance's sweeper is idle until it takes over, and building it here
-    // means a takeover has nothing left to construct.
-    let sweeper = hook_identity.as_ref().map(|_| {
-        let sweeper = Arc::new(hooks::Sweeper::new(
-            Arc::clone(&translator),
-            hooks::PathFilter::new(
-                Arc::clone(&workspace_roots_snapshot),
-                Arc::clone(&extension_map),
-                Some(Arc::clone(&watch_registry)),
-            ),
-            Duration::from_millis(config.diagnostics.hooks.sweep_quiet_ms),
-            config.workspace.max_documents,
-        ));
-        tokio::spawn(Arc::clone(&sweeper).run(cancel_rx.clone()));
-        sweeper
-    });
-
-    let pump_shared = PumpShared {
-        notification_cache: Arc::clone(&notification_cache),
-        subs: Arc::clone(&subscriptions),
-        peer_cell: Arc::clone(&peer_cell),
-        workspace_roots: Arc::clone(&workspace_roots_snapshot),
-        document_tracker: Arc::clone(translator.document_tracker()),
-        settle: Arc::clone(&settle),
-        delivery: Arc::clone(&delivery),
-        floors: Arc::clone(&floors),
-    };
-
-    let lsp_init_handle = if applicable_configs.is_empty() {
-        warn!("No applicable LSP servers configured — starting in protocol-only mode");
-        // No server will ever be spawned, so `baseline_task` never runs and
-        // `has_baseline()` would stay false for the process's whole life.
-        // Adopt an empty baseline now: there is nothing starting up and
-        // nothing to report, so `get_new_diagnostics` should say exactly
-        // that instead of advising a retry that could never succeed.
-        delivery.lock().await.set_baseline(HashMap::new());
         None
-    } else {
-        info!(
-            "Spawning {} LSP server(s) in the background...",
-            applicable_configs.len()
-        );
-        Some(spawn_lsp_servers_background(
-            applicable_configs,
-            Arc::clone(&translator),
-            cancel_rx.clone(),
-            pump_shared,
-        ))
     };
-
-    info!("Starting MCP server with rmcp...");
-    let mut context = mcp::BridgeContext::new(
-        Arc::clone(&translator),
-        Arc::clone(&notification_cache),
-        Arc::clone(&workspace_roots_snapshot),
-        Arc::clone(&subscriptions),
-        project_config_ignored,
-        delivery,
-        floors,
-        config.diagnostics,
-        settle,
-    );
-    context.hooks = Arc::new(role);
-    let context = Arc::new(context);
-    // `run_stdio` takes an `McplsServer` by value while the socket handler
-    // needs one it can keep. Both are built over the same
-    // `Arc<BridgeContext>`, which is where all the state lives, so they are
-    // the same server in every sense that matters.
-    let hook_server = Arc::new(mcp::McplsServer::from_context(Arc::clone(&context)));
-    let mcp_server = mcp::McplsServer::from_context(Arc::clone(&context));
-
-    if let (Some(identity), Some(sweeper), Some(root)) = (hook_identity, sweeper, hook_root) {
-        let location = hooks::HookLocation { identity, root };
-        let op_deadline = Duration::from_millis(config.diagnostics.hooks.op_deadline_ms);
-        let role = Arc::clone(&context.hooks);
-        let server = Arc::clone(&hook_server);
-        let cancel = cancel_rx.clone();
-        // Wrapped rather than spawned bare: a panic in either task drops the
-        // `HookListener` and so releases the ownership lock, while this
-        // process goes on believing it owns the session. Reporting it is the
-        // only thing that makes that state diagnosable.
-        tokio::spawn(log_hook_task_panic(async move {
-            match ownership {
-                Some(listener) => {
-                    hooks::hook_owner_task(
-                        listener,
-                        location,
-                        role,
-                        server,
-                        sweeper,
-                        op_deadline,
-                        cancel,
-                    )
-                    .await;
-                }
-                None => {
-                    hooks::hook_takeover_task(location, role, server, sweeper, op_deadline, cancel)
-                        .await;
-                }
-            }
-        }));
+    let hook_root = root.as_ref().ok().cloned();
+    let runtime = Runtime::start(&config, root).await?;
+    if let Some(error) = hook_root_error {
+        warn!(
+            "hooks are configured on but this project's socket identity could not be derived, \
+             so no socket is served: {error}"
+        );
     }
+    let notes = serve_hooks_in_process(&runtime, &config, identity_override, hook_root).await;
+    let mcp_server = mcp::McplsServer::from_context(Arc::clone(&runtime.context)).with_notes(notes);
     info!("MCPLS server initialized successfully");
 
     let result = match transport {
         Transport::Stdio => {
             info!("Listening for MCP requests on stdio...");
-            run_stdio(mcp_server, &peer_cell, shutdown_signal).await
+            run_stdio(mcp_server, shutdown_signal).await
         }
         #[cfg(feature = "transport-http")]
         Transport::Http(cfg) => run_http(mcp_server, cfg, shutdown_signal).await,
     };
-
-    shutdown(&cancel_tx, &translator, lsp_init_handle).await;
-
+    runtime.shutdown().await;
     info!("MCPLS server shutting down");
     result
 }
 
-/// Run one of the hook socket tasks, reporting a panic instead of losing
-/// it.
-///
-/// Both tasks own the `HookListener` that proves this process holds the
-/// ownership lock, and unwinding drops it, releasing the lock exactly as if
-/// the process had exited. Nothing else in the process notices.
+/// Bind the project's endpoint for hooks when hooks are on and no other
+/// process holds it, and answer hooks from `runtime` until it is cancelled.
+/// Returns the notes the in-process session is told.
+async fn serve_hooks_in_process(
+    runtime: &Runtime,
+    config: &ServerConfig,
+    identity_override: Option<hooks::SocketIdentity>,
+    hook_root: Option<PathBuf>,
+) -> Vec<String> {
+    if !config.diagnostics.hooks.enabled {
+        return Vec::new();
+    }
+    let identity = match identity_override.map_or_else(
+        || hook_root.as_deref().map(hooks::identity_for).transpose(),
+        |identity| Ok(Some(identity)),
+    ) {
+        Ok(Some(identity)) => identity,
+        Ok(None) => return Vec::new(),
+        Err(error) => {
+            warn!(
+                "hooks are configured on but this project's endpoint could not be derived: {error}"
+            );
+            return Vec::new();
+        }
+    };
+    let listener = match hooks::HookListener::acquire(&identity).await {
+        Ok(Some(listener)) => listener,
+        Ok(None) => return vec![ENDPOINT_HELD_NOTE.to_string()],
+        Err(error) => {
+            warn!("the project's endpoint could not be bound, so no hooks are served: {error}");
+            return Vec::new();
+        }
+    };
+    let root = hook_root.unwrap_or_else(|| {
+        std::env::current_dir()
+            .ok()
+            .and_then(|dir| dunce::canonicalize(dir).ok())
+            .unwrap_or_default()
+    });
+    let handler = hooks::build_handler(
+        Arc::new(mcp::McplsServer::from_context(Arc::clone(&runtime.context))),
+        Arc::clone(&runtime.sweeper),
+        hooks::HookLocation { identity, root },
+        Arc::new(hooks::HookStats::default()),
+        runtime.status_source(Vec::new, config.fingerprint()),
+        runtime.cancel_rx.clone(),
+    );
+    let op_deadline = Duration::from_millis(config.diagnostics.hooks.op_deadline_ms);
+    let cancel = runtime.cancel_rx.clone();
+    tokio::spawn(log_hook_task_panic(async move {
+        let _ = listener.serve(handler, op_deadline, cancel).await;
+    }));
+    Vec::new()
+}
+
+/// Told to a session whose in-process mcpls found the project's endpoint
+/// already held.
+const ENDPOINT_HELD_NOTE: &str = "NOTE: another mcpls already serves this project's \
+    endpoint, so the plugin's hooks reach that process and not this one; diagnostics \
+    delivered through hooks are not this session's.";
+
+/// Run the hook socket task, reporting a panic instead of losing it. The
+/// task owns the listener, so a panic releases the endpoint while this
+/// process keeps running.
 async fn log_hook_task_panic<F: Future<Output = ()> + Send + 'static>(task: F) {
     if let Err(panic) = tokio::spawn(task).await {
         error!("the hook socket task stopped unexpectedly and hooks are now unserved: {panic}");
@@ -2247,6 +2219,8 @@ mod tests {
                 }],
                 apply: crate::config::ApplyConfig::default(),
                 diagnostics: hookless_diagnostics(),
+                backend: crate::config::BackendConfig::default(),
+                source: crate::config::ConfigSource::default(),
                 project_config_ignored: false,
             };
 
@@ -2290,6 +2264,8 @@ mod tests {
                 lsp_servers: vec![],
                 apply: crate::config::ApplyConfig::default(),
                 diagnostics: hookless_diagnostics(),
+                backend: crate::config::BackendConfig::default(),
+                source: crate::config::ConfigSource::default(),
                 project_config_ignored: false,
             };
 
@@ -2370,6 +2346,8 @@ mod tests {
                 lsp_servers: vec![],
                 apply: crate::config::ApplyConfig::default(),
                 diagnostics: crate::config::DiagnosticsConfig::default(),
+                backend: crate::config::BackendConfig::default(),
+                source: crate::config::ConfigSource::default(),
                 project_config_ignored: false,
             };
 
@@ -2435,6 +2413,8 @@ mod tests {
                 }],
                 apply: crate::config::ApplyConfig::default(),
                 diagnostics: crate::config::DiagnosticsConfig::default(),
+                backend: crate::config::BackendConfig::default(),
+                source: crate::config::ConfigSource::default(),
                 project_config_ignored: false,
             };
 
@@ -2654,12 +2634,6 @@ mod tests {
             Arc::new(ResourceSubscriptions::new())
         }
 
-        type PeerCell = Arc<OnceCell<rmcp::Peer<rmcp::RoleServer>>>;
-
-        fn make_peer_cell() -> PeerCell {
-            Arc::new(OnceCell::new())
-        }
-
         fn make_tracker() -> Arc<bridge::DocumentTracker> {
             Arc::new(bridge::DocumentTracker::new(
                 bridge::ResourceLimits::default(),
@@ -2711,6 +2685,144 @@ mod tests {
             peer
         }
 
+        /// A live peer and the client end of its connection, read line by
+        /// line. The service skips the MCP handshake, so it can be notified
+        /// at once.
+        fn live_peer() -> (
+            rmcp::Peer<rmcp::RoleServer>,
+            tokio::io::Lines<tokio::io::BufReader<tokio::io::DuplexStream>>,
+        ) {
+            use tokio::io::AsyncBufReadExt as _;
+
+            let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+            let running = rmcp::service::serve_directly(BarePeerHandler, server_io, None);
+            let peer = running.peer().clone();
+            // Keeps the service alive for the rest of the test.
+            std::mem::forget(running);
+            (peer, tokio::io::BufReader::new(client_io).lines())
+        }
+
+        async fn next_uri(
+            lines: &mut tokio::io::Lines<tokio::io::BufReader<tokio::io::DuplexStream>>,
+            within: Duration,
+        ) -> Option<String> {
+            let line = tokio::time::timeout(within, lines.next_line())
+                .await
+                .ok()?
+                .ok()??;
+            let message: serde_json::Value = serde_json::from_str(&line).ok()?;
+            message["params"]["uri"].as_str().map(str::to_string)
+        }
+
+        /// Each connection hears about the files it subscribed to and not
+        /// about another connection's.
+        #[tokio::test]
+        async fn test_each_connection_is_notified_only_about_its_own_subscriptions() {
+            let subs = make_subs();
+            let project = tempfile::tempdir().expect("project dir");
+            let root = dunce::canonicalize(project.path()).expect("canonical root");
+            let (a_path, b_path) = (root.join("a.rs"), root.join("b.rs"));
+            let (a, mut a_lines) = live_peer();
+            let (b, mut b_lines) = live_peer();
+            let (a_id, b_id) = (bridge::ConnectionId::next(), bridge::ConnectionId::next());
+            subs.subscribe(a_id, a, make_uri(&a_path).unwrap())
+                .await
+                .unwrap();
+            subs.subscribe(b_id, b, make_uri(&b_path).unwrap())
+                .await
+                .unwrap();
+
+            let (tx, rx) = mpsc::channel(8);
+            let (_cancel_tx, cancel_rx) = watch::channel(false);
+            tokio::spawn(diagnostics_pump(
+                ServerId::from("rust"),
+                rx,
+                cancel_rx,
+                true,
+                PumpShared {
+                    notification_cache: make_cache(),
+                    subs: Arc::clone(&subs),
+                    workspace_roots: no_workspace_roots(),
+                    document_tracker: make_tracker(),
+                    settle: make_settle(),
+                    delivery: make_delivery(),
+                    floors: make_floors(),
+                },
+            ));
+            tx.send(LspNotification::PublishDiagnostics(
+                PublishDiagnosticsParams {
+                    uri: bridge::path_to_uri(&a_path).unwrap(),
+                    diagnostics: vec![],
+                    version: None,
+                },
+            ))
+            .await
+            .unwrap();
+
+            assert_eq!(
+                next_uri(&mut a_lines, Duration::from_secs(5)).await,
+                Some(make_uri(&a_path).unwrap())
+            );
+            assert_eq!(
+                next_uri(&mut b_lines, Duration::from_millis(200)).await,
+                None,
+                "a connection was told about a file only another connection subscribed to"
+            );
+        }
+
+        /// A connection that cannot be notified loses its subscriptions, and
+        /// the other connections subscribed to the same file keep hearing
+        /// about it.
+        #[tokio::test]
+        async fn test_a_failed_notify_prunes_only_that_connection() {
+            let subs = make_subs();
+            let project = tempfile::tempdir().expect("project dir");
+            let root = dunce::canonicalize(project.path()).expect("canonical root");
+            let path = root.join("shared.rs");
+            let uri = make_uri(&path).unwrap();
+            let (live, mut live_lines) = live_peer();
+            let (live_id, broken_id) = (bridge::ConnectionId::next(), bridge::ConnectionId::next());
+            subs.subscribe(live_id, live, uri.clone()).await.unwrap();
+            subs.subscribe(broken_id, broken_peer().await, uri.clone())
+                .await
+                .unwrap();
+
+            let (tx, rx) = mpsc::channel(8);
+            let (_cancel_tx, cancel_rx) = watch::channel(false);
+            tokio::spawn(diagnostics_pump(
+                ServerId::from("rust"),
+                rx,
+                cancel_rx,
+                true,
+                PumpShared {
+                    notification_cache: make_cache(),
+                    subs: Arc::clone(&subs),
+                    workspace_roots: no_workspace_roots(),
+                    document_tracker: make_tracker(),
+                    settle: make_settle(),
+                    delivery: make_delivery(),
+                    floors: make_floors(),
+                },
+            ));
+            for _ in 0..2 {
+                tx.send(LspNotification::PublishDiagnostics(
+                    PublishDiagnosticsParams {
+                        uri: bridge::path_to_uri(&path).unwrap(),
+                        diagnostics: vec![],
+                        version: None,
+                    },
+                ))
+                .await
+                .unwrap();
+                assert_eq!(
+                    next_uri(&mut live_lines, Duration::from_secs(5)).await,
+                    Some(uri.clone())
+                );
+            }
+            assert!(!subs.contains(broken_id, &uri).await);
+            assert!(subs.contains(live_id, &uri).await);
+        }
+
         /// A peer that cannot be notified is one connection's problem. The
         /// pump carries every connection's diagnostics caching, so it keeps
         /// running and keeps caching after a notify fails.
@@ -2718,10 +2830,6 @@ mod tests {
         async fn test_pump_keeps_caching_after_a_failed_notify() {
             let cache = make_cache();
             let subs = make_subs();
-            let peer_cell = make_peer_cell();
-            peer_cell
-                .set(broken_peer().await)
-                .expect("peer cell is empty");
 
             let project = tempfile::tempdir().expect("project dir");
             let root = dunce::canonicalize(project.path()).expect("canonical root");
@@ -2731,9 +2839,13 @@ mod tests {
             let second = bridge::path_to_uri(&second_path).expect("second file URI");
             // Subscribed, so the pump reaches the notify rather than
             // returning at the subscription check.
-            subs.subscribe(make_uri(&first_path).expect("subscription URI"))
-                .await
-                .expect("subscribe");
+            subs.subscribe(
+                bridge::ConnectionId::next(),
+                broken_peer().await,
+                make_uri(&first_path).expect("subscription URI"),
+            )
+            .await
+            .expect("subscribe");
 
             let (tx, rx) = mpsc::channel(8);
             let (_cancel_tx, cancel_rx) = watch::channel(false);
@@ -2746,7 +2858,6 @@ mod tests {
                 PumpShared {
                     notification_cache: c,
                     subs: Arc::clone(&subs),
-                    peer_cell: Arc::clone(&peer_cell),
                     workspace_roots: no_workspace_roots(),
                     document_tracker: make_tracker(),
                     settle: make_settle(),
@@ -2786,12 +2897,11 @@ mod tests {
             assert!(cached, "the publish after a failed notify was not cached");
         }
 
-        /// `PublishDiagnostics` is cached even when the peer is not yet connected.
+        /// `PublishDiagnostics` is cached when no connection has subscribed.
         #[tokio::test]
-        async fn test_pump_caches_before_peer_set() {
+        async fn test_pump_caches_without_subscribers() {
             let cache = make_cache();
             let subs = make_subs();
-            let peer_cell = make_peer_cell();
             let (tx, rx) = mpsc::channel(8);
             // Keep _cancel_tx alive: dropping it causes cancel_rx.changed() to return Err,
             // which makes the pump exit before processing any messages.
@@ -2806,7 +2916,6 @@ mod tests {
                 PumpShared {
                     notification_cache: c,
                     subs: Arc::clone(&subs),
-                    peer_cell: Arc::clone(&peer_cell),
                     workspace_roots: no_workspace_roots(),
                     document_tracker: make_tracker(),
                     settle: make_settle(),
@@ -2843,7 +2952,7 @@ mod tests {
             })
             .await
             .expect("pump did not cache diagnostics within 5 s");
-            assert!(cached, "diagnostics should be cached before peer is set");
+            assert!(cached, "diagnostics should be cached without subscribers");
         }
 
         /// #234 (S1 hardening): diagnostics for URIs outside the configured
@@ -2854,7 +2963,6 @@ mod tests {
         async fn test_pump_drops_diagnostics_outside_workspace_roots() {
             let cache = make_cache();
             let subs = make_subs();
-            let peer_cell = make_peer_cell();
             let (tx, rx) = mpsc::channel(8);
             let (_cancel_tx, cancel_rx) = watch::channel(false);
 
@@ -2882,7 +2990,6 @@ mod tests {
                 PumpShared {
                     notification_cache: Arc::clone(&cache),
                     subs: Arc::clone(&subs),
-                    peer_cell: Arc::clone(&peer_cell),
                     workspace_roots,
                     document_tracker: make_tracker(),
                     settle: make_settle(),
@@ -2947,7 +3054,6 @@ mod tests {
         async fn test_pump_exits_on_cancel() {
             let cache = make_cache();
             let subs = make_subs();
-            let peer_cell = make_peer_cell();
             let (_tx, rx) = mpsc::channel::<LspNotification>(8);
             let (cancel_tx, cancel_rx) = watch::channel(false);
 
@@ -2959,7 +3065,6 @@ mod tests {
                 PumpShared {
                     notification_cache: cache,
                     subs,
-                    peer_cell,
                     workspace_roots: no_workspace_roots(),
                     document_tracker: make_tracker(),
                     settle: make_settle(),
@@ -2981,7 +3086,6 @@ mod tests {
         async fn test_pump_exits_when_cancel_sender_dropped() {
             let cache = make_cache();
             let subs = make_subs();
-            let peer_cell = make_peer_cell();
             let (_tx, rx) = mpsc::channel::<LspNotification>(8);
             let (cancel_tx, cancel_rx) = watch::channel(false);
 
@@ -2993,7 +3097,6 @@ mod tests {
                 PumpShared {
                     notification_cache: cache,
                     subs,
-                    peer_cell,
                     workspace_roots: no_workspace_roots(),
                     document_tracker: make_tracker(),
                     settle: make_settle(),
@@ -3019,7 +3122,6 @@ mod tests {
             let translator = Arc::new(Mutex::new(Translator::new()));
             let cache = make_cache();
             let subs = make_subs();
-            let peer_cell = make_peer_cell();
             let (tx, rx) = mpsc::channel(8);
             let (_cancel_tx, cancel_rx) = watch::channel(false);
 
@@ -3047,7 +3149,6 @@ mod tests {
                 PumpShared {
                     notification_cache: Arc::clone(&cache),
                     subs,
-                    peer_cell,
                     workspace_roots: no_workspace_roots(),
                     document_tracker: make_tracker(),
                     settle: make_settle(),
@@ -3097,7 +3198,6 @@ mod tests {
         async fn test_a_publish_below_the_tracked_version_is_dropped() {
             let cache = make_cache();
             let subs = make_subs();
-            let peer_cell = make_peer_cell();
             let tracker = make_tracker();
             let (tx, rx) = mpsc::channel(8);
             let (_cancel_tx, cancel_rx) = watch::channel(false);
@@ -3120,7 +3220,6 @@ mod tests {
                 PumpShared {
                     notification_cache: Arc::clone(&cache),
                     subs,
-                    peer_cell,
                     workspace_roots: no_workspace_roots(),
                     document_tracker: tracker,
                     settle: make_settle(),
@@ -3177,7 +3276,6 @@ mod tests {
         async fn test_a_publish_without_a_version_is_kept() {
             let cache = make_cache();
             let subs = make_subs();
-            let peer_cell = make_peer_cell();
             let tracker = make_tracker();
             let (tx, rx) = mpsc::channel(8);
             let (_cancel_tx, cancel_rx) = watch::channel(false);
@@ -3199,7 +3297,6 @@ mod tests {
                 PumpShared {
                     notification_cache: Arc::clone(&cache),
                     subs,
-                    peer_cell,
                     workspace_roots: no_workspace_roots(),
                     document_tracker: tracker,
                     settle: make_settle(),
@@ -3239,7 +3336,6 @@ mod tests {
         async fn test_a_publish_for_an_untracked_path_is_kept() {
             let cache = make_cache();
             let subs = make_subs();
-            let peer_cell = make_peer_cell();
             let tracker = make_tracker();
             let (tx, rx) = mpsc::channel(8);
             let (_cancel_tx, cancel_rx) = watch::channel(false);
@@ -3258,7 +3354,6 @@ mod tests {
                 PumpShared {
                     notification_cache: Arc::clone(&cache),
                     subs,
-                    peer_cell,
                     workspace_roots: no_workspace_roots(),
                     document_tracker: tracker,
                     settle: make_settle(),
@@ -3298,7 +3393,6 @@ mod tests {
         async fn test_pump_feeds_progress_begin_and_end_to_settle() {
             let cache = make_cache();
             let subs = make_subs();
-            let peer_cell = make_peer_cell();
             let settle = make_settle();
             let (tx, rx) = mpsc::channel(8);
             let (_cancel_tx, cancel_rx) = watch::channel(false);
@@ -3311,7 +3405,6 @@ mod tests {
                 PumpShared {
                     notification_cache: cache,
                     subs,
-                    peer_cell,
                     workspace_roots: no_workspace_roots(),
                     document_tracker: make_tracker(),
                     settle: Arc::clone(&settle),

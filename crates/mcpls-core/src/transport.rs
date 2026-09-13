@@ -294,11 +294,9 @@ impl ShutdownSignal {
 
 /// Run the MCP server over stdio.
 ///
-/// Serves the given `mcp_server` using stdin/stdout and populates `peer_cell`
-/// once the transport is established so that diagnostic pump tasks can begin
-/// forwarding `resources/updated` notifications. Returns as soon as either
+/// Serves the given `mcp_server` using stdin/stdout. Returns as soon as either
 /// the stdio transport closes (client disconnect / stdin EOF) or a `SIGTERM`/
-/// `SIGINT` is received, so callers can run orderly cleanup — such as
+/// `SIGINT` is received, so callers can run orderly cleanup, such as
 /// [`crate::bridge::Translator::shutdown_servers`] — before the process
 /// exits. `shutdown_signal` is dropped when this function returns, and this
 /// function does no draining of its own after a signal arrives — so a
@@ -322,11 +320,12 @@ impl ShutdownSignal {
 /// runtime shutdown indefinitely (see `mcpls-cli`'s `main.rs` and #308).
 pub(crate) async fn run_stdio(
     mcp_server: crate::mcp::McplsServer,
-    peer_cell: &tokio::sync::OnceCell<rmcp::Peer<rmcp::RoleServer>>,
     mut shutdown_signal: ShutdownSignal,
 ) -> Result<(), crate::Error> {
+    use crate::bridge::SessionId;
+
     let service = tokio::select! {
-        result = mcp_server.serve(rmcp::transport::stdio()) => {
+        result = mcp_server.for_connection(SessionId::from_host_env()).serve(rmcp::transport::stdio()) => {
             result.map_err(|e| crate::Error::McpServer(format!("Failed to start MCP server: {e}")))?
         }
         () = shutdown_signal.recv() => {
@@ -335,11 +334,9 @@ pub(crate) async fn run_stdio(
         }
     };
 
-    if let Err(e) = peer_cell.set(service.peer().clone()) {
-        tracing::debug!("Peer cell already set ({}), ignoring", e);
-    }
-
-    tokio::select! {
+    let connection = service.service().connection();
+    let subscriptions = std::sync::Arc::clone(service.service().subscriptions());
+    let result = tokio::select! {
         result = service.waiting() => result
             .map(|_| ())
             .map_err(|e| crate::Error::McpServer(format!("MCP server error: {e}"))),
@@ -347,7 +344,9 @@ pub(crate) async fn run_stdio(
             tracing::info!("shutdown signal received, stopping stdio transport");
             Ok(())
         }
-    }
+    };
+    subscriptions.remove_connection(connection).await;
+    result
 }
 
 /// Run the MCP server over Streamable HTTP (MCP spec 2025-11-25).
@@ -358,13 +357,6 @@ pub(crate) async fn run_stdio(
 /// Each HTTP session receives its own `McplsServer` clone. The shared
 /// `Arc<Translator>` inside is the same across all sessions, so LSP state is
 /// still global per process.
-///
-/// # Note
-///
-/// Diagnostic push notifications (`resources/updated`) are not forwarded to
-/// HTTP sessions in this release — the single-peer pump architecture from
-/// stdio is kept as-is. Clients can still poll diagnostics via the existing
-/// MCP tools. A follow-up issue will add per-session broadcast.
 ///
 /// # Resource limits
 ///
@@ -452,7 +444,7 @@ pub(crate) async fn serve_http_on(
     http_cfg.max_request_body_bytes = cfg.max_request_body_bytes;
 
     let service = StreamableHttpService::new(
-        move || Ok::<_, std::io::Error>(mcp_for_factory.clone()),
+        move || Ok::<_, std::io::Error>(mcp_for_factory.for_connection(None)),
         session_manager,
         http_cfg,
     );
@@ -851,11 +843,9 @@ mod tests {
             DiagnosticsConfig::default(),
             settle,
         );
-        let peer_cell = tokio::sync::OnceCell::new();
-
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            super::run_stdio(server, &peer_cell, super::ShutdownSignal::new()),
+            super::run_stdio(server, super::ShutdownSignal::new()),
         )
         .await;
 

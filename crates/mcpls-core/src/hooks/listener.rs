@@ -17,6 +17,7 @@ use futures::future::BoxFuture;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::watch;
 
+use crate::backend::handshake::{self, Handshake, HandshakeReply};
 use crate::error::{Error, Result};
 use crate::hooks::identity::SocketIdentity;
 use crate::hooks::protocol::{Request, Response};
@@ -29,27 +30,12 @@ trait HookTransport: Send + Sync {
 }
 
 /// One client connection.
-trait HookStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
+pub(crate) trait HookStream:
+    tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin
+{
+}
 
 impl<T> HookStream for T where T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
-
-/// Why a listener can no longer prove it holds the lock it acquired.
-///
-/// The two call for different responses, which is why they are not
-/// flattened into one: `Replaced` means a competitor holds the lock for its
-/// whole life and this process will not win it back, while `Missing` means
-/// nothing has taken this listener's place and the next attempt succeeds.
-/// Never produced on Windows, which has no lock file to lose; the type is
-/// unconditional so [`ServeExit`] has one shape on every platform.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LockLoss {
-    /// The path now names a different inode: a competitor created its own
-    /// lock file there and may now believe it owns this session.
-    Replaced,
-    /// The path no longer exists: nothing has taken this listener's place
-    /// yet, but the file it relied on to prove ownership is gone.
-    Missing,
-}
 
 /// A bound listener, and the lock proving this process owns it.
 ///
@@ -69,12 +55,9 @@ pub struct HookListener {
     transport: Box<dyn HookTransport>,
     /// Held for as long as `Self` lives; dropping it (including on process
     /// exit) releases ownership. Never unlocked explicitly.
+    #[allow(dead_code)]
     #[cfg(not(windows))]
     lock: std::fs::File,
-    /// `identity.lock`'s path, kept so [`Self::lock_loss`] can re-`stat`
-    /// it against `lock`'s own `fstat`.
-    #[cfg(not(windows))]
-    lock_path: std::path::PathBuf,
 }
 
 /// Create `dir` if it is missing and make it owner-only.
@@ -82,7 +65,7 @@ pub struct HookListener {
 /// The mode changes through a no-follow directory handle, so a symlink or
 /// FIFO planted at `dir` fails the open instead of redirecting the change.
 #[cfg(not(windows))]
-fn ensure_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+pub(crate) fn ensure_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 
     std::fs::DirBuilder::new()
@@ -107,21 +90,11 @@ fn open_private_dir(dir: &std::path::Path) -> io::Result<std::fs::File> {
 /// Why [`HookListener::serve`] stopped serving.
 ///
 /// Named for what happened, not for what a caller should do about it,
-/// because that decision belongs to the caller. In particular,
-/// [`ServeExit::LockLost`] is not itself a reason to give up: the file a
-/// lock lives in can be recreated, so the ordinary response is to try
-/// acquiring the socket again rather than exit.
+/// because that decision belongs to the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServeExit {
     /// The `cancel` watch fired, or its sender was dropped.
     Cancelled,
-    /// Unix only: the lock file this listener held is no longer the file
-    /// it holds a lock on. The payload says whether the file was replaced
-    /// (a competitor may now believe it owns this session) or simply
-    /// removed (no competitor has appeared, only a missing file), which is
-    /// what decides whether a caller can expect to win the lock back.
-    /// Never returned on Windows, which has no lock file to lose.
-    LockLost(LockLoss),
     /// The transport hit an error it can never recover from by retrying
     /// (currently: a poisoned Windows pipe-transport lock).
     TransportUnrecoverable,
@@ -146,6 +119,11 @@ impl HookListener {
             .map_err(|e| Error::Transport(format!("the acquire task panicked: {e}")))?
     }
 
+    /// Wait for the next client, for a caller running its own accept loop.
+    pub(crate) async fn accept(&self) -> io::Result<Box<dyn HookStream>> {
+        self.transport.accept().await
+    }
+
     #[cfg(not(windows))]
     fn acquire_blocking(identity: &SocketIdentity) -> Result<Option<Self>> {
         let Some(lock) = Self::lock_file(identity)? else {
@@ -165,49 +143,7 @@ impl HookListener {
         Ok(Some(Self {
             transport: Box::new(UnixTransport { listener }),
             lock,
-            lock_path: identity.lock.clone(),
         }))
-    }
-
-    /// How often [`Self::serve`] re-`stat`s its own lock file to notice a
-    /// replacement (see [`Self::lock_loss`]). Unconditional (rather than
-    /// Unix-only, like the check itself) because [`Self::serve`]
-    /// constructs its ownership-check timer on every platform and gates
-    /// the check at runtime instead, so the timer's type does not depend
-    /// on `cfg`.
-    const OWNERSHIP_CHECK_INTERVAL: Duration = Duration::from_millis(200);
-
-    /// Whether `identity.lock` no longer names the inode this listener
-    /// holds a lock on, and if not, why not.
-    ///
-    /// This is the owner-side half of detecting an externally deleted lock
-    /// file (see [`Self::lock_file`]'s doc comment for why the newcomer's
-    /// side cannot detect it at all). Compares `lock`'s own `fstat`
-    /// against a fresh `stat` of the path it was opened from -- an
-    /// `fstat` on an open handle keeps working after its path is
-    /// unlinked, it just stops matching anything reachable by name --
-    /// and distinguishes the path naming a different inode now (something
-    /// replaced it, and that something may believe it owns this session)
-    /// from the path not existing at all (nothing has taken this
-    /// listener's place, but it can no longer prove it owns the session
-    /// either). Those are different situations: only the first means a
-    /// competitor exists.
-    #[cfg(not(windows))]
-    fn lock_loss(&self) -> Option<LockLoss> {
-        use std::os::unix::fs::MetadataExt as _;
-
-        let Ok(locked) = self.lock.metadata() else {
-            // `fstat` on a handle this call itself still has open should
-            // not fail; if it somehow does, there is no path comparison
-            // left to make, so this is treated the same as the path
-            // having vanished.
-            return Some(LockLoss::Missing);
-        };
-        match std::fs::metadata(&self.lock_path) {
-            Ok(current) if current.ino() == locked.ino() && current.dev() == locked.dev() => None,
-            Ok(_) => Some(LockLoss::Replaced),
-            Err(_) => Some(LockLoss::Missing),
-        }
     }
 
     /// The most attempts [`Self::lock_file`] makes before giving up on a
@@ -224,20 +160,10 @@ impl HookListener {
     /// *during this call*, between its own `open` and `try_lock_exclusive`
     /// succeeding: comparing this handle's `fstat` against a fresh `stat`
     /// of the path catches that, and retries against whatever is at the
-    /// path now, up to [`Self::LOCK_FILE_MAX_ATTEMPTS`] times. It says
-    /// nothing about a replacement that happens at any later point, once
-    /// a lock is already held stably -- an external cleaner (an age-based
-    /// `systemd-tmpfiles` policy over `/tmp/mcpls-<user>` is the realistic
-    /// case) can delete the file at any moment after this call has
-    /// already returned, and a newcomer that then opens the path creates
-    /// a fresh inode and locks it uncontended: exclusive at the inode
-    /// level, but no longer exclusive at the path, since this call cannot
-    /// see a replacement that happens after it. Nothing on the newcomer's
-    /// side can close that, because a replaced path is indistinguishable
-    /// from a clean start from the newcomer's own point of view.
-    /// [`Self::serve`] instead re-`stat`s the path periodically from the
-    /// side that actually knows something was taken from it (see
-    /// [`Self::lock_loss`]) and stands down when it no longer matches.
+    /// path now, up to [`Self::LOCK_FILE_MAX_ATTEMPTS`] times. A replacement
+    /// after this call returns goes unnoticed. The holder keeps serving the
+    /// connections it has, and a newcomer that locks the fresh file binds
+    /// its own socket.
     ///
     /// Windows has no equivalent: there is no lock *file* whose path an
     /// external cleaner could sever from the handle holding it, since
@@ -303,8 +229,7 @@ impl HookListener {
             })),
             Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
                 // Routine contention and a DACL denial both arrive as
-                // ERROR_ACCESS_DENIED. A passive instance retries every
-                // few seconds, so only the first denial in a process warns.
+                // ERROR_ACCESS_DENIED, so only the first denial in a process warns.
                 static DENIAL_WARNED: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(false);
                 if DENIAL_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -312,7 +237,7 @@ impl HookListener {
                 } else {
                     tracing::warn!(
                         "hook pipe creation denied for {:?}: {e}; another mcpls \
-                         likely owns this project's hooks, so this one waits to take over",
+                         likely holds this project's endpoint",
                         identity.socket
                     );
                 }
@@ -354,17 +279,6 @@ impl HookListener {
     /// life. The one exception is a poisoned Windows pipe-transport lock,
     /// which cannot recover by retrying at all: that stands down rather
     /// than retrying forever into a condition that can never clear.
-    ///
-    /// On Unix, also stands down if `Self::lock_loss` reports the lock
-    /// file no longer names the inode this listener holds: something
-    /// external took it while this process was still serving, and
-    /// continuing would risk a second process believing it owns the same
-    /// session. See `Self::lock_file`'s doc comment for why this has to
-    /// be checked from here rather than at acquisition. This includes the
-    /// case where nothing has actually taken the lock's place -- the file
-    /// was simply removed -- because this listener can no longer prove it
-    /// owns the session either way; the `tracing::warn!` this emits names
-    /// which of the two happened.
     pub async fn serve<H>(
         self,
         handler: H,
@@ -377,12 +291,6 @@ impl HookListener {
         let handler = Arc::new(handler);
         let mut accept_backoff = Self::ACCEPT_BACKOFF_FLOOR;
         let mut consecutive_accept_errors: u32 = 0;
-        // Unconditionally constructed so its type does not depend on
-        // platform, and gated off on Windows (where there is no lock file
-        // to lose) with the `if` precondition below rather than `cfg`.
-        let has_lock_file = cfg!(not(windows));
-        let mut ownership_check = tokio::time::interval(Self::OWNERSHIP_CHECK_INTERVAL);
-        ownership_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
@@ -392,35 +300,18 @@ impl HookListener {
                         return ServeExit::Cancelled;
                     }
                 }
-                _ = ownership_check.tick(), if has_lock_file => {
-                    #[cfg(not(windows))]
-                    if let Some(loss) = self.lock_loss() {
-                        match loss {
-                            LockLoss::Replaced => tracing::warn!(
-                                "the lock at {} now names a different inode than the \
-                                 one this listener holds; something else has taken \
-                                 it and may now believe it owns this session, so \
-                                 this listener is standing down rather than risk two \
-                                 owners",
-                                self.lock_path.display()
-                            ),
-                            LockLoss::Missing => tracing::warn!(
-                                "the lock at {} no longer exists; nothing has taken \
-                                 this listener's place yet, but it can no longer \
-                                 prove it owns the session, so it is standing down",
-                                self.lock_path.display()
-                            ),
-                        }
-                        return ServeExit::LockLost(loss);
-                    }
-                }
                 accepted = self.transport.accept() => {
                     match accepted {
                         Ok(stream) => {
                             accept_backoff = Self::ACCEPT_BACKOFF_FLOOR;
                             consecutive_accept_errors = 0;
                             let handler = Arc::clone(&handler);
-                            tokio::spawn(serve_connection(stream, handler, op_deadline));
+                            tokio::spawn(async move {
+                                let Some(stream) = accept_hook_handshake(stream).await else {
+                                    return;
+                                };
+                                serve_hook_connection(stream, handler, op_deadline).await;
+                            });
                         }
                         Err(e) => {
                             #[cfg(windows)]
@@ -460,12 +351,40 @@ impl HookListener {
     }
 }
 
+/// Read a connection's handshake and answer it as a listener that serves
+/// hooks and nothing else. `None` when the connection is refused or never
+/// handshakes.
+async fn accept_hook_handshake(mut stream: Box<dyn HookStream>) -> Option<Box<dyn HookStream>> {
+    use crate::backend::handshake::{ConnectionKind, Refusal};
+
+    let handshake: Handshake =
+        tokio::time::timeout(handshake::HANDSHAKE_TIMEOUT, handshake::read(&mut stream))
+            .await
+            .ok()?
+            .ok()?;
+    let refusal = if !handshake.same_build() {
+        Some(Refusal::Build)
+    } else if handshake.kind == ConnectionKind::Hook {
+        None
+    } else {
+        Some(Refusal::InProcess)
+    };
+    let refused = refusal.is_some();
+    handshake::write(&mut stream, &HandshakeReply::new(0, refusal))
+        .await
+        .ok()?;
+    (!refused).then_some(stream)
+}
+
 /// Read newline-delimited requests off `stream` until it closes, answering
 /// each within `op_deadline` before reading the next.
-async fn serve_connection<H>(stream: Box<dyn HookStream>, handler: Arc<H>, op_deadline: Duration)
-where
-    H: Fn(Request) -> BoxFuture<'static, Response> + Send + Sync + 'static,
-{
+pub(crate) async fn serve_hook_connection<
+    H: Fn(Request) -> BoxFuture<'static, Response> + Send + Sync + ?Sized + 'static,
+>(
+    stream: Box<dyn HookStream>,
+    handler: Arc<H>,
+    op_deadline: Duration,
+) {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut lines = BufReader::new(reader).lines();
 
@@ -660,42 +579,49 @@ fn acknowledgement_for(requests: &[Request], responses: &[Response]) -> Option<R
 /// [`send`] and [`send_many`] collapse everything short of a clean answer
 /// into one `Err`, which is right for every hook arm that only cares
 /// whether it got an answer back. `mcpls hook doctor` needs the finer
-/// distinctions: a refused or missing socket has no owner, so looking for
-/// one running a different directory is the right next step; a socket
-/// that accepted the connection and then went quiet has an owner that is
-/// merely busy; and a socket whose exchange failed before a readable
-/// answer arrived is neither of those. Naming some other project as the
-/// cause of any but the first would be an accusation with no evidence
-/// behind it, and calling the last one "busy" would send the reader
-/// looking for load that is not there.
+/// distinctions: a `Refused` handshake means an owner answered and rejected
+/// this connection; `NoOwner` means the transport connection could not be
+/// made, so looking for one running a different directory is the right next
+/// step; `Busy` means an endpoint did not yield a complete handshake or
+/// request answer before the deadline; and `Unintelligible` means an
+/// accepted exchange failed before a usable response arrived. Naming some
+/// other project as the cause of any but `NoOwner` would be an accusation
+/// with no evidence behind it, and calling `Unintelligible` "busy" would send
+/// the reader looking for load that is not there.
 #[derive(Debug)]
 pub enum ProbeOutcome {
     /// The peer answered before the deadline with a `Response` this
     /// build could parse.
     Answered(Response),
-    /// The connection itself could not be made: refused, or the socket
-    /// does not exist. Nobody owns this socket.
+    /// A server answered the handshake and refused this connection. The
+    /// reply names its build, pid and why.
+    Refused(HandshakeReply),
+    /// The transport connection could not be made. No handshake was
+    /// completed.
     NoOwner,
-    /// A connection was accepted, but no complete answer arrived before
-    /// the deadline. Something is there.
+    /// The endpoint did not yield a complete handshake or request answer
+    /// before the deadline. Something is there, or on Windows its only pipe
+    /// instance remained occupied.
     Busy,
-    /// A connection was accepted and the exchange then failed before a
-    /// readable answer arrived: the write failed, the read failed, the
-    /// peer hung up without answering, or what came back could not be
-    /// turned into a `Response`. Something holds the socket; the `Error`
-    /// carries which of the four happened. A wire shape this build does
-    /// not recognize lands in the last of them, and this protocol has
-    /// gained a required field more than once in this codebase's own
-    /// history, but the other three have nothing to do with versions.
+    /// A connection was accepted and the handshake or request exchange then
+    /// failed before a usable reply arrived: the write failed, the read
+    /// failed, the peer hung up without answering, or what came back could not
+    /// be parsed. Something holds the socket; the `Error` carries which of
+    /// the four happened. A wire shape this build does not recognize lands in
+    /// the last of them, and this protocol has gained a required field more
+    /// than once in this codebase's own history, but the other three have
+    /// nothing to do with versions.
     Unintelligible(Error),
 }
 
 /// Probe `identity`'s socket with one `request`.
 ///
-/// Distinguishes a refused or missing socket ([`ProbeOutcome::NoOwner`]),
-/// one that accepted the connection but did not answer within `timeout`
-/// ([`ProbeOutcome::Busy`]), and one whose exchange failed before a
-/// readable answer arrived ([`ProbeOutcome::Unintelligible`]).
+/// Distinguishes a handshake refusal ([`ProbeOutcome::Refused`]) from
+/// transport-level outcomes: no connection can be made
+/// ([`ProbeOutcome::NoOwner`]), the endpoint yields no complete handshake or
+/// request answer before `timeout` ([`ProbeOutcome::Busy`]), or an accepted
+/// connection exchange fails before a usable response
+/// ([`ProbeOutcome::Unintelligible`]).
 pub async fn probe(
     identity: &SocketIdentity,
     request: &Request,
@@ -705,6 +631,15 @@ pub async fn probe(
     let stream = match probe_connect_phase(identity, deadline).await {
         ConnectPhase::Connected(stream) => stream,
         ConnectPhase::GaveUp(outcome) => return outcome,
+    };
+    let established = match tokio::time::timeout_at(deadline, establish(stream)).await {
+        Ok(Ok(established)) => established,
+        Ok(Err(error)) => return ProbeOutcome::Unintelligible(error),
+        Err(_) => return ProbeOutcome::Busy,
+    };
+    let stream = match established {
+        Established::Accepted(stream) => stream,
+        Established::Refused(reply) => return ProbeOutcome::Refused(reply),
     };
     match tokio::time::timeout_at(deadline, answer_one(stream, request)).await {
         Ok(Ok(response)) => ProbeOutcome::Answered(response),
@@ -810,7 +745,11 @@ struct Connection {
 
 impl Connection {
     async fn open(identity: &SocketIdentity) -> Result<Self> {
-        Ok(Self::over(connect(identity).await?))
+        let stream = connect(identity).await?;
+        match establish(stream).await? {
+            Established::Accepted(stream) => Ok(Self::over(stream)),
+            Established::Refused(reply) => Err(refused(identity, &reply)),
+        }
     }
 
     fn over(stream: Box<dyn HookStream>) -> Self {
@@ -847,6 +786,32 @@ impl Connection {
     }
 }
 
+enum Established {
+    Accepted(Box<dyn HookStream>),
+    Refused(HandshakeReply),
+}
+
+/// Handshake as a hook client on a connected stream.
+async fn establish(mut stream: Box<dyn HookStream>) -> Result<Established> {
+    handshake::write(&mut stream, &Handshake::hook()).await?;
+    let reply: HandshakeReply = handshake::read(&mut stream).await?;
+    if reply.refusal.is_some() {
+        return Ok(Established::Refused(reply));
+    }
+    Ok(Established::Accepted(stream))
+}
+
+fn refused(identity: &SocketIdentity, reply: &HandshakeReply) -> Error {
+    Error::Transport(format!(
+        "the mcpls {} (pid {}) at {} refused this build ({}): {:?}",
+        reply.version,
+        reply.pid,
+        identity.socket.display(),
+        handshake::VERSION,
+        reply.refusal
+    ))
+}
+
 /// Write `request` on `stream` and read back one response line.
 async fn answer_one(stream: Box<dyn HookStream>, request: &Request) -> Result<Response> {
     let mut responses = Connection::over(stream)
@@ -860,13 +825,13 @@ async fn send_many_inner(identity: &SocketIdentity, requests: &[Request]) -> Res
 }
 
 #[cfg(not(windows))]
-async fn connect(identity: &SocketIdentity) -> io::Result<Box<dyn HookStream>> {
+pub(crate) async fn connect(identity: &SocketIdentity) -> io::Result<Box<dyn HookStream>> {
     let stream = tokio::net::UnixStream::connect(&identity.socket).await?;
     Ok(Box::new(stream))
 }
 
 #[cfg(windows)]
-async fn connect(identity: &SocketIdentity) -> io::Result<Box<dyn HookStream>> {
+pub(crate) async fn connect(identity: &SocketIdentity) -> io::Result<Box<dyn HookStream>> {
     use tokio::net::windows::named_pipe::ClientOptions;
 
     // Win32 `ERROR_PIPE_BUSY` (231): the pipe exists but every instance is

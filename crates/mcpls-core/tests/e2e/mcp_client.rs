@@ -174,7 +174,7 @@ impl McpClient {
         let config_path = config_path
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("Invalid config path"))?;
-        let mut args = vec!["--config", config_path];
+        let mut args = vec!["--no-backend", "--config", config_path];
         if capture_stderr {
             args.extend(["--log-level", "info"]);
             Self::spawn_with_args_and_stderr(&args, true)
@@ -198,6 +198,10 @@ impl McpClient {
     fn spawn_with_args_and_stderr(args: &[&str], capture_stderr: bool) -> Result<Self> {
         let binary_path = binary_under_test()?;
         let cwd = tempfile::tempdir().context("failed to create a working directory")?;
+        let mut args = args.to_vec();
+        if !args.contains(&"--no-backend") {
+            args.insert(0, "--no-backend");
+        }
         let mut command = Command::new(binary_path);
         command.args(args).current_dir(cwd.path());
         Self::spawn_command(command, Some(cwd), capture_stderr)
@@ -213,6 +217,7 @@ impl McpClient {
     ) -> Result<Self> {
         let mut command = Command::new(binary_under_test()?);
         command.args(args).current_dir(workspace);
+        command.env_remove("MCPLS_NO_BACKEND");
         match session {
             Some(session) => command.env("CLAUDE_CODE_SESSION_ID", session),
             None => command.env_remove("CLAUDE_CODE_SESSION_ID"),
@@ -593,6 +598,61 @@ impl McpClient {
     #[allow(dead_code)]
     pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         self.process.try_wait()
+    }
+
+    /// Query the backend selected for a workspace through hook doctor.
+    #[allow(dead_code)]
+    pub(crate) fn backend_pid(workspace: &Path) -> Result<Option<u32>> {
+        let output = Command::new(binary_under_test()?)
+            .args(["hook", "doctor"])
+            .current_dir(workspace)
+            .env_remove("MCPLS_NO_BACKEND")
+            .output()
+            .context("failed to query backend status")?;
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find_map(|line| line.strip_prefix("backend pid: "))
+            .and_then(|pid| pid.parse().ok()))
+    }
+
+    /// Run the hook a host fires on a prompt. On Windows it starts the
+    /// backend a frontend asked for.
+    #[allow(dead_code)]
+    pub(crate) fn fire_hook(workspace: &Path) -> Result<()> {
+        use std::io::Write as _;
+
+        let mut child = Command::new(binary_under_test()?)
+            .arg("hook")
+            .current_dir(workspace)
+            .env("CLAUDE_PROJECT_DIR", workspace)
+            .env_remove("MCPLS_NO_BACKEND")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .context("failed to run the hook")?;
+        child
+            .stdin
+            .take()
+            .context("the hook has no stdin")?
+            .write_all(br#"{"hook_event_name":"UserPromptSubmit","session_id":"e2e-hook"}"#)?;
+        let status = child.wait()?;
+        anyhow::ensure!(status.success(), "the hook exited with {status}");
+        Ok(())
+    }
+
+    /// Wait until hook doctor reports no backend for a workspace.
+    #[allow(dead_code)]
+    pub(crate) fn wait_for_backend_exit(workspace: &Path) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if Self::backend_pid(workspace)?.is_none() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!("backend did not exit for {}", workspace.display());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 }
 

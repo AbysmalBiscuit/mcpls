@@ -14,19 +14,16 @@ use crate::bridge::{
     Translator,
 };
 use crate::config::DiagnosticsConfig;
-use crate::hooks::HookRole;
 
 /// Shared context for all tool handlers.
 ///
 /// Holds the translator and subscription state. `Translator` uses interior
-/// mutability (each field locks independently, only for the short section
-/// that touches it) so it is shared as a plain `Arc` with no outer lock —
-/// this is what lets concurrent tool calls run their LSP round trips without
-/// serializing behind a single mutex.
+/// mutability, with each field locking independently for its short section, so
+/// it is shared as a plain `Arc` with no outer lock. Concurrent tool calls can
+/// run their LSP round trips without serializing behind a single mutex.
 ///
-/// The MCP peer handle is not stored here because resource-update
-/// notifications are sent by the pump tasks in `lib.rs`, which own their own
-/// `Arc<OnceCell<Peer<RoleServer>>>`.
+/// The MCP peer handle for resource notifications lives in
+/// [`ResourceSubscriptions`], keyed by connection.
 pub struct BridgeContext {
     /// Translator for converting MCP calls to LSP requests.
     pub translator: Arc<Translator>,
@@ -42,7 +39,7 @@ pub struct BridgeContext {
     /// `get_cached_diagnostics`, `read_resource`) can validate a path without
     /// locking anything.
     pub workspace_roots: Arc<[PathBuf]>,
-    /// Set of resource URIs the MCP client has subscribed to.
+    /// Which connections subscribed to which resource URIs.
     pub subscriptions: Arc<ResourceSubscriptions>,
     /// Whether a CWD-discovered `./mcpls.toml` was ignored as untrusted when
     /// the active [`ServerConfig`](crate::config::ServerConfig) was loaded.
@@ -71,24 +68,13 @@ pub struct BridgeContext {
     /// The footer waits on `$/progress` and the pump is what records it, so
     /// this must be the pump's own `Arc` rather than a fresh tracker.
     pub settle: Arc<ServerSettle>,
-    /// This process's relationship to the project's hook socket.
-    ///
-    /// Shared with the takeover task, which is what makes its
-    /// `promote_to_owner` visible to a tool call. Read by binding
-    /// `hooks.get()` to a value: the inner lock is a `std::sync::Mutex` and
-    /// no guard may cross an await point.
-    ///
-    /// [`BridgeContext::new`] sets `Disabled`, which is what every caller
-    /// but `serve_with` wants; `serve_with` decides the role before the
-    /// context is frozen into an `Arc` and overwrites this field.
-    pub hooks: Arc<HookRole>,
 }
 
 impl BridgeContext {
     /// Create a new bridge context.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub const fn new(
         translator: Arc<Translator>,
         notification_cache: Arc<Mutex<NotificationCache>>,
         workspace_roots: Arc<[PathBuf]>,
@@ -109,7 +95,6 @@ impl BridgeContext {
             floors,
             diagnostics,
             settle,
-            hooks: Arc::new(HookRole::disabled()),
         }
     }
 }

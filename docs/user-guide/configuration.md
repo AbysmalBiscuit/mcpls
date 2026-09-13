@@ -8,8 +8,7 @@ mcpls uses TOML format for configuration. The file can be placed in several loca
 
 1. Path specified by `--config` flag
 2. `$MCPLS_CONFIG` environment variable
-3. `./mcpls.toml` (current directory) — **only loaded with `--trust-project-config`** (or
-   `MCPLS_TRUST_PROJECT_CONFIG=true`); see [Trusting a Project-Local Config](#trusting-a-project-local-config)
+3. `mcpls.toml` at the checkout root, **only loaded with `--trust-project-config`** (or `MCPLS_TRUST_PROJECT_CONFIG=true`); see [Trusting a Project-Local Config](#trusting-a-project-local-config)
 4. Platform user-config directory:
    - Linux: `$XDG_CONFIG_HOME/mcpls/mcpls.toml`, else `~/.config/mcpls/mcpls.toml`
    - macOS: `~/Library/Application Support/mcpls/mcpls.toml`
@@ -17,10 +16,9 @@ mcpls uses TOML format for configuration. The file can be placed in several loca
 
 ### Trusting a Project-Local Config
 
-A `mcpls.toml` discovered in the current directory controls which command mcpls
-spawns as an LSP server (and other workspace settings), so mcpls does not load it
-automatically. Running `mcpls` inside an untrusted checkout must not execute
-commands from that checkout without explicit consent.
+mcpls looks for a project-local `mcpls.toml` at the checkout root, not in the working directory, so a session started in a subdirectory reads the same file as one started at the top. The checkout root is the nearest directory at or above the working directory that holds a `.git` entry, stopping before the home directory, or the working directory itself when none does.
+
+That file controls which command mcpls spawns as an LSP server (and other workspace settings), so mcpls does not load it automatically. Running `mcpls` inside an untrusted checkout must not execute commands from that checkout without explicit consent.
 
 To load a project-local `mcpls.toml`, opt in explicitly:
 
@@ -30,7 +28,7 @@ mcpls --trust-project-config
 MCPLS_TRUST_PROJECT_CONFIG=true mcpls
 ```
 
-Without this flag, a `./mcpls.toml` in the current directory is ignored (a warning
+Without this flag, a `mcpls.toml` at the checkout root is ignored (a warning
 is logged naming the ignored path) and mcpls falls through to the user config
 directory or built-in defaults — including built-in project-marker heuristics, so
 e.g. a `Cargo.toml` in the workspace still spawns rust-analyzer. An explicit
@@ -707,6 +705,26 @@ How long nothing may be outstanding before a footer calls it done. If no progres
 
 How long a footer waits in total before reporting whatever it has, `footer_grace_ms` included rather than on top of it: setting this below the grace shortens the grace to match. It is a bound rather than an exact duration — a wait that never goes quiet is sampled every 50 ms, and the sample that carries it past this value has already been paid, so the wait can run up to 50 ms beyond it. Sized against a real build rather than against patience, so it clears comfortably even on a large crate's rebuild; the wait is gated on progress rather than on a timer, so a fast workspace still returns quickly and the high cap costs it nothing.
 
+## Backend Section
+
+The `mcpls` an MCP client launches is a small stdio frontend. The first session in a checkout starts one backend for that checkout in the background, and every later session in the same checkout, from any subdirectory, attaches to it and shares its language servers. Two worktrees of one repository are two checkouts and get a backend each. On Windows the frontend cannot start the backend itself, so the next Claude Code hook invocation starts it; a session with no hooks installed reports that it is waiting for its backend.
+
+A frontend whose configuration fingerprint differs from the running backend's still attaches, and the backend's configuration stays in effect; the session's server instructions name both fingerprints. A frontend that trusts the project's `mcpls.toml` when the backend does not, or the reverse, is refused. `mcpls hook doctor` shows the backend's pid, uptime, attached sessions, language servers and configuration fingerprint.
+
+Pass `--no-backend` (or set `MCPLS_NO_BACKEND=true`) to serve one session entirely in-process instead, for debugging or for a host where a background process cannot run.
+
+```toml
+[backend]
+idle_shutdown_ms = 10000
+```
+
+### `backend.idle_shutdown_ms`
+
+**Type**: Integer (milliseconds)
+**Default**: `10000`
+
+How long the backend waits after its last MCP session closes before it exits and stops its language servers. Hook connections do not keep it alive. The cost of a short value is a cold reindex for a session that opens just after the timer; raise it when sessions come and go in quick succession.
+
 ## Environment Variables
 
 ### `MCPLS_CONFIG`
@@ -973,6 +991,9 @@ mcpls --log-level debug
 
 # Enable JSON logging
 mcpls --log-json
+
+# Serve this session in-process instead of through the shared backend
+mcpls --no-backend
 
 # HTTP transport (requires transport-http feature)
 mcpls --listen 127.0.0.1:3000

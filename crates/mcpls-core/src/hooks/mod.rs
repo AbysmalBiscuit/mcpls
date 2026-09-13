@@ -16,9 +16,8 @@ pub use filters::{PathFilter, watch_paths};
 pub use identity::windows_pipe_prefix;
 pub use identity::{SocketIdentity, identity_for, identity_hash, project_root};
 pub use listener::{
-    HookListener, LockLoss, ProbeOutcome, ServeExit, probe, send, send_and_acknowledge, send_many,
+    HookListener, ProbeOutcome, ServeExit, probe, send, send_and_acknowledge, send_many,
 };
 pub use protocol::{ChangeEvent, Request, Response};
-pub use service::{HookLocation, HookRole, Role, build_handler};
-pub(crate) use service::{hook_owner_task, hook_takeover_task};
+pub use service::{HookLocation, HookStats, StatusExtras, StatusSource, build_handler};
 pub use sweep::{SweepKind, Sweeper};

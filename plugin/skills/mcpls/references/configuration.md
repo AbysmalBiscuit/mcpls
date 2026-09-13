@@ -5,6 +5,8 @@ for worked examples per language, see
 [Configuration Reference](https://github.com/bug-ops/mcpls/blob/main/docs/user-guide/configuration.md)
 and [Complete Examples](https://github.com/bug-ops/mcpls/blob/main/docs/user-guide/configuration.md#complete-examples).
 
+The project-local `mcpls.toml` is discovered at the checkout root, so sessions started in subdirectories use the same project configuration.
+
 ## `[workspace]` fields
 
 | Field | Type | Default | Notes |
@@ -110,6 +112,14 @@ Sets the default severity floor and the volume caps applied when diagnostics are
 | `max_total` | integer | `50` | Most diagnostics delivered in one flush across every file — a context budget, so it is not per server. `0` disables the limit. |
 | `settle_quiet_ms` | integer (ms) | `1000` | How long the language servers must report no work before their view of the workspace counts as complete. |
 | `settle_deadline_ms` | integer (ms) | `300000` | How long to wait for that quiet before baselining anyway, bounding a server that never finishes. |
+
+## `[backend]` fields
+
+The `[backend]` table controls how long the shared backend stays alive after its sessions close.
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `idle_shutdown_ms` | integer (ms) | `10000` | How long the backend waits after the last MCP session closes before it exits. Hook connections do not keep the backend alive. |
 
 ## Environment passthrough (`env`)
 

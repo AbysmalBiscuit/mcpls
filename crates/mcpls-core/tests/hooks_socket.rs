@@ -69,6 +69,52 @@ fn handler(
     f
 }
 
+/// A client that skips the handshake gets nothing served: the listener
+/// cannot tell a hook request from an MCP frame or a newer build's line.
+#[tokio::test]
+async fn test_a_connection_without_a_handshake_is_not_served() {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+
+    let (dir, identity) = temp_identity();
+    let listener = HookListener::acquire(&identity)
+        .await
+        .expect("acquire")
+        .expect("owner");
+    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(listener.serve(
+        handler(|_| Box::pin(async { Response::Ack })),
+        Duration::from_secs(1),
+        cancel_rx,
+    ));
+
+    #[cfg(not(windows))]
+    let mut stream = tokio::net::UnixStream::connect(&identity.socket)
+        .await
+        .expect("connect");
+    #[cfg(windows)]
+    let mut stream = tokio::net::windows::named_pipe::ClientOptions::new()
+        .open(&identity.socket)
+        .expect("connect");
+    stream
+        .write_all(b"{\"op\":\"status\"}\n")
+        .await
+        .expect("write");
+
+    let mut line = String::new();
+    let read = tokio::time::timeout(
+        Duration::from_secs(5),
+        BufReader::new(stream).read_line(&mut line),
+    )
+    .await
+    .expect("the listener answers or hangs up rather than waiting");
+    let reply: Option<mcpls_core::backend::HandshakeReply> = serde_json::from_str(&line).ok();
+    assert!(
+        read.map_or(true, |n| n == 0) || reply.is_some_and(|reply| reply.refusal.is_some()),
+        "a request line was served as if it were a handshake: {line}"
+    );
+    drop(dir);
+}
+
 #[tokio::test]
 async fn test_one_listener_acquires_and_a_second_defers() {
     let (_guard, identity) = temp_identity();
@@ -158,61 +204,6 @@ async fn test_a_stale_socket_file_does_not_block_acquisition() {
         listener.is_some(),
         "a crashed owner leaves its socket file behind and nothing else \
          will ever clean it up"
-    );
-}
-
-/// A temp-file cleaner deleting the lock file out from under a live owner
-/// is not something the newcomer's side can ever detect: it opens a
-/// genuinely fresh inode at the path and genuinely locks it, which is
-/// indistinguishable, from its own point of view, from there having been
-/// no owner at all. The owner is the side that has to notice, by
-/// re-`stat`ing the path it locked and comparing it against the handle it
-/// still holds.
-#[tokio::test]
-#[cfg(unix)]
-async fn test_an_owner_stands_down_when_its_lock_file_is_replaced() {
-    let (_guard, identity) = temp_identity();
-    let owner = HookListener::acquire(&identity)
-        .await
-        .expect("acquire")
-        .expect("owner");
-    let (_tx, cancel) = tokio::sync::watch::channel(false);
-    let serve_task = tokio::spawn(owner.serve(
-        handler(|_req| {
-            Box::pin(async {
-                Response::Flush {
-                    context: None,
-                    token: None,
-                }
-            })
-        }),
-        Duration::from_millis(1500),
-        cancel,
-    ));
-
-    // Stand in for an age-based tmp-file cleaner: the path is gone, but the
-    // inode the owner locked is still alive and still locked.
-    std::fs::remove_file(&identity.lock).expect("remove the lock file out from under the owner");
-
-    let challenger = HookListener::acquire(&identity).await.expect("acquire");
-    assert!(
-        challenger.is_some(),
-        "the newcomer opens a genuinely fresh inode at the path and genuinely \
-         locks it; from its own side this is indistinguishable from there \
-         having been no owner at all, so it must succeed"
-    );
-
-    let exit = tokio::time::timeout(Duration::from_secs(3), serve_task)
-        .await
-        .expect(
-            "the original owner must notice its lock file was replaced and stop \
-             serving, rather than continue believing it owns a session a second \
-             process now also owns",
-        )
-        .expect("the serve task");
-    assert!(
-        matches!(exit, ServeExit::LockLost(_)),
-        "stood down for the wrong reason: {exit:?}"
     );
 }
 
