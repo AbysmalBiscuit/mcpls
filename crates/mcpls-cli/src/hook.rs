@@ -834,9 +834,15 @@ mod tests {
     /// directory-scoped.
     fn rand_suffix() -> u64 {
         use std::hash::{Hash, Hasher};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        // The pid separates concurrent processes, the counter separates
+        // calls within one. The clock cannot: it ticks every 100ns and
+        // `DefaultHasher` is unseeded, so simultaneous starts collide.
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        std::thread::current().id().hash(&mut hasher);
-        std::time::SystemTime::now().hash(&mut hasher);
+        std::process::id().hash(&mut hasher);
+        COUNTER.fetch_add(1, Ordering::Relaxed).hash(&mut hasher);
         hasher.finish()
     }
 
@@ -2838,6 +2844,25 @@ mod tests {
              failure from a read failure from a hang-up from a parse \
              failure, which is the whole reason the prose is allowed to \
              stay silent about which one it was: {out}"
+        );
+    }
+
+    /// The reason a scan failed is the whole difference between "could not
+    /// scan" and the clean "nothing is listening", so it has to reach the
+    /// line. The permission fixture below drives the same wording end to
+    /// end but runs on Unix only, and the Windows pipe namespace cannot be
+    /// made to fail from a test, so this is the wording's only coverage
+    /// there.
+    #[test]
+    fn test_a_failed_scan_reports_its_reason_rather_than_a_clean_negative() {
+        let line = super::no_owner_line(super::ForeignOwners::ScanFailed(
+            "Access is denied. (os error 5)".to_string(),
+        ));
+
+        assert_eq!(
+            line,
+            "server sees: no owner for this directory; could not scan for other mcpls \
+             instances: Access is denied. (os error 5)"
         );
     }
 

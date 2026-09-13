@@ -41,13 +41,19 @@ fn temp_identity() -> (TempDir, SocketIdentity) {
 /// Windows pipe name, which is process-global rather than directory-scoped.
 ///
 /// `TempDir` already gives uniqueness on Unix; this is what gives it on
-/// Windows. Derived from the current thread id and the clock rather than
-/// from a new random-number dependency.
+/// Windows. Derived from the process id and a counter rather than from a
+/// new random-number dependency.
 fn rand_suffix() -> u64 {
     use std::hash::{Hash, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // The pid separates concurrent processes, the counter separates calls
+    // within one. The clock cannot: it ticks every 100ns and
+    // `DefaultHasher` is unseeded, so simultaneous starts collide.
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    std::thread::current().id().hash(&mut hasher);
-    std::time::SystemTime::now().hash(&mut hasher);
+    std::process::id().hash(&mut hasher);
+    COUNTER.fetch_add(1, Ordering::Relaxed).hash(&mut hasher);
     hasher.finish()
 }
 
