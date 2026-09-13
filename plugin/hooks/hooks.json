@@ -1,6 +1,17 @@
 {
   "hooks": {
-    "SessionStart": [{ "hooks": [{ "type": "command", "command": "mcpls hook" }] }],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" bootstrap-binaries claude",
+            "timeout": 300
+          },
+          { "type": "command", "command": "mcpls hook" }
+        ]
+      }
+    ],
     "FileChanged": [{ "hooks": [{ "type": "command", "command": "mcpls hook" }] }],
     "PostToolBatch": [{ "hooks": [{ "type": "command", "command": "mcpls hook" }] }],
     "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "mcpls hook" }] }],

@@ -1,8 +1,5 @@
 {
   "mcpServers": {
-    "mcpls": {
-      "command": "mcpls",
-      "args": []
-    }
+    "mcpls": { "command": "mcpls" }
   }
 }

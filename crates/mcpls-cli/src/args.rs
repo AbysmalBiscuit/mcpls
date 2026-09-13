@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use crate::completions::Shell;
+use crate::hook::Host;
 
 /// Parses a boolean flag/env value, accepting common truthy and falsy
 /// spellings beyond the strict `"true"`/`"false"` that `str::parse::<bool>`
@@ -139,13 +140,18 @@ pub enum Command {
         shell: Shell,
     },
 
-    /// Serve one Claude Code hook invocation
+    /// Serve one agent hook invocation
     ///
     /// With no argument, reads the hook payload from stdin and writes hook
     /// JSON to stdout, dispatching on the payload's own `hook_event_name`.
-    /// One subcommand rather than five means no shell script and the same
+    /// One subcommand rather than one per event means no shell script and the
     /// registrations work on Windows.
     Hook {
+        /// The harness that spawned this hook, which decides where the
+        /// project directory comes from
+        #[arg(long, value_enum, default_value_t = Host::Claude)]
+        host: Host,
+
         /// What to do instead of reading a hook payload from stdin
         #[command(subcommand)]
         action: Option<HookAction>,

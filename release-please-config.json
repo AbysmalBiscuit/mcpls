@@ -1,0 +1,21 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "include-component-in-tag": false,
+  "bootstrap-sha": "216dbb84567aabc8b4b8d79a59302a2bd8214345",
+  "packages": {
+    ".": {
+      "release-type": "simple",
+      "package-name": "mcpls",
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": true,
+      "extra-files": [
+        { "type": "toml", "path": "Cargo.toml", "jsonpath": "$.workspace.package.version" },
+        { "type": "toml", "path": "Cargo.toml", "jsonpath": "$.workspace.dependencies['mcpls-core'].version" },
+        { "type": "toml", "path": "Cargo.lock", "jsonpath": "$.package[?(@.name.value=='mcpls' || @.name.value=='mcpls-core')].version" },
+        { "type": "json", "path": "plugin/.claude-plugin/plugin.json", "jsonpath": "$.version" },
+        { "type": "json", "path": "plugin/.codex-plugin/plugin.json", "jsonpath": "$.version" },
+        { "type": "json", "path": ".claude-plugin/marketplace.json", "jsonpath": "$.plugins[0].version" }
+      ]
+    }
+  }
+}

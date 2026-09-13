@@ -1,5 +1,9 @@
 {
   "name": "mcpls",
   "description": "Language server intelligence and push diagnostics through mcpls",
-  "version": "0.1.0"
+  "version": "0.3.9",
+  "author": { "name": "Lev Velykoivanenko" },
+  "homepage": "https://github.com/AbysmalBiscuit/mcpls",
+  "repository": "https://github.com/AbysmalBiscuit/mcpls",
+  "license": "MIT OR Apache-2.0"
 }

@@ -1,0 +1,24 @@
+name: release-please
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  # Maintains the release PR and, on merge, creates the tag and GitHub
+  # Release. The token is a PAT rather than GITHUB_TOKEN because a tag
+  # created with GITHUB_TOKEN does not trigger release.yml, which builds the
+  # binaries the plugin launcher downloads.
+  release-please:
+    name: release-please
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
