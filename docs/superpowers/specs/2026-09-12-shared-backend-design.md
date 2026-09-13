@@ -1,6 +1,6 @@
 # One mcpls backend per project
 
-Status: proposed. Nothing here is built.
+Status: Stage 1 is built. Stages 2 to 4 are not.
 
 Target: the `AbysmalBiscuit/mcpls` fork, not upstream. Defaults are tuned for one user running many agents on a desktop or laptop, and breaking changes to configuration are acceptable when they buy ergonomics.
 
@@ -79,7 +79,7 @@ The rule is not configurable. Two processes on different rules derive different 
 
 1. The frontend connects. If that succeeds, it is done.
 2. Otherwise it takes the spawn lock and holds it until the endpoint accepts.
-3. The winner starts a detached backend, `setsid` on Unix and a request the next hook invocation honours on Windows, for the reasons below. It then waits for the endpoint to accept.
+3. The winner starts a detached backend, using `process_group(0)` on Unix and a request the next hook invocation honours on Windows, for the reasons below. It uses `process_group(0)` rather than `setsid`, which needs `unsafe` code this workspace denies; a new process group is what leaves the group Codex signals. It then waits for the endpoint to accept.
 4. Everyone else waits on the lock and retries the connect, so a loser attaches to the winner's backend instead of spawning a second one.
 
 There is no runtime election left. The only race is which frontend spawns the backend, and the lock settles it at startup instead of through role transitions during service.
@@ -88,7 +88,7 @@ The spawn lock is its own file, not the ownership lock the hook listener takes t
 
 The backend's standard streams decide whether detaching works at all. The frontend's stdin and stdout are the host's MCP pipes, and a child that inherits them holds the write end open, so the host never sees EOF when the frontend exits, and anything the backend writes to stdout lands in the middle of the MCP stream. Codex also reads a server's stderr continuously (`codex-rs/rmcp-client/src/stdio_server_launcher.rs:393`), so all three streams are redirected to null and a log file before the backend is spawned.
 
-Leaving the frontend's process group matters as much. Codex launches a stdio server with `process_group(0)` and sends `SIGTERM` to that whole group on cleanup, then `SIGKILL` two seconds later (`codex-rs/rmcp-client/src/stdio_server_launcher.rs:274,354`). `setsid` puts the backend in a new session and group, so the group signal does not reach it.
+Leaving the frontend's process group matters as much. Codex launches a stdio server with `process_group(0)` and sends `SIGTERM` to that whole group on cleanup, then `SIGKILL` two seconds later (`codex-rs/rmcp-client/src/stdio_server_launcher.rs:274,354`). The backend uses its own process group, so the group signal does not reach it.
 
 Windows under Codex cannot spawn the backend as an ordinary child. Codex creates a job object per server launch, with kill-on-close and without breakaway, and assigns the suspended server before resuming it (`codex-rs/rmcp-client/src/stdio_server_launcher.rs:290`; `codex-rs/utils/pty/src/win/job.rs:62`), so anything the frontend spawns normally stays inside and dies with it. Wrapping the spawn in another executable changes nothing, because the wrapper is in the job too.
 
@@ -205,11 +205,11 @@ This is the only message the backend sends that answers no request, so the front
 
 Each stage lands on main in a working state.
 
-**Stage 1: the split.** Frontend, detached backend, handshake, spawn lock, idle shutdown, `--no-backend`, and the doctor reporting the backend's pid, uptime, attached sessions, language servers and configuration fingerprint. The owner, passive, demotion and forwarding paths are deleted here, because nothing can reach them once one process holds every record. Per-connection resource subscriptions land here too: one process serving many connections is exactly what breaks the single peer cell.
+**Stage 1: the split.** Frontend, detached backend, handshake, spawn lock, idle shutdown, `--no-backend`, and the doctor reporting the backend's pid, uptime, attached sessions, language servers and configuration fingerprint. The owner, passive, demotion and forwarding paths are deleted here, because nothing can reach them once one process holds every record. Per-connection resource subscriptions land here too: one process serving many connections is exactly what breaks the single peer cell. It lands as the frontend and backend described above, with the decisions recorded in `docs/superpowers/plans/2026-09-13-shared-backend-split.md` under "Decisions this plan makes".
 
 Session identity belongs to this stage rather than the next one. `SessionId::from_env_or_process` reads the process environment and falls back to one token per process (`crates/mcpls-core/src/bridge/delivery.rs:17,41-59`), and the backend inherits the environment of whichever frontend spawned it. Left in place it would hand every session the spawner's record: one session's `get_new_diagnostics` would consume another's, while the hook door kept keying correctly off the payload's session id, which is the split-record failure the diagnostics design built forwarding to prevent. So `McplsServer` carries the session its connection named in the handshake, the two remaining call sites read that field, and the backend never asks its own environment.
 
-The identity rule landed ahead of the split, because the endpoint's name is the first thing the two sides have to agree on (`docs/superpowers/plans/2026-09-12-shared-backend-prerequisites.md`). Both sides call `project_root` before hashing, the workspace base is the root, and the Unix runtime directory no longer reads `XDG_RUNTIME_DIR`. Project configuration is still found at the working directory, so a session started in a subdirectory never reads the checkout's `mcpls.toml`; discovery moves to the root in this stage.
+The identity rule landed ahead of the split, because the endpoint's name is the first thing the two sides have to agree on (`docs/superpowers/plans/2026-09-12-shared-backend-prerequisites.md`). Both sides call `project_root` before hashing, the workspace base is the root, and the Unix runtime directory no longer reads `XDG_RUNTIME_DIR`. Project configuration is found at the checkout root, so a session started in a subdirectory reads the checkout's `mcpls.toml`.
 
 **Stage 2: the rest of identity.** The Codex `_meta` lookup, which is what remains once Stage 1 holds the handshake id and the connection fallback.
 

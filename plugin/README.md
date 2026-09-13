@@ -12,6 +12,14 @@ claude --plugin-dir /path/to/mcpls/plugin
 
 `--plugin-dir` loads a plugin for that session only. To make it permanent, wrap the command in a shell alias or function, or add `--plugin-dir` to whatever launches your interactive sessions.
 
+## One backend per checkout
+
+The `mcpls` the MCP entry launches is a small frontend. The first session in a checkout starts a backend in the background, and every later session in that checkout, from any subdirectory, attaches to it and shares its language servers. The backend exits `idle_shutdown_ms` after the last session closes (10 seconds by default; set it under `[backend]`).
+
+On Windows the backend is started by the plugin's hooks rather than by the frontend, so the hooks are required there. A session with no hooks installed reports that it is waiting for its backend.
+
+`mcpls --no-backend` runs one session entirely in-process, which is useful for debugging or for a host where a background process cannot run.
+
 ## Check that it's working
 
 Payload and socket failures exit cleanly without output, so a broken connection can look like a quiet workspace. `SessionStart` reports watch-path scan failures through a non-blocking user warning. To inspect the connection and scan, run:
