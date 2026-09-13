@@ -412,7 +412,6 @@ async fn replacement_owner_scenario(order: ReplacementOwnerOrder, attempt: Repla
             entered_rx
         };
         let subs = Arc::new(ResourceSubscriptions::new());
-        let peer_cell = Arc::new(OnceCell::new());
         let settle = Arc::new(bridge::ServerSettle::new(
             Duration::from_millis(config.diagnostics.settle_quiet_ms),
             Duration::from_millis(config.diagnostics.settle_deadline_ms),
@@ -427,7 +426,6 @@ async fn replacement_owner_scenario(order: ReplacementOwnerOrder, attempt: Repla
         let shared = PumpShared {
             notification_cache: Arc::clone(&cache),
             subs: Arc::clone(&subs),
-            peer_cell: Arc::clone(&peer_cell),
             workspace_roots: Arc::from(vec![root.clone()]),
             document_tracker: Arc::clone(translator.document_tracker()),
             settle: Arc::clone(&settle),
@@ -465,7 +463,6 @@ async fn replacement_owner_scenario(order: ReplacementOwnerOrder, attempt: Repla
             .unwrap();
         wire.flush().await.unwrap();
         let running = started.await.unwrap();
-        peer_cell.set(running.peer().clone()).unwrap();
 
         let rust_control = root.join("rust");
         let rust_initialized = root.join("rust.initialized");
@@ -837,13 +834,12 @@ async fn recovery_scenario(startup: StartupMode) {
             Some((entered_rx, resume_tx))
         } else { None };
         let subs = Arc::new(ResourceSubscriptions::new());
-        let peer_cell = Arc::new(OnceCell::new());
         let settle = Arc::new(bridge::ServerSettle::new(Duration::from_millis(config.diagnostics.settle_quiet_ms),
             Duration::from_millis(config.diagnostics.settle_deadline_ms)));
         let delivery = Arc::new(Mutex::new(bridge::DiagnosticsDelivery::new(config.diagnostics)));
         let floors = Arc::new(bridge::FloorTable::new(&config.diagnostics, &config.lsp_servers));
         let shared = PumpShared { notification_cache: Arc::clone(&cache), subs: Arc::clone(&subs),
-            peer_cell: Arc::clone(&peer_cell), workspace_roots: Arc::from(vec![root.clone()]),
+            workspace_roots: Arc::from(vec![root.clone()]),
             document_tracker: Arc::clone(translator.document_tracker()), settle: Arc::clone(&settle),
             delivery: Arc::clone(&delivery), floors: Arc::clone(&floors) };
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
@@ -861,7 +857,6 @@ async fn recovery_scenario(startup: StartupMode) {
         wire.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n").await.unwrap();
         wire.flush().await.unwrap();
         let running = started.await.unwrap();
-        peer_cell.set(running.peer().clone()).unwrap();
         if let Some((entered, resume)) = publication_pause {
             let original = tokio::time::timeout(Duration::from_secs(5), entered).await.unwrap().unwrap();
             std::fs::write(root.join("rust.crash-1"), "").unwrap();

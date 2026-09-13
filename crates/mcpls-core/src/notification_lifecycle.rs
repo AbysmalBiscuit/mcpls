@@ -151,7 +151,6 @@ mod tests {
     use std::time::Duration;
 
     use lsp_types::{Diagnostic, PublishDiagnosticsParams, Uri};
-    use tokio::sync::OnceCell;
 
     use super::*;
     use crate::bridge::{
@@ -164,7 +163,6 @@ mod tests {
         PumpShared {
             notification_cache: Arc::new(Mutex::new(NotificationCache::new())),
             subs: Arc::new(ResourceSubscriptions::new()),
-            peer_cell: Arc::new(OnceCell::new()),
             workspace_roots: Arc::from([]),
             document_tracker: Arc::new(DocumentTracker::new(
                 crate::bridge::ResourceLimits::default(),

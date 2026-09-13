@@ -44,7 +44,6 @@ use crate::hooks::{self, ChangeEvent, Role, SocketIdentity};
 #[derive(Clone)]
 pub struct McplsServer {
     context: Arc<BridgeContext>,
-    #[allow(dead_code)]
     connection: ConnectionId,
     session: SessionId,
     /// Sentences appended to this connection's instructions.
@@ -619,6 +618,14 @@ impl McplsServer {
     #[allow(dead_code)]
     pub(crate) const fn session(&self) -> &SessionId {
         &self.session
+    }
+
+    pub(crate) const fn connection(&self) -> ConnectionId {
+        self.connection
+    }
+
+    pub(crate) fn subscriptions(&self) -> &Arc<ResourceSubscriptions> {
+        &self.context.subscriptions
     }
 
     #[cfg(all(test, unix))]
@@ -1712,23 +1719,16 @@ impl ServerHandler for McplsServer {
         let validated_path = validate_path_against_roots(&path, &self.context.workspace_roots)
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
-        // Track and reply under the canonical resource URI, not the client's raw
-        // `request.uri`: `diagnostics_pump` derives `mcp_uri` from the canonical LSP
-        // path (see below), so a subscription keyed by a non-canonical but equivalent
-        // URI (symlink, macOS /var vs /private/var, ...) would never match its
-        // `subs.contains` check and silently stop receiving pushes.
+        // The pump derives its resource URI from the canonical LSP path, so
+        // subscriptions use the same canonical key.
         let canonical_uri =
             make_uri(&validated_path).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
-        // Record the subscription *before* checking the cache. This closes the race where
-        // a PublishDiagnostics notification lands between the cache check and the
-        // subscription being recorded: if diagnostics arrive before this point, the check
-        // below catches them; if they arrive after, `diagnostics_pump`'s own
-        // `subs.contains` check already sees this URI as subscribed and delivers the
-        // update through the normal push path.
+        // Record before checking the cache so diagnostics arriving between
+        // the two operations are either replayed or pushed by the pump.
         self.context
             .subscriptions
-            .subscribe(canonical_uri.clone())
+            .subscribe(self.connection, context.peer.clone(), canonical_uri.clone())
             .await
             .map_err(|e| McpError::invalid_params(e, None))?;
 
@@ -1772,7 +1772,10 @@ impl ServerHandler for McplsServer {
             .and_then(|validated_path| make_uri(&validated_path).ok())
             .unwrap_or_else(|| request.uri.clone());
 
-        self.context.subscriptions.unsubscribe(&key).await;
+        self.context
+            .subscriptions
+            .unsubscribe(self.connection, &key)
+            .await;
         Ok(())
     }
 
@@ -2762,7 +2765,6 @@ mod tests {
                 crate::PumpShared {
                     notification_cache: cache,
                     subs: subscriptions,
-                    peer_cell: Arc::new(tokio::sync::OnceCell::new()),
                     workspace_roots,
                     document_tracker: Arc::clone(translator.document_tracker()),
                     settle: Arc::clone(&settle),
@@ -5204,34 +5206,6 @@ mod tests {
         let translator = Translator::new();
         let result = translator.validate_path(Path::new("/this/path/does/not/exist/at/all.rs"));
         assert!(result.is_err());
-    }
-
-    /// subscribe cap enforced: after `MAX_SUBSCRIPTIONS` entries, the next call returns `Err`.
-    #[tokio::test]
-    async fn test_subscription_cap_enforced_in_handler_context() {
-        use crate::bridge::resources::MAX_SUBSCRIPTIONS;
-
-        let subscriptions = Arc::new(ResourceSubscriptions::new());
-        for i in 0..MAX_SUBSCRIPTIONS {
-            subscriptions
-                .subscribe(format!("lsp-diagnostics:///file{i}.rs"))
-                .await
-                .unwrap();
-        }
-        let over = subscriptions
-            .subscribe("lsp-diagnostics:///overflow.rs".to_string())
-            .await;
-        assert!(over.is_err());
-    }
-
-    /// unsubscribing a URI that was never subscribed is a no-op (returns `false`, not an error).
-    #[tokio::test]
-    async fn test_unsubscribe_nonexistent_is_noop() {
-        let subscriptions = Arc::new(ResourceSubscriptions::new());
-        let removed = subscriptions
-            .unsubscribe("lsp-diagnostics:///nonexistent.rs")
-            .await;
-        assert!(!removed);
     }
 
     /// Server capabilities advertise resources support.

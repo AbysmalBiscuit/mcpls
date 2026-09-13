@@ -5,13 +5,15 @@
 //! file whose diagnostics are cached from LSP `textDocument/publishDiagnostics`
 //! notifications.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use rmcp::{Peer, RoleServer};
 use thiserror::Error;
 use tokio::sync::RwLock;
 use url::Url;
 
+use super::ConnectionId;
 use super::state::encode_rfc3986_path_chars;
 
 /// URI scheme used for diagnostic resources.
@@ -115,65 +117,108 @@ pub fn parse_uri(uri: &str) -> Result<PathBuf, ResourceUriError> {
         .map_err(|()| ResourceUriError::DecodeFailed(file_uri))
 }
 
-/// Tracks which MCP resource URIs the client has subscribed to.
+/// Which connections want updates for which resource URIs, and the peer
+/// each one is notified through.
 ///
-/// The hot read path (pump tasks checking before sending notifications) uses
-/// a `RwLock` so concurrent readers do not block each other.
-#[derive(Debug)]
-pub struct ResourceSubscriptions(RwLock<HashSet<String>>);
+/// One process serves many connections, so a notification for a file goes
+/// to the connections subscribed to that file and to no other. The hot read
+/// path (the diagnostics pump) takes a read lock, so concurrent readers do
+/// not block each other.
+#[derive(Default)]
+pub struct ResourceSubscriptions(RwLock<HashMap<ConnectionId, Subscriber>>);
 
-impl Default for ResourceSubscriptions {
-    fn default() -> Self {
-        Self::new()
+struct Subscriber {
+    peer: Peer<RoleServer>,
+    uris: HashSet<String>,
+}
+
+impl std::fmt::Debug for ResourceSubscriptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResourceSubscriptions")
+            .finish_non_exhaustive()
     }
 }
 
 impl ResourceSubscriptions {
-    /// Create an empty subscription set.
+    /// No subscriptions.
     #[must_use]
     pub fn new() -> Self {
-        Self(RwLock::new(HashSet::new()))
+        Self::default()
     }
 
-    /// Add a URI to the subscription set.
+    /// Record that `connection`, notified through `peer`, wants updates for
+    /// `uri`.
     ///
     /// Returns `Ok(true)` if newly inserted, `Ok(false)` if already present.
-    /// Returns `Err` if the subscription set has reached [`MAX_SUBSCRIPTIONS`].
     ///
     /// # Errors
     ///
-    /// Returns an error string when the cap is exceeded.
-    pub async fn subscribe(&self, uri: String) -> Result<bool, String> {
-        let mut set = self.0.write().await;
-        if !set.contains(&uri) && set.len() >= MAX_SUBSCRIPTIONS {
+    /// Returns an error string when `connection` already holds
+    /// [`MAX_SUBSCRIPTIONS`] URIs.
+    pub async fn subscribe(
+        &self,
+        connection: ConnectionId,
+        peer: Peer<RoleServer>,
+        uri: String,
+    ) -> Result<bool, String> {
+        let mut map = self.0.write().await;
+        let subscriber = map.entry(connection).or_insert_with(|| Subscriber {
+            peer: peer.clone(),
+            uris: HashSet::new(),
+        });
+        subscriber.peer = peer;
+        if !subscriber.uris.contains(&uri) && subscriber.uris.len() >= MAX_SUBSCRIPTIONS {
             return Err(format!("subscription limit of {MAX_SUBSCRIPTIONS} reached"));
         }
-        Ok(set.insert(uri))
+        let inserted = subscriber.uris.insert(uri);
+        drop(map);
+        Ok(inserted)
     }
 
-    /// Check whether the subscription set is empty.
-    ///
-    /// Used as a fast path in the diagnostics pump to skip URI construction
-    /// when no client has subscribed yet.
+    /// Whether no connection is subscribed to anything, so the pump can
+    /// skip building a URI.
     pub async fn is_empty(&self) -> bool {
         self.0.read().await.is_empty()
     }
 
-    /// Remove a URI from the subscription set.
-    ///
-    /// Returns `true` if the URI was present and removed.
-    pub async fn unsubscribe(&self, uri: &str) -> bool {
-        self.0.write().await.remove(uri)
+    /// Remove `uri` from `connection`'s subscriptions. Returns `true` if it
+    /// was present.
+    pub async fn unsubscribe(&self, connection: ConnectionId, uri: &str) -> bool {
+        let mut map = self.0.write().await;
+        let Some(subscriber) = map.get_mut(&connection) else {
+            return false;
+        };
+        let removed = subscriber.uris.remove(uri);
+        if subscriber.uris.is_empty() {
+            map.remove(&connection);
+        }
+        removed
     }
 
-    /// Check if a URI is currently subscribed.
-    pub async fn contains(&self, uri: &str) -> bool {
-        self.0.read().await.contains(uri)
+    /// Whether `connection` is subscribed to `uri`.
+    pub async fn contains(&self, connection: ConnectionId, uri: &str) -> bool {
+        self.0
+            .read()
+            .await
+            .get(&connection)
+            .is_some_and(|subscriber| subscriber.uris.contains(uri))
     }
 
-    /// Return a snapshot of all subscribed URIs (primarily for tests).
-    pub async fn snapshot(&self) -> Vec<String> {
-        self.0.read().await.iter().cloned().collect()
+    /// Every connection subscribed to `uri`, with the peer to notify.
+    pub async fn subscribers(&self, uri: &str) -> Vec<(ConnectionId, Peer<RoleServer>)> {
+        self.0
+            .read()
+            .await
+            .iter()
+            .filter(|(_, subscriber)| subscriber.uris.contains(uri))
+            .map(|(connection, subscriber)| (*connection, subscriber.peer.clone()))
+            .collect()
+    }
+
+    /// Forget everything `connection` subscribed to: its service stopped,
+    /// or a notification to it failed.
+    pub async fn remove_connection(&self, connection: ConnectionId) {
+        self.0.write().await.remove(&connection);
     }
 }
 
@@ -301,64 +346,109 @@ mod tests {
     // ResourceSubscriptions
     // ------------------------------------------------------------------
 
+    #[derive(Debug)]
+    struct BarePeerHandler;
+
+    impl rmcp::ServerHandler for BarePeerHandler {}
+
+    fn peer() -> Peer<RoleServer> {
+        let (server_io, client_io) = tokio::io::duplex(1024);
+        let running = rmcp::service::serve_directly(BarePeerHandler, server_io, None);
+        let peer = running.peer().clone();
+        std::mem::forget((running, client_io));
+        peer
+    }
+
     #[tokio::test]
     async fn test_subscribe_and_contains() {
         let subs = ResourceSubscriptions::new();
+        let connection = ConnectionId::next();
         let uri = "lsp-diagnostics:///home/user/main.rs".to_string();
-
-        assert!(!subs.contains(&uri).await);
-        assert!(subs.subscribe(uri.clone()).await.unwrap());
-        assert!(subs.contains(&uri).await);
+        assert!(!subs.contains(connection, &uri).await);
+        assert!(
+            subs.subscribe(connection, peer(), uri.clone())
+                .await
+                .unwrap()
+        );
+        assert!(subs.contains(connection, &uri).await);
+        assert!(!subs.contains(ConnectionId::next(), &uri).await);
     }
 
     #[tokio::test]
     async fn test_subscribe_duplicate_returns_false() {
         let subs = ResourceSubscriptions::new();
+        let connection = ConnectionId::next();
         let uri = "lsp-diagnostics:///tmp/file.rs".to_string();
-        assert!(subs.subscribe(uri.clone()).await.unwrap());
-        assert!(!subs.subscribe(uri).await.unwrap());
+        assert!(
+            subs.subscribe(connection, peer(), uri.clone())
+                .await
+                .unwrap()
+        );
+        assert!(!subs.subscribe(connection, peer(), uri).await.unwrap());
     }
 
     #[tokio::test]
-    async fn test_unsubscribe() {
+    async fn test_unsubscribe_removes_only_that_connections_entry() {
         let subs = ResourceSubscriptions::new();
+        let (one, two) = (ConnectionId::next(), ConnectionId::next());
         let uri = "lsp-diagnostics:///tmp/file.rs".to_string();
-        subs.subscribe(uri.clone()).await.unwrap();
-        assert!(subs.unsubscribe(&uri).await);
-        assert!(!subs.contains(&uri).await);
+        subs.subscribe(one, peer(), uri.clone()).await.unwrap();
+        subs.subscribe(two, peer(), uri.clone()).await.unwrap();
+        assert!(subs.unsubscribe(one, &uri).await);
+        assert!(!subs.contains(one, &uri).await);
+        assert!(subs.contains(two, &uri).await);
+        assert!(
+            !subs
+                .unsubscribe(one, "lsp-diagnostics:///nonexistent.rs")
+                .await
+        );
     }
 
     #[tokio::test]
-    async fn test_unsubscribe_nonexistent_returns_false() {
+    async fn test_the_cap_is_per_connection() {
         let subs = ResourceSubscriptions::new();
-        assert!(!subs.unsubscribe("lsp-diagnostics:///nonexistent.rs").await);
-    }
-
-    #[tokio::test]
-    async fn test_subscribe_cap_exceeded() {
-        let subs = ResourceSubscriptions::new();
+        let full = ConnectionId::next();
         for i in 0..MAX_SUBSCRIPTIONS {
-            subs.subscribe(format!("lsp-diagnostics:///file{i}.rs"))
+            subs.subscribe(full, peer(), format!("lsp-diagnostics:///file{i}.rs"))
                 .await
                 .unwrap();
         }
-        let result = subs
-            .subscribe("lsp-diagnostics:///overflow.rs".to_string())
-            .await;
-        assert!(result.is_err());
+        assert!(
+            subs.subscribe(full, peer(), "lsp-diagnostics:///overflow.rs".to_string())
+                .await
+                .is_err()
+        );
+        assert!(
+            subs.subscribe(
+                ConnectionId::next(),
+                peer(),
+                "lsp-diagnostics:///overflow.rs".to_string()
+            )
+            .await
+            .is_ok(),
+            "one connection's subscriptions must not use up another's"
+        );
     }
 
     #[tokio::test]
-    async fn test_snapshot() {
+    async fn test_subscribers_and_remove_connection() {
         let subs = ResourceSubscriptions::new();
-        subs.subscribe("lsp-diagnostics:///a.rs".to_string())
+        let (one, two) = (ConnectionId::next(), ConnectionId::next());
+        let uri = "lsp-diagnostics:///a.rs".to_string();
+        subs.subscribe(one, peer(), uri.clone()).await.unwrap();
+        subs.subscribe(two, peer(), uri.clone()).await.unwrap();
+        let mut found: Vec<_> = subs
+            .subscribers(&uri)
             .await
-            .unwrap();
-        subs.subscribe("lsp-diagnostics:///b.rs".to_string())
-            .await
-            .unwrap();
-        let mut snap = subs.snapshot().await;
-        snap.sort();
-        assert_eq!(snap, ["lsp-diagnostics:///a.rs", "lsp-diagnostics:///b.rs"]);
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        found.sort();
+        assert_eq!(found, vec![one, two]);
+        subs.remove_connection(one).await;
+        assert_eq!(subs.subscribers(&uri).await.len(), 1);
+        assert!(!subs.is_empty().await);
+        subs.remove_connection(two).await;
+        assert!(subs.is_empty().await);
     }
 }
