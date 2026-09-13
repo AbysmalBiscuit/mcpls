@@ -27,7 +27,7 @@ socket: /tmp/mcpls-lev/39df698ef1ac4f49.sock
 hook sees: /home/lev/project/crates/core
 root: /home/lev/project -> 39df698ef1ac4f49
 server sees: /home/lev/project -> 39df698ef1ac4f49
-owner pid: 2816002
+backend pid: 2816002
 hooks seen: 3 request(s) since this owner started
 mcpls on PATH: /home/lev/.cargo/bin/mcpls; launch not checked
 watch scan: selected 4 top-level path(s); hidden entries excluded by default; ignore rules applied; host registration unverified
@@ -46,8 +46,8 @@ Line by line:
 
   Any of the four can carry further clauses appended to the end of the line: `; N other mcpls sockets are live but did not answer a status request this build could read` means something is holding a socket nearby that this build could not talk to, most likely an mcpls on a different version speaking an older or newer wire shape, worth checking and updating; `; N other mcpls instances also relate to this directory` appears alongside the second case above when more than one related owner exists, and should be treated the same way as that case; `; more may exist beyond the scan's limit` means the runtime directory held more candidate sockets than the doctor checks, so every count on the line is a floor, not a total.
 
-  When an owner does answer but the exchange itself fails, the line reports the specific fault instead: an owner answering with an error message, answering with something other than its own status, a socket that accepted the connection but whose reply this build could not parse, or a socket that answered nothing within the probe window. Each of those pairs with `owner pid: unknown` below. The doctor names no cause for any of them, because an accepted connection and a failed exchange are the whole of what it established; what it prints instead is the answer or the error itself, and that is the thing to act on.
-- **`owner pid:`** the process id holding the socket, `none` if nothing does, or `unknown` if an owner exists but the exchange did not get far enough to learn its pid (see the fault messages above). When it does print a pid, confirm it names a live `mcpls` process; a pid that no longer exists or belongs to something else means the socket is orphaned: delete the socket file at the path in `socket:` above (a Windows named pipe clears on its own once nothing holds it) so a new mcpls can bind it.
+  When an owner does answer but the exchange itself fails, the line reports the specific fault instead: an owner answering with an error message, answering with something other than its own status, a socket that accepted the connection but whose reply this build could not parse, or a socket that answered nothing within the probe window. Each of those pairs with `backend pid: unknown` below. The doctor names no cause for any of them, because an accepted connection and a failed exchange are the whole of what it established; what it prints instead is the answer or the error itself, and that is the thing to act on.
+- **`backend pid:`** the process id holding the socket, `none` if nothing does, or `unknown` if an owner exists but the exchange did not get far enough to learn its pid (see the fault messages above). When it does print a pid, confirm it names a live `mcpls` process; a pid that no longer exists or belongs to something else means the socket is orphaned: delete the socket file at the path in `socket:` above (a Windows named pipe clears on its own once nothing holds it) so a new mcpls can bind it.
 - **`hooks seen:`** how many `Changed`, `Flush`, or `EndSession` requests this owner has served since it started; a `Status` probe, including the doctor's own, is never counted. Zero is not by itself a fault: `SessionStart` never touches the socket, so an owner that just started, or just took over from a previous one, looks identical to one that has never received a hook. The line's own wording says what to do about a zero.
 - **`mcpls on PATH:`** the absolute path of a candidate found on `PATH`, or `not found`. The doctor does not execute it: a text file named `mcpls.exe` on Windows is still a candidate, not a verified installation. Hooks invoke `mcpls` by name, so check the `PATH` the hook process inherits, not just your interactive shell's.
 - **`watch scan:`** what a fresh local scan can select for `SessionStart`. An empty successful scan says `no eligible top-level paths`; traversal or ignore-rule failures say `incomplete` and include their causes. A selected path does not prove the host registered it or can read its descendants. Hidden top-level files and directories, including `.github`, are excluded by default. Explicit allow rules in ignore files can include them; for example, `!.github/` in a Git repository's `.gitignore` includes `.github` in the watch scan. After fixing scan errors, restart the session to register a fresh watch list.
@@ -60,7 +60,7 @@ If mcpls cannot derive a socket identity for the project directory at all (an un
 socket: none; could not derive an identity for this directory: socket path exceeds the 107-byte platform limit (267 bytes): "/home/lev/a/very/deep/temporary/directory/mcpls-lev/39df698ef1ac4f49.sock"
 hook sees: /home/lev/project -> unknown
 server sees: nothing can run here; no socket exists to probe
-owner pid: none
+backend pid: none
 mcpls on PATH: /home/lev/.cargo/bin/mcpls; launch not checked
 watch scan: selected 4 top-level path(s); hidden entries excluded by default; ignore rules applied; host registration unverified
 ```

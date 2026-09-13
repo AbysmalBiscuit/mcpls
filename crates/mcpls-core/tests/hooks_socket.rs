@@ -69,6 +69,52 @@ fn handler(
     f
 }
 
+/// A client that skips the handshake gets nothing served: the listener
+/// cannot tell a hook request from an MCP frame or a newer build's line.
+#[tokio::test]
+async fn test_a_connection_without_a_handshake_is_not_served() {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+
+    let (dir, identity) = temp_identity();
+    let listener = HookListener::acquire(&identity)
+        .await
+        .expect("acquire")
+        .expect("owner");
+    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(listener.serve(
+        handler(|_| Box::pin(async { Response::Ack })),
+        Duration::from_secs(1),
+        cancel_rx,
+    ));
+
+    #[cfg(not(windows))]
+    let mut stream = tokio::net::UnixStream::connect(&identity.socket)
+        .await
+        .expect("connect");
+    #[cfg(windows)]
+    let mut stream = tokio::net::windows::named_pipe::ClientOptions::new()
+        .open(&identity.socket)
+        .expect("connect");
+    stream
+        .write_all(b"{\"op\":\"status\"}\n")
+        .await
+        .expect("write");
+
+    let mut line = String::new();
+    let read = tokio::time::timeout(
+        Duration::from_secs(5),
+        BufReader::new(stream).read_line(&mut line),
+    )
+    .await
+    .expect("the listener answers or hangs up rather than waiting");
+    let reply: Option<mcpls_core::backend::HandshakeReply> = serde_json::from_str(&line).ok();
+    assert!(
+        read.map_or(true, |n| n == 0) || reply.is_some_and(|reply| reply.refusal.is_some()),
+        "a request line was served as if it were a handshake: {line}"
+    );
+    drop(dir);
+}
+
 #[tokio::test]
 async fn test_one_listener_acquires_and_a_second_defers() {
     let (_guard, identity) = temp_identity();

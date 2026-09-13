@@ -17,6 +17,7 @@ use futures::future::BoxFuture;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::watch;
 
+use crate::backend::handshake::{self, Handshake, HandshakeReply};
 use crate::error::{Error, Result};
 use crate::hooks::identity::SocketIdentity;
 use crate::hooks::protocol::{Request, Response};
@@ -29,7 +30,10 @@ trait HookTransport: Send + Sync {
 }
 
 /// One client connection.
-trait HookStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
+pub(crate) trait HookStream:
+    tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin
+{
+}
 
 impl<T> HookStream for T where T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
 
@@ -297,7 +301,12 @@ impl HookListener {
                             accept_backoff = Self::ACCEPT_BACKOFF_FLOOR;
                             consecutive_accept_errors = 0;
                             let handler = Arc::clone(&handler);
-                            tokio::spawn(serve_connection(stream, handler, op_deadline));
+                            tokio::spawn(async move {
+                                let Some(stream) = accept_hook_handshake(stream).await else {
+                                    return;
+                                };
+                                serve_hook_connection(stream, handler, op_deadline).await;
+                            });
                         }
                         Err(e) => {
                             #[cfg(windows)]
@@ -337,12 +346,40 @@ impl HookListener {
     }
 }
 
+/// Read a connection's handshake and answer it as a listener that serves
+/// hooks and nothing else. `None` when the connection is refused or never
+/// handshakes.
+async fn accept_hook_handshake(mut stream: Box<dyn HookStream>) -> Option<Box<dyn HookStream>> {
+    use crate::backend::handshake::{ConnectionKind, Refusal};
+
+    let handshake: Handshake =
+        tokio::time::timeout(handshake::HANDSHAKE_TIMEOUT, handshake::read(&mut stream))
+            .await
+            .ok()?
+            .ok()?;
+    let refusal = if !handshake.same_build() {
+        Some(Refusal::Build)
+    } else if handshake.kind == ConnectionKind::Hook {
+        None
+    } else {
+        Some(Refusal::InProcess)
+    };
+    let refused = refusal.is_some();
+    handshake::write(&mut stream, &HandshakeReply::new(0, refusal))
+        .await
+        .ok()?;
+    (!refused).then_some(stream)
+}
+
 /// Read newline-delimited requests off `stream` until it closes, answering
 /// each within `op_deadline` before reading the next.
-async fn serve_connection<H>(stream: Box<dyn HookStream>, handler: Arc<H>, op_deadline: Duration)
-where
-    H: Fn(Request) -> BoxFuture<'static, Response> + Send + Sync + 'static,
-{
+pub(crate) async fn serve_hook_connection<
+    H: Fn(Request) -> BoxFuture<'static, Response> + Send + Sync + ?Sized + 'static,
+>(
+    stream: Box<dyn HookStream>,
+    handler: Arc<H>,
+    op_deadline: Duration,
+) {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut lines = BufReader::new(reader).lines();
 
@@ -550,6 +587,9 @@ pub enum ProbeOutcome {
     /// The peer answered before the deadline with a `Response` this
     /// build could parse.
     Answered(Response),
+    /// A server answered the handshake and refused this connection. The
+    /// reply names its build, pid and why.
+    Refused(HandshakeReply),
     /// The connection itself could not be made: refused, or the socket
     /// does not exist. Nobody owns this socket.
     NoOwner,
@@ -582,6 +622,15 @@ pub async fn probe(
     let stream = match probe_connect_phase(identity, deadline).await {
         ConnectPhase::Connected(stream) => stream,
         ConnectPhase::GaveUp(outcome) => return outcome,
+    };
+    let established = match tokio::time::timeout_at(deadline, establish(stream)).await {
+        Ok(Ok(established)) => established,
+        Ok(Err(error)) => return ProbeOutcome::Unintelligible(error),
+        Err(_) => return ProbeOutcome::Busy,
+    };
+    let stream = match established {
+        Established::Accepted(stream) => stream,
+        Established::Refused(reply) => return ProbeOutcome::Refused(reply),
     };
     match tokio::time::timeout_at(deadline, answer_one(stream, request)).await {
         Ok(Ok(response)) => ProbeOutcome::Answered(response),
@@ -687,7 +736,11 @@ struct Connection {
 
 impl Connection {
     async fn open(identity: &SocketIdentity) -> Result<Self> {
-        Ok(Self::over(connect(identity).await?))
+        let stream = connect(identity).await?;
+        match establish(stream).await? {
+            Established::Accepted(stream) => Ok(Self::over(stream)),
+            Established::Refused(reply) => Err(refused(identity, &reply)),
+        }
     }
 
     fn over(stream: Box<dyn HookStream>) -> Self {
@@ -724,6 +777,32 @@ impl Connection {
     }
 }
 
+enum Established {
+    Accepted(Box<dyn HookStream>),
+    Refused(HandshakeReply),
+}
+
+/// Handshake as a hook client on a connected stream.
+async fn establish(mut stream: Box<dyn HookStream>) -> Result<Established> {
+    handshake::write(&mut stream, &Handshake::hook()).await?;
+    let reply: HandshakeReply = handshake::read(&mut stream).await?;
+    if reply.refusal.is_some() {
+        return Ok(Established::Refused(reply));
+    }
+    Ok(Established::Accepted(stream))
+}
+
+fn refused(identity: &SocketIdentity, reply: &HandshakeReply) -> Error {
+    Error::Transport(format!(
+        "the mcpls {} (pid {}) at {} refused this build ({}): {:?}",
+        reply.version,
+        reply.pid,
+        identity.socket.display(),
+        handshake::VERSION,
+        reply.refusal
+    ))
+}
+
 /// Write `request` on `stream` and read back one response line.
 async fn answer_one(stream: Box<dyn HookStream>, request: &Request) -> Result<Response> {
     let mut responses = Connection::over(stream)
@@ -737,13 +816,13 @@ async fn send_many_inner(identity: &SocketIdentity, requests: &[Request]) -> Res
 }
 
 #[cfg(not(windows))]
-async fn connect(identity: &SocketIdentity) -> io::Result<Box<dyn HookStream>> {
+pub(crate) async fn connect(identity: &SocketIdentity) -> io::Result<Box<dyn HookStream>> {
     let stream = tokio::net::UnixStream::connect(&identity.socket).await?;
     Ok(Box::new(stream))
 }
 
 #[cfg(windows)]
-async fn connect(identity: &SocketIdentity) -> io::Result<Box<dyn HookStream>> {
+pub(crate) async fn connect(identity: &SocketIdentity) -> io::Result<Box<dyn HookStream>> {
     use tokio::net::windows::named_pipe::ClientOptions;
 
     // Win32 `ERROR_PIPE_BUSY` (231): the pipe exists but every instance is
