@@ -1106,6 +1106,95 @@ async fn test_hook_context_outputs_name_the_triggering_event_through_cli() {
     owner.await.unwrap();
 }
 
+/// A Codex hook names its project in the payload's `cwd` rather than in
+/// `CLAUDE_PROJECT_DIR`, and Codex spawns it from its own working directory,
+/// so the flush has to reach the owner of the payload's project.
+#[tokio::test]
+async fn test_codex_hook_reaches_the_owner_named_by_the_payload_cwd() {
+    use mcpls_core::hooks::{HookListener, Request, Response};
+    let project = TempDir::new().unwrap();
+    let runtime = TempDir::new().unwrap();
+    let elsewhere = TempDir::new().unwrap();
+    #[cfg(windows)]
+    let identity = mcpls_core::hooks::identity_for(project.path()).unwrap();
+    // The child derives its socket from the temporary directory set below,
+    // which `identity_for` in this process would not read.
+    #[cfg(not(windows))]
+    let identity = {
+        let hash = mcpls_core::hooks::identity_hash(project.path()).unwrap();
+        mcpls_core::hooks::SocketIdentity {
+            socket: runtime
+                .path()
+                .join("mcpls-mcpls-test")
+                .join(format!("{hash}.sock")),
+            lock: runtime
+                .path()
+                .join("mcpls-mcpls-test")
+                .join(format!("{hash}.lock")),
+            hash,
+        }
+    };
+    let listener = HookListener::acquire(&identity).await.unwrap().unwrap();
+    let (cancel, rx) = tokio::sync::watch::channel(false);
+    let owner = tokio::spawn(listener.serve(
+        |request| {
+            Box::pin(async move {
+                match request {
+                    Request::Changed { .. } => Response::Changed { queued: 0 },
+                    Request::Flush { .. } => Response::Flush {
+                        context: Some("diagnostic".into()),
+                        token: None,
+                    },
+                    _ => unreachable!(),
+                }
+            })
+        },
+        Duration::from_secs(1),
+        rx,
+    ));
+    tokio::task::spawn_blocking(move || {
+        for event in ["UserPromptSubmit", "PostToolUse"] {
+            let mut cmd = Command::cargo_bin("mcpls").unwrap();
+            clear_ambient_env(&mut cmd);
+            let output = assert_cmd::Command::from_std(cmd)
+                .env_remove("CLAUDE_PROJECT_DIR")
+                .current_dir(elsewhere.path())
+                .env_remove("XDG_RUNTIME_DIR")
+                .env("TMPDIR", runtime.path())
+                .env("USER", "mcpls-test")
+                .args(["hook", "--host", "codex"])
+                .write_stdin(
+                    serde_json::json!({
+                        "hook_event_name": event,
+                        "session_id": "test",
+                        "cwd": project.path(),
+                        "tool_name": "apply_patch",
+                        "tool_input": {
+                            "command": "*** Begin Patch\n*** Update File: a.rs\n*** End Patch\n"
+                        }
+                    })
+                    .to_string(),
+                )
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone();
+            let parsed: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(
+                parsed,
+                serde_json::json!({"hookSpecificOutput": {
+                    "hookEventName": event, "additionalContext": "diagnostic"
+                }})
+            );
+        }
+    })
+    .await
+    .unwrap();
+    cancel.send(true).unwrap();
+    owner.await.unwrap();
+}
+
 /// A hook invocation must never panic on a closed stdout, the same
 /// guarantee `test_completions_survives_a_closed_pipe` proves for
 /// `completions`: a hook branch that wrote with `print!` would panic past

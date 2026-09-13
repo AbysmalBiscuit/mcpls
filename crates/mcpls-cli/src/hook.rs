@@ -1,10 +1,13 @@
-//! Dispatching one Claude Code hook invocation.
+//! Dispatching one agent hook invocation.
 //!
 //! A hook registration spawns `mcpls hook`, writes one JSON payload to its
 //! stdin, and reads one JSON payload back from its stdout. Routing on the
 //! payload's own `hook_event_name` here, in one binary, means there is no
-//! shell script translating five hook names into five subcommands, and the
-//! same registrations work unmodified on Windows.
+//! shell script translating hook names into subcommands, and the same
+//! registrations work unmodified on Windows. Claude Code and Codex send
+//! different payload shapes, so `--host` picks which dispatcher reads it.
+
+mod codex;
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -25,6 +28,28 @@ const SOCKET_TIMEOUT: Duration = Duration::from_millis(50);
 /// The client timeout tracks the owner's default operation deadline.
 /// The acknowledgement has a separate allowance.
 const FLUSH_SOCKET_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// The agent harness that spawned a hook, which decides where its project
+/// directory and session identity come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Host {
+    /// Claude Code, which names the project in `CLAUDE_PROJECT_DIR`.
+    Claude,
+    /// Codex, which names the project in every payload's `cwd`.
+    Codex,
+}
+
+/// The directory a hook invocation names as its project, before
+/// canonicalization, or `.` when it names none.
+pub fn project_dir(host: Host, stdin: &str) -> PathBuf {
+    let named = match host {
+        Host::Claude => std::env::var_os("CLAUDE_PROJECT_DIR").map(PathBuf::from),
+        Host::Codex => serde_json::from_str::<serde_json::Value>(stdin)
+            .ok()
+            .and_then(|payload| payload.get("cwd")?.as_str().map(PathBuf::from)),
+    };
+    named.unwrap_or_else(|| PathBuf::from("."))
+}
 
 /// The hook payload Claude Code writes to stdin, keeping only the fields
 /// the dispatch table below reads. Every field is optional or defaulted,
@@ -61,13 +86,18 @@ async fn silently<T: Default>(body: impl Future<Output = Result<T>>) -> T {
 }
 
 /// Return hook JSON, or an empty answer on payload or socket failure.
-/// `SessionStart` works without an identity and reports local watch-scan failures.
+/// Claude Code's `SessionStart` works without an identity and reports local
+/// watch-scan failures.
 pub async fn dispatch_payload(
+    host: Host,
     stdin: &str,
     project_dir: &Path,
     identity: Option<&SocketIdentity>,
 ) -> String {
-    silently(run(stdin, project_dir, identity)).await
+    match host {
+        Host::Claude => silently(run(stdin, project_dir, identity)).await,
+        Host::Codex => silently(codex::run(stdin, project_dir, identity)).await,
+    }
 }
 
 async fn run(stdin: &str, project_dir: &Path, identity: Option<&SocketIdentity>) -> Result<String> {
@@ -909,13 +939,23 @@ mod tests {
     /// goes through the same path.
     async fn dispatch_raw(stdin: &str, project_dir: &Path) -> String {
         let identity = mcpls_core::hooks::identity_for(project_dir).expect("identity");
-        super::dispatch_payload(stdin, project_dir, Some(&identity)).await
+        super::dispatch_payload(Host::Claude, stdin, project_dir, Some(&identity)).await
     }
 
     /// Run the dispatcher against a listener that records the requests it
     /// gets.
     async fn dispatch_against(payload: &serde_json::Value, recorder: &RecordingOwner) -> String {
+        dispatch_as(Host::Claude, payload, recorder).await
+    }
+
+    /// The same, for a hook spawned by `host`.
+    async fn dispatch_as(
+        host: Host,
+        payload: &serde_json::Value,
+        recorder: &RecordingOwner,
+    ) -> String {
         super::dispatch_payload(
+            host,
             &payload.to_string(),
             recorder.project_dir(),
             Some(&recorder.identity),
@@ -1546,6 +1586,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
 
         let out = super::dispatch_payload(
+            Host::Claude,
             &json!({ "hook_event_name": "SessionStart" }).to_string(),
             dir.path(),
             None,
@@ -1568,6 +1609,7 @@ mod tests {
     async fn test_a_missing_identity_produces_no_output_for_socket_using_arms() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let out = super::dispatch_payload(
+            Host::Claude,
             &json!({ "hook_event_name": "UserPromptSubmit", "session_id": "s1" }).to_string(),
             dir.path(),
             None,
@@ -3457,5 +3499,105 @@ mod tests {
              the two commands' output has one consistent shape: {out}"
         );
         assert!(lines[4].starts_with("mcpls on PATH: "));
+    }
+
+    #[tokio::test]
+    async fn test_codex_post_tool_use_reports_patched_files_under_the_subagent_session() {
+        let recorder = RecordingOwner::start_with_flush(Some(DEFAULT_FLUSH_TEXT.to_string()));
+        let cwd = recorder.project_dir().join("crates");
+        let out = dispatch_as(
+            Host::Codex,
+            &json!({
+                "hook_event_name": "PostToolUse",
+                "session_id": "s1",
+                "agent_id": "a1",
+                "cwd": cwd.display().to_string(),
+                "tool_name": "apply_patch",
+                "tool_input": {
+                    "command": "*** Begin Patch\n*** Update File: src/a.rs\n*** End Patch\n"
+                }
+            }),
+            &recorder,
+        )
+        .await;
+
+        assert_eq!(
+            out,
+            additional_context_output("PostToolUse", Some(DEFAULT_FLUSH_TEXT.to_string()))
+        );
+        let requests = recorder.requests();
+        let Request::Changed {
+            session,
+            paths,
+            event,
+        } = &requests[0]
+        else {
+            panic!("expected a changed request: {:?}", requests[0]);
+        };
+        assert_eq!(session.as_str(), "s1/a1");
+        assert_eq!(
+            *paths,
+            vec![cwd.join("src/a.rs")],
+            "apply_patch paths are relative to the session's cwd"
+        );
+        assert_eq!(*event, ChangeEvent::Change);
+        let Request::Flush { session } = &requests[1] else {
+            panic!("expected a flush request: {:?}", requests[1]);
+        };
+        assert_eq!(session.as_str(), "s1/a1");
+    }
+
+    #[tokio::test]
+    async fn test_codex_session_start_prints_nothing() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
+
+        let out = super::dispatch_payload(
+            Host::Codex,
+            &json!({ "hook_event_name": "SessionStart", "session_id": "s1" }).to_string(),
+            dir.path(),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            out, "",
+            "Codex fails a SessionStart hook whose JSON carries a field it does \
+             not know, and watchPaths is one"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_codex_subagent_stop_ends_the_subagent_session() {
+        let recorder = RecordingOwner::start();
+        let out = dispatch_as(
+            Host::Codex,
+            &json!({ "hook_event_name": "SubagentStop", "session_id": "s1", "agent_id": "a1" }),
+            &recorder,
+        )
+        .await;
+
+        assert_eq!(out, "");
+        let requests = recorder.requests();
+        let Request::EndSession { session } = &requests[0] else {
+            panic!("expected an end-session request: {:?}", requests[0]);
+        };
+        assert_eq!(session.as_str(), "s1/a1");
+    }
+
+    #[test]
+    fn test_codex_project_dir_is_the_payload_cwd() {
+        assert_eq!(
+            project_dir(
+                Host::Codex,
+                r#"{"hook_event_name":"Stop","cwd":"/work/project"}"#
+            ),
+            PathBuf::from("/work/project")
+        );
+        assert_eq!(
+            project_dir(Host::Codex, "not json"),
+            PathBuf::from("."),
+            "an unreadable payload falls back the way a missing CLAUDE_PROJECT_DIR does"
+        );
     }
 }

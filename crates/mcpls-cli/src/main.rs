@@ -31,14 +31,13 @@ async fn main() {
 
     // A hook invocation needs neither a loaded config nor a log subscriber,
     // and reading stdin and writing hook JSON is the whole command.
-    if let Some(Command::Hook { action }) = &args.command {
+    if let Some(Command::Hook { host, action }) = &args.command {
         match action {
             None => {
                 use std::io::{Read as _, Write as _};
                 let mut stdin = String::new();
                 let _ = std::io::stdin().read_to_string(&mut stdin);
-                let raw_project_dir = std::env::var_os("CLAUDE_PROJECT_DIR")
-                    .map_or_else(|| std::path::PathBuf::from("."), std::path::PathBuf::from);
+                let raw_project_dir = hook::project_dir(*host, &stdin);
                 // A watch path is consumed by the host, which has no
                 // obligation to resolve it against this process's own
                 // working directory, so it must be absolute. Falling back
@@ -60,7 +59,7 @@ async fn main() {
                     // job-contained session, so it asks and a hook starts it.
                     let _ = mcpls_core::backend::start_requested(identity, &exe).await;
                 }
-                let out = hook::dispatch_payload(&stdin, &root, identity.as_ref()).await;
+                let out = hook::dispatch_payload(*host, &stdin, &root, identity.as_ref()).await;
                 // `print!` panics on a write failure (a closed stdout pipe
                 // reached past the `LineWriter`'s buffer), which would
                 // break the exit-0 guarantee this whole command exists to
