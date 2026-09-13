@@ -542,7 +542,6 @@ impl McplsServer {
 
     /// This server with `notes` appended to its instructions.
     #[must_use]
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn with_notes(mut self, notes: Vec<String>) -> Self {
         self.notes = Arc::from(notes);
         self

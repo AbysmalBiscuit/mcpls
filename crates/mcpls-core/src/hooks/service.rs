@@ -1192,6 +1192,32 @@ mod tests {
         drop(dir);
     }
 
+    /// An in-process mcpls (`--no-backend`) that finds the project's
+    /// endpoint already held serves its own session without hooks, and
+    /// tells that session so.
+    #[cfg(feature = "transport-http")]
+    #[tokio::test]
+    async fn test_an_in_process_server_names_an_endpoint_already_held() {
+        let (dir, identity) = temp_identity();
+        let workspace = tempfile::tempdir().expect("a temp dir");
+        let root = dunce::canonicalize(workspace.path()).expect("a canonical workspace");
+        let _held = crate::hooks::HookListener::acquire(&identity)
+            .await
+            .expect("acquire")
+            .expect("the endpoint is free");
+        let config = bare_config_over(&root);
+        let runtime = crate::Runtime::start(&config, Ok(root.clone()))
+            .await
+            .expect("a runtime");
+
+        let notes =
+            crate::serve_hooks_in_process(&runtime, &config, Some(identity), Some(root)).await;
+
+        assert_eq!(notes, vec![crate::ENDPOINT_HELD_NOTE.to_string()]);
+        runtime.shutdown().await;
+        drop(dir);
+    }
+
     /// The sweep half: the paths a `changed` op queues are acted on by a
     /// loop `serve_with` also has to start.
     ///

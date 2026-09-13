@@ -4,8 +4,10 @@
 //! project's endpoint, and the backend owns the language servers and every
 //! session's records.
 
+pub mod endpoint;
 pub mod handshake;
 
+pub use endpoint::serve_backend;
 pub use handshake::{
     ConfigStamp, ConnectionKind, Handshake, HandshakeReply, PROTOCOL, Refusal, VERSION,
     compare_builds,

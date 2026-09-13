@@ -120,7 +120,6 @@ impl HookListener {
     }
 
     /// Wait for the next client, for a caller running its own accept loop.
-    #[allow(dead_code)]
     pub(crate) async fn accept(&self) -> io::Result<Box<dyn HookStream>> {
         self.transport.accept().await
     }

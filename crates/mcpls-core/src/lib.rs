@@ -811,9 +811,8 @@ pub(crate) async fn serve_with_identity(
              so no socket is served: {error}"
         );
     }
-    serve_hooks_in_process(&runtime, &config, identity_override, hook_root).await;
-
-    let mcp_server = mcp::McplsServer::from_context(Arc::clone(&runtime.context));
+    let notes = serve_hooks_in_process(&runtime, &config, identity_override, hook_root).await;
+    let mcp_server = mcp::McplsServer::from_context(Arc::clone(&runtime.context)).with_notes(notes);
     info!("MCPLS server initialized successfully");
 
     let result = match transport {
@@ -831,40 +830,35 @@ pub(crate) async fn serve_with_identity(
 
 /// Bind the project's endpoint for hooks when hooks are on and no other
 /// process holds it, and answer hooks from `runtime` until it is cancelled.
+/// Returns the notes the in-process session is told.
 async fn serve_hooks_in_process(
     runtime: &Runtime,
     config: &ServerConfig,
     identity_override: Option<hooks::SocketIdentity>,
     hook_root: Option<PathBuf>,
-) {
+) -> Vec<String> {
     if !config.diagnostics.hooks.enabled {
-        return;
+        return Vec::new();
     }
     let identity = match identity_override.map_or_else(
         || hook_root.as_deref().map(hooks::identity_for).transpose(),
         |identity| Ok(Some(identity)),
     ) {
         Ok(Some(identity)) => identity,
-        Ok(None) => return,
+        Ok(None) => return Vec::new(),
         Err(error) => {
             warn!(
                 "hooks are configured on but this project's endpoint could not be derived: {error}"
             );
-            return;
+            return Vec::new();
         }
     };
     let listener = match hooks::HookListener::acquire(&identity).await {
         Ok(Some(listener)) => listener,
-        Ok(None) => {
-            warn!(
-                "another mcpls holds this project's endpoint, so its hooks are answered there \
-                 rather than here"
-            );
-            return;
-        }
+        Ok(None) => return vec![ENDPOINT_HELD_NOTE.to_string()],
         Err(error) => {
             warn!("the project's endpoint could not be bound, so no hooks are served: {error}");
-            return;
+            return Vec::new();
         }
     };
     let root = hook_root.unwrap_or_else(|| {
@@ -885,7 +879,14 @@ async fn serve_hooks_in_process(
     tokio::spawn(log_hook_task_panic(async move {
         let _ = listener.serve(handler, op_deadline, cancel).await;
     }));
+    Vec::new()
 }
+
+/// Told to a session whose in-process mcpls found the project's endpoint
+/// already held.
+const ENDPOINT_HELD_NOTE: &str = "NOTE: another mcpls already serves this project's \
+    endpoint, so the plugin's hooks reach that process and not this one; diagnostics \
+    delivered through hooks are not this session's.";
 
 /// Run the hook socket task, reporting a panic instead of losing it. The
 /// task owns the listener, so a panic releases the endpoint while this
