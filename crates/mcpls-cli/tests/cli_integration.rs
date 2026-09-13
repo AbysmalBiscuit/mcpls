@@ -40,6 +40,7 @@ fn hook_doctor_reports_the_checkout_root_from_a_subdirectory() {
     let runtime = TempDir::new().unwrap();
     let root = dunce::canonicalize(project.path()).unwrap();
     fs::create_dir(root.join(".git")).unwrap();
+    fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
     let nested = root.join("crates").join("core");
     fs::create_dir_all(&nested).unwrap();
 

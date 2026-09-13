@@ -61,12 +61,12 @@ pub fn identity_hash(dir: &Path) -> Result<String> {
 }
 
 /// The checkout root enclosing `dir`: the nearest directory at or above it
-/// holding an entry named `.git`, or `dir` itself when none does.
+/// holding a `.git` entry git would accept, or `dir` itself when none does.
 ///
 /// Both sides of the socket resolve this before hashing, so two sessions in
 /// one checkout reach one endpoint however deep in it they started. The test
-/// is an entry named `.git` rather than anything git reports, because that
-/// entry marks a working tree: a linked worktree and a submodule each hold
+/// is the `.git` entry rather than anything git reports, because that entry
+/// marks a working tree: a linked worktree and a submodule each hold
 /// one, so each is its own root, while `git rev-parse --git-common-dir`
 /// would collapse every worktree of a repository onto one endpoint and serve
 /// one tree's contents under another tree's name.
@@ -100,11 +100,27 @@ fn root_from(canonical: &Path, home: Option<&Path>) -> PathBuf {
         if candidate.parent().is_none() || home.is_some_and(|home| candidate == home) {
             break;
         }
-        if candidate.join(".git").exists() {
+        if holds_checkout_marker(candidate) {
             return candidate.to_path_buf();
         }
     }
     canonical.to_path_buf()
+}
+
+/// Whether `dir` holds a `.git` directory with a `HEAD`, or a `.git` file
+/// pointing at one with `gitdir:`.
+///
+/// A bare `.git` name is not enough: an empty one left behind in a shared
+/// directory such as `/tmp` would otherwise claim every directory under it.
+/// The file is checked with `is_file` before it is read, so a FIFO named
+/// `.git` is never opened.
+fn holds_checkout_marker(dir: &Path) -> bool {
+    let marker = dir.join(".git");
+    if marker.is_dir() {
+        return marker.join("HEAD").is_file();
+    }
+    marker.is_file()
+        && std::fs::read(&marker).is_ok_and(|contents| contents.starts_with(b"gitdir:"))
 }
 
 /// The prefix every named pipe this user's mcpls binds on Windows carries.
@@ -442,13 +458,19 @@ mod tests {
         );
     }
 
+    /// Makes `dir` a checkout the way git itself would recognize one.
+    fn mark_checkout(dir: &Path) {
+        std::fs::create_dir(dir.join(".git")).expect("git dir");
+        std::fs::write(dir.join(".git").join("HEAD"), "ref: refs/heads/main\n").expect("HEAD");
+    }
+
     /// A `.git` entry marks a working tree, so a directory inside one
     /// resolves to the tree rather than to itself.
     #[test]
     fn test_root_from_finds_the_nearest_git_entry() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dunce::canonicalize(dir.path()).expect("canonical");
-        std::fs::create_dir(root.join(".git")).expect("git dir");
+        mark_checkout(&root);
         let nested = root.join("crates").join("core");
         std::fs::create_dir_all(&nested).expect("nested dirs");
 
@@ -474,9 +496,40 @@ mod tests {
     #[test]
     fn test_root_from_falls_back_to_the_start() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let start = dunce::canonicalize(dir.path()).expect("canonical");
+        let boundary = dunce::canonicalize(dir.path()).expect("canonical");
+        let start = boundary.join("project");
+        std::fs::create_dir(&start).expect("start dir");
 
-        assert_eq!(root_from(&start, None), start);
+        assert_eq!(root_from(&start, Some(&boundary)), start);
+    }
+
+    /// An empty `.git` directory is not a checkout, so a stray one left in a
+    /// shared directory such as `/tmp` does not claim everything beneath it.
+    #[test]
+    fn test_root_from_ignores_an_empty_git_directory() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let boundary = dunce::canonicalize(dir.path()).expect("canonical");
+        let outer = boundary.join("shared");
+        std::fs::create_dir_all(outer.join(".git")).expect("empty git dir");
+        let start = outer.join("project");
+        std::fs::create_dir(&start).expect("start dir");
+
+        assert_eq!(root_from(&start, Some(&boundary)), start);
+    }
+
+    /// A `.git` file that does not point at a git directory is not a
+    /// checkout either.
+    #[test]
+    fn test_root_from_ignores_a_git_file_without_gitdir() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let boundary = dunce::canonicalize(dir.path()).expect("canonical");
+        let outer = boundary.join("shared");
+        std::fs::create_dir(&outer).expect("outer dir");
+        std::fs::write(outer.join(".git"), "").expect("empty git file");
+        let start = outer.join("project");
+        std::fs::create_dir(&start).expect("start dir");
+
+        assert_eq!(root_from(&start, Some(&boundary)), start);
     }
 
     /// The walk stops before the home directory, so a dotfiles repository
@@ -486,7 +539,7 @@ mod tests {
     fn test_root_from_stops_before_home() {
         let dir = tempfile::tempdir().expect("temp dir");
         let home = dunce::canonicalize(dir.path()).expect("canonical");
-        std::fs::create_dir(home.join(".git")).expect("git dir");
+        mark_checkout(&home);
         let project = home.join("notes");
         std::fs::create_dir(&project).expect("project dir");
 
@@ -499,7 +552,7 @@ mod tests {
     fn test_root_from_prefers_the_nearest_marker() {
         let dir = tempfile::tempdir().expect("temp dir");
         let outer = dunce::canonicalize(dir.path()).expect("canonical");
-        std::fs::create_dir(outer.join(".git")).expect("outer git");
+        mark_checkout(&outer);
         let inner = outer.join("vendor").join("dep");
         std::fs::create_dir_all(&inner).expect("inner dirs");
         std::fs::write(inner.join(".git"), "gitdir: ../../.git/modules/dep")
@@ -515,7 +568,7 @@ mod tests {
     fn test_root_from_is_idempotent() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dunce::canonicalize(dir.path()).expect("canonical");
-        std::fs::create_dir(root.join(".git")).expect("git dir");
+        mark_checkout(&root);
         let nested = root.join("src");
         std::fs::create_dir(&nested).expect("nested dir");
 
@@ -529,7 +582,7 @@ mod tests {
     fn test_project_root_canonicalizes_its_start() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dunce::canonicalize(dir.path()).expect("canonical");
-        std::fs::create_dir(root.join(".git")).expect("git dir");
+        mark_checkout(&root);
         let nested = root.join("src");
         std::fs::create_dir(&nested).expect("nested dir");
 

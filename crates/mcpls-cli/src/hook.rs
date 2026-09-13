@@ -779,6 +779,13 @@ mod tests {
 
     use super::*;
 
+    /// Makes `dir` a checkout the way git itself would recognize one, so an
+    /// enclosing directory cannot change the root a doctor test expects.
+    fn mark_checkout(dir: &Path) {
+        std::fs::create_dir(dir.join(".git")).expect("git dir");
+        std::fs::write(dir.join(".git").join("HEAD"), "ref: refs/heads/main\n").expect("HEAD");
+    }
+
     /// The canned text a default `RecordingOwner` answers `Flush` with:
     /// multi-line, with a blank-free but indented second line, so a
     /// dispatcher that trims or re-wraps the owner's text before handing it
@@ -2043,7 +2050,7 @@ mod tests {
     #[tokio::test]
     async fn test_doctor_reports_the_live_owners_root_pid_and_hook_activity() {
         let project = tempfile::tempdir().expect("a temp dir");
-        std::fs::create_dir(project.path().join(".git")).expect("checkout marker");
+        mark_checkout(project.path());
 
         let (out, identity) = doctor_with_own_owner(project.path(), 3).await;
         let hash = mcpls_core::hooks::identity_hash(project.path()).expect("hash");
@@ -2079,7 +2086,7 @@ mod tests {
     #[tokio::test]
     async fn test_doctor_does_not_read_a_non_owner_answer_as_this_projects_owner() {
         let project = tempfile::tempdir().expect("a temp dir");
-        std::fs::create_dir(project.path().join(".git")).expect("checkout marker");
+        mark_checkout(project.path());
         let other = tempfile::tempdir().expect("a temp dir");
         let socket_dir = tempfile::tempdir().expect("a temp dir");
         let identity = local_identity_for(project.path(), socket_dir.path());
@@ -2151,7 +2158,7 @@ mod tests {
     #[tokio::test]
     async fn test_doctor_reports_no_owner_when_nothing_is_reachable_anywhere() {
         let project = tempfile::tempdir().expect("a temp dir");
-        std::fs::create_dir(project.path().join(".git")).expect("checkout marker");
+        mark_checkout(project.path());
 
         let (out, identity) = doctor_with_nothing_running(project.path()).await;
         let hash = mcpls_core::hooks::identity_hash(project.path()).expect("hash");
@@ -2178,7 +2185,7 @@ mod tests {
     async fn test_doctor_scans_the_checkout_root_from_a_nested_start() {
         let project = tempfile::tempdir().expect("project dir");
         let root = dunce::canonicalize(project.path()).expect("canonical root");
-        std::fs::create_dir(root.join(".git")).expect("git dir");
+        mark_checkout(&root);
         let nested = root.join("src");
         std::fs::create_dir(&nested).expect("start dir");
         std::fs::write(root.join("README.md"), "project").expect("root file");
