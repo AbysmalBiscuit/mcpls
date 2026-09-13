@@ -55,7 +55,7 @@ use std::time::Duration;
 use bridge::apply::Applier;
 use bridge::resources::make_uri;
 use bridge::{NotificationCache, ResourceSubscriptions, Translator};
-pub use config::{ProjectConfigTrust, ServerConfig};
+pub use config::{BackendConfig, ConfigSource, ProjectConfigTrust, ServerConfig};
 use config::{ServerId, ToolRouter};
 pub use error::Error;
 use lsp::{LspNotification, LspServer, ServerInitConfig};
@@ -2233,6 +2233,8 @@ mod tests {
                 }],
                 apply: crate::config::ApplyConfig::default(),
                 diagnostics: hookless_diagnostics(),
+                backend: crate::config::BackendConfig::default(),
+                source: crate::config::ConfigSource::default(),
                 project_config_ignored: false,
             };
 
@@ -2276,6 +2278,8 @@ mod tests {
                 lsp_servers: vec![],
                 apply: crate::config::ApplyConfig::default(),
                 diagnostics: hookless_diagnostics(),
+                backend: crate::config::BackendConfig::default(),
+                source: crate::config::ConfigSource::default(),
                 project_config_ignored: false,
             };
 
@@ -2356,6 +2360,8 @@ mod tests {
                 lsp_servers: vec![],
                 apply: crate::config::ApplyConfig::default(),
                 diagnostics: crate::config::DiagnosticsConfig::default(),
+                backend: crate::config::BackendConfig::default(),
+                source: crate::config::ConfigSource::default(),
                 project_config_ignored: false,
             };
 
@@ -2421,6 +2427,8 @@ mod tests {
                 }],
                 apply: crate::config::ApplyConfig::default(),
                 diagnostics: crate::config::DiagnosticsConfig::default(),
+                backend: crate::config::BackendConfig::default(),
+                source: crate::config::ConfigSource::default(),
                 project_config_ignored: false,
             };
 

@@ -46,14 +46,14 @@ pub struct Args {
     ///
     /// If not specified, searches for mcpls.toml in:
     /// 1. `$MCPLS_CONFIG` environment variable
-    /// 2. Current directory (only loaded with `--trust-project-config`)
+    /// 2. The checkout root (only loaded with `--trust-project-config`)
     /// 3. Platform config file: `$XDG_CONFIG_HOME/mcpls/mcpls.toml`, else
     ///    `~/.config/mcpls/mcpls.toml` (Linux); `~/Library/Application
     ///    Support/mcpls/mcpls.toml` (macOS); `%APPDATA%\mcpls\mcpls.toml` (Windows)
     #[arg(short, long, value_name = "FILE", env = "MCPLS_CONFIG")]
     pub config: Option<PathBuf>,
 
-    /// Trust and load a `mcpls.toml` found in the current directory.
+    /// Trust and load a `mcpls.toml` found at the checkout root.
     ///
     /// A project-local config discovered this way (as opposed to one passed
     /// explicitly via `--config`/`MCPLS_CONFIG`) can control the LSP server

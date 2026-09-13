@@ -306,6 +306,47 @@ impl Default for HooksConfig {
     }
 }
 
+/// How long a shared backend outlives its last session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackendConfig {
+    /// How long a backend with no session attached waits before it exits.
+    ///
+    /// Short by default so memory returns to the machine soon after the
+    /// last session closes. The cost of short is a cold reindex for a
+    /// session that opens just after the timer; raise it when sessions
+    /// alternate quickly.
+    #[serde(default = "default_idle_shutdown_ms")]
+    pub idle_shutdown_ms: u64,
+}
+
+const fn default_idle_shutdown_ms() -> u64 {
+    10_000
+}
+
+impl Default for BackendConfig {
+    fn default() -> Self {
+        Self {
+            idle_shutdown_ms: default_idle_shutdown_ms(),
+        }
+    }
+}
+
+/// Where a loaded configuration came from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigSource {
+    /// A path named with `--config` or `MCPLS_CONFIG`.
+    Explicit,
+    /// The checkout's own `mcpls.toml`, loaded because it was trusted.
+    Project,
+    /// The user's global configuration file.
+    Global,
+    /// No file: built-in defaults.
+    #[default]
+    Defaults,
+}
+
 /// Main configuration for the MCPLS server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -329,7 +370,16 @@ pub struct ServerConfig {
     #[serde(default)]
     pub diagnostics: DiagnosticsConfig,
 
-    /// Whether a CWD-discovered `./mcpls.toml` was ignored as untrusted
+    /// How a shared backend manages its own lifetime.
+    #[serde(default)]
+    pub backend: BackendConfig,
+
+    /// Where this configuration was loaded from. Load-time metadata, never
+    /// read from or written to a file.
+    #[serde(skip)]
+    pub source: ConfigSource,
+
+    /// Whether the checkout's discovered `mcpls.toml` was ignored as untrusted
     /// during this load (see [`ProjectConfigTrust`]).
     ///
     /// Load-time metadata, not user-configurable: never read from or written
@@ -391,6 +441,9 @@ const DEFAULT_CONFIG_TEMPLATE: &str = r#"# mcpls configuration
 # enabled = true
 # sweep_quiet_ms = 500
 # op_deadline_ms = 1500
+#
+# [backend]
+# idle_shutdown_ms = 10000
 #
 # Built-in servers are active when their project markers are present. Copy an
 # example to override one, or set enabled = false to disable it.
@@ -795,10 +848,10 @@ fn default_language_extensions() -> Vec<LanguageExtensionMapping> {
     ]
 }
 
-/// Trust level applied to a `./mcpls.toml` discovered relative to the
-/// process's current working directory.
+/// Trust level applied to the checkout's `mcpls.toml` discovered at the
+/// checkout root.
 ///
-/// A CWD-discovered project-local config is not the same trust tier as an
+/// A checkout-discovered project-local config is not the same trust tier as an
 /// explicit `--config`/`MCPLS_CONFIG` path: it can be planted by whoever
 /// controls the checked-out repository, and it controls the `command` and
 /// `args` mcpls spawns as well as `[workspace]` (which can redirect the
@@ -811,10 +864,10 @@ fn default_language_extensions() -> Vec<LanguageExtensionMapping> {
 /// enum and is always trusted: naming a path is itself the user's consent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectConfigTrust {
-    /// Ignore a CWD-discovered `./mcpls.toml` entirely; fall through to the
+    /// Ignore the checkout's `mcpls.toml` entirely; fall through to the
     /// global config tier or built-in defaults.
     Untrusted,
-    /// Load a CWD-discovered `./mcpls.toml` normally.
+    /// Load the checkout's `mcpls.toml` normally.
     Trusted,
 }
 
@@ -844,7 +897,7 @@ const MAX_CONFIG_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// What a relative [`WorkspaceConfig::roots`] entry resolves against, for
 /// [`ServerConfig::load_from_with_root_base`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum RelativeRootBase {
     /// Resolve against the directory containing the loaded config file.
     /// [`ServerConfig::load_from`]'s documented behavior, used for an
@@ -852,14 +905,29 @@ enum RelativeRootBase {
     /// `mcpls.toml` and `$MCPLS_CONFIG`) -- portable when mcpls is launched
     /// from a different working directory than the config lives in.
     ConfigDir,
-    /// Resolve against the process's current working directory. Used only
-    /// for the auto-discovered global/user config
-    /// (`~/.config/mcpls/mcpls.toml`), which is not tied to any particular
-    /// project (#348 case 2).
-    Cwd,
+    /// Resolve against a given directory: the checkout root, for the
+    /// auto-discovered global config, which is not tied to the file's own
+    /// location.
+    Dir(PathBuf),
 }
 
 impl ServerConfig {
+    /// A stable digest of every setting, so two processes can tell whether
+    /// they loaded the same configuration. Where the configuration came
+    /// from is not part of it.
+    #[must_use]
+    pub fn fingerprint(&self) -> String {
+        use std::hash::{Hash as _, Hasher as _};
+
+        // Through `Value`, whose object keys are sorted, so a `HashMap`'s
+        // iteration order never reaches the digest.
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        serde_json::to_value(self)
+            .map_or_else(|error| error.to_string(), |value| value.to_string())
+            .hash(&mut hasher);
+        format!("{:016x}", hasher.finish())
+    }
+
     /// Build the effective extension map used for language detection.
     ///
     /// Starts with workspace mappings and overlays mappings inferred from
@@ -880,12 +948,12 @@ impl ServerConfig {
         map
     }
 
-    /// Load configuration from the default path, treating a CWD-discovered
-    /// `./mcpls.toml` as untrusted.
+    /// Load configuration from the default path, treating the checkout's
+    /// `mcpls.toml` as untrusted.
     ///
     /// Default paths checked in order:
     /// 1. `$MCPLS_CONFIG` environment variable (always trusted)
-    /// 2. `./mcpls.toml` (current directory) — **skipped**; see
+    /// 2. The checkout's `mcpls.toml` at the checkout root. It is **skipped**; see
     ///    [`load_with_trust`](Self::load_with_trust) to opt in
     /// 3. Platform user-config directory:
     ///    - Linux: `$XDG_CONFIG_HOME/mcpls/mcpls.toml`, else `~/.config/mcpls/mcpls.toml`
@@ -910,10 +978,10 @@ impl ServerConfig {
     }
 
     /// Load configuration from the default path, with explicit control over
-    /// whether a CWD-discovered `./mcpls.toml` is honored.
+    /// whether the checkout's `mcpls.toml` is honored.
     ///
-    /// Behaves like [`load`](Self::load), except a `./mcpls.toml` found in
-    /// the current directory is only loaded when `trust` is
+    /// Behaves like [`load`](Self::load), except an `mcpls.toml` found at
+    /// the checkout root is only loaded when `trust` is
     /// [`ProjectConfigTrust::Trusted`]. When untrusted, the file is skipped
     /// entirely (including its `[workspace]` section) and a warning is
     /// logged naming the ignored path; discovery falls through to the
@@ -931,43 +999,48 @@ impl ServerConfig {
     /// [`WorkspaceConfig::roots`] resolved against the config file's own
     /// directory), the global/user config tier
     /// (`~/.config/mcpls/mcpls.toml`, or the platform equivalent) resolves
-    /// relative roots against the process's current working directory
-    /// instead -- it isn't tied to any particular project, so cwd is the
-    /// more intuitive base (#348).
+    /// relative roots against the checkout root.
     ///
     /// # Errors
     ///
     /// Returns an error if parsing an existing config fails.
     /// If config creation fails, returns default config with graceful degradation.
     pub fn load_with_trust(trust: ProjectConfigTrust) -> Result<Self> {
-        // This `$MCPLS_CONFIG` check is unreachable from the `mcpls` binary:
-        // `crates/mcpls-cli/src/args.rs` already binds `env = "MCPLS_CONFIG"`
-        // to `--config`, so the CLI resolves that variable before `load`/
-        // `load_with_trust` is ever called. It only fires for library
-        // callers that invoke this function directly without going through
-        // `Args`. The actual, CLI-enforced guarantee that `$MCPLS_CONFIG` is
-        // always trusted lives in `main.rs`'s `--config` branch, not here.
+        let cwd = std::env::current_dir().map_err(Error::Io)?;
+        Self::load_at(trust, &cwd)
+    }
+
+    /// Load configuration at the checkout root enclosing `start`.
+    ///
+    /// Project config discovery and global relative roots use that root.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `start` cannot be canonicalized or parsing an
+    /// existing config fails.
+    pub fn load_at(trust: ProjectConfigTrust, start: &Path) -> Result<Self> {
         if let Ok(path) = std::env::var("MCPLS_CONFIG") {
             return Self::load_from(Path::new(&path));
         }
 
+        let root = crate::hooks::project_root(start)?;
         let mut project_config_ignored = false;
 
-        let local_config = PathBuf::from("mcpls.toml");
-        if local_config.exists() {
+        let local_config = root.join("mcpls.toml");
+        if local_config.is_file() {
             match trust {
-                ProjectConfigTrust::Trusted => return Self::load_from(&local_config),
+                ProjectConfigTrust::Trusted => {
+                    let mut config = Self::load_from(&local_config)?;
+                    config.source = ConfigSource::Project;
+                    return Ok(config);
+                }
                 ProjectConfigTrust::Untrusted => {
                     project_config_ignored = true;
-                    let display_path = local_config.canonicalize().unwrap_or_else(|_| {
-                        std::env::current_dir()
-                            .map_or_else(|_| local_config.clone(), |cwd| cwd.join(&local_config))
-                    });
                     tracing::warn!(
                         "ignoring untrusted project-local config at {}; pass \
                          --trust-project-config (or set MCPLS_TRUST_PROJECT_CONFIG=true) to \
                          load it",
-                        display_path.display()
+                        local_config.display()
                     );
                 }
             }
@@ -976,17 +1049,10 @@ impl ServerConfig {
         if let Some(config_dir) = dirs::config_dir() {
             let user_config = config_dir.join("mcpls").join("mcpls.toml");
             if user_config.exists() {
-                // The auto-discovered global/user config is not tied to any
-                // particular project, so a relative `workspace.roots` entry
-                // is more intuitively resolved against the process cwd than
-                // against `~/.config/mcpls/` itself (matches pre-#345
-                // behavior; #348 case 2). This differs from `load_from`'s
-                // public default, which resolves against the directory of
-                // an explicitly named config file -- that behavior is kept
-                // unchanged for project-local `mcpls.toml` and `$MCPLS_CONFIG`.
                 let mut config =
-                    Self::load_from_with_root_base(&user_config, RelativeRootBase::Cwd)?;
+                    Self::load_from_with_root_base(&user_config, &RelativeRootBase::Dir(root))?;
                 config.project_config_ignored = project_config_ignored;
+                config.source = ConfigSource::Global;
                 return Ok(config);
             }
 
@@ -1021,18 +1087,21 @@ impl ServerConfig {
     /// Returns an error if the file doesn't exist, exceeds the maximum
     /// allowed config file size, or parsing fails.
     pub fn load_from(path: &Path) -> Result<Self> {
-        Self::load_from_with_root_base(path, RelativeRootBase::ConfigDir)
+        Self::load_from_with_root_base(path, &RelativeRootBase::ConfigDir)
     }
 
     /// Implements [`load_from`](Self::load_from), parameterized over what a
     /// relative [`WorkspaceConfig::roots`] entry resolves against.
     ///
     /// [`load_with_trust`](Self::load_with_trust) uses
-    /// [`RelativeRootBase::Cwd`] for the auto-discovered global/user config
+    /// [`RelativeRootBase::Dir`] for the auto-discovered global/user config
     /// (#348 case 2); every other caller (including the public
     /// [`load_from`](Self::load_from)) uses
     /// [`RelativeRootBase::ConfigDir`], preserving #345's original behavior.
-    fn load_from_with_root_base(path: &Path, relative_root_base: RelativeRootBase) -> Result<Self> {
+    fn load_from_with_root_base(
+        path: &Path,
+        relative_root_base: &RelativeRootBase,
+    ) -> Result<Self> {
         let file = std::fs::File::open(path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 Error::ConfigNotFound(path.to_path_buf())
@@ -1091,7 +1160,7 @@ impl ServerConfig {
                             ))
                         })?
                     }
-                    RelativeRootBase::Cwd => std::env::current_dir().map_err(Error::Io)?,
+                    RelativeRootBase::Dir(dir) => dir.clone(),
                 };
                 crate::resolve_workspace_roots(&config.workspace.roots, &base_dir)?
             } else {
@@ -1102,6 +1171,7 @@ impl ServerConfig {
             };
         }
 
+        config.source = ConfigSource::Explicit;
         Ok(config)
     }
 
@@ -1277,6 +1347,8 @@ impl Default for ServerConfig {
             lsp_servers: LspServerConfig::builtins(),
             apply: ApplyConfig::default(),
             diagnostics: DiagnosticsConfig::default(),
+            backend: BackendConfig::default(),
+            source: ConfigSource::default(),
             project_config_ignored: false,
         }
     }
@@ -1290,6 +1362,89 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    fn mark_checkout(dir: &Path) {
+        fs::create_dir(dir.join(".git")).unwrap();
+        fs::write(dir.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    }
+
+    /// A session started in a subdirectory reads the checkout's own
+    /// `mcpls.toml`, which is where the backend it shares reads it.
+    #[test]
+    fn test_load_at_finds_the_project_config_at_the_checkout_root() {
+        let tmp = TempDir::new().unwrap();
+        let root = dunce::canonicalize(tmp.path()).unwrap();
+        mark_checkout(&root);
+        fs::write(root.join("mcpls.toml"), "[diagnostics]\nmax_total = 7\n").unwrap();
+        let nested = root.join("crates").join("core");
+        fs::create_dir_all(&nested).unwrap();
+
+        let trusted = ServerConfig::load_at(ProjectConfigTrust::Trusted, &nested).unwrap();
+        assert_eq!(trusted.diagnostics.max_total, 7);
+        assert_eq!(trusted.source, ConfigSource::Project);
+        assert!(!trusted.project_config_ignored);
+
+        let untrusted = ServerConfig::load_at(ProjectConfigTrust::Untrusted, &nested).unwrap();
+        assert_ne!(untrusted.diagnostics.max_total, 7);
+        assert!(untrusted.project_config_ignored);
+        assert_ne!(untrusted.source, ConfigSource::Project);
+    }
+
+    #[test]
+    fn test_an_explicit_path_is_stamped_explicit() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("custom.toml");
+        fs::write(&path, "").unwrap();
+        assert_eq!(
+            ServerConfig::load_from(&path).unwrap().source,
+            ConfigSource::Explicit
+        );
+    }
+
+    #[test]
+    fn test_the_fingerprint_follows_the_settings() {
+        let base = ServerConfig::default();
+        assert_eq!(base.fingerprint(), ServerConfig::default().fingerprint());
+        assert_eq!(base.fingerprint().len(), 16);
+
+        let mut changed = ServerConfig::default();
+        changed.diagnostics.max_total += 1;
+        assert_ne!(base.fingerprint(), changed.fingerprint());
+
+        let relabelled = ServerConfig {
+            source: ConfigSource::Explicit,
+            project_config_ignored: true,
+            ..ServerConfig::default()
+        };
+        assert_eq!(
+            base.fingerprint(),
+            relabelled.fingerprint(),
+            "where settings came from is reported beside the fingerprint, not inside it"
+        );
+    }
+
+    /// An `env` table is a `HashMap`, whose iteration order differs between
+    /// two maps holding the same entries. Two processes loading one file
+    /// must still agree.
+    #[test]
+    fn test_the_fingerprint_ignores_map_order() {
+        let entries: Vec<(String, String)> = (0..32)
+            .map(|i| (format!("KEY_{i}"), format!("value-{i}")))
+            .collect();
+        let mut forward = ServerConfig::default();
+        let mut backward = ServerConfig::default();
+        forward.lsp_servers[0].env = entries.iter().cloned().collect();
+        backward.lsp_servers[0].env = entries.iter().rev().cloned().collect();
+        assert_eq!(forward.fingerprint(), backward.fingerprint());
+    }
+
+    #[test]
+    fn test_the_backend_table_parses_and_defaults() {
+        let parsed: ServerConfig = toml::from_str("[backend]\nidle_shutdown_ms = 250\n").unwrap();
+        assert_eq!(parsed.backend.idle_shutdown_ms, 250);
+        assert_eq!(ServerConfig::default().backend.idle_shutdown_ms, 10_000);
+        assert!(toml::from_str::<ServerConfig>("[backend]\nunknown = 1\n").is_err());
+    }
 
     fn toml_path_literal(path: &Path) -> String {
         toml::Value::String(path.to_string_lossy().into_owned()).to_string()
@@ -1434,17 +1589,10 @@ mod tests {
         assert!(config.workspace.roots.iter().all(|root| root.is_absolute()));
     }
 
-    /// #348 case 2: unlike `load_from`'s `ConfigDir` default (see
-    /// `test_load_from_resolves_relative_roots_against_config_directory`
-    /// above), `load_with_trust`'s auto-discovered global/user config uses
-    /// `RelativeRootBase::Cwd` so a relative root resolves against the
-    /// process cwd instead of `~/.config/mcpls/`. Exercises the private
-    /// `load_from_with_root_base` helper directly, since the global config
-    /// path itself lives under `dirs::config_dir()`, which tests cannot
-    /// override without mutating process-wide env state (denied by this
-    /// crate's `unsafe_code` lint).
+    /// A global config resolves relative roots against the directory supplied
+    /// by discovery rather than the directory containing the config file.
     #[test]
-    fn test_load_from_with_root_base_cwd_resolves_relative_roots_against_cwd() {
+    fn test_the_global_config_resolves_relative_roots_against_the_given_dir() {
         let config_tmp_dir = TempDir::new().unwrap();
         let config_dir = dunce::canonicalize(config_tmp_dir.path()).unwrap();
         let config_path = config_dir.join("mcpls.toml");
@@ -1455,10 +1603,9 @@ mod tests {
         let expected_root = cwd.join("relative-root");
         fs::create_dir(&expected_root).unwrap();
 
-        let config = {
-            let _guard = CwdGuard::enter(&cwd);
-            ServerConfig::load_from_with_root_base(&config_path, RelativeRootBase::Cwd).unwrap()
-        };
+        let config =
+            ServerConfig::load_from_with_root_base(&config_path, &RelativeRootBase::Dir(cwd))
+                .unwrap();
 
         assert_eq!(config.workspace.roots, vec![expected_root]);
     }
@@ -2155,6 +2302,8 @@ mod tests {
             }],
             apply: ApplyConfig::default(),
             diagnostics: DiagnosticsConfig::default(),
+            backend: BackendConfig::default(),
+            source: ConfigSource::default(),
             project_config_ignored: false,
         };
 
@@ -2183,6 +2332,8 @@ mod tests {
             }],
             apply: ApplyConfig::default(),
             diagnostics: DiagnosticsConfig::default(),
+            backend: BackendConfig::default(),
+            source: ConfigSource::default(),
             project_config_ignored: false,
         };
 
@@ -2211,6 +2362,8 @@ mod tests {
             }],
             apply: ApplyConfig::default(),
             diagnostics: DiagnosticsConfig::default(),
+            backend: BackendConfig::default(),
+            source: ConfigSource::default(),
             project_config_ignored: false,
         };
 
@@ -2239,6 +2392,8 @@ mod tests {
             }],
             apply: ApplyConfig::default(),
             diagnostics: DiagnosticsConfig::default(),
+            backend: BackendConfig::default(),
+            source: ConfigSource::default(),
             project_config_ignored: false,
         };
 
