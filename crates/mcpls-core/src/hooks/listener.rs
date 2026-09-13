@@ -77,6 +77,33 @@ pub struct HookListener {
     lock_path: std::path::PathBuf,
 }
 
+/// Create `dir` if it is missing and make it owner-only.
+///
+/// The mode changes through a no-follow directory handle, so a symlink or
+/// FIFO planted at `dir` fails the open instead of redirecting the change.
+#[cfg(not(windows))]
+fn ensure_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    open_private_dir(dir)?.set_permissions(std::fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(windows))]
+fn open_private_dir(dir: &std::path::Path) -> io::Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags};
+
+    Ok(rustix::fs::open(
+        dir,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?
+    .into())
+}
+
 /// Why [`HookListener::serve`] stopped serving.
 ///
 /// Named for what happened, not for what a caller should do about it,
@@ -227,7 +254,7 @@ impl HookListener {
         // rather than assuming either one covers the other.
         for path in [&identity.socket, &identity.lock] {
             if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
+                ensure_private_dir(parent)?;
             }
         }
 
@@ -1115,6 +1142,110 @@ mod client_rule_tests {
             panic!("a client bound that elapsed is a transport failure");
         };
         assert_eq!(message, "the hook socket did not answer within 1500ms");
+    }
+}
+
+#[cfg(all(test, not(windows)))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod runtime_dir_tests {
+    use super::*;
+
+    #[test]
+    fn test_open_private_dir_rejects_fifo_without_waiting_for_a_writer() {
+        let parent = tempfile::tempdir().expect("temp dir");
+        let fifo = parent.path().join("runtime.fifo");
+        let status = std::process::Command::new("mkfifo")
+            .args(["-m", "600"])
+            .arg(&fifo)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo must create the FIFO fixture");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let opener = std::thread::spawn(move || {
+            let _ = sender.send(open_private_dir(&fifo));
+        });
+
+        let result = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("runtime directory open must return without waiting for a FIFO writer");
+        opener.join().expect("open thread");
+        assert!(result.is_err(), "a FIFO must not open as a directory");
+    }
+
+    #[tokio::test]
+    async fn test_acquire_rejects_a_symlink_runtime_dir_without_chmod() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let parent = tempfile::tempdir().expect("temp dir");
+        let target = parent.path().join("unrelated");
+        std::fs::create_dir(&target).expect("target dir");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
+            .expect("target permissions");
+        let dir = parent.path().join("mcpls-someone");
+        symlink(&target, &dir).expect("runtime symlink");
+        let identity = SocketIdentity {
+            socket: dir.join("test.sock"),
+            lock: dir.join("test.lock"),
+            hash: "test".to_string(),
+        };
+
+        let result = HookListener::acquire(&identity).await;
+
+        assert_eq!(
+            std::fs::metadata(&target)
+                .expect("target metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "the symlink target's permissions must stay unchanged"
+        );
+        assert!(result.is_err(), "a runtime symlink must be rejected");
+        assert!(!target.join("test.lock").exists());
+        assert!(!target.join("test.sock").exists());
+    }
+
+    /// The runtime directory is private to its user. Nothing else keeps one
+    /// user's socket out of another's reach on a shared temporary directory,
+    /// and the design's cross-user non-goal rests on this.
+    #[test]
+    fn test_ensure_private_dir_sets_owner_only_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let parent = tempfile::tempdir().expect("temp dir");
+        let dir = parent.path().join("mcpls-someone");
+
+        ensure_private_dir(&dir).expect("dir created");
+
+        let mode = std::fs::metadata(&dir)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700, "mode was {:o}", mode & 0o777);
+    }
+
+    /// Creating a directory that already exists is not an error, because two
+    /// processes of one project race to create it.
+    #[test]
+    fn test_ensure_private_dir_accepts_an_existing_dir() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let parent = tempfile::tempdir().expect("temp dir");
+        let dir = parent.path().join("mcpls-someone");
+
+        std::fs::create_dir(&dir).expect("existing dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+            .expect("permissive mode");
+        ensure_private_dir(&dir).expect("first create");
+        ensure_private_dir(&dir).expect("second create");
+        assert_eq!(
+            std::fs::metadata(&dir)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
     }
 }
 

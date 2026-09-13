@@ -149,7 +149,6 @@ pub(crate) struct PumpShared {
 /// The task exits when:
 /// - The LSP notification channel closes (`rx.recv()` returns `None`).
 /// - The cancellation watch fires (or the sender is dropped).
-/// - `notify_resource_updated` returns an error (peer disconnect / transport closed).
 ///
 /// # Lock independence
 /// Cache writes acquire only `Arc<Mutex<NotificationCache>>`, a lock entirely
@@ -183,9 +182,7 @@ pub(crate) async fn diagnostics_pump(
                 let Some(notif) = msg else { break };
                 match notif {
                     LspNotification::PublishDiagnostics(p) => {
-                        if handle_publish_diagnostics(&server_id, caches_diagnostics, p, &shared).await {
-                            break;
-                        }
+                        handle_publish_diagnostics(&server_id, caches_diagnostics, p, &shared).await;
                     }
                     LspNotification::LogMessage(m) => {
                         let mut cache = shared.notification_cache.lock().await;
@@ -213,14 +210,13 @@ pub(crate) async fn diagnostics_pump(
 /// owns the diagnostics route) and notify a subscribed peer.
 ///
 /// Split out of [`diagnostics_pump`] to keep that function under clippy's
-/// line-count lint. Returns `true` when the pump should stop (peer
-/// disconnected).
+/// line-count lint.
 async fn handle_publish_diagnostics(
     server_id: &ServerId,
     caches_diagnostics: bool,
     p: lsp_types::PublishDiagnosticsParams,
     shared: &PumpShared,
-) -> bool {
+) {
     // Only the server the router resolves `Diagnostics` to for this
     // notification's language caches (and notifies subscribers of) it --
     // see #174 §8. A server that was never the diagnostics route, or lost
@@ -228,14 +224,14 @@ async fn handle_publish_diagnostics(
     // source for this language's diagnostics; skip publishing so it doesn't
     // overwrite (or spuriously notify about) another server's cache entry.
     if !caches_diagnostics {
-        return false;
+        return;
     }
     if !diagnostic_path_in_workspace(&p.uri, &shared.workspace_roots) {
         debug!(
             "dropping diagnostics for out-of-workspace URI: {}",
             p.uri.as_str()
         );
-        return false;
+        return;
     }
     if let Some(version) = p.version
         && let Some(path) = bridge::uri_to_path(&p.uri)
@@ -246,7 +242,7 @@ async fn handle_publish_diagnostics(
             "dropping diagnostics for {} at version {version}, tracker holds {tracked_version}",
             p.uri.as_str()
         );
-        return false;
+        return;
     }
     {
         let mut cache = shared.notification_cache.lock().await;
@@ -255,28 +251,30 @@ async fn handle_publish_diagnostics(
 
     // Fast path: skip URI construction when nothing is subscribed.
     if shared.subs.is_empty().await {
-        return false;
+        return;
     }
 
     // Notify only when peer is ready and URI is subscribed.
     let Some(peer) = shared.peer_cell.get() else {
-        return false;
+        return;
     };
     let Some(path) = bridge::uri_to_path(&p.uri) else {
-        return false;
+        return;
     };
     let Ok(mcp_uri) = make_uri(&path) else {
-        return false;
+        return;
     };
 
     if !shared.subs.contains(&mcp_uri).await {
-        return false;
+        return;
     }
 
-    // `true` (pump stops) means the peer disconnected.
-    peer.notify_resource_updated(ResourceUpdatedNotificationParam::new(mcp_uri))
+    if let Err(error) = peer
+        .notify_resource_updated(ResourceUpdatedNotificationParam::new(mcp_uri))
         .await
-        .is_err()
+    {
+        tracing::debug!(%error, "a subscriber could not be notified");
+    }
 }
 
 /// Diagnostics ownership after registration, used to divide the cache budget.
@@ -587,18 +585,15 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     serve_with_identity(config, transport, None).await
 }
 
-/// This process's own canonicalized working directory and the socket
-/// identity derived from it, from one canonicalization rather than two, so
+/// The checkout root enclosing this process's working directory, and the
+/// socket identity derived from it, from one resolution rather than two, so
 /// a `Status` answer's `root` and `hash` describe the same directory by
 /// construction rather than by coincidence.
-fn canonicalized_cwd_identity() -> Result<(hooks::SocketIdentity, PathBuf), Error> {
+fn canonicalized_root_identity() -> Result<(hooks::SocketIdentity, PathBuf), Error> {
     let dir = std::env::current_dir().map_err(Error::Io)?;
-    let canonical = dunce::canonicalize(&dir).map_err(|e| Error::FileIo {
-        path: dir,
-        source: e,
-    })?;
-    let identity = hooks::identity_for(&canonical)?;
-    Ok((identity, canonical))
+    let root = hooks::project_root(&dir)?;
+    let identity = hooks::identity_for(&root)?;
+    Ok((identity, root))
 }
 
 /// [`serve_with`], with the project's hook socket identity supplied rather
@@ -609,8 +604,8 @@ fn canonicalized_cwd_identity() -> Result<(hooks::SocketIdentity, PathBuf), Erro
 /// one machine-global lock. A test that wants to observe the socket passes
 /// a temporary identity instead, which is also what keeps a test run from
 /// answering a real agent's hooks. An env override would not do: the
-/// derivation already reads `XDG_RUNTIME_DIR`, and a process-wide variable
-/// races between tests sharing a process.
+/// derivation already reads `TMPDIR`, and a process-wide variable races
+/// between tests sharing a process.
 ///
 /// # Errors
 ///
@@ -651,18 +646,14 @@ pub(crate) async fn serve_with_identity(
     config.validate()?;
 
     let project_config_ignored = config.project_config_ignored;
-    // `current_dir()` always returns an absolute path. Configs loaded from a
-    // TOML file have already had relative roots rebased to that file's
-    // directory in `ServerConfig::load_from`; this second pass covers
-    // caller-built `ServerConfig`s, whose relative roots are defined against
-    // the process cwd. Only actually called when a root needs it (empty
-    // `roots`, which defaults to cwd, or at least one relative root): a
-    // fully-absolute `workspace.roots` must not fail startup just because
-    // cwd happens to be unreadable/removed (#348).
+    // `ServerConfig::load_from` already rebases TOML-relative roots;
+    // empty roots and caller-built relative roots use the enclosing checkout.
+    // Absolute roots need no cwd lookup, so an unreadable cwd cannot block them.
     let workspace_roots = if config.workspace.roots.is_empty()
         || config.workspace.roots.iter().any(|root| root.is_relative())
     {
-        let workspace_base = std::env::current_dir().map_err(Error::Io)?;
+        let cwd = std::env::current_dir().map_err(Error::Io)?;
+        let workspace_base = hooks::project_root(&cwd)?;
         resolve_workspace_roots(&config.workspace.roots, &workspace_base)?
     } else {
         // Every root is absolute already, so `base_dir` is never joined
@@ -761,12 +752,12 @@ pub(crate) async fn serve_with_identity(
     // must not turn an unreadable working directory into a startup failure.
     //
     // The identity and the root a `Status` answer reports both come from
-    // one canonicalization, not two independent ones: a directory that
-    // canonicalizes for `identity_for` but not for a second, separate call
+    // one root resolution, not independent resolutions: a directory that
+    // resolves for `identity_for` but not for a second, separate call
     // would otherwise leave `root` silently blank while `hash` is fine.
     let (mut hook_identity, hook_root) = if config.diagnostics.hooks.enabled {
         identity_override.map_or_else(
-            || match canonicalized_cwd_identity() {
+            || match canonicalized_root_identity() {
                 Ok((identity, root)) => (Some(identity), Some(root)),
                 Err(error) => {
                     warn!(
@@ -2701,6 +2692,98 @@ mod tests {
         /// pump-mechanics tests don't need to construct real workspace paths.
         fn no_workspace_roots() -> Arc<[PathBuf]> {
             Arc::from([])
+        }
+
+        /// A bare handler, to obtain a real peer. Every `ServerHandler`
+        /// method has a default, so this needs no body.
+        #[derive(Debug)]
+        struct BarePeerHandler;
+
+        impl rmcp::ServerHandler for BarePeerHandler {}
+
+        /// A peer whose service has already stopped, so every notification
+        /// it sends fails.
+        async fn broken_peer() -> rmcp::Peer<rmcp::RoleServer> {
+            let (server_io, _client_io) = tokio::io::duplex(1024);
+            let running = rmcp::service::serve_directly(BarePeerHandler, server_io, None);
+            let peer = running.peer().clone();
+            running.cancel().await.expect("the bare service stops");
+            peer
+        }
+
+        /// A peer that cannot be notified is one connection's problem. The
+        /// pump carries every connection's diagnostics caching, so it keeps
+        /// running and keeps caching after a notify fails.
+        #[tokio::test]
+        async fn test_pump_keeps_caching_after_a_failed_notify() {
+            let cache = make_cache();
+            let subs = make_subs();
+            let peer_cell = make_peer_cell();
+            peer_cell
+                .set(broken_peer().await)
+                .expect("peer cell is empty");
+
+            let project = tempfile::tempdir().expect("project dir");
+            let root = dunce::canonicalize(project.path()).expect("canonical root");
+            let first_path = root.join("first.rs");
+            let second_path = root.join("second.rs");
+            let first = bridge::path_to_uri(&first_path).expect("first file URI");
+            let second = bridge::path_to_uri(&second_path).expect("second file URI");
+            // Subscribed, so the pump reaches the notify rather than
+            // returning at the subscription check.
+            subs.subscribe(make_uri(&first_path).expect("subscription URI"))
+                .await
+                .expect("subscribe");
+
+            let (tx, rx) = mpsc::channel(8);
+            let (_cancel_tx, cancel_rx) = watch::channel(false);
+            let c = Arc::clone(&cache);
+            tokio::spawn(diagnostics_pump(
+                ServerId::from("rust"),
+                rx,
+                cancel_rx,
+                true,
+                PumpShared {
+                    notification_cache: c,
+                    subs: Arc::clone(&subs),
+                    peer_cell: Arc::clone(&peer_cell),
+                    workspace_roots: no_workspace_roots(),
+                    document_tracker: make_tracker(),
+                    settle: make_settle(),
+                    delivery: make_delivery(),
+                    floors: make_floors(),
+                },
+            ));
+
+            for uri in [&first, &second] {
+                tx.send(LspNotification::PublishDiagnostics(
+                    PublishDiagnosticsParams {
+                        uri: uri.clone(),
+                        diagnostics: vec![],
+                        version: None,
+                    },
+                ))
+                .await
+                .unwrap();
+            }
+            drop(tx);
+
+            let cached = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    tokio::task::yield_now().await;
+                    let found = {
+                        let guard = cache.lock().await;
+                        guard.get_diagnostics(second.as_str()).is_some()
+                    };
+                    if found {
+                        return true;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the pump stopped after the first notify failed");
+            assert!(cached, "the publish after a failed notify was not cached");
         }
 
         /// `PublishDiagnostics` is cached even when the peer is not yet connected.

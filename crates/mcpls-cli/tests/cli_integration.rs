@@ -31,6 +31,42 @@ fn clear_ambient_env(cmd: &mut Command) -> &mut Command {
         .env_remove("MCPLS_LOG_JSON")
 }
 
+/// A session started in a subdirectory of a checkout derives the endpoint
+/// the checkout's own root derives, which is what lets the two share one
+/// backend.
+#[test]
+fn hook_doctor_reports_the_checkout_root_from_a_subdirectory() {
+    let project = TempDir::new().unwrap();
+    let runtime = TempDir::new().unwrap();
+    let root = dunce::canonicalize(project.path()).unwrap();
+    fs::create_dir(root.join(".git")).unwrap();
+    fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    let nested = root.join("crates").join("core");
+    fs::create_dir_all(&nested).unwrap();
+
+    let root_hash = mcpls_core::hooks::identity_hash(&root).unwrap();
+
+    let mut cmd = Command::cargo_bin("mcpls").unwrap();
+    let output = clear_ambient_env(&mut cmd)
+        .env("CLAUDE_PROJECT_DIR", &nested)
+        .env_remove("XDG_RUNTIME_DIR")
+        .env("TMPDIR", runtime.path())
+        .env("USER", "mcpls-test")
+        .args(["hook", "doctor"])
+        .output()
+        .unwrap();
+    let report = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        report.contains(&root_hash),
+        "doctor reported a hash other than the checkout root's: {report}"
+    );
+    assert!(
+        report.contains(&format!("root: {}", root.display())),
+        "doctor did not name the checkout root: {report}"
+    );
+}
+
 #[test]
 fn test_help_flag() {
     let mut cmd = Command::cargo_bin("mcpls").unwrap();
@@ -140,7 +176,9 @@ fn test_config_with_empty_file() {
         .arg("--config")
         .arg(&config_path)
         // Default config starts hook service, so isolate its runtime directory.
-        .env("XDG_RUNTIME_DIR", temp_dir.path())
+        .env_remove("XDG_RUNTIME_DIR")
+        .env("TMPDIR", temp_dir.path())
+        .env("USER", "mcpls-test")
         .assert()
         .failure();
 }
@@ -217,7 +255,9 @@ fn i1_t2_generated_config_inherits_builtins() {
     let mut cmd = Command::cargo_bin("mcpls").unwrap();
     clear_ambient_env(&mut cmd)
         .env(config_env, user_config.path())
-        .env("XDG_RUNTIME_DIR", first_runtime.path())
+        .env_remove("XDG_RUNTIME_DIR")
+        .env("TMPDIR", first_runtime.path())
+        .env("USER", "mcpls-test")
         .current_dir(workspace.path());
     let first_output = assert_cmd::Command::from_std(cmd)
         .write_stdin(MCP_INPUT)
@@ -256,7 +296,9 @@ command = "custom-rust-analyzer"
 
     let mut cmd = Command::cargo_bin("mcpls").unwrap();
     clear_ambient_env(&mut cmd)
-        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env_remove("XDG_RUNTIME_DIR")
+        .env("TMPDIR", runtime.path())
+        .env("USER", "mcpls-test")
         .current_dir(workspace.path())
         .arg("--config")
         .arg(&config_path);
@@ -293,7 +335,9 @@ fn test_trust_project_config_env_false_does_not_grant_trust() {
     let output = cmd
         .current_dir(temp_dir.path())
         // Isolate the hook socket when startup proceeds past config loading.
-        .env("XDG_RUNTIME_DIR", temp_dir.path())
+        .env_remove("XDG_RUNTIME_DIR")
+        .env("TMPDIR", temp_dir.path())
+        .env("USER", "mcpls-test")
         .env("MCPLS_TRUST_PROJECT_CONFIG", "false")
         // Allow startup to log before killing the process blocked on stdio.
         .timeout(Duration::from_secs(5))
@@ -355,7 +399,9 @@ fn test_trust_project_config_env_0_does_not_grant_trust() {
         .current_dir(temp_dir.path())
         // See test_trust_project_config_env_false_does_not_grant_trust
         // above for why this redirects the real hook socket.
-        .env("XDG_RUNTIME_DIR", temp_dir.path())
+        .env_remove("XDG_RUNTIME_DIR")
+        .env("TMPDIR", temp_dir.path())
+        .env("USER", "mcpls-test")
         .env("MCPLS_TRUST_PROJECT_CONFIG", "0")
         // See test_trust_project_config_env_false_does_not_grant_trust above
         // for why this timeout is expected to always elapse.
@@ -716,7 +762,9 @@ fn doctor_output(project: &std::path::Path) -> String {
     let mut cmd = Command::cargo_bin("mcpls").unwrap();
     let output = clear_ambient_env(&mut cmd)
         .env("CLAUDE_PROJECT_DIR", project)
-        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env_remove("XDG_RUNTIME_DIR")
+        .env("TMPDIR", runtime.path())
+        .env("USER", "mcpls-test")
         .env(
             "USERNAME",
             format!(
@@ -746,7 +794,9 @@ fn test_doctor_does_not_claim_a_path_candidate_can_launch() {
     let mut cmd = Command::cargo_bin("mcpls").unwrap();
     let output = clear_ambient_env(&mut cmd)
         .env("CLAUDE_PROJECT_DIR", project.path())
-        .env("XDG_RUNTIME_DIR", bin.path())
+        .env_remove("XDG_RUNTIME_DIR")
+        .env("TMPDIR", bin.path())
+        .env("USER", "mcpls-test")
         .env("USERNAME", bin.path().file_name().unwrap())
         .env("PATH", bin.path())
         .args(["hook", "doctor"])
@@ -920,7 +970,6 @@ fn test_doctor_identity_uses_current_user_without_xdg_runtime_dir() {
     let mut cmd = Command::cargo_bin("mcpls").unwrap();
     let output = clear_ambient_env(&mut cmd)
         .env("CLAUDE_PROJECT_DIR", project.path())
-        .env_remove("XDG_RUNTIME_DIR")
         .env("USER", "mcpls-followup-user")
         .args(["hook", "doctor"])
         .output()
@@ -942,7 +991,9 @@ fn test_doctor_identity_rejects_socket_path_that_cannot_bind() {
     let mut cmd = Command::cargo_bin("mcpls").unwrap();
     let output = clear_ambient_env(&mut cmd)
         .env("CLAUDE_PROJECT_DIR", project.path())
-        .env("XDG_RUNTIME_DIR", &runtime)
+        .env_remove("XDG_RUNTIME_DIR")
+        .env("TMPDIR", &runtime)
+        .env("USER", "mcpls-test")
         .args(["hook", "doctor"])
         .output()
         .unwrap();
@@ -962,14 +1013,20 @@ async fn test_hook_context_outputs_name_the_triggering_event_through_cli() {
     let runtime = TempDir::new().unwrap();
     #[cfg(windows)]
     let identity = mcpls_core::hooks::identity_for(project.path()).unwrap();
-    // The child derives its socket from the XDG_RUNTIME_DIR set below,
+    // The child derives its socket from the temporary directory set below,
     // which `identity_for` in this process would not read.
     #[cfg(not(windows))]
     let identity = {
         let hash = mcpls_core::hooks::identity_hash(project.path()).unwrap();
         mcpls_core::hooks::SocketIdentity {
-            socket: runtime.path().join("mcpls").join(format!("{hash}.sock")),
-            lock: runtime.path().join("mcpls").join(format!("{hash}.lock")),
+            socket: runtime
+                .path()
+                .join("mcpls-mcpls-test")
+                .join(format!("{hash}.sock")),
+            lock: runtime
+                .path()
+                .join("mcpls-mcpls-test")
+                .join(format!("{hash}.lock")),
             hash,
         }
     };
@@ -997,7 +1054,9 @@ async fn test_hook_context_outputs_name_the_triggering_event_through_cli() {
             clear_ambient_env(&mut cmd);
             let output = assert_cmd::Command::from_std(cmd)
                 .env("CLAUDE_PROJECT_DIR", project.path())
-                .env("XDG_RUNTIME_DIR", runtime.path())
+                .env_remove("XDG_RUNTIME_DIR")
+                .env("TMPDIR", runtime.path())
+                .env("USER", "mcpls-test")
                 .arg("hook")
                 .write_stdin(
                     serde_json::json!({"hook_event_name": event, "session_id": "test"}).to_string(),
