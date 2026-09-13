@@ -184,6 +184,10 @@ check "the default store ignores XDG_DATA_HOME" no "$([ -e "${WORK}/xdg" ] && ec
 # installed copy of the plugin under CODEX_HOME and execs its launcher. Codex
 # keeps one version of a plugin in its cache and deletes the old one on
 # upgrade (core-plugins/src/store.rs), so the fixture installs one.
+codex_command=$(jq -r '.mcpServers.mcpls.command' "${REPO_ROOT}/plugin/.codex-plugin/plugin.json" 2>/dev/null)
+check "the Codex entry uses sh" sh "$codex_command"
+codex_arg0=$(jq -r '.mcpServers.mcpls.args[0]' "${REPO_ROOT}/plugin/.codex-plugin/plugin.json" 2>/dev/null)
+check "the Codex entry invokes sh with -c" -c "$codex_arg0"
 entry=$(jq -r '.mcpServers.mcpls.args[1]' "${REPO_ROOT}/plugin/.codex-plugin/plugin.json" 2>/dev/null)
 check "the Codex entry is readable from the manifest" yes "$([ -n "$entry" ] && echo yes || echo no)"
 

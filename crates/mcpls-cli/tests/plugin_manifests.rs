@@ -110,9 +110,16 @@ fn test_every_entry_runs_the_launcher_for_its_harness() {
         let mut names: Vec<&str> = hooks.keys().map(String::as_str).collect();
         names.sort_unstable();
         assert_eq!(names, events, "{file}");
-        for group in hooks.values().flat_map(|groups| groups.as_array().unwrap()) {
-            for hook in group["hooks"].as_array().unwrap() {
-                assert_eq!(hook["command"], command, "{file}");
+        for event in events {
+            let groups = hooks[*event].as_array().unwrap();
+            assert!(!groups.is_empty(), "{file}: {event}");
+            for group in groups {
+                let registrations = group["hooks"].as_array().unwrap();
+                assert!(!registrations.is_empty(), "{file}: {event}");
+                for hook in registrations {
+                    assert_eq!(hook["type"], "command", "{file}: {event}");
+                    assert_eq!(hook["command"], command, "{file}: {event}");
+                }
             }
         }
     }
