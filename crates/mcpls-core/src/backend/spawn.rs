@@ -11,6 +11,8 @@ use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -22,6 +24,12 @@ const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
 
 /// How long a hook waits to learn whether a backend already answers.
 const RUNNING_PROBE: Duration = Duration::from_millis(200);
+
+/// How long a starter keeps ownership while a new backend becomes ready.
+const STARTUP_DEADLINE: Duration = Duration::from_secs(5);
+
+/// How often a starter retries a backend that has not answered yet.
+const STARTUP_RETRY: Duration = Duration::from_millis(25);
 
 /// What a backend is started with.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,6 +167,28 @@ fn spawn_detached_command(
     cwd: &Path,
     log: &Path,
 ) -> io::Result<u32> {
+    Ok(spawn_detached_command_with_status(exe, args, cwd, log)?.pid)
+}
+
+struct SpawnedChild {
+    pid: u32,
+    exited: Arc<AtomicBool>,
+}
+
+fn spawn_detached_with_status(
+    exe: &Path,
+    launch: &BackendLaunch,
+    log: &Path,
+) -> io::Result<SpawnedChild> {
+    spawn_detached_command_with_status(exe, launch.args(), &launch.root, log)
+}
+
+fn spawn_detached_command_with_status(
+    exe: &Path,
+    args: impl IntoIterator<Item = OsString>,
+    cwd: &Path,
+    log: &Path,
+) -> io::Result<SpawnedChild> {
     let mut command = Command::new(exe);
     command
         .args(args)
@@ -181,12 +211,15 @@ fn spawn_detached_command(
     }
     let mut child = command.spawn()?;
     let pid = child.id();
+    let exited = Arc::new(AtomicBool::new(false));
+    let child_exited = Arc::clone(&exited);
     // Reaped here so an exiting backend never lingers as a zombie of this
     // process.
     std::thread::spawn(move || {
         let _ = child.wait();
+        child_exited.store(true, Ordering::Release);
     });
-    Ok(pid)
+    Ok(SpawnedChild { pid, exited })
 }
 
 /// Ask the next hook invocation to start a backend for `launch`.
@@ -214,6 +247,17 @@ pub fn request_start(identity: &SocketIdentity, launch: &BackendLaunch) -> io::R
 ///
 /// Returns an error when the request is unreadable or the spawn fails.
 pub async fn start_requested(identity: &SocketIdentity, exe: &Path) -> io::Result<bool> {
+    start_requested_with(identity, exe, spawn_detached_with_status).await
+}
+
+async fn start_requested_with<S>(
+    identity: &SocketIdentity,
+    exe: &Path,
+    spawn: S,
+) -> io::Result<bool>
+where
+    S: FnOnce(&Path, &BackendLaunch, &Path) -> io::Result<SpawnedChild>,
+{
     let request = identity.start_request();
     if !request.exists() {
         return Ok(false);
@@ -232,8 +276,30 @@ pub async fn start_requested(identity: &SocketIdentity, exe: &Path) -> io::Resul
         return Ok(false);
     }
     let launch: BackendLaunch = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-    spawn_detached(exe, &launch, &identity.log_file())?;
+    let child = spawn(exe, &launch, &identity.log_file())?;
+    wait_for_startup(identity, &child.exited).await;
     Ok(true)
+}
+
+async fn wait_for_startup(identity: &SocketIdentity, exited: &AtomicBool) {
+    let deadline = Instant::now() + STARTUP_DEADLINE;
+    loop {
+        if exited.load(Ordering::Acquire) {
+            return;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        let probe = remaining.min(RUNNING_PROBE);
+        let running = tokio::time::timeout(probe, crate::hooks::listener::connect(identity))
+            .await
+            .is_ok_and(|connected| connected.is_ok());
+        if running || exited.load(Ordering::Acquire) {
+            return;
+        }
+        tokio::time::sleep(remaining.min(STARTUP_RETRY)).await;
+    }
 }
 
 #[cfg(test)]
@@ -388,6 +454,57 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_a_second_request_cannot_spawn_during_delayed_bind() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = test_identity(dir.path());
+        request_start(&identity, &launch(dir.path())).unwrap();
+
+        let (spawned_tx, spawned_rx) = tokio::sync::oneshot::channel();
+        let spawn_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let child_exited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first_identity = identity.clone();
+        let first_count = std::sync::Arc::clone(&spawn_count);
+        let first_exited = std::sync::Arc::clone(&child_exited);
+        let first = tokio::spawn(async move {
+            start_requested_with(
+                &first_identity,
+                Path::new("/bin/ignored"),
+                move |_, _, _| {
+                    first_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    spawned_tx.send(()).unwrap();
+                    Ok(SpawnedChild {
+                        pid: 0,
+                        exited: first_exited,
+                    })
+                },
+            )
+            .await
+        });
+        spawned_rx.await.unwrap();
+
+        request_start(&identity, &launch(dir.path())).unwrap();
+        let second_count = std::sync::Arc::clone(&spawn_count);
+        assert!(
+            !start_requested_with(&identity, Path::new("/bin/ignored"), move |_, _, _| {
+                second_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(SpawnedChild {
+                    pid: 0,
+                    exited: std::sync::Arc::clone(&child_exited),
+                })
+            },)
+            .await
+            .unwrap()
+        );
+        assert_eq!(spawn_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(identity.start_request().exists());
+
+        let _listener = tokio::net::UnixListener::bind(&identity.socket).unwrap();
+        assert!(first.await.unwrap().unwrap());
+        assert_eq!(spawn_count.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[cfg(unix)]
