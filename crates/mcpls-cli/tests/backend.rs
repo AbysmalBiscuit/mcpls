@@ -293,13 +293,20 @@ fn alive(pid: u32) -> bool {
 struct KillOnDrop(u32);
 
 #[cfg(unix)]
+impl KillOnDrop {
+    fn terminate(&self) -> bool {
+        !alive(self.0)
+            || Command::new("kill")
+                .args(["-TERM", &self.0.to_string()])
+                .status()
+                .is_ok_and(|status| status.success())
+    }
+}
+
+#[cfg(unix)]
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
-        if alive(self.0) {
-            let _ = Command::new("kill")
-                .args(["-TERM", &self.0.to_string()])
-                .status();
-        }
+        let _ = self.terminate();
     }
 }
 
@@ -465,8 +472,11 @@ fn two_worktrees_get_a_backend_each() {
         &one.user,
         "the second backend to exit",
     );
-    assert!(!alive(first_pid));
-    assert!(!alive(second_pid));
+    #[cfg(unix)]
+    {
+        assert!(!alive(first_pid));
+        assert!(!alive(second_pid));
+    }
 }
 
 /// Frontends racing from nothing start one backend, and none of them sees
@@ -507,7 +517,8 @@ fn a_killed_backend_is_reported_not_replaced() {
     let project = Project::new(500).with_counting_server(500);
     let mut frontend = project.frontend();
     project.wait_for("the server to start", |p| line_count(&p.spawns()) == 1);
-    let _server_cleanup = KillOnDrop(last_pid(&project.spawns()));
+    let server_pid = last_pid(&project.spawns());
+    let server_cleanup = KillOnDrop(server_pid);
     let pid = project.backend_pid().unwrap();
 
     let status = Command::new("kill")
@@ -523,6 +534,11 @@ fn a_killed_backend_is_reported_not_replaced() {
     project.holds_for("no replacement backend", Duration::from_millis(500), |p| {
         line_count(&p.spawns()) == 1 && p.backend_pid().is_none()
     });
+    assert!(
+        server_cleanup.terminate(),
+        "failed to terminate counting server {server_pid}"
+    );
+    project.wait_for("the counting server to exit", |_| !alive(server_pid));
 }
 
 /// A deleted socket leaves attached sessions working, and the backend still
@@ -589,6 +605,7 @@ fn a_group_signal_to_the_frontend_spares_the_backend() {
     assert!(alive(pid), "the backend died with the frontend's group");
     drop(frontend);
     project.wait_for("the backend to exit", |p| p.backend_pid().is_none());
+    project.wait_for("the backend process to exit", |_| !alive(pid));
 }
 
 /// Sessions that disagree about trusting the project's config cannot share
