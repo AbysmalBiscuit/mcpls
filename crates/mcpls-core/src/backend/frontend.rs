@@ -67,17 +67,35 @@ pub(crate) enum Outcome {
 async fn handshake_with(
     door: &dyn Door,
     request: &Handshake,
-) -> Option<(Box<dyn HookStream>, HandshakeReply)> {
-    let mut stream = tokio::time::timeout(CONNECT_TIMEOUT, door.connect())
-        .await
-        .ok()?
-        .ok()?;
-    handshake::write(&mut stream, request).await.ok()?;
-    let reply = tokio::time::timeout(handshake::HANDSHAKE_TIMEOUT, handshake::read(&mut stream))
-        .await
-        .ok()?
-        .ok()?;
-    Some((stream, reply))
+) -> ConnectionAttempt<(Box<dyn HookStream>, HandshakeReply)> {
+    let mut stream = match connect_with(door).await {
+        ConnectionAttempt::Connected(stream) => stream,
+        ConnectionAttempt::Absent => return ConnectionAttempt::Absent,
+        ConnectionAttempt::Busy => return ConnectionAttempt::Busy,
+    };
+    if handshake::write(&mut stream, request).await.is_err() {
+        return ConnectionAttempt::Busy;
+    }
+    let Ok(Ok(reply)) =
+        tokio::time::timeout(handshake::HANDSHAKE_TIMEOUT, handshake::read(&mut stream)).await
+    else {
+        return ConnectionAttempt::Busy;
+    };
+    ConnectionAttempt::Connected((stream, reply))
+}
+
+enum ConnectionAttempt<T> {
+    Connected(T),
+    Absent,
+    Busy,
+}
+
+async fn connect_with(door: &dyn Door) -> ConnectionAttempt<Box<dyn HookStream>> {
+    match tokio::time::timeout(CONNECT_TIMEOUT, door.connect()).await {
+        Ok(Ok(stream)) => ConnectionAttempt::Connected(stream),
+        Ok(Err(_)) => ConnectionAttempt::Absent,
+        Err(_) => ConnectionAttempt::Busy,
+    }
 }
 
 enum Judged {
@@ -89,20 +107,28 @@ enum Judged {
 /// Attach to the project's backend, starting one when none answers.
 pub(crate) async fn attach(door: &dyn Door, request: &Handshake, timing: &Timing) -> Outcome {
     let place = door.place();
-    if let Some(found) = handshake_with(door, request).await
-        && let Judged::Done(outcome) = judge(door, request, found, timing, true).await
-    {
-        return outcome;
+    match handshake_with(door, request).await {
+        ConnectionAttempt::Connected(found) => {
+            if let Judged::Done(outcome) = judge(door, request, found, timing, true).await {
+                return outcome;
+            }
+        }
+        ConnectionAttempt::Absent => {}
+        ConnectionAttempt::Busy => return Outcome::Failed(messages::busy_endpoint(&place)),
     }
     let _lock = match door.lock(timing.start).await {
         Ok(Some(lock)) => lock,
         Ok(None) => return Outcome::Failed(messages::busy_starting(&place, timing.start)),
         Err(error) => return Outcome::Failed(messages::start_failed(&place, &error)),
     };
-    if let Some(found) = handshake_with(door, request).await
-        && let Judged::Done(outcome) = judge(door, request, found, timing, false).await
-    {
-        return outcome;
+    match handshake_with(door, request).await {
+        ConnectionAttempt::Connected(found) => {
+            if let Judged::Done(outcome) = judge(door, request, found, timing, false).await {
+                return outcome;
+            }
+        }
+        ConnectionAttempt::Absent => {}
+        ConnectionAttempt::Busy => return Outcome::Failed(messages::busy_endpoint(&place)),
     }
     match door.start().await {
         Err(error) => Outcome::Failed(messages::start_failed(&place, &error)),
@@ -110,10 +136,15 @@ pub(crate) async fn attach(door: &dyn Door, request: &Handshake, timing: &Timing
         Ok(Start::Spawned) => {
             let deadline = Instant::now() + timing.start;
             loop {
-                if let Some(found) = handshake_with(door, request).await
-                    && let Judged::Done(outcome) = judge(door, request, found, timing, false).await
-                {
-                    return outcome;
+                match handshake_with(door, request).await {
+                    ConnectionAttempt::Connected(found) => {
+                        if let Judged::Done(outcome) =
+                            judge(door, request, found, timing, false).await
+                        {
+                            return outcome;
+                        }
+                    }
+                    ConnectionAttempt::Absent | ConnectionAttempt::Busy => {}
                 }
                 if Instant::now() >= deadline {
                     return Outcome::Failed(messages::did_not_start(&place, timing.start));
@@ -163,19 +194,20 @@ async fn evict(door: &dyn Door, request: &Handshake, timing: &Timing) -> bool {
         kind: handshake::ConnectionKind::Shutdown,
         ..request.clone()
     };
-    let Some((_stream, reply)) = handshake_with(door, &shutdown).await else {
-        return true;
+    let reply = match handshake_with(door, &shutdown).await {
+        ConnectionAttempt::Connected((_stream, reply)) => reply,
+        ConnectionAttempt::Absent => return true,
+        ConnectionAttempt::Busy => return false,
     };
     if reply.refusal.is_some() {
         return false;
     }
     let deadline = Instant::now() + timing.gone;
     while Instant::now() < deadline {
-        let reachable = tokio::time::timeout(CONNECT_TIMEOUT, door.connect())
-            .await
-            .is_ok_and(|connected| connected.is_ok());
-        if !reachable {
-            return true;
+        match connect_with(door).await {
+            ConnectionAttempt::Connected(stream) => drop(stream),
+            ConnectionAttempt::Absent => return true,
+            ConnectionAttempt::Busy => return false,
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -218,6 +250,15 @@ mod messages {
             place.root.display(),
             wait.as_secs(),
             place.log.display()
+        )
+    }
+
+    pub(super) fn busy_endpoint(place: &Place) -> String {
+        format!(
+            "Tell the user: the mcpls backend endpoint for {} stayed busy while this session \
+             tried to attach, so this session has no mcpls tools. Restart the session after the \
+             other mcpls session finishes, or run mcpls with --no-backend.",
+            place.root.display()
         )
     }
 
@@ -302,6 +343,8 @@ mod fake {
     pub(super) enum Script {
         /// Nothing listens.
         Nobody,
+        /// A connect attempt remains pending because the endpoint is busy.
+        Busy,
         /// A server answering the handshake with the reply, then doing
         /// what `Then` says.
         Server(HandshakeReply, Then),
@@ -344,8 +387,12 @@ mod fake {
                 .unwrap_or(Script::Nobody);
             let kinds = Arc::clone(&self.kinds);
             Box::pin(async move {
-                let Script::Server(reply, then) = script else {
-                    return Err(io::ErrorKind::ConnectionRefused.into());
+                let (reply, then) = match script {
+                    Script::Nobody => return Err(io::ErrorKind::ConnectionRefused.into()),
+                    Script::Busy => {
+                        return std::future::pending::<io::Result<Box<dyn HookStream>>>().await;
+                    }
+                    Script::Server(reply, then) => (reply, then),
                 };
                 let (client, mut server) = tokio::io::duplex(1 << 20);
                 tokio::spawn(async move {
@@ -479,6 +526,14 @@ mod attach_tests {
     }
 
     #[tokio::test]
+    async fn test_a_busy_initial_endpoint_does_not_start_another_backend() {
+        let door = FakeDoor::new(Start::Spawned, vec![Script::Busy]);
+        let text = failure(attach(door.as_ref(), &request(), &fast()).await);
+        assert!(text.contains("stayed busy"), "{text}");
+        assert_eq!(*door.starts.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
     async fn test_an_idle_older_backend_is_evicted_and_replaced() {
         let door = FakeDoor::new(
             Start::Spawned,
@@ -499,6 +554,27 @@ mod attach_tests {
                 .contains(&ConnectionKind::Shutdown)
         );
         assert_eq!(*door.starts.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_a_busy_endpoint_is_not_reported_as_gone_during_eviction() {
+        let door = FakeDoor::new(
+            Start::Spawned,
+            vec![
+                Script::Server(refused("0.0.1", 0, Refusal::Build), Then::Close),
+                Script::Server(accepted(), Then::Close),
+                Script::Busy,
+            ],
+        );
+        let text = failure(attach(door.as_ref(), &request(), &fast()).await);
+        assert!(text.contains("0.0.1"), "{text}");
+        assert!(
+            door.kinds
+                .lock()
+                .unwrap()
+                .contains(&ConnectionKind::Shutdown)
+        );
+        assert_eq!(*door.starts.lock().unwrap(), 0);
     }
 
     #[tokio::test]
