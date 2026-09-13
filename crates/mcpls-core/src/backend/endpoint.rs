@@ -932,12 +932,21 @@ while True:
             .run(listener, Duration::from_millis(50), std::future::pending())
             .await;
         assert_eq!(exit, Exit::Idle);
-        assert!(
-            crate::hooks::HookListener::acquire(&identity)
+        // Windows closes a dropped pipe instance's handle asynchronously, so
+        // the name frees shortly after `run` returns rather than at once.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let reacquired = loop {
+            let acquired = crate::hooks::HookListener::acquire(&identity)
                 .await
-                .unwrap()
-                .is_some(),
-            "the endpoint was still held when run returned"
+                .unwrap();
+            if acquired.is_some() || tokio::time::Instant::now() >= deadline {
+                break acquired;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert!(
+            reacquired.is_some(),
+            "the endpoint was still held after run returned"
         );
         runtime.shutdown().await;
     }

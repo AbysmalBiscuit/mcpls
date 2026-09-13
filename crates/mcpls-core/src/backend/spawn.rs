@@ -429,7 +429,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let identity = test_identity(dir.path());
         assert!(
-            !start_requested(&identity, Path::new("/bin/true"))
+            !start_requested(&identity, Path::new("/usr/bin/true"))
                 .await
                 .unwrap()
         );
@@ -444,13 +444,13 @@ mod tests {
         assert!(identity.start_request().exists());
 
         assert!(
-            start_requested(&identity, Path::new("/bin/true"))
+            start_requested(&identity, Path::new("/usr/bin/true"))
                 .await
                 .unwrap()
         );
         assert!(!identity.start_request().exists());
         assert!(
-            !start_requested(&identity, Path::new("/bin/true"))
+            !start_requested(&identity, Path::new("/usr/bin/true"))
                 .await
                 .unwrap()
         );

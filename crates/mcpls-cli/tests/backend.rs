@@ -30,7 +30,7 @@ impl Project {
         std::fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
         let project = Self {
             dir,
-            runtime: TempDir::new().unwrap(),
+            runtime: short_temp_dir(),
             user: format!("mcpls-backend-test-{}-{}", std::process::id(), next()),
         };
         project.write_config(idle_ms, "");
@@ -131,6 +131,56 @@ impl Project {
         String::from_utf8_lossy(&output.stdout).into_owned()
     }
 
+    /// Assert the frontend's tool calls reach its backend.
+    ///
+    /// On Windows a frontend cannot start a backend: it asks, a hook starts
+    /// the one it asked for, and the frontend attaches on its next retry.
+    fn assert_attaches(&self, frontend: &mut Frontend) {
+        Self::assert_attaches_in(&self.root(), self.runtime.path(), &self.user, frontend);
+    }
+
+    fn assert_attaches_in(root: &Path, runtime: &Path, user: &str, frontend: &mut Frontend) {
+        #[cfg(windows)]
+        {
+            Self::fire_hook_for(root, runtime, user);
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                let call = frontend.call_tool();
+                let waiting = call["result"]["content"][0]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("waiting for its backend"));
+                if !waiting || Instant::now() >= deadline {
+                    assert_tool_success(&call);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (root, runtime, user);
+            assert_tool_success(&frontend.call_tool());
+        }
+    }
+
+    #[cfg(windows)]
+    fn fire_hook_for(root: &Path, runtime: &Path, user: &str) {
+        let status =
+            Self::command_with_identity(root, runtime, user)
+                .env("CLAUDE_PROJECT_DIR", root)
+                .arg("hook")
+                .stdin(Stdio::piped())
+                .spawn()
+                .and_then(|mut child| {
+                    child.stdin.take().unwrap().write_all(
+                        br#"{"hook_event_name":"UserPromptSubmit","session_id":"s1"}"#,
+                    )?;
+                    child.wait()
+                })
+                .unwrap();
+        assert!(status.success());
+    }
+
     /// The backend's pid, or `None` when nothing answers.
     fn backend_pid(&self) -> Option<u32> {
         Self::backend_pid_for(&self.root(), self.runtime.path(), &self.user)
@@ -166,6 +216,16 @@ impl Project {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
+}
+
+/// macOS's `$TMPDIR` is deep enough that a runtime directory inside it
+/// pushes the socket path past the `sun_path` limit.
+fn short_temp_dir() -> TempDir {
+    #[cfg(unix)]
+    let dir = tempfile::Builder::new().tempdir_in("/tmp");
+    #[cfg(not(unix))]
+    let dir = TempDir::new();
+    dir.unwrap()
 }
 
 fn next() -> u64 {
@@ -452,8 +512,8 @@ fn two_worktrees_get_a_backend_each() {
             .arg(two.config());
         command
     });
-    assert_tool_success(&a.call_tool());
-    assert_tool_success(&b.call_tool());
+    one.assert_attaches(&mut a);
+    Project::assert_attaches_in(&two.root(), one.runtime.path(), &one.user, &mut b);
     let first_pid = one.backend_pid().expect("the first backend");
     let second_pid = Project::backend_pid_for(&two.root(), one.runtime.path(), &one.user)
         .expect("the second backend");
@@ -497,7 +557,7 @@ fn racing_frontends_start_one_backend() {
         .map(|thread| thread.join().unwrap())
         .collect();
     for frontend in &mut frontends {
-        assert_tool_success(&frontend.call_tool());
+        project.assert_attaches(frontend);
     }
     assert!(
         project.doctor().contains("sessions: 4 attached"),
@@ -624,7 +684,7 @@ fn a_trust_disagreement_is_refused_with_both_states() {
         command.arg("--trust-project-config");
         command
     });
-    assert_tool_success(&trusting.call_tool());
+    project.assert_attaches(&mut trusting);
 
     let mut untrusting = Frontend::spawn_uninitialized(project.command(&project.root()));
     let init = untrusting.initialize();
@@ -650,24 +710,8 @@ fn a_hook_starts_the_backend_a_frontend_asked_for() {
     let before = project.doctor();
     assert!(before.contains("backend pid: none"), "{before}");
 
-    let status = project
-        .command(&project.root())
-        .env("CLAUDE_PROJECT_DIR", project.root())
-        .arg("hook")
-        .stdin(Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(br#"{"hook_event_name":"UserPromptSubmit","session_id":"s1"}"#)?;
-            child.wait()
-        })
-        .unwrap();
-    assert!(status.success());
-    project.wait_for("the hook-started backend", |p| p.backend_pid().is_some());
-    assert_tool_success(&frontend.call_tool());
+    project.assert_attaches(&mut frontend);
+    assert!(project.backend_pid().is_some(), "{}", project.doctor());
     frontend.close(Duration::from_secs(5));
     project.wait_for("the backend to exit", |p| p.backend_pid().is_none());
 }

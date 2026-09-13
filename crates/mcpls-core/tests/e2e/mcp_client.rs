@@ -615,6 +615,31 @@ impl McpClient {
             .and_then(|pid| pid.parse().ok()))
     }
 
+    /// Run the hook a host fires on a prompt. On Windows it starts the
+    /// backend a frontend asked for.
+    #[allow(dead_code)]
+    pub(crate) fn fire_hook(workspace: &Path) -> Result<()> {
+        use std::io::Write as _;
+
+        let mut child = Command::new(binary_under_test()?)
+            .arg("hook")
+            .current_dir(workspace)
+            .env("CLAUDE_PROJECT_DIR", workspace)
+            .env_remove("MCPLS_NO_BACKEND")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .context("failed to run the hook")?;
+        child
+            .stdin
+            .take()
+            .context("the hook has no stdin")?
+            .write_all(br#"{"hook_event_name":"UserPromptSubmit","session_id":"e2e-hook"}"#)?;
+        let status = child.wait()?;
+        anyhow::ensure!(status.success(), "the hook exited with {status}");
+        Ok(())
+    }
+
     /// Wait until hook doctor reports no backend for a workspace.
     #[allow(dead_code)]
     pub(crate) fn wait_for_backend_exit(workspace: &Path) -> Result<()> {

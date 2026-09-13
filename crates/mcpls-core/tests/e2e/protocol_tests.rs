@@ -203,7 +203,18 @@ fn write_duplicate_floor_config(
 fn wait_for_diagnostics_baseline(client: &mut McpClient) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let response = client.call_tool("get_new_diagnostics", &json!({}))?;
+        // A frontend answers from its stub until it attaches to a backend,
+        // which on Windows only starts once a hook has fired.
+        let response = match client.call_tool("get_new_diagnostics", &json!({})) {
+            Err(error)
+                if error.to_string().contains("waiting for its backend")
+                    && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(25));
+                continue;
+            }
+            response => response?,
+        };
         let text = response["result"]["content"][0]["text"]
             .as_str()
             .with_context(|| format!("expected diagnostic text content, got {response}"))?;
@@ -606,6 +617,8 @@ async fn e2e_shared_backend_keeps_records_per_session(
 
     let mut first = McpClient::spawn_in_workspace(&["--config", config_arg], &root, session)?;
     first.initialize()?;
+    #[cfg(windows)]
+    McpClient::fire_hook(&root)?;
     wait_for_diagnostics_baseline(&mut first)?;
     let mut second = McpClient::spawn_in_workspace(&["--config", config_arg], &root, session)?;
     second.initialize()?;
