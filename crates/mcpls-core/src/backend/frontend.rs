@@ -290,24 +290,36 @@ pub(crate) async fn relay<R, W>(
                     Event::BackendClosed(current),
                 );
                 heard = false;
+                let mut write_failed = false;
                 if init_answered {
                     if let Some(line) = &init
                         && let Ok(mut replay) = serde_json::from_str::<Value>(line)
                     {
                         replay["id"] = Value::from(REPLAY_ID);
-                        let _ = write_line(&mut writer, &replay.to_string()).await;
+                        write_failed = write_line(&mut writer, &replay.to_string()).await.is_err();
                     }
-                    if let Some(line) = &initialized {
-                        let _ = write_line(&mut writer, line).await;
+                    if !write_failed && let Some(line) = &initialized {
+                        write_failed = write_line(&mut writer, line).await.is_err();
                     }
                 }
-                for (line, message) in std::mem::take(&mut deferred) {
-                    track(&mut pending, &message);
-                    let _ = write_line(&mut writer, &line).await;
-                    unheard.push((line, message));
+                let deferred = std::mem::take(&mut deferred);
+                for (_, message) in &deferred {
+                    track(&mut pending, message);
+                }
+                unheard.extend(deferred.iter().cloned());
+                if !write_failed {
+                    for (line, _) in deferred {
+                        if write_line(&mut writer, &line).await.is_err() {
+                            write_failed = true;
+                            break;
+                        }
+                    }
                 }
                 backend = Some(writer);
                 state = State::Attached;
+                if write_failed {
+                    let _ = events.send(Event::BackendClosed(current));
+                }
             }
             Event::Attach(Outcome::Waiting(reason)) => {
                 answer_from_stub(&mut host_out, &mut deferred, &reason, &mut init_answered).await;
@@ -725,13 +737,18 @@ mod fake {
     use std::collections::VecDeque;
     use std::io;
     use std::path::PathBuf;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
     use std::time::Duration;
 
     use futures::future::BoxFuture;
     use rmcp::ServiceExt as _;
     use serde_json::{Value, json};
-    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+    use tokio::io::{
+        AsyncBufReadExt as _, AsyncRead, AsyncWrite, AsyncWriteExt as _, BufReader, ReadBuf,
+    };
 
     use super::{Door, Place, Start, Timing};
     use crate::backend::handshake::{
@@ -759,9 +776,49 @@ mod fake {
         CloseBeforeReply,
         /// Close as soon as the first MCP line arrives, having sent nothing.
         CloseOnFirstLine,
+        /// Close the backend's read half while keeping its output half open.
+        CloseRead,
         /// Answer the first MCP line as an `initialize`, then close as soon
         /// as the next line arrives.
         AnswerOnceThenClose,
+    }
+
+    struct WriteClosedStream {
+        inner: tokio::io::DuplexStream,
+        closed: Arc<AtomicBool>,
+    }
+
+    impl AsyncRead for WriteClosedStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_read(cx, buffer)
+        }
+    }
+
+    impl AsyncWrite for WriteClosedStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            if this.closed.load(Ordering::Acquire) {
+                Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
+            } else {
+                Pin::new(&mut this.inner).poll_write(cx, buffer)
+            }
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
     }
 
     /// A door whose connect attempts follow a script, and which counts the
@@ -802,6 +859,15 @@ mod fake {
                     Script::Server(reply, then) => (reply, then),
                 };
                 let (client, mut server) = tokio::io::duplex(1 << 20);
+                let write_closed = Arc::new(AtomicBool::new(false));
+                let client: Box<dyn HookStream> = if matches!(&then, Then::CloseRead) {
+                    Box::new(WriteClosedStream {
+                        inner: client,
+                        closed: Arc::clone(&write_closed),
+                    })
+                } else {
+                    Box::new(client)
+                };
                 tokio::spawn(async move {
                     let Ok(request) = handshake::read::<_, Handshake>(&mut server).await else {
                         return;
@@ -825,6 +891,10 @@ mod fake {
                             let mut lines = BufReader::new(server).lines();
                             let _ = lines.next_line().await;
                         }
+                        Then::CloseRead => {
+                            write_closed.store(true, Ordering::Release);
+                            std::future::pending::<()>().await;
+                        }
                         Then::AnswerOnceThenClose => {
                             let (reader, mut writer) = tokio::io::split(server);
                             let mut lines = BufReader::new(reader).lines();
@@ -842,7 +912,7 @@ mod fake {
                         }
                     }
                 });
-                Ok(Box::new(client) as Box<dyn HookStream>)
+                Ok(client)
             })
         }
 
@@ -1146,6 +1216,26 @@ mod relay_tests {
             }
         }
 
+        async fn start_with_pending(
+            door: Arc<dyn Door>,
+            request: Handshake,
+            timing: Timing,
+            message: Value,
+        ) -> Self {
+            let (mut input, relay_in) = tokio::io::duplex(1 << 20);
+            let (relay_out, output) = tokio::io::duplex(1 << 20);
+            input
+                .write_all(format!("{message}\n").as_bytes())
+                .await
+                .unwrap();
+            let relay = tokio::spawn(relay(relay_in, relay_out, door, request, timing));
+            Self {
+                input,
+                output: BufReader::new(output).lines(),
+                relay,
+            }
+        }
+
         async fn send(&mut self, message: Value) {
             self.input
                 .write_all(format!("{message}\n").as_bytes())
@@ -1294,6 +1384,29 @@ mod relay_tests {
         );
         let mut host = Host::start(door, request(), fast());
         host.send(initialize_request()).await;
+        let failed = host.response(1).await;
+        assert!(
+            failed["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("stopped"),
+            "{failed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_half_closed_backend_fails_a_deferred_request() {
+        let door = FakeDoor::new(
+            Start::Spawned,
+            vec![
+                Script::Nobody,
+                Script::Nobody,
+                Script::Server(accepted(), Then::CloseRead),
+                Script::Server(accepted(), Then::CloseRead),
+            ],
+        );
+        let mut host =
+            Host::start_with_pending(door, request(), fast(), initialize_request()).await;
         let failed = host.response(1).await;
         assert!(
             failed["error"]["message"]
