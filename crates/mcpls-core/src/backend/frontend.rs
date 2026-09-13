@@ -74,12 +74,12 @@ async fn handshake_with(
         ConnectionAttempt::Busy => return ConnectionAttempt::Busy,
     };
     if handshake::write(&mut stream, request).await.is_err() {
-        return ConnectionAttempt::Busy;
+        return ConnectionAttempt::Absent;
     }
     let Ok(Ok(reply)) =
         tokio::time::timeout(handshake::HANDSHAKE_TIMEOUT, handshake::read(&mut stream)).await
     else {
-        return ConnectionAttempt::Busy;
+        return ConnectionAttempt::Absent;
     };
     ConnectionAttempt::Connected((stream, reply))
 }
@@ -355,6 +355,8 @@ mod fake {
         Serve,
         /// Close at once.
         Close,
+        /// Close after reading the request and before sending a reply.
+        CloseBeforeReply,
     }
 
     /// A door whose connect attempts follow a script, and which counts the
@@ -400,6 +402,9 @@ mod fake {
                         return;
                     };
                     kinds.lock().unwrap().push(request.kind);
+                    if matches!(&then, Then::CloseBeforeReply) {
+                        return;
+                    }
                     if handshake::write(&mut server, &reply).await.is_err() {
                         return;
                     }
@@ -410,6 +415,7 @@ mod fake {
                             }
                         }
                         Then::Close => {}
+                        Then::CloseBeforeReply => unreachable!(),
                     }
                 });
                 Ok(Box::new(client) as Box<dyn HookStream>)
@@ -534,6 +540,21 @@ mod attach_tests {
     }
 
     #[tokio::test]
+    async fn test_a_connected_endpoint_that_closes_before_reply_starts_a_backend() {
+        let door = FakeDoor::new(
+            Start::Spawned,
+            vec![
+                Script::Server(accepted(), Then::CloseBeforeReply),
+                Script::Nobody,
+                Script::Server(accepted(), Then::Serve),
+            ],
+        );
+        let outcome = attach(door.as_ref(), &request(), &fast()).await;
+        assert!(matches!(outcome, Outcome::Attached(_)));
+        assert_eq!(*door.starts.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
     async fn test_an_idle_older_backend_is_evicted_and_replaced() {
         let door = FakeDoor::new(
             Start::Spawned,
@@ -575,6 +596,28 @@ mod attach_tests {
                 .contains(&ConnectionKind::Shutdown)
         );
         assert_eq!(*door.starts.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_eviction_treats_a_connected_close_before_reply_as_gone() {
+        let door = FakeDoor::new(
+            Start::Spawned,
+            vec![
+                Script::Server(refused("0.0.1", 0, Refusal::Build), Then::Close),
+                Script::Server(accepted(), Then::CloseBeforeReply),
+                Script::Nobody,
+                Script::Server(accepted(), Then::Serve),
+            ],
+        );
+        let outcome = attach(door.as_ref(), &request(), &fast()).await;
+        assert!(matches!(outcome, Outcome::Attached(_)));
+        assert!(
+            door.kinds
+                .lock()
+                .unwrap()
+                .contains(&ConnectionKind::Shutdown)
+        );
+        assert_eq!(*door.starts.lock().unwrap(), 1);
     }
 
     #[tokio::test]
