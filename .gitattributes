@@ -1,6 +1,5 @@
 # Bash reads a CRLF checkout as commands ending in \r, which Windows runners
 # with core.autocrlf would otherwise produce.
-plugin/bin/* text eol=lf
 plugin/hooks/bootstrap-binaries text eol=lf
 plugin/hooks/run-hook.cmd text eol=lf
 tests/plugin/*.sh text eol=lf

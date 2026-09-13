@@ -1,6 +1,6 @@
 //! The plugin's manifests are JSON that other programs read, so these check
 //! the invariants that break without an error: the version every manifest
-//! pins, the launcher every entry runs, and the manifest file Codex must
+//! pins, the `PATH` lookup every entry runs, and the manifest file Codex must
 //! never find.
 
 #![allow(clippy::unwrap_used)]
@@ -28,7 +28,7 @@ fn test_the_plugin_root_has_no_plugin_json() {
     assert!(!repo_root().join("plugin/plugin.json").exists());
 }
 
-/// The launcher downloads the release named by the Claude Code manifest's
+/// The bootstrap installs the release named by the Claude Code manifest's
 /// version, so every file repeating that version must agree with the
 /// workspace the release is built from.
 #[test]
@@ -58,33 +58,28 @@ fn test_every_manifest_pins_the_workspace_version() {
     }
 }
 
-/// Nothing puts `mcpls` itself on `PATH`, so every entry a harness runs goes
-/// through the launcher, and each harness's hook file names only events
+/// Every entry a harness runs names `mcpls` on `PATH`, which the bootstrap
+/// installs at session start, and each harness's hook file names only events
 /// that harness has.
 #[test]
-fn test_every_entry_runs_the_launcher_for_its_harness() {
+fn test_every_entry_runs_mcpls_from_path() {
     assert_eq!(
-        json("plugin/.mcp.json")["mcpServers"]["mcpls"]["command"],
-        "${CLAUDE_PLUGIN_ROOT}/bin/mcpls"
+        json("plugin/.mcp.json")["mcpServers"]["mcpls"],
+        serde_json::json!({ "command": "mcpls" })
     );
 
     let codex = json("plugin/.codex-plugin/plugin.json");
     assert_eq!(codex["hooks"], "./hooks/hooks-codex.json");
-    assert_eq!(codex["mcpServers"]["mcpls"]["command"], "sh");
     assert_eq!(
-        codex["mcpServers"]["mcpls"]["env_vars"],
-        serde_json::json!(["CODEX_HOME", "MCPLS_BIN", "MCPLS_HOME"]),
-        "Codex starts an MCP server with none of these unless the entry names them"
-    );
-    assert_eq!(
-        codex["mcpServers"]["mcpls"]["startup_timeout_sec"], 300,
-        "Codex kills a server still starting after 30 seconds, and a cold start downloads for up to 300"
+        codex["mcpServers"], "./.mcp.json",
+        "an inline object would replace the shared registration"
     );
 
-    let harnesses: [(&str, &str, &[&str]); 2] = [
+    let harnesses: [(&str, &str, &str, &[&str]); 2] = [
         (
             "plugin/hooks/hooks.json",
-            "\"${CLAUDE_PLUGIN_ROOT}/bin/mcpls\" hook",
+            "mcpls hook",
+            "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" bootstrap-binaries claude",
             &[
                 "FileChanged",
                 "PostToolBatch",
@@ -95,32 +90,51 @@ fn test_every_entry_runs_the_launcher_for_its_harness() {
         ),
         (
             "plugin/hooks/hooks-codex.json",
-            "\"${PLUGIN_ROOT}/bin/mcpls\" hook --host codex",
+            "mcpls hook --host codex",
+            "\"${PLUGIN_ROOT}/hooks/run-hook.cmd\" bootstrap-binaries codex",
             &[
                 "PostToolUse",
                 "SessionEnd",
+                "SessionStart",
                 "SubagentStop",
                 "UserPromptSubmit",
             ],
         ),
     ];
-    for (file, command, events) in harnesses {
+    for (file, hook, bootstrap, events) in harnesses {
         let hooks = json(file);
         let hooks = hooks["hooks"].as_object().unwrap();
         let mut names: Vec<&str> = hooks.keys().map(String::as_str).collect();
         names.sort_unstable();
         assert_eq!(names, events, "{file}");
-        for event in events {
-            let groups = hooks[*event].as_array().unwrap();
+
+        let mut bootstraps = Vec::new();
+        for (event, groups) in hooks {
+            let groups = groups.as_array().unwrap();
             assert!(!groups.is_empty(), "{file}: {event}");
             for group in groups {
                 let registrations = group["hooks"].as_array().unwrap();
                 assert!(!registrations.is_empty(), "{file}: {event}");
-                for hook in registrations {
-                    assert_eq!(hook["type"], "command", "{file}: {event}");
-                    assert_eq!(hook["command"], command, "{file}: {event}");
+                for registration in registrations {
+                    assert_eq!(registration["type"], "command", "{file}: {event}");
+                    if registration["command"] == bootstrap {
+                        bootstraps.push(event.as_str());
+                    } else {
+                        assert_eq!(registration["command"], hook, "{file}: {event}");
+                    }
                 }
             }
         }
+        assert_eq!(
+            bootstraps,
+            ["SessionStart"],
+            "{file}: the bootstrap runs once, at session start"
+        );
     }
+
+    assert_eq!(
+        json("plugin/hooks/hooks-codex.json")["hooks"]["SessionStart"][0]["hooks"][0]["commandWindows"],
+        "& \"${PLUGIN_ROOT}/hooks/run-hook.cmd\" bootstrap-binaries codex",
+        "Codex runs Windows hooks through PowerShell, where a quoted path needs the call operator"
+    );
 }

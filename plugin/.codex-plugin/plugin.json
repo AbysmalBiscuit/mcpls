@@ -9,14 +9,7 @@
   "keywords": ["mcp", "lsp", "language-server", "diagnostics"],
   "skills": "./skills/",
   "hooks": "./hooks/hooks-codex.json",
-  "mcpServers": {
-    "mcpls": {
-      "command": "sh",
-      "args": ["-c", "root=$(ls -td \"${CODEX_HOME:-$HOME/.codex}\"/plugins/cache/*/mcpls/*/ 2>/dev/null | head -n 1); if [ -z \"$root\" ]; then echo \"mcpls plugin: no installed mcpls plugin under ${CODEX_HOME:-$HOME/.codex}/plugins/cache\" >&2; exit 1; fi; exec \"${root}bin/mcpls\""],
-      "env_vars": ["CODEX_HOME", "MCPLS_BIN", "MCPLS_HOME"],
-      "startup_timeout_sec": 300
-    }
-  },
+  "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "mcpls",
     "shortDescription": "Language server diagnostics and code intelligence through MCP",

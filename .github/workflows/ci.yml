@@ -317,7 +317,7 @@ jobs:
       - name: Shellcheck install script
         run: shellcheck --shell=sh scripts/install.sh
       - name: Shellcheck plugin scripts
-        run: shellcheck plugin/bin/mcpls tests/plugin/launcher.test.sh plugin/hooks/bootstrap-binaries tests/plugin/bootstrap-binaries.test.sh
+        run: shellcheck plugin/hooks/bootstrap-binaries tests/plugin/bootstrap-binaries.test.sh
 
   dist-check:
     name: Release workflow matches dist config
@@ -335,8 +335,8 @@ jobs:
       - name: Check release.yml
         run: dist generate --check
 
-  plugin-launcher:
-    name: Plugin launcher (${{ matrix.os }})
+  plugin-bootstrap:
+    name: Plugin bootstrap (${{ matrix.os }})
     needs: detect-changes
     if: needs.detect-changes.outputs.plugin == 'true'
     runs-on: ${{ matrix.os }}
@@ -349,9 +349,6 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
-      - name: Launcher tests
-        shell: bash
-        run: bash tests/plugin/launcher.test.sh
       - name: Bootstrap tests
         shell: bash
         run: bash tests/plugin/bootstrap-binaries.test.sh
@@ -402,7 +399,7 @@ jobs:
   ci-gate:
     name: CI Gate
     if: always()
-    needs: [fmt, clippy, build-tests, build, test, test-integration, test-e2e, msrv, docs, shellcheck, dist-check, plugin-launcher, security, coverage]
+    needs: [fmt, clippy, build-tests, build, test, test-integration, test-e2e, msrv, docs, shellcheck, dist-check, plugin-bootstrap, security, coverage]
     runs-on: ubuntu-latest
     timeout-minutes: 1
     steps:
@@ -420,7 +417,7 @@ jobs:
             "${{ needs.docs.result }}"
             "${{ needs.shellcheck.result }}"
             "${{ needs.dist-check.result }}"
-            "${{ needs.plugin-launcher.result }}"
+            "${{ needs.plugin-bootstrap.result }}"
             "${{ needs.security.result }}"
             "${{ needs.coverage.result }}"
           )
