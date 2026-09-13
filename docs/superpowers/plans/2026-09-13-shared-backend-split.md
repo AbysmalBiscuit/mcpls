@@ -12,6 +12,7 @@
 
 ## Global Constraints
 
+- All tasks land as one PR, in order. Each task still ends green and commits on its own.
 - The workspace sets `unsafe_code = "deny"`. No `pre_exec`, no `libc`, no `std::env::set_var`. Every function that reads the environment splits into a reader and a pure inner function taking the value.
 - Canonicalize through `dunce::canonicalize`, never `Path::canonicalize`.
 - Clippy runs with `-D warnings` over `all`, `pedantic`, `nursery`, `unwrap_used` and `expect_used`. Tests carry `#[allow(clippy::unwrap_used, clippy::expect_used)]` on their module, as the existing test modules do.
@@ -21,7 +22,7 @@
 - Commits follow Conventional Commits, subject at most 50 characters including the prefix, imperative, lowercase after the colon, no trailing period, body wrapped at 72. Every commit ends with `Co-Authored-By: <model> <address>` per `AGENTS.md`. Commits are GPG signed; if signing fails, stop and report.
 - Tests run through devkit only. Direct `cargo nextest` and `cargo test` are blocked by a harness hook. `devrun task check` compiles every target, `devrun task test` runs the whole suite (there is no filter), `devrun task test-e2e` runs the ignored end-to-end suite (added in Task 0), and `devrun task verify` runs formatting, clippy, tests and doctests. Run `devrun task verify` before every commit.
 - `devrun task verify` runs on Linux and cannot see a Windows-only compile failure. Check every `#[cfg(windows)]` block against what it calls by reading it.
-- A CLI test that spawns `mcpls` isolates the child's runtime directory with `env_remove("XDG_RUNTIME_DIR")`, `env("TMPDIR", <temp>)` and `env("USER", <unique name>)`, and calls `clear_ambient_env` first (`crates/mcpls-cli/tests/cli_integration.rs:27-32`).
+- A CLI test that spawns `mcpls` isolates the child's runtime directory with `env_remove("XDG_RUNTIME_DIR")`, `env("TMPDIR", <temp>)` and `env("USER", <unique name>)`, and calls `clear_ambient_env` first (`crates/mcpls-cli/tests/cli_integration.rs:27-32`). On Windows the runtime directory is a known folder no environment variable redirects, so such a test relies on a unique temporary checkout root, whose hash is its own, and removes the `{hash}.*` files it leaves there.
 - A process that faces the host (the frontend, `--no-backend`) writes nothing to stdout except JSON-RPC frames. Logs go to stderr.
 
 ## Decisions this plan makes
@@ -29,21 +30,18 @@
 Each is a ruling where the spec is silent or cannot be followed literally. The task that implements it repeats what it needs.
 
 1. **`process_group(0)` instead of `setsid`.** `setsid` needs `pre_exec`, which is `unsafe`, and a child calling `setsid` itself fails because a process spawned with its own group is already a group leader. What the spec needs from `setsid` is leaving the group Codex signals, and `std::os::unix::process::CommandExt::process_group(0)` gives exactly that without `unsafe`. On Windows the spawn uses `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`, and only a hook ever spawns there.
-2. **The frontend replays the host's `initialize` to a backend that attaches late.** On Windows the backend appears when a hook fires, after the host has already initialized. The frontend answers `initialize` from the frozen surface, keeps the request line, and sends it (under a frontend-owned id whose answer it drops) plus `notifications/initialized` to the backend once one attaches.
+2. **The frontend replays the host's `initialize` to a backend that attaches late.** On Windows the backend appears when a hook fires, after the host has already initialized. The frontend answers `initialize` from the frozen surface, keeps the request line, and sends it (under a frontend-owned id whose answer it drops) plus `notifications/initialized` to the backend once one attaches. While it waits, a tool call fails at once with the waiting reason, because the spec reports a wait the way it reports any unreachable backend.
 3. **The ownership lock stops being watched.** `LockLoss`, `ServeExit::LockLost` and the 200 ms ownership check go. The spec says a backend that loses its lock or socket keeps serving and exits on the idle timer, and nothing else consumed the check.
 4. **Handshake wire format.** One JSON object per line, written without buffering past its newline and read one byte at a time, so neither side ever consumes bytes of the protocol that follows. Frozen fields: request `mcpls` (protocol number), `version`, `kind` (`mcp`, `hook`, `shutdown`); reply `mcpls`, `version`, `pid`, `sessions`, `refusal`. Every other field is optional with a default, and no reader rejects an unknown field or an unknown refusal reason.
 5. **Trust conflict rule.** Two sides conflict exactly when one loaded a project-local `mcpls.toml` and the other ignored one for want of trust. An explicit `--config`, the global file and built-in defaults conflict with nothing. A differing fingerprint is served and reported.
 6. **Build mismatch is refused on every connection kind except `shutdown`.** The reply still names the backend's version, pid and session count, which is what the frontend decides eviction on and what `mcpls hook doctor` prints.
-7. **The doctor keeps its `owner pid:` label.** Renaming it rewrites dozens of exact-line assertions for no behaviour. New lines are added after it.
-8. **Windows gets a runtime directory too.** `SocketIdentity::lock` becomes a real path under `%TEMP%\mcpls-<user>` on Windows (unused for ownership there), so the spawn lock, the backend log and the start request live beside it on both platforms as `{hash}.spawn.lock`, `{hash}.log` and `{hash}.start`.
+7. **The doctor's pid label is `backend pid:`.** After Task 4 there is no owner, only the process holding the endpoint, which is a backend or an in-process `--no-backend` server. Task 5 renames the label everywhere it is printed or asserted, and every later doctor line is added after it.
+8. **Windows gets a runtime directory too, under `%LOCALAPPDATA%`.** On Windows `runtime_dir()` is `dirs::data_local_dir()` joined with `mcpls`, falling back to `%TEMP%\mcpls-<user>` only when that folder is unknown, and `SocketIdentity::lock` becomes a real path there (unused for ownership). `dirs` resolves the folder through `SHGetKnownFolderPath`, which ignores environment overrides, so a frontend and a hook launched by a harness with a different `%TEMP%` agree on the path, and the profile folder's ACL is already per-user. Unix stays under `TMPDIR`. The spawn lock, the backend log and the start request live beside the lock on both platforms as `{hash}.spawn.lock`, `{hash}.log` and `{hash}.start`. Windows process tests cannot redirect the folder, so they rely on unique temporary checkout roots and remove their `{hash}.*` files.
 9. **HTTP sessions get a record each.** Every HTTP session is a fresh connection. A closed HTTP session's subscriptions are pruned the first time a notify to it fails, since rmcp offers no close callback there.
 10. **`--no-backend` binds the endpoint for hooks only** and refuses `mcp` handshakes, because its lifetime is one host session's.
 11. **A backend configured with `diagnostics.hooks.enabled = false` refuses hook handshakes** with a named refusal, so the doctor explains it.
-12. **No reconnect after the backend dies mid-session.** The spec's verification asks the frontend to report the failure, and a silent reattach would hide it.
-
-## PR boundaries
-
-Tasks 0 to 3 change nothing a user sees and land as one PR. Tasks 4 to 12 are the split and land together as a second PR, because between them the multi-session hook behaviour is temporarily reduced to "whichever process bound the endpoint".
+12. **No reconnect after the backend dies mid-session, except in the idle-exit race.** The spec's verification asks the frontend to report the failure, and a silent reattach would hide it. The exception is a backend that starts exiting just as a frontend attaches. A backend that has stopped accepting reads a handshake and hangs up without replying, so the frontend's handshake sees no reply and `attach` takes the spawn lock and starts a fresh backend, as the spec requires of a frontend arriving during the drain. A backend that replied and then closes before sending the frontend any line counts as a failed attach: the relay reruns `attach` once and resends what the host sent since.
+13. **`--trust-project-config` trusts the checkout root's `mcpls.toml`.** Discovery runs at the root, so the flag in a session started in a subdirectory trusts the checkout's file, which such a session did not read before. Accepted, because root discovery is what lets every session in a checkout share one backend.
 
 ## File structure
 
@@ -391,6 +389,7 @@ Import `ConnectionId` from `crate::bridge` beside `SessionId`. Replace `from_con
 
     /// This server with `notes` appended to its instructions.
     #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn with_notes(mut self, notes: Vec<String>) -> Self {
         self.notes = Arc::from(notes);
         self
@@ -470,6 +469,7 @@ git commit -m "refactor(mcp): key records on the connection"
   - `ResourceSubscriptions::contains(&self, connection: ConnectionId, uri: &str) -> bool`
   - `ResourceSubscriptions::is_empty(&self) -> bool` (unchanged)
   - `McplsServer::connection(&self) -> ConnectionId` (`pub(crate)`)
+  - `McplsServer::subscriptions(&self) -> &Arc<ResourceSubscriptions>` (`pub(crate)`)
   - `run_stdio(mcp_server, shutdown_signal)`: no peer cell parameter.
 - Removes: `PumpShared::peer_cell`, `ResourceSubscriptions::snapshot`.
 
@@ -1097,7 +1097,34 @@ Append to `DEFAULT_CONFIG_TEMPLATE` after the `[diagnostics.hooks]` block:
 
 - [ ] **Step 4: Implement the fingerprint**
 
-In `impl ServerConfig`:
+First learn whether anything in the build enables `serde_json`'s `preserve_order` feature, which decides whether a `serde_json::Value` object keeps its keys sorted.
+
+Run: `cargo tree -e features -i serde_json`
+If a harness hook blocks `cargo`, run the same command through `devrun`. Look for `preserve_order` among the features listed for `serde_json`.
+
+Shape A, when nothing enables `preserve_order`. `Value`'s map is then a `BTreeMap`, so converting to a `Value` sorts every object's keys, and the digest needs no recursion. Add only this to `impl ServerConfig`:
+
+```rust
+    /// A stable digest of every setting, so two processes can tell whether
+    /// they loaded the same configuration. Where the configuration came
+    /// from is not part of it.
+    #[must_use]
+    pub fn fingerprint(&self) -> String {
+        use std::hash::{Hash as _, Hasher as _};
+
+        // Through `Value`, whose object keys are sorted, so a `HashMap`'s
+        // iteration order never reaches the digest.
+        let canonical = serde_json::to_value(self)
+            .map_or_else(|error| error.to_string(), |value| value.to_string());
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        canonical.hash(&mut hasher);
+        format!("{:016x}", hasher.finish())
+    }
+```
+
+Do not hash `serde_json::to_string(self)` directly: it writes each `HashMap` field in that map's own iteration order, which is exactly what `test_the_fingerprint_ignores_map_order` catches. The conversion to `Value` is what sorts the keys.
+
+Shape B, when `preserve_order` is enabled or neither command runs. Hash the value with object keys sorted explicitly. In `impl ServerConfig`:
 
 ```rust
     /// A stable digest of every setting, so two processes can tell whether
@@ -1149,7 +1176,7 @@ fn hash_json(value: &serde_json::Value, hasher: &mut std::collections::hash_map:
 }
 ```
 
-`DefaultHasher` differs between Rust releases, which does not matter: two builds of different versions already refuse each other at the handshake before comparing fingerprints.
+In either shape, `DefaultHasher` differs between Rust releases, which does not matter: two builds of different versions already refuse each other at the handshake before comparing fingerprints.
 
 - [ ] **Step 5: Discover at the root**
 
@@ -1255,8 +1282,6 @@ git add crates/mcpls-core/src crates/mcpls-cli/src/args.rs
 git commit -m "feat(config): discover config at the checkout root"
 ```
 
-This completes the first PR's scope.
-
 ---
 
 ### Task 4: delete the owner, passive, demotion and forwarding paths
@@ -1278,7 +1303,7 @@ This completes the first PR's scope.
   - `ServeExit { Cancelled, TransportUnrecoverable }`.
 - Removes: `HookRole`, `Role`, `hook_owner_task`, `hook_takeover_task`, `acquire_when_free`, `LOCK_RETRY_INTERVAL`, `LockLoss`, `LockLossPause` and its helpers, `ServeExit::LockLost`, `HookListener::lock_loss`, `OWNERSHIP_CHECK_INTERVAL`, `BridgeContext::hooks`, `McplsServer::{flush_from_owner, forward_apply_targets}`, `NewDiagnosticsResult::{from_owner, owner_unreachable}`.
 
-After this task one process holds the endpoint and answers hooks; any other in-process mcpls in the same project serves its own MCP session and hears no hooks. That is the intermediate state the second PR lands past. The sweeper, `HookLocation`, the listener's accept loop and the hook protocol stay.
+After this task one process holds the endpoint and answers hooks; any other in-process mcpls in the same project serves its own MCP session and hears no hooks. Tasks 6b to 9 replace that state with one shared backend. The sweeper, `HookLocation`, the listener's accept loop and the hook protocol stay.
 
 This task is deletion. Its test is that nothing references the removed names and the remaining suite passes.
 
@@ -1454,7 +1479,8 @@ git commit -m "refactor(hooks): drop owner and passive roles"
 - Create: `crates/mcpls-core/src/backend/mod.rs`, `crates/mcpls-core/src/backend/handshake.rs`
 - Modify: `crates/mcpls-core/src/lib.rs:38-48` (`pub mod backend;`)
 - Modify: `crates/mcpls-core/src/hooks/listener.rs`: `HookStream` visibility (`:32`), `serve` accept arm (`:417-424`), `serve_connection` (`:463-502`), `ProbeOutcome` (`:671-691`), `probe` (`:699-723`), `Connection` (`:801-860`), `connect` visibility (`:862-899`)
-- Modify: `crates/mcpls-cli/src/hook.rs`: doctor arms (`:264-321`), foreign scan (`:585-609`), test fake `serve_connection` (`:1233-1300`)
+- Modify: `crates/mcpls-cli/src/hook.rs`: doctor arms (`:264-321`), foreign scan (`:585-609`), test fake `serve_connection` (`:1233-1300`), and the doctor's pid label wherever it is printed or asserted
+- Modify: `plugin/README.md` (the doctor's pid label in its examples and field description)
 - Test: `crates/mcpls-core/src/backend/handshake.rs`, `crates/mcpls-core/tests/hooks_socket.rs`, `crates/mcpls-cli/src/hook.rs` tests
 
 **Interfaces:**
@@ -1465,7 +1491,7 @@ git commit -m "refactor(hooks): drop owner and passive roles"
   - `pub struct ConfigStamp { pub fingerprint: String, pub source: ConfigSource, pub project_ignored: bool }` with `ConfigStamp::of(config: &ServerConfig) -> ConfigStamp` and `ConfigStamp::conflicts_with(&self, other: &ConfigStamp) -> bool`.
   - `pub struct Handshake { pub mcpls: u32, pub version: String, pub kind: ConnectionKind, pub root: Option<PathBuf>, pub session: Option<String>, pub config: Option<ConfigStamp> }` with `Handshake::mcp(root: PathBuf, session: Option<String>, config: ConfigStamp)`, `Handshake::hook()`, `Handshake::shutdown()`, `Handshake::same_build(&self) -> bool`.
   - `pub struct HandshakeReply { pub mcpls: u32, pub version: String, pub pid: u32, pub sessions: usize, pub refusal: Option<Refusal> }` with `HandshakeReply::new(sessions: usize, refusal: Option<Refusal>)`, `HandshakeReply::same_build(&self) -> bool`.
-  - `pub enum Refusal { Build, Trust { backend: ConfigStamp }, Root { backend: PathBuf }, Attached, InProcess, HooksDisabled, Other }`.
+  - `pub enum Refusal { Build, Trust { backend: ConfigStamp }, Attached, InProcess, HooksDisabled, Other }`.
   - `pub fn compare_builds(ours: (u32, &str), theirs: (u32, &str)) -> std::cmp::Ordering`.
   - `pub(crate) async fn write<W, T>(writer: &mut W, value: &T) -> io::Result<()>` and `pub(crate) async fn read<R, T>(reader: &mut R) -> io::Result<T>`.
   - `pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);`
@@ -1688,11 +1714,6 @@ pub enum Refusal {
     Trust {
         /// The server's configuration.
         backend: ConfigStamp,
-    },
-    /// The client resolved a different checkout root.
-    Root {
-        /// The root the server serves.
-        backend: PathBuf,
     },
     /// A shutdown was asked for while sessions are attached.
     Attached,
@@ -2007,7 +2028,7 @@ In `crates/mcpls-cli/src/hook.rs` `doctor_scanning`, add before the `Busy` arm:
                 mcpls_core::backend::VERSION,
                 refusal_text(reply.refusal.as_ref())
             ));
-            lines.push(format!("owner pid: {}", reply.pid));
+            lines.push(format!("backend pid: {}", reply.pid));
         }
 ```
 
@@ -2055,6 +2076,8 @@ In the test fake `serve_connection` (`hook.rs:1233`), before `let (reader, mut w
 
 The `silent` branch stays above this, so a silent owner still never answers the handshake and the doctor still reports it busy.
 
+Rename the doctor's pid label to `backend pid:` (Decision 7). Every print and assertion of the old label is in `crates/mcpls-cli/src/hook.rs` or `plugin/README.md`; list them with `rg -n 'owner.pid' crates plugin`. In `hook.rs` they are the answered-status arm, the no-owner arm, `doctor_without_identity`, the `OWNER_PID_UNKNOWN` constant (rename it `BACKEND_PID_UNKNOWN`, value `"backend pid: unknown"`), and the doctor tests that assert those lines exactly or find them by prefix, including the assertion messages that name the line. Change only the label; every assertion stays exact. In `plugin/README.md`, change both doctor examples and the field description. Afterwards `rg -n 'owner.pid' crates plugin` prints nothing.
+
 Add a doctor test beside `test_doctor_reports_an_answer_that_is_not_a_status`:
 
 ```rust
@@ -2076,7 +2099,7 @@ Add a doctor test beside `test_doctor_reports_an_answer_that_is_not_a_status`:
             out.contains("server sees: mcpls 0.0.1 refused this build"),
             "{out}"
         );
-        assert!(out.contains("owner pid: 4242"), "{out}");
+        assert!(out.contains("backend pid: 4242"), "{out}");
     }
 ```
 
@@ -2093,31 +2116,226 @@ Run: `devrun task verify`
 Expected: PASS.
 
 ```bash
-git add crates/mcpls-core crates/mcpls-cli/src/hook.rs
-git commit -m "feat(backend): open endpoint connections with a handshake"
+git add crates/mcpls-core crates/mcpls-cli/src/hook.rs plugin/README.md
+git commit -m "feat(backend): handshake on every connection"
 ```
 
 ---
 
-### Task 6: the backend serves many connections and exits when idle
+### Task 6a: extract the runtime
 
 **Files:**
-- Modify: `crates/mcpls-core/src/lib.rs` (`serve_with_identity` split into `Runtime::start` and the in-process runner)
-- Create: `crates/mcpls-core/src/backend/endpoint.rs`
-- Modify: `crates/mcpls-core/src/backend/mod.rs`
+- Modify: `crates/mcpls-core/src/lib.rs` (`serve_with_identity` split into `Runtime::start`, `serve_hooks_in_process` and the in-process runner)
 - Modify: `crates/mcpls-core/src/hooks/listener.rs` (`HookListener::accept`)
-- Test: `crates/mcpls-core/src/backend/endpoint.rs`
+- Test: the existing suite, notably `test_serve_with_binds_the_socket_and_answers_as_its_owner` and `test_serve_with_runs_the_sweep_loop_it_built` in `crates/mcpls-core/src/hooks/service.rs`
 
 **Interfaces:**
-- Consumes: `McplsServer::for_connection`, `with_notes`, `connection`, `session`, `subscriptions` (Tasks 1-2), `ServerConfig::backend` and `ConfigStamp` (Tasks 3, 5), `HookStats`, `build_handler` (Task 4), `handshake::{read, write, HANDSHAKE_TIMEOUT}`, `serve_hook_connection`, `HookStream` (Task 5).
+- Consumes: `McplsServer::from_context` (Task 1), `HookStats`, `build_handler(server, sweeper, location, stats, cancel)`, `HookListener::acquire`, `HookListener::serve` (Task 4).
 - Produces:
-  - `pub(crate) struct Runtime` in `lib.rs` with `pub(crate) async fn start(config: &ServerConfig, root: Result<PathBuf, Error>) -> Result<Runtime, Error>`, `pub(crate) async fn shutdown(self)`, and fields `context: Arc<mcp::BridgeContext>`, `sweeper: Arc<hooks::Sweeper>`, `cancel_rx: watch::Receiver<bool>`.
+  - `pub(crate) struct Runtime` in `lib.rs` with `pub(crate) async fn start(config: &ServerConfig, root: Result<PathBuf, Error>) -> Result<Runtime, Error>`, `pub(crate) async fn shutdown(self)`, crate-visible fields `context: Arc<mcp::BridgeContext>`, `sweeper: Arc<hooks::Sweeper>`, `cancel_rx: watch::Receiver<bool>`, and private fields `translator: Arc<Translator>`, `cancel_tx: watch::Sender<bool>`, `lsp_init_handle: Option<JoinHandle<()>>`.
+  - `async fn serve_hooks_in_process(runtime: &Runtime, config: &ServerConfig, identity_override: Option<hooks::SocketIdentity>, hook_root: Option<PathBuf>)` in `lib.rs`, private, so tests in descendant modules call it as `crate::serve_hooks_in_process`.
   - `HookListener::accept(&self) -> io::Result<Box<dyn HookStream>>` (`pub(crate)`).
+
+A backend and an in-process server serve from the same state, so that state moves out of `serve_with_identity` into a value both build. This task changes no behaviour, and the existing suite is its test.
+
+- [ ] **Step 1: Extract the runtime**
+
+In `crates/mcpls-core/src/lib.rs`, move the body of `serve_with_identity` from `config.validate()?;` through the construction of `context` into:
+
+```rust
+/// Everything one mcpls process serves from, however many connections
+/// reach it: the language servers, the caches and every record.
+pub(crate) struct Runtime {
+    pub(crate) context: Arc<mcp::BridgeContext>,
+    pub(crate) sweeper: Arc<hooks::Sweeper>,
+    pub(crate) cancel_rx: tokio::sync::watch::Receiver<bool>,
+    translator: Arc<Translator>,
+    cancel_tx: tokio::sync::watch::Sender<bool>,
+    lsp_init_handle: Option<JoinHandle<()>>,
+}
+
+impl Runtime {
+    /// Validate `config`, resolve its workspace against `root`, start the
+    /// language servers in the background, and build the shared state.
+    ///
+    /// `root` is only consulted when a workspace root is empty or
+    /// relative, so an unreadable working directory does not block a
+    /// configuration whose roots are all absolute.
+    pub(crate) async fn start(
+        config: &ServerConfig,
+        root: Result<PathBuf, Error>,
+    ) -> Result<Self, Error> {
+        config.validate()?;
+        let workspace_roots = if config.workspace.roots.is_empty()
+            || config.workspace.roots.iter().any(|root| root.is_relative())
+        {
+            resolve_workspace_roots(&config.workspace.roots, &root?)?
+        } else {
+            canonicalize_workspace_roots(&config.workspace.roots, Path::new(""))?
+        };
+        // ... the rest of the moved block, unchanged, from `extension_map`
+        // through `context`, with the sweeper built unconditionally:
+        //     let sweeper = Arc::new(hooks::Sweeper::new(...));
+        //     tokio::spawn(Arc::clone(&sweeper).run(cancel_rx.clone()));
+        Ok(Self {
+            context: Arc::new(context),
+            sweeper,
+            cancel_rx,
+            translator,
+            cancel_tx,
+            lsp_init_handle,
+        })
+    }
+
+    /// Stop the background tasks and drain the language servers.
+    pub(crate) async fn shutdown(self) {
+        shutdown(&self.cancel_tx, &self.translator, self.lsp_init_handle).await;
+    }
+}
+```
+
+The comment lines inside the snippet mark where the existing statements go; do not leave them in the code. Everything the moved block referenced from `config` by value (`config.diagnostics`, `config.workspace.max_documents`) reads through `&ServerConfig`; `DiagnosticsConfig` is `Copy`. The block that built the sweeper only when a listener existed (Task 4) builds it unconditionally here.
+
+`serve_with_identity` becomes, with its hook wiring moved into a function of its own:
+
+```rust
+pub(crate) async fn serve_with_identity(
+    config: ServerConfig,
+    transport: Transport,
+    identity_override: Option<hooks::SocketIdentity>,
+) -> Result<(), Error> {
+    info!("Starting MCPLS server...");
+    let shutdown_signal = ShutdownSignal::new();
+    let root = std::env::current_dir()
+        .map_err(Error::Io)
+        .and_then(|dir| hooks::project_root(&dir));
+    let hook_root = root.as_ref().ok().cloned();
+    let runtime = Runtime::start(&config, root).await?;
+    serve_hooks_in_process(&runtime, &config, identity_override, hook_root).await;
+
+    let mcp_server = mcp::McplsServer::from_context(Arc::clone(&runtime.context));
+    info!("MCPLS server initialized successfully");
+    let result = match transport {
+        Transport::Stdio => {
+            info!("Listening for MCP requests on stdio...");
+            run_stdio(mcp_server, shutdown_signal).await
+        }
+        #[cfg(feature = "transport-http")]
+        Transport::Http(cfg) => run_http(mcp_server, cfg, shutdown_signal).await,
+    };
+    runtime.shutdown().await;
+    info!("MCPLS server shutting down");
+    result
+}
+
+/// Bind the project's endpoint for hooks when hooks are on and no other
+/// process holds it, and answer hooks from `runtime` until it is cancelled.
+async fn serve_hooks_in_process(
+    runtime: &Runtime,
+    config: &ServerConfig,
+    identity_override: Option<hooks::SocketIdentity>,
+    hook_root: Option<PathBuf>,
+) {
+    if !config.diagnostics.hooks.enabled {
+        return;
+    }
+    let identity = match identity_override.map_or_else(
+        || hook_root.as_deref().map(hooks::identity_for).transpose(),
+        |identity| Ok(Some(identity)),
+    ) {
+        Ok(Some(identity)) => identity,
+        Ok(None) => return,
+        Err(error) => {
+            warn!("hooks are configured on but this project's endpoint could not be derived: {error}");
+            return;
+        }
+    };
+    let listener = match hooks::HookListener::acquire(&identity).await {
+        Ok(Some(listener)) => listener,
+        Ok(None) => {
+            warn!(
+                "another mcpls holds this project's endpoint, so its hooks are answered there \
+                 rather than here"
+            );
+            return;
+        }
+        Err(error) => {
+            warn!("the project's endpoint could not be bound, so no hooks are served: {error}");
+            return;
+        }
+    };
+    let root = hook_root.unwrap_or_else(|| {
+        std::env::current_dir()
+            .ok()
+            .and_then(|dir| dunce::canonicalize(dir).ok())
+            .unwrap_or_default()
+    });
+    let handler = hooks::build_handler(
+        Arc::new(mcp::McplsServer::from_context(Arc::clone(&runtime.context))),
+        Arc::clone(&runtime.sweeper),
+        hooks::HookLocation { identity, root },
+        Arc::new(hooks::HookStats::default()),
+        runtime.cancel_rx.clone(),
+    );
+    let op_deadline = Duration::from_millis(config.diagnostics.hooks.op_deadline_ms);
+    let cancel = runtime.cancel_rx.clone();
+    tokio::spawn(log_hook_task_panic(async move {
+        let _ = listener.serve(handler, op_deadline, cancel).await;
+    }));
+}
+```
+
+Keep the existing "Registered before any other startup work" comment above `ShutdownSignal::new()` and the `serve_with_identity` doc. Delete `canonicalized_root_identity` if nothing else calls it. The HTTP tests in `hooks/service.rs` pass an identity override and a workspace with absolute roots. For them `hook_root` may be absent, and the `unwrap_or_else` gives `HookLocation::root` the canonical current directory, as the deleted override branch did.
+
+- [ ] **Step 2: Expose accept**
+
+In `crates/mcpls-core/src/hooks/listener.rs` `impl HookListener`:
+
+```rust
+    /// Wait for the next client, for a caller running its own accept loop.
+    pub(crate) async fn accept(&self) -> io::Result<Box<dyn HookStream>> {
+        self.transport.accept().await
+    }
+```
+
+Nothing calls `accept` until the backend's accept loop in Task 6b. Put `#[allow(dead_code)]` on the method with no comment; Task 6b removes it.
+
+- [ ] **Step 3: Run the tests**
+
+Run: `devrun task test`
+Expected: PASS with no test added or changed, including `test_serve_with_binds_the_socket_and_answers_as_its_owner` and `test_serve_with_runs_the_sweep_loop_it_built`.
+
+- [ ] **Step 4: Verify and commit**
+
+Run: `devrun task verify`
+Expected: PASS.
+
+```bash
+git add crates/mcpls-core/src/lib.rs crates/mcpls-core/src/hooks/listener.rs
+git commit -m "refactor(core): extract the runtime"
+```
+
+---
+
+### Task 6b: the backend serves many connections and exits when idle
+
+**Files:**
+- Create: `crates/mcpls-core/src/backend/endpoint.rs`
+- Modify: `crates/mcpls-core/src/backend/mod.rs`
+- Modify: `crates/mcpls-core/src/lib.rs` (`serve_hooks_in_process` returns the session's notes, `ENDPOINT_HELD_NOTE`)
+- Modify: `crates/mcpls-core/src/hooks/listener.rs` (drop the `dead_code` allow on `accept`)
+- Test: `crates/mcpls-core/src/backend/endpoint.rs`, `crates/mcpls-core/src/hooks/service.rs`
+
+**Interfaces:**
+- Consumes: `Runtime::{start, shutdown}`, the fields `Runtime::{context, sweeper, cancel_rx}`, `serve_hooks_in_process`, `HookListener::accept` (Task 6a); `McplsServer::for_connection`, `with_notes`, `connection`, `session` (Task 1), `McplsServer::subscriptions` (Task 2); `ServerConfig::backend` (Task 3); `HookStats`, `build_handler` (Task 4); `ConfigStamp`, `ConnectionKind`, `Handshake`, `HandshakeReply`, `Refusal`, `handshake::{read, write, HANDSHAKE_TIMEOUT, VERSION}`, `serve_hook_connection`, `HookStream`, `listener::connect` (Task 5).
+- Produces:
   - `pub async fn serve_backend(config: ServerConfig, root: PathBuf) -> Result<(), Error>` in `backend::endpoint`, re-exported as `mcpls_core::backend::serve_backend`.
   - `pub(crate) async fn serve_backend_on(config: ServerConfig, root: PathBuf, identity: SocketIdentity) -> Result<(), Error>` for tests.
+  - `pub(crate) struct Endpoint` with `pub(crate) fn new(runtime: &crate::Runtime, config: &ServerConfig, root: PathBuf, identity: SocketIdentity) -> Arc<Endpoint>` and `pub(crate) async fn run(self: Arc<Self>, listener: HookListener, idle: Duration, signal: impl Future<Output = ()>) -> Exit`; `pub(crate) enum Exit { Idle, Shutdown, Signal }`.
   - `pub(crate) struct Attachments` with `attach(self: &Arc<Self>, connection: ConnectionId, session: String) -> Attached`, `count(&self) -> usize`, `sessions(&self) -> Vec<String>`, `watch(&self) -> watch::Receiver<usize>`.
+  - `async fn serve_hooks_in_process(runtime: &Runtime, config: &ServerConfig, identity_override: Option<hooks::SocketIdentity>, hook_root: Option<PathBuf>) -> Vec<String>` and `const ENDPOINT_HELD_NOTE: &str` in `lib.rs`.
 
-The spec's order on exit matters more than its timer: stop accepting, close every open stream, then drain the language servers. Dropping the listener releases the endpoint (and on Unix its ownership lock), so a frontend arriving during the drain starts a new backend.
+The spec's order on exit matters more than its timer: stop accepting, close every open stream, then drain the language servers. Dropping the listener releases the endpoint (and on Unix its ownership lock), and a connection whose handshake is read after the loop stopped accepting is closed without a reply, so a frontend arriving during the drain starts a new backend instead of attaching to one on its way out.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2351,8 +2569,65 @@ mod tests {
         );
         runtime.shutdown().await;
     }
+
+    /// A handshake read after the endpoint stopped accepting gets no reply,
+    /// which is what sends its client to start a fresh backend.
+    #[tokio::test]
+    async fn test_a_handshake_during_the_drain_gets_no_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let identity = temp_identity(&root);
+        let runtime = crate::Runtime::start(&config(60_000), Ok(root.clone())).await.unwrap();
+        let endpoint = Endpoint::new(&runtime, &config(60_000), root.clone(), identity);
+        endpoint.closing.send_replace(true);
+
+        let (mut client, server) = tokio::io::duplex(4096);
+        let served = tokio::spawn(Arc::clone(&endpoint).connection(Box::new(server)));
+        handshake::write(&mut client, &Handshake::mcp(root, None, ConfigStamp::of(&config(0))))
+            .await
+            .unwrap();
+        let reply = tokio::time::timeout(
+            Duration::from_secs(5),
+            handshake::read::<_, HandshakeReply>(&mut client),
+        )
+        .await
+        .expect("the connection hung up rather than waiting");
+        assert!(reply.is_err(), "a closing endpoint answered a handshake: {reply:?}");
+        served.await.unwrap();
+        runtime.shutdown().await;
+    }
 }
 ```
+
+Add to `mod tests` in `crates/mcpls-core/src/hooks/service.rs`, beside `test_serve_with_binds_the_socket_and_answers_as_its_owner`:
+
+```rust
+    /// An in-process mcpls (`--no-backend`) that finds the project's
+    /// endpoint already held serves its own session without hooks, and
+    /// tells that session so.
+    #[tokio::test]
+    async fn test_an_in_process_server_names_an_endpoint_already_held() {
+        let (dir, identity) = temp_identity();
+        let workspace = tempfile::tempdir().expect("a temp dir");
+        let root = dunce::canonicalize(workspace.path()).expect("a canonical workspace");
+        let _held = crate::hooks::HookListener::acquire(&identity)
+            .await
+            .expect("acquire")
+            .expect("the endpoint is free");
+        let config = bare_config_over(&root);
+        let runtime = crate::Runtime::start(&config, Ok(root.clone()))
+            .await
+            .expect("a runtime");
+
+        let notes = crate::serve_hooks_in_process(&runtime, &config, Some(identity), Some(root)).await;
+
+        assert_eq!(notes, vec![crate::ENDPOINT_HELD_NOTE.to_string()]);
+        runtime.shutdown().await;
+        drop(dir);
+    }
+```
+
+It drives no transport, so it needs no `transport-http` gate. `temp_identity` and `bare_config_over` are that module's helpers; if either is gated on a feature, gate this test the same way.
 
 Drop any import clippy reports unused (`ConnectionKind` is only needed by the implementation).
 
@@ -2361,156 +2636,9 @@ Add `pub mod endpoint;` and `pub use endpoint::serve_backend;` to `crates/mcpls-
 - [ ] **Step 2: See them fail**
 
 Run: `devrun task check`
-Expected: FAIL to compile: `cannot find function serve_backend_on`, `cannot find type Endpoint`, `Runtime` not found.
+Expected: FAIL to compile: `cannot find function serve_backend_on`, `cannot find type Endpoint`, `cannot find value ENDPOINT_HELD_NOTE`.
 
-- [ ] **Step 3: Extract the runtime**
-
-In `crates/mcpls-core/src/lib.rs`, move the body of `serve_with_identity` from `config.validate()?;` through the construction of `context` into:
-
-```rust
-/// Everything one mcpls process serves from, however many connections
-/// reach it: the language servers, the caches and every record.
-pub(crate) struct Runtime {
-    pub(crate) context: Arc<mcp::BridgeContext>,
-    pub(crate) sweeper: Arc<hooks::Sweeper>,
-    pub(crate) cancel_rx: tokio::sync::watch::Receiver<bool>,
-    translator: Arc<Translator>,
-    cancel_tx: tokio::sync::watch::Sender<bool>,
-    lsp_init_handle: Option<JoinHandle<()>>,
-}
-
-impl Runtime {
-    /// Validate `config`, resolve its workspace against `root`, start the
-    /// language servers in the background, and build the shared state.
-    ///
-    /// `root` is only consulted when a workspace root is empty or
-    /// relative, so an unreadable working directory does not block a
-    /// configuration whose roots are all absolute.
-    pub(crate) async fn start(
-        config: &ServerConfig,
-        root: Result<PathBuf, Error>,
-    ) -> Result<Self, Error> {
-        config.validate()?;
-        let workspace_roots = if config.workspace.roots.is_empty()
-            || config.workspace.roots.iter().any(|root| root.is_relative())
-        {
-            resolve_workspace_roots(&config.workspace.roots, &root?)?
-        } else {
-            canonicalize_workspace_roots(&config.workspace.roots, Path::new(""))?
-        };
-        // ... the rest of the moved block, unchanged, from `extension_map`
-        // through `context`, with the sweeper built unconditionally:
-        //     let sweeper = Arc::new(hooks::Sweeper::new(...));
-        //     tokio::spawn(Arc::clone(&sweeper).run(cancel_rx.clone()));
-        Ok(Self {
-            context: Arc::new(context),
-            sweeper,
-            cancel_rx,
-            translator,
-            cancel_tx,
-            lsp_init_handle,
-        })
-    }
-
-    /// Stop the background tasks and drain the language servers.
-    pub(crate) async fn shutdown(self) {
-        shutdown(&self.cancel_tx, &self.translator, self.lsp_init_handle).await;
-    }
-}
-```
-
-The comment lines inside the snippet mark where the existing statements go; do not leave them in the code. Everything the moved block referenced from `config` by value (`config.diagnostics`, `config.workspace.max_documents`) reads through `&ServerConfig`; `DiagnosticsConfig` is `Copy`. The block that built the sweeper only when a listener existed (Task 4) builds it unconditionally here.
-
-`serve_with_identity` becomes:
-
-```rust
-pub(crate) async fn serve_with_identity(
-    config: ServerConfig,
-    transport: Transport,
-    identity_override: Option<hooks::SocketIdentity>,
-) -> Result<(), Error> {
-    info!("Starting MCPLS server...");
-    let shutdown_signal = ShutdownSignal::new();
-    let root = std::env::current_dir()
-        .map_err(Error::Io)
-        .and_then(|dir| hooks::project_root(&dir));
-    let hook_root = root.as_ref().ok().cloned();
-    let runtime = Runtime::start(&config, root).await?;
-
-    let mut notes = Vec::new();
-    if config.diagnostics.hooks.enabled {
-        let identity = identity_override.map_or_else(
-            || hook_root.as_deref().map(hooks::identity_for).transpose(),
-            |identity| Ok(Some(identity)),
-        );
-        match identity {
-            Ok(Some(identity)) => match hooks::HookListener::acquire(&identity).await {
-                Ok(Some(listener)) => {
-                    let handler = hooks::build_handler(
-                        Arc::new(mcp::McplsServer::from_context(Arc::clone(&runtime.context))),
-                        Arc::clone(&runtime.sweeper),
-                        hooks::HookLocation {
-                            identity,
-                            root: hook_root.clone().unwrap_or_default(),
-                        },
-                        Arc::new(hooks::HookStats::default()),
-                        runtime.cancel_rx.clone(),
-                    );
-                    let op_deadline =
-                        Duration::from_millis(config.diagnostics.hooks.op_deadline_ms);
-                    let cancel = runtime.cancel_rx.clone();
-                    tokio::spawn(log_hook_task_panic(async move {
-                        let _ = listener.serve(handler, op_deadline, cancel).await;
-                    }));
-                }
-                Ok(None) => notes.push(ENDPOINT_HELD_NOTE.to_string()),
-                Err(error) => {
-                    warn!("the project's endpoint could not be bound, so no hooks are served: {error}");
-                }
-            },
-            Ok(None) => {}
-            Err(error) => warn!(
-                "hooks are configured on but this project's endpoint could not be derived: {error}"
-            ),
-        }
-    }
-
-    let mcp_server = mcp::McplsServer::from_context(Arc::clone(&runtime.context)).with_notes(notes);
-    info!("MCPLS server initialized successfully");
-    let result = match transport {
-        Transport::Stdio => {
-            info!("Listening for MCP requests on stdio...");
-            run_stdio(mcp_server, shutdown_signal).await
-        }
-        #[cfg(feature = "transport-http")]
-        Transport::Http(cfg) => run_http(mcp_server, cfg, shutdown_signal).await,
-    };
-    runtime.shutdown().await;
-    info!("MCPLS server shutting down");
-    result
-}
-
-/// Told to a session whose in-process mcpls found the project's endpoint
-/// already held.
-const ENDPOINT_HELD_NOTE: &str = "NOTE: another mcpls already serves this project's \
-    endpoint, so the plugin's hooks reach that process and not this one; diagnostics \
-    delivered through hooks are not this session's.";
-```
-
-Keep the existing "Registered before any other startup work" comment above `ShutdownSignal::new()` and the `serve_with_identity` doc. Delete `canonicalized_root_identity` if nothing else calls it. The HTTP tests in `hooks/service.rs` pass an identity override and a workspace with absolute roots; they keep working because the override path does not need `hook_root` for anything but `HookLocation::root`. For them, set `root` to the canonical current directory as the deleted override branch did: replace `hook_root.clone().unwrap_or_default()` with `hook_root.clone().unwrap_or_else(|| std::env::current_dir().ok().and_then(|dir| dunce::canonicalize(dir).ok()).unwrap_or_default())`.
-
-- [ ] **Step 4: Expose accept**
-
-In `crates/mcpls-core/src/hooks/listener.rs` `impl HookListener`:
-
-```rust
-    /// Wait for the next client, for a caller running its own accept loop.
-    pub(crate) async fn accept(&self) -> io::Result<Box<dyn HookStream>> {
-        self.transport.accept().await
-    }
-```
-
-- [ ] **Step 5: Implement the endpoint**
+- [ ] **Step 3: Implement the endpoint**
 
 Put the implementation above the test module in `crates/mcpls-core/src/backend/endpoint.rs`:
 
@@ -2590,7 +2718,6 @@ pub(crate) struct Endpoint {
     handler: Arc<HookHandler>,
     attachments: Arc<Attachments>,
     stamp: ConfigStamp,
-    root: PathBuf,
     hooks_enabled: bool,
     op_deadline: Duration,
     closing: watch::Sender<bool>,
@@ -2608,10 +2735,7 @@ impl Endpoint {
         let handler = hooks::build_handler(
             Arc::new(template.clone()),
             Arc::clone(&runtime.sweeper),
-            HookLocation {
-                identity,
-                root: root.clone(),
-            },
+            HookLocation { identity, root },
             Arc::new(HookStats::default()),
             runtime.cancel_rx.clone(),
         );
@@ -2620,7 +2744,6 @@ impl Endpoint {
             handler: Arc::new(handler),
             attachments: Arc::new(Attachments::default()),
             stamp: ConfigStamp::of(config),
-            root,
             hooks_enabled: config.diagnostics.hooks.enabled,
             op_deadline: Duration::from_millis(config.diagnostics.hooks.op_deadline_ms),
             closing: watch::channel(false).0,
@@ -2658,7 +2781,7 @@ impl Endpoint {
             }
         };
         drop(listener);
-        let _ = self.closing.send(true);
+        self.closing.send_replace(true);
         if tokio::time::timeout(Duration::from_secs(2), async {
             while tasks.join_next().await.is_some() {}
         })
@@ -2680,6 +2803,11 @@ impl Endpoint {
         else {
             return;
         };
+        // A backend that has stopped accepting hangs up without a reply, so
+        // its client starts a fresh backend rather than attaching to this one.
+        if *self.closing.borrow() {
+            return;
+        }
         let sessions = self.attachments.count();
         let refusal = self.refusal_for(&request, sessions);
         let refused = refusal.is_some();
@@ -2714,22 +2842,13 @@ impl Endpoint {
         }
         match request.kind {
             ConnectionKind::Hook => (!self.hooks_enabled).then_some(Refusal::HooksDisabled),
-            ConnectionKind::Mcp => {
-                if let Some(root) = &request.root
-                    && *root != self.root
-                {
-                    return Some(Refusal::Root {
-                        backend: self.root.clone(),
-                    });
-                }
-                request
-                    .config
-                    .as_ref()
-                    .filter(|theirs| self.stamp.conflicts_with(theirs))
-                    .map(|_| Refusal::Trust {
-                        backend: self.stamp.clone(),
-                    })
-            }
+            ConnectionKind::Mcp => request
+                .config
+                .as_ref()
+                .filter(|theirs| self.stamp.conflicts_with(theirs))
+                .map(|_| Refusal::Trust {
+                    backend: self.stamp.clone(),
+                }),
             ConnectionKind::Shutdown => None,
         }
     }
@@ -2860,21 +2979,94 @@ impl Drop for Attached {
 
 `watch::Sender<usize>` has no `Default`; replace `#[derive(Default)]` on `Attachments` with a manual `impl Default` building `watch::channel(0).0`. `ShutdownSignal` is `pub(crate)` in `transport.rs` already. If `build_handler` returns an `impl Fn` that `Arc::new` cannot coerce to `Arc<HookHandler>` directly, annotate: `let handler: Arc<HookHandler> = Arc::new(handler);`.
 
-The accept arm sleeps 50 ms after an error to avoid spinning; it holds no lock while sleeping.
+The accept arm sleeps 50 ms after an error to avoid spinning; it holds no lock while sleeping. `closing` is set with `send_replace`, because `send` leaves the value unchanged when no receiver exists, and a connection still reading its handshake reads the value rather than subscribing. `Refusal` has no variant for a differing root: both sides hash the canonical root into the endpoint name, so a client never reaches a backend for another root, and `Handshake::root` stays in the request because the request line is frozen.
 
-- [ ] **Step 6: Run the tests**
+Remove the `#[allow(dead_code)]` Task 6a put on `HookListener::accept`, and the `#[cfg_attr(not(test), allow(dead_code))]` Task 1 put on `McplsServer::with_notes`.
+
+- [ ] **Step 4: Tell an in-process session the endpoint is held**
+
+In `crates/mcpls-core/src/lib.rs`, replace `serve_hooks_in_process` with:
+
+```rust
+/// Bind the project's endpoint for hooks when hooks are on and no other
+/// process holds it, and answer hooks from `runtime` until it is cancelled.
+/// Returns the notes the in-process session is told.
+async fn serve_hooks_in_process(
+    runtime: &Runtime,
+    config: &ServerConfig,
+    identity_override: Option<hooks::SocketIdentity>,
+    hook_root: Option<PathBuf>,
+) -> Vec<String> {
+    if !config.diagnostics.hooks.enabled {
+        return Vec::new();
+    }
+    let identity = match identity_override.map_or_else(
+        || hook_root.as_deref().map(hooks::identity_for).transpose(),
+        |identity| Ok(Some(identity)),
+    ) {
+        Ok(Some(identity)) => identity,
+        Ok(None) => return Vec::new(),
+        Err(error) => {
+            warn!("hooks are configured on but this project's endpoint could not be derived: {error}");
+            return Vec::new();
+        }
+    };
+    let listener = match hooks::HookListener::acquire(&identity).await {
+        Ok(Some(listener)) => listener,
+        Ok(None) => return vec![ENDPOINT_HELD_NOTE.to_string()],
+        Err(error) => {
+            warn!("the project's endpoint could not be bound, so no hooks are served: {error}");
+            return Vec::new();
+        }
+    };
+    let root = hook_root.unwrap_or_else(|| {
+        std::env::current_dir()
+            .ok()
+            .and_then(|dir| dunce::canonicalize(dir).ok())
+            .unwrap_or_default()
+    });
+    let handler = hooks::build_handler(
+        Arc::new(mcp::McplsServer::from_context(Arc::clone(&runtime.context))),
+        Arc::clone(&runtime.sweeper),
+        hooks::HookLocation { identity, root },
+        Arc::new(hooks::HookStats::default()),
+        runtime.cancel_rx.clone(),
+    );
+    let op_deadline = Duration::from_millis(config.diagnostics.hooks.op_deadline_ms);
+    let cancel = runtime.cancel_rx.clone();
+    tokio::spawn(log_hook_task_panic(async move {
+        let _ = listener.serve(handler, op_deadline, cancel).await;
+    }));
+    Vec::new()
+}
+
+/// Told to a session whose in-process mcpls found the project's endpoint
+/// already held.
+const ENDPOINT_HELD_NOTE: &str = "NOTE: another mcpls already serves this project's \
+    endpoint, so the plugin's hooks reach that process and not this one; diagnostics \
+    delivered through hooks are not this session's.";
+```
+
+In `serve_with_identity`, replace the `serve_hooks_in_process` call and the `mcp_server` line with:
+
+```rust
+    let notes = serve_hooks_in_process(&runtime, &config, identity_override, hook_root).await;
+    let mcp_server = mcp::McplsServer::from_context(Arc::clone(&runtime.context)).with_notes(notes);
+```
+
+- [ ] **Step 5: Run the tests**
 
 Run: `devrun task test`
-Expected: PASS, including the ten endpoint tests. `test_a_backend_nobody_attaches_to_exits_after_the_idle_timer` also proves the empty-config runtime drains promptly.
+Expected: PASS, including the eleven endpoint tests and `test_an_in_process_server_names_an_endpoint_already_held`. `test_a_backend_nobody_attaches_to_exits_after_the_idle_timer` also proves the empty-config runtime drains promptly.
 
-- [ ] **Step 7: Verify and commit**
+- [ ] **Step 6: Verify and commit**
 
 Run: `devrun task verify`
 Expected: PASS.
 
 ```bash
 git add crates/mcpls-core
-git commit -m "feat(backend): serve many sessions from one process"
+git commit -m "feat(backend): serve many sessions in one process"
 ```
 
 ---
@@ -2889,6 +3081,7 @@ git commit -m "feat(backend): serve many sessions from one process"
 - Test: `crates/mcpls-core/src/backend/spawn.rs`, `crates/mcpls-core/src/hooks/identity.rs`
 
 **Interfaces:**
+- Consumes: `listener::connect` (Task 5), `HookListener::acquire` (existing), `dirs::data_local_dir` (existing `mcpls-core` dependency).
 - Produces:
   - `SocketIdentity::spawn_lock(&self) -> PathBuf` (`{hash}.spawn.lock`), `log_file(&self) -> PathBuf` (`{hash}.log`), `start_request(&self) -> PathBuf` (`{hash}.start`), all siblings of `lock`.
   - `pub struct BackendLaunch { pub root: PathBuf, pub config: Option<PathBuf>, pub trust_project_config: bool, pub log_level: String, pub log_json: bool }` with `args(&self) -> Vec<OsString>`.
@@ -2925,6 +3118,22 @@ Add to `crates/mcpls-core/src/hooks/identity.rs` tests:
         let dir = tempfile::tempdir().expect("a temp dir");
         let identity = identity_for(dir.path()).expect("identity");
         assert!(identity.lock.ends_with(format!("{}.lock", identity.hash)));
+    }
+
+    /// The Windows directory is a known folder, which no environment
+    /// variable redirects, and the shared temporary one only when the
+    /// platform names no such folder.
+    #[test]
+    fn test_the_windows_runtime_dir_is_under_local_app_data() {
+        let local = PathBuf::from("C:/Users/ada/AppData/Local");
+        assert_eq!(
+            local_app_data_runtime_dir(Some(local.clone()), Some("ada".to_string())),
+            local.join("mcpls")
+        );
+        assert_eq!(
+            local_app_data_runtime_dir(None, Some("ada".to_string())),
+            shared_temp_runtime_dir(Some("ada".to_string()))
+        );
     }
 ```
 
@@ -3103,7 +3312,32 @@ impl SocketIdentity {
 }
 ```
 
-Remove `#[cfg(not(windows))]` from `shared_temp_runtime_dir` and `runtime_dir` (and their tests' gates where the test is platform-neutral; `test_runtime_dir_ignores_the_xdg_variable` stays Unix-only). In `identity_for`'s Windows branch, set `lock: runtime_dir().join(format!("{hash}.lock"))`. Update `runtime_dir`'s doc to say it holds the socket and lock on Unix and the lock, spawn lock, log and start request on both.
+Remove `#[cfg(not(windows))]` from `shared_temp_runtime_dir` and from `test_a_shared_temp_runtime_dir_carries_the_user`; `test_runtime_dir_ignores_the_xdg_variable` stays Unix-only. Keep the Unix `runtime_dir`, which stays under `TMPDIR`, and update its doc to say it holds the socket, lock, spawn lock, log and start request. Add beside it:
+
+```rust
+/// Where the lock, spawn lock, backend log and start request go on Windows:
+/// `mcpls` in the user's local application data folder.
+///
+/// `dirs` resolves that folder through `SHGetKnownFolderPath`, which ignores
+/// environment overrides, so a frontend and a hook launched by a harness
+/// with a different `%TEMP%` agree on the path. The profile folder's access
+/// control is already per-user.
+#[cfg(windows)]
+fn runtime_dir() -> PathBuf {
+    local_app_data_runtime_dir(dirs::data_local_dir(), current_user())
+}
+
+/// `mcpls` under `local`, or the shared temporary runtime directory for
+/// `user` when the platform names no local application data folder.
+#[cfg(any(windows, test))]
+fn local_app_data_runtime_dir(local: Option<PathBuf>, user: Option<String>) -> PathBuf {
+    local.map_or_else(|| shared_temp_runtime_dir(user), |local| local.join("mcpls"))
+}
+```
+
+In `identity_for`'s Windows branch, set `lock: runtime_dir().join(format!("{hash}.lock"))`. `dirs` is already a dependency of `mcpls-core` (`crates/mcpls-core/Cargo.toml`).
+
+The directory is created on first use by `ensure_runtime_dir` (Step 4). On Unix that is `ensure_private_dir`; `ensure_private_dir` is Unix-only, so on Windows it is `create_dir_all`, and the profile folder's ACL keeps other users out.
 
 In `crates/mcpls-core/src/hooks/listener.rs`, make `ensure_private_dir` `pub(crate)`.
 
@@ -3369,35 +3603,29 @@ git commit -m "feat(backend): spawn one detached backend"
 
 ---
 
-### Task 8: the frontend relays, waits, evicts and reports
+### Task 8a: the frontend attaches, starts and evicts
 
 **Files:**
 - Create: `crates/mcpls-core/src/backend/stub.rs`, `crates/mcpls-core/src/backend/frontend.rs`
 - Modify: `crates/mcpls-core/src/backend/mod.rs`
-- Modify: `crates/mcpls-core/src/mcp/server.rs:1754-1760` (`INSTRUCTIONS` constant)
-- Test: `crates/mcpls-core/src/backend/stub.rs`, `crates/mcpls-core/src/backend/frontend.rs`
+- Modify: `crates/mcpls-core/src/mcp/server.rs:1754-1760` (`INSTRUCTIONS` constant), `crates/mcpls-core/src/mcp/mod.rs` (its re-export)
+- Test: `crates/mcpls-core/src/backend/stub.rs`, `crates/mcpls-core/src/backend/frontend.rs` (`mod fake`, `mod attach_tests`)
 
 **Interfaces:**
-- Consumes: `Handshake`, `HandshakeReply`, `Refusal`, `compare_builds`, `handshake::{read, write, HANDSHAKE_TIMEOUT}` (Task 5); `SpawnLock`, `spawn_detached`, `request_start`, `BackendLaunch` (Task 7); `listener::connect`, `HookStream` (Task 5); `SessionId::from_host_env` (Task 1).
+- Consumes: `ConfigSource` (Task 3); `ConfigStamp`, `ConnectionKind`, `Handshake`, `HandshakeReply`, `Refusal`, `compare_builds`, `VERSION`, `handshake::{read, write, HANDSHAKE_TIMEOUT}`, `HookStream` (Task 5); `McplsServer::new` (existing).
 - Produces:
-  - `pub(crate) const INSTRUCTIONS: &str` in `mcp::server`.
-  - `stub::answer(message: &serde_json::Value, reason: &str, waiting: bool) -> stub::Answer` with `enum Answer { Reply(serde_json::Value), Defer, Ignore }`; `stub::failure(message: &Value, reason: &str) -> Option<Value>`.
-  - `pub(crate) trait Door` with `connect`, `lock`, `start`, `place`; `pub(crate) enum Start { Spawned, Requested }`; `pub(crate) struct Place { root: PathBuf, log: PathBuf }`.
-  - `pub(crate) struct Timing { start, tool_wait, retry, gone: Duration }` with `Default` (10 s, 10 s, 500 ms, 5 s).
-  - `pub(crate) enum Outcome { Attached(Box<dyn HookStream>), Waiting(String), Failed(String) }` and `pub(crate) async fn attach(door: &dyn Door, request: &Handshake, timing: &Timing) -> Outcome`.
-  - `pub(crate) async fn relay<R, W>(host_in: R, host_out: W, door: Arc<dyn Door>, request: Handshake, timing: Timing)`.
-  - `pub struct FrontendOptions { pub launch: BackendLaunch, pub stamp: ConfigStamp }` and `pub async fn run_frontend(options: FrontendOptions)`, re-exported from `mcpls_core::backend`.
+  - `pub(crate) const INSTRUCTIONS: &str` in `mcp::server`, re-exported as `crate::mcp::INSTRUCTIONS`.
+  - `pub(crate) fn answer(message: &serde_json::Value, reason: &str) -> Option<serde_json::Value>` in `backend::stub`: the response to write to the host, or `None` for a message that expects none.
+  - In `backend::frontend`:
+    - `pub(crate) trait Door: Send + Sync + 'static` with `fn connect(&self) -> BoxFuture<'_, io::Result<Box<dyn HookStream>>>`, `fn lock(&self, wait: Duration) -> BoxFuture<'_, io::Result<Option<Box<dyn Send>>>>`, `fn start(&self) -> BoxFuture<'_, io::Result<Start>>`, `fn place(&self) -> Place`.
+    - `pub(crate) enum Start { Spawned, Requested }` and `pub(crate) struct Place { pub(crate) root: PathBuf, pub(crate) log: PathBuf }`.
+    - `pub(crate) struct Timing { pub(crate) start: Duration, pub(crate) gone: Duration }` with `Default` (10 s, 5 s).
+    - `pub(crate) enum Outcome { Attached(Box<dyn HookStream>), Waiting(String), Failed(String) }` and `pub(crate) async fn attach(door: &dyn Door, request: &Handshake, timing: &Timing) -> Outcome`.
+    - `const CONNECT_TIMEOUT: Duration`.
+    - `mod messages` with `pub(super) fn start_failed(place: &Place, error: &std::io::Error)`, `did_not_start(place: &Place, wait: Duration)`, `busy_starting(place: &Place, wait: Duration)`, `waiting_for_hook(place: &Place)` and `refused(place: &Place, request: &Handshake, reply: &HandshakeReply)`, each returning `String`.
+    - `#[cfg(test)] mod fake`, the harness both frontend test modules use: `pub(super) enum Script { Nobody, Server(HandshakeReply, Then) }`, `pub(super) enum Then { Serve, Close }`, `pub(super) struct FakeDoor` with `pub(super) fn new(start: Start, scripts: Vec<Script>) -> Arc<FakeDoor>` and fields `pub(super) starts: Mutex<usize>` and `pub(super) kinds: Arc<Mutex<Vec<ConnectionKind>>>`, and `pub(super) fn accepted() -> HandshakeReply`, `pub(super) fn refused(version: &str, sessions: usize, refusal: Refusal) -> HandshakeReply`, `pub(super) fn fast() -> Timing`, `pub(super) fn request() -> Handshake`.
 
-The frontend is not a byte pipe. To report a missing backend it answers `initialize` and `tools/list` itself, fails `tools/call` with the reason, and fails any request in flight when the backend dies. It relays everything else in both directions, including the backend's unsolicited notifications.
-
-States, in one task driven by one event channel:
-
-| State | Host request | Leaves when |
-|---|---|---|
-| `Connecting` | deferred, in order | the first attach finishes: `Attached`, `Waiting` or `Failed` |
-| `Attached` | forwarded; id recorded as pending | the backend stream closes: pending ids answered with an error, then `Failed` |
-| `Waiting` | answered by the stub; `tools/call` deferred until `tool_wait` elapses | a retry attaches: the host's `initialize` is replayed, then deferred requests forwarded |
-| `Failed` | answered by the stub with the reason | never |
+One attempt to reach the backend ends attached, waiting for a hook to start it, or failed with a reason addressed to the user. This task builds that decision and what the frontend answers with no backend; relaying host traffic over it is Task 8b. Nothing outside the tests calls this code until then, so both new files open with `#![cfg_attr(not(test), allow(dead_code))]`, which Task 8b removes.
 
 - [ ] **Step 1: Extract the instructions**
 
@@ -3415,6 +3643,8 @@ pub(crate) const INSTRUCTIONS: &str = concat!(
 
 and in `get_info` use `let mut instructions = INSTRUCTIONS.to_string();`.
 
+In `crates/mcpls-core/src/mcp/mod.rs`, which declares `mod server;` privately, add `pub(crate) use server::INSTRUCTIONS;`.
+
 - [ ] **Step 2: Write the stub with its tests**
 
 Create `crates/mcpls-core/src/backend/stub.rs`:
@@ -3422,24 +3652,14 @@ Create `crates/mcpls-core/src/backend/stub.rs`:
 ```rust
 //! What the frontend answers when no backend is attached: the frozen tool
 //! surface, and the reason every tool call fails.
+#![cfg_attr(not(test), allow(dead_code))]
 
 use std::sync::OnceLock;
 
 use serde_json::{Value, json};
 
 use crate::backend::handshake::VERSION;
-use crate::mcp::server::INSTRUCTIONS;
-
-/// How the frontend handles one host message with no backend attached.
-#[derive(Debug, PartialEq)]
-pub(crate) enum Answer {
-    /// Write this response to the host.
-    Reply(Value),
-    /// Hold the request until a backend attaches or the wait runs out.
-    Defer,
-    /// A notification, or a response to nothing: drop it.
-    Ignore,
-}
+use crate::mcp::INSTRUCTIONS;
 
 fn tools() -> &'static Value {
     static TOOLS: OnceLock<Value> = OnceLock::new();
@@ -3448,13 +3668,14 @@ fn tools() -> &'static Value {
     })
 }
 
-/// Answer `message` for a session with no backend, because of `reason`.
-/// `waiting` defers tool calls rather than failing them.
-pub(crate) fn answer(message: &Value, reason: &str, waiting: bool) -> Answer {
-    let (Some(id), Some(method)) = (message.get("id"), message.get("method").and_then(Value::as_str))
-    else {
-        return Answer::Ignore;
-    };
+/// The response to `message` for a session with no backend, because of
+/// `reason`. `None` for a notification or a response to nothing.
+///
+/// A tool call fails at once, whether the session is waiting for a backend
+/// or has none, so a wait reads like any other unreachable backend.
+pub(crate) fn answer(message: &Value, reason: &str) -> Option<Value> {
+    let id = message.get("id")?;
+    let method = message.get("method").and_then(Value::as_str)?;
     let result = match method {
         "initialize" => json!({
             "protocolVersion": message["params"]["protocolVersion"].as_str().unwrap_or("2025-06-18"),
@@ -3466,25 +3687,19 @@ pub(crate) fn answer(message: &Value, reason: &str, waiting: bool) -> Answer {
         "tools/list" => json!({"tools": tools()}),
         "resources/list" => json!({"resources": []}),
         "resources/templates/list" => json!({"resourceTemplates": []}),
-        "tools/call" if waiting => return Answer::Defer,
-        _ => return failure(message, reason).map_or(Answer::Ignore, Answer::Reply),
-    };
-    Answer::Reply(json!({"jsonrpc": "2.0", "id": id, "result": result}))
-}
-
-/// The response that fails `message` with `reason`, or `None` for a
-/// message that expects no response.
-pub(crate) fn failure(message: &Value, reason: &str) -> Option<Value> {
-    let id = message.get("id")?;
-    message.get("method")?;
-    Some(if message["method"] == "tools/call" {
-        json!({"jsonrpc": "2.0", "id": id, "result": {
+        "tools/call" => json!({
             "content": [{"type": "text", "text": reason}],
             "isError": true,
-        }})
-    } else {
-        json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32603, "message": reason}})
-    })
+        }),
+        _ => {
+            return Some(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {"code": -32603, "message": reason},
+            }));
+        }
+    };
+    Some(json!({"jsonrpc": "2.0", "id": id, "result": result}))
 }
 
 #[cfg(test)]
@@ -3494,13 +3709,11 @@ mod tests {
 
     #[test]
     fn test_initialize_carries_the_reason_in_the_instructions() {
-        let Answer::Reply(reply) = answer(
+        let reply = answer(
             &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}),
             "No backend.",
-            false,
-        ) else {
-            panic!("initialize is answered");
-        };
+        )
+        .expect("initialize is answered");
         assert_eq!(reply["result"]["protocolVersion"], "2025-11-25");
         assert!(reply["result"]["instructions"].as_str().unwrap().ends_with(" No backend."));
         assert_eq!(reply["result"]["serverInfo"]["name"], "mcpls");
@@ -3508,90 +3721,88 @@ mod tests {
 
     #[test]
     fn test_the_tool_list_is_the_frozen_surface() {
-        let Answer::Reply(reply) =
-            answer(&json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}), "r", false)
-        else {
-            panic!("tools/list is answered");
-        };
+        let reply = answer(&json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}), "r")
+            .expect("tools/list is answered");
         let expected: Value =
             serde_json::from_str(include_str!("../mcp/tool_surface.json")).unwrap();
         assert_eq!(reply["result"]["tools"], expected);
     }
 
     #[test]
-    fn test_a_tool_call_fails_with_the_reason_or_waits() {
+    fn test_a_tool_call_fails_at_once_with_the_reason() {
         let call = json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_hover"}});
-        let Answer::Reply(reply) = answer(&call, "Backend stopped.", false) else {
-            panic!("a failed session answers tool calls");
-        };
+        let reply = answer(&call, "Backend stopped.").expect("a tool call is answered");
+        assert_eq!(reply["id"], 3);
         assert_eq!(reply["result"]["isError"], true);
         assert_eq!(reply["result"]["content"][0]["text"], "Backend stopped.");
-        assert_eq!(answer(&call, "r", true), Answer::Defer);
     }
 
     #[test]
     fn test_notifications_are_dropped_and_unknown_requests_fail() {
         assert_eq!(
-            answer(&json!({"jsonrpc":"2.0","method":"notifications/initialized"}), "r", false),
-            Answer::Ignore
+            answer(&json!({"jsonrpc":"2.0","method":"notifications/initialized"}), "r"),
+            None
         );
-        let Answer::Reply(reply) =
-            answer(&json!({"jsonrpc":"2.0","id":"x","method":"resources/read"}), "gone", false)
-        else {
-            panic!("a request gets a response");
-        };
+        let reply = answer(&json!({"jsonrpc":"2.0","id":"x","method":"resources/read"}), "gone")
+            .expect("a request gets a response");
         assert_eq!(reply["error"]["message"], "gone");
         assert_eq!(reply["id"], "x");
     }
 }
 ```
 
-`crate::mcp::server` must be reachable: `mcp/mod.rs` declares `mod server;` privately. Import through a `pub(crate) use server::INSTRUCTIONS;` added to `crates/mcpls-core/src/mcp/mod.rs`, and write `use crate::mcp::INSTRUCTIONS;` here.
+Add `mod stub;` to `crates/mcpls-core/src/backend/mod.rs`.
 
-- [ ] **Step 3: Write the failing frontend tests**
+- [ ] **Step 3: Write the harness and the failing attach tests**
 
-Create `crates/mcpls-core/src/backend/frontend.rs` with its tests:
+Create `crates/mcpls-core/src/backend/frontend.rs` with the harness and the attach tests; the implementation goes above them in Step 5:
 
 ```rust
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
-mod tests {
+mod fake {
     use std::collections::VecDeque;
-    use std::sync::Mutex;
+    use std::io;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
+    use futures::future::BoxFuture;
     use rmcp::ServiceExt as _;
-    use serde_json::{Value, json};
-    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, DuplexStream, Lines};
 
-    use super::*;
-    use crate::backend::handshake::ConnectionKind;
+    use super::{Door, Place, Start, Timing};
+    use crate::backend::handshake::{
+        self, ConfigStamp, ConnectionKind, Handshake, HandshakeReply, Refusal,
+    };
+    use crate::hooks::listener::HookStream;
 
     /// What one connect attempt reaches.
-    enum Script {
+    pub(super) enum Script {
         /// Nothing listens.
         Nobody,
-        /// A server answering the handshake with `reply`, then doing `then`.
+        /// A server answering the handshake with the reply, then doing
+        /// what `Then` says.
         Server(HandshakeReply, Then),
     }
 
-    enum Then {
+    pub(super) enum Then {
         /// Serve a real `McplsServer` on the stream.
         Serve,
-        /// Close as soon as the first MCP line arrives.
-        CloseOnFirstLine,
         /// Close at once.
         Close,
     }
 
-    struct FakeDoor {
+    /// A door whose connect attempts follow a script, and which counts the
+    /// starts it is asked for and the connection kinds it saw.
+    pub(super) struct FakeDoor {
         scripts: Mutex<VecDeque<Script>>,
         start: Start,
-        starts: Mutex<usize>,
-        kinds: Arc<Mutex<Vec<ConnectionKind>>>,
+        pub(super) starts: Mutex<usize>,
+        pub(super) kinds: Arc<Mutex<Vec<ConnectionKind>>>,
     }
 
     impl FakeDoor {
-        fn new(start: Start, scripts: Vec<Script>) -> Arc<Self> {
+        pub(super) fn new(start: Start, scripts: Vec<Script>) -> Arc<Self> {
             Arc::new(Self {
                 scripts: Mutex::new(scripts.into()),
                 start,
@@ -3623,10 +3834,6 @@ mod tests {
                             if let Ok(running) = test_server().serve(server).await {
                                 let _ = running.waiting().await;
                             }
-                        }
-                        Then::CloseOnFirstLine => {
-                            let mut lines = BufReader::new(server).lines();
-                            let _ = lines.next_line().await;
                         }
                         Then::Close => {}
                     }
@@ -3669,139 +3876,67 @@ mod tests {
         )
     }
 
-    fn accepted() -> HandshakeReply {
+    pub(super) fn accepted() -> HandshakeReply {
         HandshakeReply::new(0, None)
     }
 
-    fn refused(version: &str, sessions: usize, refusal: Refusal) -> HandshakeReply {
+    pub(super) fn refused(version: &str, sessions: usize, refusal: Refusal) -> HandshakeReply {
         HandshakeReply {
             version: version.to_string(),
             ..HandshakeReply::new(sessions, Some(refusal))
         }
     }
 
-    fn fast() -> Timing {
+    pub(super) fn fast() -> Timing {
         Timing {
             start: Duration::from_millis(300),
-            tool_wait: Duration::from_millis(300),
-            retry: Duration::from_millis(20),
             gone: Duration::from_millis(300),
         }
     }
 
-    fn request() -> Handshake {
+    pub(super) fn request() -> Handshake {
         Handshake::mcp(
             PathBuf::from("/work"),
             None,
             ConfigStamp::of(&crate::config::ServerConfig::default()),
         )
     }
+}
 
-    struct Host {
-        input: DuplexStream,
-        output: Lines<BufReader<DuplexStream>>,
-        relay: tokio::task::JoinHandle<()>,
-    }
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod attach_tests {
+    use std::path::PathBuf;
 
-    impl Host {
-        fn start(door: Arc<dyn Door>, request: Handshake, timing: Timing) -> Self {
-            let (input, relay_in) = tokio::io::duplex(1 << 20);
-            let (relay_out, output) = tokio::io::duplex(1 << 20);
-            let relay = tokio::spawn(relay(relay_in, relay_out, door, request, timing));
-            Self { input, output: BufReader::new(output).lines(), relay }
-        }
+    use super::fake::{FakeDoor, Script, Then, accepted, fast, refused, request};
+    use super::{Outcome, Start, attach};
+    use crate::backend::handshake::{
+        self, ConfigStamp, ConnectionKind, Handshake, HandshakeReply, Refusal,
+    };
 
-        async fn send(&mut self, message: Value) {
-            self.input.write_all(format!("{message}\n").as_bytes()).await.unwrap();
-        }
-
-        async fn response(&mut self, id: i64) -> Value {
-            tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    let line = self.output.next_line().await.unwrap().expect("the relay closed");
-                    let message: Value = serde_json::from_str(&line).unwrap();
-                    if message["id"] == id {
-                        return message;
-                    }
-                }
-            })
-            .await
-            .expect("a response arrived")
-        }
-
-        async fn initialize(&mut self) -> Value {
-            self.send(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"t","version":"1"}}})).await;
-            let answer = self.response(1).await;
-            self.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"})).await;
-            answer
-        }
-
-        async fn call_tool(&mut self, id: i64) -> Value {
-            self.send(json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"get_server_logs","arguments":{}}})).await;
-            self.response(id).await
+    fn failure(outcome: Outcome) -> String {
+        match outcome {
+            Outcome::Failed(text) => text,
+            Outcome::Waiting(text) => panic!("expected a failure, got a wait: {text}"),
+            Outcome::Attached(_) => panic!("expected a failure, got an attached backend"),
         }
     }
 
     #[tokio::test]
-    async fn test_an_attached_session_is_answered_by_the_backend() {
-        let door = FakeDoor::new(Start::Spawned, vec![Script::Server(accepted(), Then::Serve)]);
-        let mut host = Host::start(door, request(), fast());
-        let init = host.initialize().await;
-        assert_eq!(init["result"]["instructions"], crate::mcp::INSTRUCTIONS, "{init}");
-        let call = host.call_tool(2).await;
-        assert_ne!(call["result"]["isError"], true, "{call}");
-    }
-
-    #[tokio::test]
-    async fn test_a_backend_that_never_starts_is_reported_without_serving_tools() {
+    async fn test_a_backend_that_never_starts_is_reported_with_its_log() {
         let door = FakeDoor::new(Start::Spawned, vec![]);
-        let mut host = Host::start(Arc::clone(&door) as Arc<dyn Door>, request(), fast());
-        let init = host.initialize().await;
-        let instructions = init["result"]["instructions"].as_str().unwrap();
-        assert!(instructions.contains("/run/mcpls/x.log"), "{instructions}");
-        let call = host.call_tool(2).await;
-        assert_eq!(call["result"]["isError"], true);
+        let text = failure(attach(door.as_ref(), &request(), &fast()).await);
+        assert!(text.contains("/run/mcpls/x.log"), "{text}");
         assert_eq!(*door.starts.lock().unwrap(), 1);
     }
 
     #[tokio::test]
-    async fn test_a_backend_dying_mid_request_fails_that_request_and_the_rest() {
-        let door = FakeDoor::new(
-            Start::Spawned,
-            vec![Script::Server(accepted(), Then::CloseOnFirstLine)],
-        );
-        let mut host = Host::start(door, request(), fast());
-        host.send(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"t","version":"1"}}})).await;
-        let failed = host.response(1).await;
-        assert!(failed["error"]["message"].as_str().unwrap().contains("stopped"), "{failed}");
-        let call = host.call_tool(2).await;
-        assert_eq!(call["result"]["isError"], true);
-    }
-
-    #[tokio::test]
-    async fn test_a_waiting_session_replays_initialize_when_the_backend_arrives() {
-        let door = FakeDoor::new(
-            Start::Requested,
-            vec![Script::Nobody, Script::Nobody, Script::Nobody, Script::Server(accepted(), Then::Serve)],
-        );
-        let timing = Timing { tool_wait: Duration::from_secs(5), ..fast() };
-        let mut host = Host::start(door, request(), timing);
-        let init = host.initialize().await;
-        assert!(init["result"]["instructions"].as_str().unwrap().contains("hook"), "{init}");
-        let call = host.call_tool(2).await;
-        assert_ne!(
-            call["result"]["isError"], true,
-            "the deferred call reached a backend that had been initialized: {call}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_a_waiting_tool_call_fails_after_its_wait() {
+    async fn test_a_requested_start_waits_for_a_hook() {
         let door = FakeDoor::new(Start::Requested, vec![]);
-        let mut host = Host::start(door, request(), fast());
-        host.initialize().await;
-        let call = host.call_tool(2).await;
-        assert_eq!(call["result"]["isError"], true);
+        let Outcome::Waiting(text) = attach(door.as_ref(), &request(), &fast()).await else {
+            panic!("a requested start waits");
+        };
+        assert!(text.contains("hook"), "{text}");
     }
 
     #[tokio::test]
@@ -3816,9 +3951,8 @@ mod tests {
                 Script::Server(accepted(), Then::Serve),
             ],
         );
-        let mut host = Host::start(Arc::clone(&door) as Arc<dyn Door>, request(), fast());
-        let init = host.initialize().await;
-        assert_eq!(init["result"]["instructions"], crate::mcp::INSTRUCTIONS, "{init}");
+        let outcome = attach(door.as_ref(), &request(), &fast()).await;
+        assert!(matches!(outcome, Outcome::Attached(_)));
         assert!(door.kinds.lock().unwrap().contains(&ConnectionKind::Shutdown));
         assert_eq!(*door.starts.lock().unwrap(), 1);
     }
@@ -3829,12 +3963,8 @@ mod tests {
             Start::Spawned,
             vec![Script::Server(refused("0.0.1", 2, Refusal::Build), Then::Close)],
         );
-        let mut host = Host::start(Arc::clone(&door) as Arc<dyn Door>, request(), fast());
-        let init = host.initialize().await;
-        let text = init["result"]["instructions"].as_str().unwrap().to_string();
+        let text = failure(attach(door.as_ref(), &request(), &fast()).await);
         assert!(text.contains("0.0.1") && text.contains(handshake::VERSION), "{text}");
-        let call = host.call_tool(2).await;
-        assert!(call["result"]["content"][0]["text"].as_str().unwrap().contains("0.0.1"));
         assert!(!door.kinds.lock().unwrap().contains(&ConnectionKind::Shutdown));
         assert_eq!(*door.starts.lock().unwrap(), 0);
     }
@@ -3845,9 +3975,8 @@ mod tests {
             Start::Spawned,
             vec![Script::Server(refused("999.0.0", 0, Refusal::Build), Then::Close)],
         );
-        let mut host = Host::start(Arc::clone(&door) as Arc<dyn Door>, request(), fast());
-        let init = host.initialize().await;
-        assert!(init["result"]["instructions"].as_str().unwrap().contains("older"), "{init}");
+        let text = failure(attach(door.as_ref(), &request(), &fast()).await);
+        assert!(text.contains("older"), "{text}");
         assert!(!door.kinds.lock().unwrap().contains(&ConnectionKind::Shutdown));
     }
 
@@ -3865,64 +3994,41 @@ mod tests {
         let mut ignoring = crate::config::ServerConfig::default();
         ignoring.project_config_ignored = true;
         let request = Handshake::mcp(PathBuf::from("/work"), None, ConfigStamp::of(&ignoring));
-        let mut host = Host::start(door, request, fast());
-        let init = host.initialize().await;
-        let text = init["result"]["instructions"].as_str().unwrap();
+        let text = failure(attach(door.as_ref(), &request, &fast()).await);
         assert!(text.contains("loaded the project's mcpls.toml"), "{text}");
         assert!(text.contains("ignored the project's mcpls.toml"), "{text}");
-    }
-
-    #[tokio::test]
-    async fn test_the_relay_ends_when_the_host_closes() {
-        let door = FakeDoor::new(Start::Spawned, vec![Script::Server(accepted(), Then::Serve)]);
-        let mut host = Host::start(door, request(), fast());
-        host.initialize().await;
-        let Host { input, relay, .. } = host;
-        drop(input);
-        tokio::time::timeout(Duration::from_secs(5), relay)
-            .await
-            .expect("the relay returned after host EOF")
-            .unwrap();
     }
 }
 ```
 
-In `test_an_idle_older_backend_is_evicted_and_replaced`, the scripts are consumed in order: the first connect finds the old build idle; the second is the shutdown connection, accepted; the next two are the frontend checking the endpoint is gone, and the re-check under the spawn lock; after the spawn the fifth serves. If the implementation connects a different number of times on this path, adjust the number of `Script::Nobody` entries to match what Step 4's `attach` does and say so in the report, rather than changing `attach` to fit the test.
+In `test_an_idle_older_backend_is_evicted_and_replaced`, the scripts are consumed in order: the first connect finds the old build idle; the second is the shutdown connection, accepted; the next two are the frontend checking the endpoint is gone, and the re-check under the spawn lock; after the spawn the fifth serves. If the implementation connects a different number of times on this path, adjust the number of `Script::Nobody` entries to match what Step 5's `attach` does and say so in the report, rather than changing `attach` to fit the test.
 
-- [ ] **Step 4: Implement the frontend**
+Add `pub mod frontend;` to `crates/mcpls-core/src/backend/mod.rs`.
 
-Put above the tests in `crates/mcpls-core/src/backend/frontend.rs`:
+- [ ] **Step 4: See them fail**
+
+Run: `devrun task check`
+Expected: FAIL to compile: `unresolved imports super::Door`, `super::attach`, `super::Outcome`.
+
+- [ ] **Step 5: Implement attaching**
+
+Put above the test modules in `crates/mcpls-core/src/backend/frontend.rs`:
 
 ```rust
 //! The process a host launches: attach to the project's backend and relay
 //! MCP traffic, or explain why there is no backend.
+#![cfg_attr(not(test), allow(dead_code))]
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
 use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::BoxFuture;
-use serde_json::Value;
-use tokio::io::{AsyncBufReadExt as _, AsyncRead, AsyncWrite, AsyncWriteExt as _, BufReader};
-use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-use crate::backend::handshake::{
-    self, ConfigStamp, Handshake, HandshakeReply, Refusal, compare_builds,
-};
-use crate::backend::spawn::{BackendLaunch, SpawnLock};
-use crate::backend::stub::{self, Answer};
-use crate::bridge::SessionId;
-use crate::config::ConfigSource;
+use crate::backend::handshake::{self, Handshake, HandshakeReply, Refusal, compare_builds};
 use crate::hooks::listener::HookStream;
-use crate::hooks::{self, SocketIdentity};
-
-/// The id a replayed `initialize` goes out under, whose answer the host
-/// already had from the stub.
-const REPLAY_ID: &str = "mcpls-frontend-replay";
 
 /// How long one connect attempt may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -3955,10 +4061,6 @@ pub(crate) struct Place {
 pub(crate) struct Timing {
     /// How long a spawned backend has to answer.
     pub(crate) start: Duration,
-    /// How long a tool call waits for a backend a hook is starting.
-    pub(crate) tool_wait: Duration,
-    /// How often a waiting frontend tries again.
-    pub(crate) retry: Duration,
     /// How long an evicted backend has to release the endpoint.
     pub(crate) gone: Duration,
 }
@@ -3967,8 +4069,6 @@ impl Default for Timing {
     fn default() -> Self {
         Self {
             start: Duration::from_secs(10),
-            tool_wait: Duration::from_secs(10),
-            retry: Duration::from_millis(500),
             gone: Duration::from_secs(5),
         }
     }
@@ -3980,105 +4080,7 @@ pub(crate) enum Outcome {
     Waiting(String),
     Failed(String),
 }
-
-/// What the host launches mcpls with.
-pub struct FrontendOptions {
-    /// How to start a backend, including the checkout root.
-    pub launch: BackendLaunch,
-    /// This process's configuration.
-    pub stamp: ConfigStamp,
-}
-
-/// Relay this process's stdio to the project's backend until the host
-/// closes stdin.
-pub async fn run_frontend(options: FrontendOptions) {
-    let request = Handshake::mcp(
-        options.launch.root.clone(),
-        SessionId::from_host_env().map(|session| session.to_string()),
-        options.stamp,
-    );
-    let door: Arc<dyn Door> = match (hooks::identity_for(&options.launch.root), std::env::current_exe()) {
-        (Ok(identity), Ok(exe)) => Arc::new(ProcessDoor {
-            identity,
-            launch: options.launch,
-            exe,
-        }),
-        (Err(error), _) => Arc::new(Unreachable(options.launch.root, error.to_string())),
-        (_, Err(error)) => Arc::new(Unreachable(options.launch.root, error.to_string())),
-    };
-    relay(tokio::io::stdin(), tokio::io::stdout(), door, request, Timing::default()).await;
-}
-
-struct ProcessDoor {
-    identity: SocketIdentity,
-    launch: BackendLaunch,
-    exe: PathBuf,
-}
-
-impl Door for ProcessDoor {
-    fn connect(&self) -> BoxFuture<'_, io::Result<Box<dyn HookStream>>> {
-        Box::pin(hooks::listener::connect(&self.identity))
-    }
-
-    fn lock(&self, wait: Duration) -> BoxFuture<'_, io::Result<Option<Box<dyn Send>>>> {
-        Box::pin(async move {
-            Ok(SpawnLock::acquire(&self.identity.spawn_lock(), wait)
-                .await?
-                .map(|lock| Box::new(lock) as Box<dyn Send>))
-        })
-    }
-
-    fn start(&self) -> BoxFuture<'_, io::Result<Start>> {
-        Box::pin(async move {
-            #[cfg(windows)]
-            {
-                crate::backend::spawn::request_start(&self.identity, &self.launch)?;
-                Ok(Start::Requested)
-            }
-            #[cfg(not(windows))]
-            {
-                crate::backend::spawn::spawn_detached(&self.exe, &self.launch, &self.identity.log_file())?;
-                Ok(Start::Spawned)
-            }
-        })
-    }
-
-    fn place(&self) -> Place {
-        Place {
-            root: self.launch.root.clone(),
-            log: self.identity.log_file(),
-        }
-    }
-}
-
-/// A frontend that cannot derive its endpoint at all.
-struct Unreachable(PathBuf, String);
-
-impl Door for Unreachable {
-    fn connect(&self) -> BoxFuture<'_, io::Result<Box<dyn HookStream>>> {
-        Box::pin(async { Err(io::ErrorKind::NotFound.into()) })
-    }
-
-    fn lock(&self, _wait: Duration) -> BoxFuture<'_, io::Result<Option<Box<dyn Send>>>> {
-        let reason = self.1.clone();
-        Box::pin(async move { Err(io::Error::other(reason)) })
-    }
-
-    fn start(&self) -> BoxFuture<'_, io::Result<Start>> {
-        let reason = self.1.clone();
-        Box::pin(async move { Err(io::Error::other(reason)) })
-    }
-
-    fn place(&self) -> Place {
-        Place {
-            root: self.0.clone(),
-            log: PathBuf::new(),
-        }
-    }
-}
 ```
-
-`ProcessDoor::exe` is unused on Windows; mark the field `#[cfg_attr(windows, allow(dead_code))]`.
 
 Attaching:
 
@@ -4240,16 +4242,6 @@ mod messages {
         )
     }
 
-    pub(super) fn backend_stopped(place: &Place) -> String {
-        format!(
-            "Tell the user: the mcpls backend for {} stopped while this session was attached, so \
-             this session has no mcpls tools. Restart the session to start a new one. Its log is \
-             {}.",
-            place.root.display(),
-            place.log.display()
-        )
-    }
-
     fn trust_state(stamp: &ConfigStamp) -> &'static str {
         if stamp.source == ConfigSource::Project {
             "loaded the project's mcpls.toml as trusted"
@@ -4289,11 +4281,6 @@ mod messages {
                 trust_state(backend),
                 request.config.as_ref().map_or("has no configuration", trust_state)
             ),
-            Some(Refusal::Root { backend }) => format!(
-                "Tell the user: this session resolved the checkout root {root}, but the backend on \
-                 its endpoint serves {}. Run `mcpls hook doctor` from both directories.",
-                backend.display()
-            ),
             other => format!(
                 "Tell the user: the mcpls backend serving {root} refused this session ({other:?}), \
                  so this session has no mcpls tools."
@@ -4303,15 +4290,488 @@ mod messages {
 }
 ```
 
+The message for a backend that stops after attaching belongs to the relay, and Task 8b adds it.
+
+- [ ] **Step 6: Run the tests**
+
+Run: `devrun task test`
+Expected: PASS, including the four stub tests and the six attach tests.
+
+- [ ] **Step 7: Verify and commit**
+
+Run: `devrun task verify`
+Expected: PASS.
+
+```bash
+git add crates/mcpls-core
+git commit -m "feat(backend): attach a frontend to its backend"
+```
+
+---
+
+### Task 8b: the frontend relays a session
+
+**Files:**
+- Modify: `crates/mcpls-core/src/backend/frontend.rs` (`Timing::retry`, `messages::backend_stopped`, `FrontendOptions`, `run_frontend`, `relay`, two new `fake::Then` behaviours, `mod relay_tests`)
+- Modify: `crates/mcpls-core/src/backend/stub.rs` (drop the dead-code `cfg_attr`)
+- Modify: `crates/mcpls-core/src/backend/mod.rs`
+- Test: `crates/mcpls-core/src/backend/frontend.rs` (`mod relay_tests`)
+
+**Interfaces:**
+- Consumes: from Task 8a, `attach(door: &dyn Door, request: &Handshake, timing: &Timing) -> Outcome`, `Outcome`, `Door`, `Start`, `Place`, `Timing { start, gone }`, `messages`, `stub::answer(message: &Value, reason: &str) -> Option<Value>`, `crate::mcp::INSTRUCTIONS`, and the `fake` harness (`FakeDoor`, `Script`, `Then`, `accepted`, `refused`, `fast`, `request`); from Task 7, `BackendLaunch`, `SpawnLock::acquire`, `spawn_detached`, `request_start`, `SocketIdentity::{spawn_lock, log_file}`; from Task 5, `ConfigStamp`, `Handshake::mcp`, `listener::connect`, `HookStream`, `VERSION`; `hooks::identity_for` (existing); `SessionId::from_host_env` (Task 1).
+- Produces:
+  - `Timing::retry: Duration` (`pub(crate)`), default 500 ms.
+  - `pub(crate) async fn relay<R, W>(host_in: R, host_out: W, door: Arc<dyn Door>, request: Handshake, timing: Timing)` where `R: AsyncRead + Unpin + Send + 'static` and `W: AsyncWrite + Unpin + Send`.
+  - `pub struct FrontendOptions { pub launch: BackendLaunch, pub stamp: ConfigStamp }` and `pub async fn run_frontend(options: FrontendOptions)`, re-exported from `mcpls_core::backend`.
+  - `fake::Then::{CloseOnFirstLine, AnswerOnceThenClose}`.
+
+The frontend is not a byte pipe. To report a missing backend it answers `initialize` and `tools/list` itself, fails `tools/call` with the reason, and fails any request in flight when the backend dies. It relays everything else in both directions, including the backend's unsolicited notifications.
+
+States, in one task driven by one event channel:
+
+| State | Host request | Leaves when |
+|---|---|---|
+| `Connecting` | deferred, in order | the attach finishes: `Attached`, `Waiting` or `Failed` |
+| `Attached` | forwarded; id recorded as pending | the backend stream closes. If the backend never sent a line and this is the first such close, what the host sent since the attach is deferred again and `attach` reruns (`Connecting`). Otherwise pending ids are answered with an error, then `Failed` |
+| `Waiting` | answered by the stub; `tools/call` fails at once with the waiting reason | a retry attaches: the host's `initialize` is replayed, then later requests are forwarded |
+| `Failed` | answered by the stub with the reason | never |
+
+A wait is reported the way any unreachable backend is, so nothing is held back while `Waiting`. A backend that accepts the handshake and closes before sending a line is one that began exiting as this frontend attached; rerunning `attach` starts a fresh backend under the spawn lock. It reruns once, so a backend that drops every connection cannot make the frontend loop.
+
+- [ ] **Step 1: Write the failing relay tests**
+
+In `mod fake` in `crates/mcpls-core/src/backend/frontend.rs`, add these imports:
+
+```rust
+    use serde_json::{Value, json};
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+```
+
+add two variants to `Then`:
+
+```rust
+        /// Close as soon as the first MCP line arrives, having sent nothing.
+        CloseOnFirstLine,
+        /// Answer the first MCP line as an `initialize`, then close as soon
+        /// as the next line arrives.
+        AnswerOnceThenClose,
+```
+
+add their arms to the `match then` in `FakeDoor::connect`:
+
+```rust
+                        Then::CloseOnFirstLine => {
+                            let mut lines = BufReader::new(server).lines();
+                            let _ = lines.next_line().await;
+                        }
+                        Then::AnswerOnceThenClose => {
+                            let (reader, mut writer) = tokio::io::split(server);
+                            let mut lines = BufReader::new(reader).lines();
+                            let Ok(Some(first)) = lines.next_line().await else {
+                                return;
+                            };
+                            let first: Value = serde_json::from_str(&first).unwrap();
+                            let answer = json!({"jsonrpc":"2.0","id":first["id"],"result":{
+                                "protocolVersion":"2025-11-25",
+                                "capabilities":{},
+                                "serverInfo":{"name":"mcpls","version":"0"},
+                            }});
+                            let _ = writer.write_all(format!("{answer}\n").as_bytes()).await;
+                            let _ = lines.next_line().await;
+                        }
+```
+
+and give `fast()` a retry: `retry: Duration::from_millis(20),` between `start` and `gone`.
+
+Append to `crates/mcpls-core/src/backend/frontend.rs`:
+
+```rust
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod relay_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use serde_json::{Value, json};
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, DuplexStream, Lines};
+    use tokio::time::Instant;
+
+    use super::fake::{FakeDoor, Script, Then, accepted, fast, refused, request};
+    use super::{Door, Start, Timing, relay};
+    use crate::backend::handshake::{self, Handshake, Refusal};
+
+    struct Host {
+        input: DuplexStream,
+        output: Lines<BufReader<DuplexStream>>,
+        relay: tokio::task::JoinHandle<()>,
+    }
+
+    impl Host {
+        fn start(door: Arc<dyn Door>, request: Handshake, timing: Timing) -> Self {
+            let (input, relay_in) = tokio::io::duplex(1 << 20);
+            let (relay_out, output) = tokio::io::duplex(1 << 20);
+            let relay = tokio::spawn(relay(relay_in, relay_out, door, request, timing));
+            Self { input, output: BufReader::new(output).lines(), relay }
+        }
+
+        async fn send(&mut self, message: Value) {
+            self.input.write_all(format!("{message}\n").as_bytes()).await.unwrap();
+        }
+
+        async fn response(&mut self, id: i64) -> Value {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let line = self.output.next_line().await.unwrap().expect("the relay closed");
+                    let message: Value = serde_json::from_str(&line).unwrap();
+                    if message["id"] == id {
+                        return message;
+                    }
+                }
+            })
+            .await
+            .expect("a response arrived")
+        }
+
+        async fn initialize(&mut self) -> Value {
+            self.send(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"t","version":"1"}}})).await;
+            let answer = self.response(1).await;
+            self.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"})).await;
+            answer
+        }
+
+        async fn call_tool(&mut self, id: i64) -> Value {
+            self.send(json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"get_server_logs","arguments":{}}})).await;
+            self.response(id).await
+        }
+    }
+
+    fn initialize_request() -> Value {
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"t","version":"1"}}})
+    }
+
+    #[tokio::test]
+    async fn test_an_attached_session_is_answered_by_the_backend() {
+        let door = FakeDoor::new(Start::Spawned, vec![Script::Server(accepted(), Then::Serve)]);
+        let mut host = Host::start(door, request(), fast());
+        let init = host.initialize().await;
+        assert_eq!(init["result"]["instructions"], crate::mcp::INSTRUCTIONS, "{init}");
+        let call = host.call_tool(2).await;
+        assert_ne!(call["result"]["isError"], true, "{call}");
+    }
+
+    #[tokio::test]
+    async fn test_a_refusal_is_repeated_in_initialize_and_every_tool_call() {
+        let door = FakeDoor::new(
+            Start::Spawned,
+            vec![Script::Server(refused("0.0.1", 2, Refusal::Build), Then::Close)],
+        );
+        let mut host = Host::start(door, request(), fast());
+        let init = host.initialize().await;
+        let text = init["result"]["instructions"].as_str().unwrap().to_string();
+        assert!(text.contains("0.0.1") && text.contains(handshake::VERSION), "{text}");
+        for id in [2, 3] {
+            let call = host.call_tool(id).await;
+            assert_eq!(call["result"]["isError"], true, "{call}");
+            assert!(call["result"]["content"][0]["text"].as_str().unwrap().contains("0.0.1"), "{call}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_backend_dying_mid_request_fails_that_request_and_the_rest() {
+        let door = FakeDoor::new(
+            Start::Spawned,
+            vec![Script::Server(accepted(), Then::AnswerOnceThenClose)],
+        );
+        let mut host = Host::start(door, request(), fast());
+        host.send(initialize_request()).await;
+        let init = host.response(1).await;
+        assert_eq!(init["result"]["serverInfo"]["name"], "mcpls", "{init}");
+        host.send(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_server_logs","arguments":{}}})).await;
+        let failed = host.response(2).await;
+        assert!(failed["error"]["message"].as_str().unwrap().contains("stopped"), "{failed}");
+        let call = host.call_tool(3).await;
+        assert_eq!(call["result"]["isError"], true, "{call}");
+    }
+
+    /// A backend that accepts the handshake and closes before sending
+    /// anything was exiting as the frontend attached. The frontend attaches
+    /// again and the host never sees the first backend.
+    #[tokio::test]
+    async fn test_a_backend_closing_before_its_first_line_is_attached_again() {
+        let door = FakeDoor::new(
+            Start::Spawned,
+            vec![
+                Script::Server(accepted(), Then::CloseOnFirstLine),
+                Script::Server(accepted(), Then::Serve),
+            ],
+        );
+        let mut host = Host::start(Arc::clone(&door) as Arc<dyn Door>, request(), fast());
+        let init = host.initialize().await;
+        assert_eq!(init["result"]["instructions"], crate::mcp::INSTRUCTIONS, "{init}");
+        let call = host.call_tool(2).await;
+        assert_ne!(call["result"]["isError"], true, "{call}");
+        assert_eq!(*door.starts.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_a_second_silent_close_fails_the_session() {
+        let door = FakeDoor::new(
+            Start::Spawned,
+            vec![
+                Script::Server(accepted(), Then::CloseOnFirstLine),
+                Script::Server(accepted(), Then::CloseOnFirstLine),
+            ],
+        );
+        let mut host = Host::start(door, request(), fast());
+        host.send(initialize_request()).await;
+        let failed = host.response(1).await;
+        assert!(failed["error"]["message"].as_str().unwrap().contains("stopped"), "{failed}");
+    }
+
+    #[tokio::test]
+    async fn test_a_waiting_tool_call_fails_at_once() {
+        let door = FakeDoor::new(Start::Requested, vec![]);
+        let mut host = Host::start(door, request(), fast());
+        host.initialize().await;
+        let started = Instant::now();
+        let call = host.call_tool(2).await;
+        assert!(started.elapsed() < Duration::from_secs(1), "the call waited for a backend");
+        assert_eq!(call["result"]["isError"], true, "{call}");
+        assert!(call["result"]["content"][0]["text"].as_str().unwrap().contains("hook"), "{call}");
+    }
+
+    #[tokio::test]
+    async fn test_a_waiting_session_replays_initialize_when_the_backend_arrives() {
+        let door = FakeDoor::new(
+            Start::Requested,
+            vec![Script::Nobody, Script::Nobody, Script::Nobody, Script::Server(accepted(), Then::Serve)],
+        );
+        let timing = Timing { retry: Duration::from_millis(200), ..fast() };
+        let mut host = Host::start(door, request(), timing);
+        let init = host.initialize().await;
+        assert!(init["result"]["instructions"].as_str().unwrap().contains("hook"), "{init}");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut id = 2;
+        loop {
+            let call = host.call_tool(id).await;
+            if call["result"]["isError"] != true {
+                break;
+            }
+            assert!(call["result"]["content"][0]["text"].as_str().unwrap().contains("hook"), "{call}");
+            assert!(Instant::now() < deadline, "no backend attached: {call}");
+            id += 1;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_the_relay_ends_when_the_host_closes() {
+        let door = FakeDoor::new(Start::Spawned, vec![Script::Server(accepted(), Then::Serve)]);
+        let mut host = Host::start(door, request(), fast());
+        host.initialize().await;
+        let Host { input, relay, .. } = host;
+        drop(input);
+        tokio::time::timeout(Duration::from_secs(5), relay)
+            .await
+            .expect("the relay returned after host EOF")
+            .unwrap();
+    }
+}
+```
+
+A successful tool call in `test_a_waiting_session_replays_initialize_when_the_backend_arrives` proves the replay: the served `McplsServer` answers no tool call before it has been initialized. The 200 ms retry keeps the host's `initialize` ahead of the attach, so the stub answers it.
+
+- [ ] **Step 2: See them fail**
+
+Run: `devrun task check`
+Expected: FAIL to compile: `struct Timing has no field named retry`, `unresolved import super::relay`.
+
+- [ ] **Step 3: Implement the relay**
+
+In `crates/mcpls-core/src/backend/frontend.rs` and `crates/mcpls-core/src/backend/stub.rs`, delete the `#![cfg_attr(not(test), allow(dead_code))]` line.
+
+Replace the top-level imports of `frontend.rs` with:
+
+```rust
+use std::cmp::Ordering;
+use std::collections::HashSet;
+use std::io;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use futures::future::BoxFuture;
+use serde_json::Value;
+use tokio::io::{AsyncBufReadExt as _, AsyncRead, AsyncWrite, AsyncWriteExt as _, BufReader};
+use tokio::sync::mpsc;
+use tokio::time::Instant;
+
+use crate::backend::handshake::{
+    self, ConfigStamp, Handshake, HandshakeReply, Refusal, compare_builds,
+};
+use crate::backend::spawn::{BackendLaunch, SpawnLock};
+use crate::backend::stub;
+use crate::bridge::SessionId;
+use crate::hooks::listener::HookStream;
+use crate::hooks::{self, SocketIdentity};
+```
+
+Replace `Timing` and its `Default` with:
+
+```rust
+/// The frontend's waits.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Timing {
+    /// How long a spawned backend has to answer.
+    pub(crate) start: Duration,
+    /// How often a waiting frontend tries again.
+    pub(crate) retry: Duration,
+    /// How long an evicted backend has to release the endpoint.
+    pub(crate) gone: Duration,
+}
+
+impl Default for Timing {
+    fn default() -> Self {
+        Self {
+            start: Duration::from_secs(10),
+            retry: Duration::from_millis(500),
+            gone: Duration::from_secs(5),
+        }
+    }
+}
+```
+
+Add to `mod messages`, after `waiting_for_hook`:
+
+```rust
+    pub(super) fn backend_stopped(place: &Place) -> String {
+        format!(
+            "Tell the user: the mcpls backend for {} stopped while this session was attached, so \
+             this session has no mcpls tools. Restart the session to start a new one. Its log is \
+             {}.",
+            place.root.display(),
+            place.log.display()
+        )
+    }
+```
+
+After `Outcome`, add the process's doors and entry point:
+
+```rust
+/// What the host launches mcpls with.
+pub struct FrontendOptions {
+    /// How to start a backend, including the checkout root.
+    pub launch: BackendLaunch,
+    /// This process's configuration.
+    pub stamp: ConfigStamp,
+}
+
+/// Relay this process's stdio to the project's backend until the host
+/// closes stdin.
+pub async fn run_frontend(options: FrontendOptions) {
+    let request = Handshake::mcp(
+        options.launch.root.clone(),
+        SessionId::from_host_env().map(|session| session.to_string()),
+        options.stamp,
+    );
+    let door: Arc<dyn Door> = match (hooks::identity_for(&options.launch.root), std::env::current_exe()) {
+        (Ok(identity), Ok(exe)) => Arc::new(ProcessDoor {
+            identity,
+            launch: options.launch,
+            exe,
+        }),
+        (Err(error), _) => Arc::new(Unreachable(options.launch.root, error.to_string())),
+        (_, Err(error)) => Arc::new(Unreachable(options.launch.root, error.to_string())),
+    };
+    relay(tokio::io::stdin(), tokio::io::stdout(), door, request, Timing::default()).await;
+}
+
+struct ProcessDoor {
+    identity: SocketIdentity,
+    launch: BackendLaunch,
+    exe: PathBuf,
+}
+
+impl Door for ProcessDoor {
+    fn connect(&self) -> BoxFuture<'_, io::Result<Box<dyn HookStream>>> {
+        Box::pin(hooks::listener::connect(&self.identity))
+    }
+
+    fn lock(&self, wait: Duration) -> BoxFuture<'_, io::Result<Option<Box<dyn Send>>>> {
+        Box::pin(async move {
+            Ok(SpawnLock::acquire(&self.identity.spawn_lock(), wait)
+                .await?
+                .map(|lock| Box::new(lock) as Box<dyn Send>))
+        })
+    }
+
+    fn start(&self) -> BoxFuture<'_, io::Result<Start>> {
+        Box::pin(async move {
+            #[cfg(windows)]
+            {
+                crate::backend::spawn::request_start(&self.identity, &self.launch)?;
+                Ok(Start::Requested)
+            }
+            #[cfg(not(windows))]
+            {
+                crate::backend::spawn::spawn_detached(&self.exe, &self.launch, &self.identity.log_file())?;
+                Ok(Start::Spawned)
+            }
+        })
+    }
+
+    fn place(&self) -> Place {
+        Place {
+            root: self.launch.root.clone(),
+            log: self.identity.log_file(),
+        }
+    }
+}
+
+/// A frontend that cannot derive its endpoint at all.
+struct Unreachable(PathBuf, String);
+
+impl Door for Unreachable {
+    fn connect(&self) -> BoxFuture<'_, io::Result<Box<dyn HookStream>>> {
+        Box::pin(async { Err(io::ErrorKind::NotFound.into()) })
+    }
+
+    fn lock(&self, _wait: Duration) -> BoxFuture<'_, io::Result<Option<Box<dyn Send>>>> {
+        let reason = self.1.clone();
+        Box::pin(async move { Err(io::Error::other(reason)) })
+    }
+
+    fn start(&self) -> BoxFuture<'_, io::Result<Start>> {
+        let reason = self.1.clone();
+        Box::pin(async move { Err(io::Error::other(reason)) })
+    }
+
+    fn place(&self) -> Place {
+        Place {
+            root: self.0.clone(),
+            log: PathBuf::new(),
+        }
+    }
+}
+```
+
+`ProcessDoor::exe` is unused on Windows; mark the field `#[cfg_attr(windows, allow(dead_code))]`.
+
 The relay:
 
 ```rust
+/// The id a replayed `initialize` goes out under, whose answer the host
+/// already had from the stub.
+const REPLAY_ID: &str = "mcpls-frontend-replay";
+
 enum Event {
     Host(String),
     HostClosed,
     Attach(Outcome),
-    Backend(String),
-    BackendClosed,
+    /// A line from the backend stream the numbered attach opened.
+    Backend(u64, String),
+    BackendClosed(u64),
 }
 
 enum State {
@@ -4339,29 +4799,20 @@ pub(crate) async fn relay<R, W>(
     let place = door.place();
     let mut state = State::Connecting;
     let mut backend: Option<tokio::io::WriteHalf<Box<dyn HookStream>>> = None;
+    // Events from any backend stream but the latest one are stale.
+    let mut generation = 0u64;
     let mut pending: HashSet<String> = HashSet::new();
     let mut deferred: Vec<(String, Value)> = Vec::new();
-    let mut wait_until: Option<Instant> = None;
+    // What the host sent the current backend before it sent anything back.
+    let mut unheard: Vec<(String, Value)> = Vec::new();
+    let mut heard = false;
+    let mut reattached = false;
     let mut init: Option<String> = None;
     let mut initialized: Option<String> = None;
     let mut init_answered = false;
 
-    loop {
-        let event = tokio::select! {
-            event = inbox.recv() => event,
-            () = sleep_until(wait_until) => {
-                wait_until = None;
-                if let State::Waiting(reason) = &state {
-                    for (_, message) in deferred.drain(..) {
-                        if let Some(reply) = stub::failure(&message, reason) {
-                            write_value(&mut host_out, &reply).await;
-                        }
-                    }
-                }
-                continue;
-            }
-        };
-        match event.unwrap_or(Event::HostClosed) {
+    while let Some(event) = inbox.recv().await {
+        match event {
             Event::HostClosed => return,
             Event::Host(line) => {
                 let Ok(message) = serde_json::from_str::<Value>(&line) else {
@@ -4376,33 +4827,34 @@ pub(crate) async fn relay<R, W>(
                     State::Connecting => deferred.push((line, message)),
                     State::Attached => {
                         if let Some(writer) = backend.as_mut() {
-                            if let (Some(id), Some(_)) = (message.get("id"), message.get("method")) {
-                                pending.insert(id.to_string());
-                            }
+                            track(&mut pending, &message);
                             if write_line(writer, &line).await.is_err() {
-                                let _ = events.send(Event::BackendClosed);
+                                let _ = events.send(Event::BackendClosed(generation));
+                            }
+                            if !heard {
+                                unheard.push((line, message));
                             }
                         }
                     }
                     State::Waiting(reason) | State::Failed(reason) => {
-                        let waiting = matches!(state, State::Waiting(_));
-                        match stub::answer(&message, reason, waiting) {
-                            Answer::Reply(reply) => {
-                                init_answered |= message["method"] == "initialize";
-                                write_value(&mut host_out, &reply).await;
-                            }
-                            Answer::Defer => {
-                                wait_until.get_or_insert_with(|| Instant::now() + timing.tool_wait);
-                                deferred.push((line, message));
-                            }
-                            Answer::Ignore => {}
+                        if let Some(reply) = stub::answer(&message, reason) {
+                            init_answered |= message["method"] == "initialize";
+                            write_value(&mut host_out, &reply).await;
                         }
                     }
                 }
             }
             Event::Attach(Outcome::Attached(stream)) => {
+                generation += 1;
+                let current = generation;
                 let (reader, mut writer) = tokio::io::split(stream);
-                spawn_lines(reader, events.clone(), Event::Backend, Event::BackendClosed);
+                spawn_lines(
+                    reader,
+                    events.clone(),
+                    move |line| Event::Backend(current, line),
+                    Event::BackendClosed(current),
+                );
+                heard = false;
                 if init_answered {
                     if let Some(line) = &init
                         && let Ok(mut replay) = serde_json::from_str::<Value>(line)
@@ -4414,45 +4866,29 @@ pub(crate) async fn relay<R, W>(
                         let _ = write_line(&mut writer, line).await;
                     }
                 }
-                for (line, message) in deferred.drain(..) {
-                    if let (Some(id), Some(_)) = (message.get("id"), message.get("method")) {
-                        pending.insert(id.to_string());
-                    }
+                for (line, message) in std::mem::take(&mut deferred) {
+                    track(&mut pending, &message);
                     let _ = write_line(&mut writer, &line).await;
+                    unheard.push((line, message));
                 }
-                wait_until = None;
                 backend = Some(writer);
                 state = State::Attached;
             }
             Event::Attach(Outcome::Waiting(reason)) => {
-                if !matches!(state, State::Waiting(_)) {
-                    state = State::Waiting(reason.clone());
-                    for (line, message) in std::mem::take(&mut deferred) {
-                        match stub::answer(&message, &reason, true) {
-                            Answer::Reply(reply) => {
-                                init_answered |= message["method"] == "initialize";
-                                write_value(&mut host_out, &reply).await;
-                            }
-                            Answer::Defer => {
-                                wait_until.get_or_insert_with(|| Instant::now() + timing.tool_wait);
-                                deferred.push((line, message));
-                            }
-                            Answer::Ignore => {}
-                        }
-                    }
-                }
+                answer_from_stub(&mut host_out, &mut deferred, &reason, &mut init_answered).await;
+                state = State::Waiting(reason);
                 spawn_attach(Arc::clone(&door), request.clone(), timing, events.clone(), timing.retry);
             }
             Event::Attach(Outcome::Failed(reason)) => {
-                for (_, message) in deferred.drain(..) {
-                    if let Answer::Reply(reply) = stub::answer(&message, &reason, false) {
-                        write_value(&mut host_out, &reply).await;
-                    }
-                }
-                wait_until = None;
+                answer_from_stub(&mut host_out, &mut deferred, &reason, &mut init_answered).await;
                 state = State::Failed(reason);
             }
-            Event::Backend(line) => {
+            Event::Backend(from, line) => {
+                if from != generation {
+                    continue;
+                }
+                heard = true;
+                unheard.clear();
                 let Ok(message) = serde_json::from_str::<Value>(&line) else {
                     continue;
                 };
@@ -4466,10 +4902,20 @@ pub(crate) async fn relay<R, W>(
                 }
                 write_raw(&mut host_out, &line).await;
             }
-            Event::BackendClosed => {
-                if !matches!(state, State::Attached) {
+            Event::BackendClosed(from) => {
+                if from != generation || !matches!(state, State::Attached) {
                     continue;
                 }
+                backend = None;
+                if !heard && !reattached {
+                    reattached = true;
+                    pending.clear();
+                    deferred = std::mem::take(&mut unheard);
+                    state = State::Connecting;
+                    spawn_attach(Arc::clone(&door), request.clone(), timing, events.clone(), Duration::ZERO);
+                    continue;
+                }
+                unheard.clear();
                 let reason = messages::backend_stopped(&place);
                 for id in pending.drain() {
                     let Ok(id) = serde_json::from_str::<Value>(&id) else {
@@ -4482,9 +4928,30 @@ pub(crate) async fn relay<R, W>(
                     });
                     write_value(&mut host_out, &reply).await;
                 }
-                backend = None;
                 state = State::Failed(reason);
             }
+        }
+    }
+}
+
+/// Record `message`'s id as awaiting the backend's answer, if it is a
+/// request.
+fn track(pending: &mut HashSet<String>, message: &Value) {
+    if let (Some(id), Some(_)) = (message.get("id"), message.get("method")) {
+        pending.insert(id.to_string());
+    }
+}
+
+async fn answer_from_stub<W: AsyncWrite + Unpin>(
+    host: &mut W,
+    deferred: &mut Vec<(String, Value)>,
+    reason: &str,
+    init_answered: &mut bool,
+) {
+    for (_, message) in deferred.drain(..) {
+        if let Some(reply) = stub::answer(&message, reason) {
+            *init_answered |= message["method"] == "initialize";
+            write_value(host, &reply).await;
         }
     }
 }
@@ -4506,7 +4973,7 @@ fn spawn_attach(
 fn spawn_lines<R>(
     reader: R,
     events: mpsc::UnboundedSender<Event>,
-    line: fn(String) -> Event,
+    line: impl Fn(String) -> Event + Send + 'static,
     closed: Event,
 ) where
     R: AsyncRead + Unpin + Send + 'static,
@@ -4520,13 +4987,6 @@ fn spawn_lines<R>(
         }
         let _ = events.send(closed);
     });
-}
-
-async fn sleep_until(deadline: Option<Instant>) {
-    match deadline {
-        Some(deadline) => tokio::time::sleep_until(deadline).await,
-        None => std::future::pending().await,
-    }
 }
 
 async fn write_line<W: AsyncWrite + Unpin + ?Sized>(writer: &mut W, line: &str) -> io::Result<()> {
@@ -4548,16 +5008,16 @@ async fn write_value<W: AsyncWrite + Unpin>(host: &mut W, value: &Value) {
 
 While `Waiting`, every retry runs `attach`, which on Windows rewrites the start request. That is intended: a hook that fired before the frontend's first request removed nothing, and the next hook sees the fresh one.
 
-A `Waiting` retry that returns `Failed` moves the session to `Failed`, which answers any still-deferred tool calls with the failure. Unused imports (`ConfigSource` in the outer module) go.
+A `Waiting` retry that returns `Failed` moves the session to `Failed`. A stream error while writing to the backend is reported as a close of that stream, so it takes the same path.
 
-Add to `crates/mcpls-core/src/backend/mod.rs`: `pub mod frontend;`, `mod stub;`, and `pub use frontend::{FrontendOptions, run_frontend};`.
+Add to `crates/mcpls-core/src/backend/mod.rs`: `pub use frontend::{FrontendOptions, run_frontend};`.
 
-- [ ] **Step 5: Run the tests**
+- [ ] **Step 4: Run the tests**
 
 Run: `devrun task test`
-Expected: PASS, including the four stub tests and ten frontend tests.
+Expected: PASS, including the eight relay tests, and the stub and attach tests from Task 8a unchanged.
 
-- [ ] **Step 6: Verify and commit**
+- [ ] **Step 5: Verify and commit**
 
 Run: `devrun task verify`
 Expected: PASS.
@@ -4575,11 +5035,16 @@ git commit -m "feat(backend): relay a session through a frontend"
 - Modify: `crates/mcpls-cli/src/args.rs:40-145` (`--no-backend`, hidden `backend` subcommand) and its tests
 - Modify: `crates/mcpls-cli/src/main.rs:32-162`
 - Modify: `crates/mcpls-cli/tests/cli_integration.rs` (tests that drive the MCP server over stdio)
-- Test: `crates/mcpls-cli/src/args.rs` tests, `crates/mcpls-cli/tests/cli_integration.rs`
+- Modify: `crates/mcpls-core/tests/e2e/mcp_client.rs` (`--no-backend` for the in-process protocol tests)
+- Create: `crates/mcpls-cli/tests/backend.rs` (the process harness and the default frontend's lifecycle test)
+- Test: `crates/mcpls-cli/src/args.rs` tests, `crates/mcpls-cli/tests/cli_integration.rs`, `crates/mcpls-cli/tests/backend.rs`
 
 **Interfaces:**
-- Consumes: `run_frontend`, `FrontendOptions`, `BackendLaunch`, `ConfigStamp::of`, `serve_backend`, `start_requested` (Tasks 5-8), `ServerConfig::load_at` (Task 3).
-- Produces: `Args::no_backend: bool` (`--no-backend`, env `MCPLS_NO_BACKEND`), `Command::Backend { root: PathBuf }` (hidden).
+- Consumes: `ServerConfig::load_at` (Task 3); `ConfigStamp::of` and the doctor's `backend pid:` label (Task 5); `serve_backend` (Task 6b); `BackendLaunch`, `start_requested` (Task 7); `run_frontend`, `FrontendOptions` (Task 8b).
+- Produces:
+  - `Args::no_backend: bool` (`--no-backend`, env `MCPLS_NO_BACKEND`), `Command::Backend { root: PathBuf }` (hidden).
+  - `fn load_config(args: &Args, root: &std::path::Path) -> Result<mcpls_core::ServerConfig>` in `crates/mcpls-cli/src/main.rs`.
+  - In `crates/mcpls-cli/tests/backend.rs`: `struct Project { dir: TempDir, runtime: TempDir, user: String }` with `new(idle_ms: u64) -> Project`, `root(&self) -> PathBuf`, `config(&self) -> PathBuf`, `write_config(&self, idle_ms: u64, servers: &str)`, `command(&self, cwd: &Path) -> Command`, `frontend(&self) -> Frontend`, `frontend_in(&self, cwd: &Path, extra: &[&str]) -> Frontend`, `doctor(&self) -> String`, `backend_pid(&self) -> Option<u32>`, `wait_for(&self, what: &str, ready: impl FnMut(&Project) -> bool)`; `struct Frontend { child: Child, stdin: Option<ChildStdin>, lines: Receiver<String>, next_id: i64 }` with `spawn(command: Command) -> Frontend`, `spawn_uninitialized(command: Command) -> Frontend`, `request(&mut self, method: &str, params: Value) -> Value`, `send(&mut self, message: &Value)`, `initialize(&mut self) -> Value`, `close(&mut self, within: Duration) -> bool`; `fn next() -> u64`; `#[cfg(unix)] fn alive(pid: u32) -> bool`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -4776,247 +5241,9 @@ CLI tests in `crates/mcpls-cli/tests/cli_integration.rs` that pipe `MCP_INPUT` a
 
 `crates/mcpls-core/tests/e2e/mcp_client.rs` spawns `mcpls` for protocol tests that expect an in-process server reading `STDIO_READY_MARKER` from stderr: add `--no-backend` in `spawn_with_empty_config` and `spawn_with_args_and_stderr`'s argument list unless the caller already passes it, so the existing e2e suite keeps its meaning. `spawn_in_workspace` does not add it; Task 11's shared-backend test uses it.
 
-- [ ] **Step 6: Run the tests**
+- [ ] **Step 6: Prove the default across processes**
 
-Run: `devrun task test`, then `devrun task test-e2e`
-Expected: PASS for both.
-
-- [ ] **Step 7: Verify and commit**
-
-Run: `devrun task verify`
-Expected: PASS.
-
-```bash
-git add crates/mcpls-cli crates/mcpls-core/tests/e2e/mcp_client.rs
-git commit -m "feat(cli): launch the frontend by default"
-```
-
----
-
-### Task 10: the doctor reports the backend
-
-**Files:**
-- Modify: `crates/mcpls-core/src/hooks/protocol.rs:94-113` (`Response::Status`), `:254-273` (its wire test)
-- Modify: `crates/mcpls-core/src/hooks/service.rs` (`build_handler` status arm)
-- Modify: `crates/mcpls-core/src/bridge/translator/mod.rs:951-956` (`registered_server_ids`)
-- Modify: `crates/mcpls-core/src/backend/endpoint.rs` (`Endpoint::new` passes a status source)
-- Modify: `crates/mcpls-core/src/lib.rs` (in-process status source)
-- Modify: `crates/mcpls-cli/src/hook.rs` (doctor lines, fake owner `answer`, `test_doctor_reports_the_live_owners_root_pid_and_hook_activity`)
-- Modify: `plugin/README.md` (doctor section)
-
-**Interfaces:**
-- Consumes: `Attachments::sessions` (Task 6).
-- Produces:
-  - `Response::Status` gains `#[serde(default)] version: String`, `uptime_ms: u64`, `sessions: Vec<String>`, `servers: Vec<String>`, `config_fingerprint: String`.
-  - `pub struct StatusExtras { pub version: String, pub uptime_ms: u64, pub sessions: Vec<String>, pub servers: Vec<String>, pub config_fingerprint: String }` and `pub type StatusSource = Arc<dyn Fn() -> StatusExtras + Send + Sync>` in `hooks::service`.
-  - `build_handler(..., stats: Arc<HookStats>, status: StatusSource, cancel)`.
-  - `Translator::registered_server_ids(&self) -> Vec<String>`, sorted.
-
-- [ ] **Step 1: Write the failing tests**
-
-In `crates/mcpls-core/src/hooks/protocol.rs`, replace `test_the_status_response_pins_the_wire_shape`'s literal and value with:
-
-```rust
-        let literal = r#"{"op":"status","hash":"abc123","socket":"mcpls.sock","pid":42,"owner":true,"root":"/work","hooks_seen":7,"version":"0.3.9","uptime_ms":61000,"sessions":["s1","connection-4"],"servers":["rust"],"config_fingerprint":"00000000000000ff"}"#;
-        let value = Response::Status {
-            hash: "abc123".to_string(),
-            socket: PathBuf::from("mcpls.sock"),
-            pid: 42,
-            owner: true,
-            root: PathBuf::from("/work"),
-            hooks_seen: 7,
-            version: "0.3.9".to_string(),
-            uptime_ms: 61_000,
-            sessions: vec!["s1".to_string(), "connection-4".to_string()],
-            servers: vec!["rust".to_string()],
-            config_fingerprint: "00000000000000ff".to_string(),
-        };
-```
-
-and add:
-
-```rust
-    /// A status from a build that predates the backend fields still parses.
-    #[test]
-    fn test_an_older_status_parses_with_empty_backend_fields() {
-        let literal = r#"{"op":"status","hash":"a","socket":"s","pid":1,"owner":true,"root":"/w","hooks_seen":0}"#;
-        let Response::Status { sessions, version, .. } =
-            serde_json::from_str::<Response>(literal).expect("deserialize")
-        else {
-            panic!("a status");
-        };
-        assert!(sessions.is_empty());
-        assert!(version.is_empty());
-    }
-```
-
-In `crates/mcpls-cli/src/hook.rs`, change `test_doctor_reports_the_live_owners_root_pid_and_hook_activity` to expect twelve lines: indexes 0 to 5 as today, then
-
-```rust
-        assert_eq!(lines[6], "backend: mcpls 0.3.9, up 1m1s");
-        assert_eq!(lines[7], "sessions: 2 attached (s1, connection-4)");
-        assert_eq!(lines[8], "language servers: rust");
-        assert_eq!(lines[9], "config: 00000000000000ff");
-        assert!(lines[10].starts_with("mcpls on PATH: "));
-        assert_eq!(lines[11], "watch scan: no eligible top-level paths; hidden entries excluded by default; ignore rules applied; host registration unverified");
-```
-
-with the fake owner's `answer` for `Request::Status` returning those backend fields (`version: "0.3.9"`, `uptime_ms: 61_000`, the two sessions, `["rust"]`, the fingerprint). Add a test:
-
-```rust
-    #[test]
-    fn test_backend_lines_for_an_idle_backend() {
-        assert_eq!(sessions_line(&[]), "sessions: none attached");
-        assert_eq!(servers_line(&[]), "language servers: none");
-        assert_eq!(uptime(0), "0s");
-        assert_eq!(uptime(3_725_000), "1h2m");
-    }
-```
-
-- [ ] **Step 2: See them fail**
-
-Run: `devrun task check`
-Expected: FAIL to compile on the new fields and functions.
-
-- [ ] **Step 3: Extend the status**
-
-Add the five fields to `Response::Status` after `hooks_seen`, each `#[serde(default)]` and documented ("This mcpls's version", "How long the backend has run", "The sessions attached", "The language servers registered", "The configuration fingerprint the backend started with").
-
-In `crates/mcpls-core/src/hooks/service.rs`:
-
-```rust
-/// What a status answer reports beyond the socket itself.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct StatusExtras {
-    /// This build's version.
-    pub version: String,
-    /// How long this process has served.
-    pub uptime_ms: u64,
-    /// The MCP sessions attached.
-    pub sessions: Vec<String>,
-    /// The language servers registered.
-    pub servers: Vec<String>,
-    /// The configuration fingerprint this process started with.
-    pub config_fingerprint: String,
-}
-
-/// Computes [`StatusExtras`] at the moment a status is asked for.
-pub type StatusSource = Arc<dyn Fn() -> StatusExtras + Send + Sync>;
-```
-
-`build_handler` takes `status: StatusSource` after `stats`; the `Request::Status` arm builds `let extras = status();` and fills the new fields from it. Export both from `hooks/mod.rs`.
-
-In `crates/mcpls-core/src/bridge/translator/mod.rs`, beside `registered_server_count`:
-
-```rust
-    /// The routing identities of every registered language server, sorted.
-    #[must_use]
-    pub fn registered_server_ids(&self) -> Vec<String> {
-        let mut ids: Vec<String> = lock_std(&self.lsp_servers).keys().map(ToString::to_string).collect();
-        ids.sort();
-        ids
-    }
-```
-
-`Runtime` (Task 6) keeps its `translator` private; add `pub(crate) fn status_source(&self, sessions: impl Fn() -> Vec<String> + Send + Sync + 'static, fingerprint: String) -> StatusSource` that captures `Instant::now()` taken in `Runtime::start` (store it as `started: Instant`) and `Arc::clone(&self.translator)`:
-
-```rust
-    pub(crate) fn status_source(
-        &self,
-        sessions: impl Fn() -> Vec<String> + Send + Sync + 'static,
-        config_fingerprint: String,
-    ) -> hooks::StatusSource {
-        let translator = Arc::clone(&self.translator);
-        let started = self.started;
-        Arc::new(move || hooks::StatusExtras {
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            uptime_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            sessions: sessions(),
-            servers: translator.registered_server_ids(),
-            config_fingerprint: config_fingerprint.clone(),
-        })
-    }
-```
-
-In `Endpoint::new`, build `attachments` first and pass `runtime.status_source({ let attachments = Arc::clone(&attachments); move || attachments.sessions() }, config.fingerprint())`. In the in-process `serve_with_identity`, pass `runtime.status_source(Vec::new, config.fingerprint())`. Tests that call `build_handler` pass `Arc::new(StatusExtras::default)`.
-
-- [ ] **Step 4: Print it**
-
-In `crates/mcpls-cli/src/hook.rs` `doctor_scanning`'s answered-status arm, destructure the new fields and push after `hooks_seen_line`:
-
-```rust
-            lines.push(format!("backend: mcpls {version}, up {}", uptime(uptime_ms)));
-            lines.push(sessions_line(&sessions));
-            lines.push(servers_line(&servers));
-            lines.push(format!("config: {config_fingerprint}"));
-```
-
-with
-
-```rust
-fn uptime(ms: u64) -> String {
-    let secs = ms / 1000;
-    match (secs / 3600, secs / 60 % 60, secs % 60) {
-        (0, 0, s) => format!("{s}s"),
-        (0, m, s) => format!("{m}m{s}s"),
-        (h, m, _) => format!("{h}h{m}m"),
-    }
-}
-
-fn sessions_line(sessions: &[String]) -> String {
-    if sessions.is_empty() {
-        "sessions: none attached".to_string()
-    } else {
-        format!("sessions: {} attached ({})", sessions.len(), sessions.join(", "))
-    }
-}
-
-fn servers_line(servers: &[String]) -> String {
-    if servers.is_empty() {
-        "language servers: none".to_string()
-    } else {
-        format!("language servers: {}", servers.join(", "))
-    }
-}
-```
-
-Other doctor tests that assert an exact line count or the index of the PATH or watch-scan line for an answering owner move those indexes by four (`rg -n "lines\[|lines.len\(\)" crates/mcpls-cli/src/hook.rs`). Update the count and indexes; do not loosen them to `contains`.
-
-`HookAction::Doctor`'s help text in `crates/mcpls-cli/src/args.rs:142-144` becomes "Print the socket path, both directory hashes, the backend's pid, uptime, sessions, language servers and configuration, and whether mcpls resolves on PATH".
-
-Update the doctor example output in `plugin/README.md` to show the four new lines after `hooks seen:`.
-
-- [ ] **Step 5: Run the tests**
-
-Run: `devrun task test`
-Expected: PASS.
-
-- [ ] **Step 6: Verify and commit**
-
-Run: `devrun task verify`
-Expected: PASS.
-
-```bash
-git add crates plugin/README.md
-git commit -m "feat(doctor): report the backend's sessions and servers"
-```
-
----
-
-### Task 11: prove the lifecycle across real processes
-
-**Files:**
-- Create: `crates/mcpls-cli/tests/backend.rs`
-- Modify: `crates/mcpls-core/tests/e2e/protocol_tests.rs` (shared-backend records test)
-
-**Interfaces:**
-- Consumes: everything above, through the `mcpls` binary only.
-
-These are the spec's Verification items that need processes. Items already proven in-crate are not repeated: per-connection records (Task 1), per-connection subscriptions (Task 2), upgrade and trust decisions (Tasks 6 and 8), exit ordering (Task 6).
-
-- [ ] **Step 1: Write the harness**
-
-Create `crates/mcpls-cli/tests/backend.rs`:
+The flip is real only if a host launching plain `mcpls` gets a backend that goes away with it. Create `crates/mcpls-cli/tests/backend.rs` with the process harness and one lifecycle test; Task 11 extends both.
 
 ```rust
 //! A frontend and its backend as the host sees them: separate processes
@@ -5024,6 +5251,7 @@ Create `crates/mcpls-cli/tests/backend.rs`:
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 #![allow(deprecated)]
+#![cfg_attr(windows, allow(dead_code))]
 
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
@@ -5066,10 +5294,6 @@ impl Project {
         self.root().join("test-mcpls.toml")
     }
 
-    fn spawns(&self) -> PathBuf {
-        self.root().join("spawns.txt")
-    }
-
     /// `servers` is extra TOML appended after the backend table.
     fn write_config(&self, idle_ms: u64, servers: &str) {
         std::fs::write(
@@ -5077,22 +5301,6 @@ impl Project {
             format!("[backend]\nidle_shutdown_ms = {idle_ms}\n{servers}"),
         )
         .unwrap();
-    }
-
-    /// A language server that records each start and never answers, so
-    /// the number of lines in `spawns.txt` is the number of servers mcpls
-    /// started.
-    #[cfg(unix)]
-    fn with_counting_server(self, idle_ms: u64) -> Self {
-        std::fs::write(self.root().join("marker.fake"), "").unwrap();
-        let script = format!("echo $$ >> '{}'; exec sleep 30", self.spawns().display());
-        self.write_config(
-            idle_ms,
-            &format!(
-                "\n[[lsp_servers]]\nlanguage_id = \"fake\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", {script:?}]\nfile_patterns = [\"**/*.fake\"]\ntimeout_seconds = 30\n\n[lsp_servers.heuristics]\nproject_markers = [\"marker.fake\"]\n"
-            ),
-        );
-        self
     }
 
     fn command(&self, cwd: &Path) -> Command {
@@ -5106,7 +5314,6 @@ impl Project {
             .env_remove("XDG_RUNTIME_DIR")
             .env_remove("CLAUDE_CODE_SESSION_ID")
             .env("TMPDIR", self.runtime.path())
-            .env("TEMP", self.runtime.path())
             .env("USER", &self.user)
             .env("USERNAME", &self.user)
             .current_dir(cwd);
@@ -5138,7 +5345,7 @@ impl Project {
     fn backend_pid(&self) -> Option<u32> {
         self.doctor()
             .lines()
-            .find_map(|line| line.strip_prefix("owner pid: "))
+            .find_map(|line| line.strip_prefix("backend pid: "))
             .and_then(|pid| pid.parse().ok())
     }
 
@@ -5228,10 +5435,6 @@ impl Frontend {
         answer
     }
 
-    fn call_tool(&mut self) -> Value {
-        self.request("tools/call", json!({"name": "get_server_logs", "arguments": {}}))
-    }
-
     /// Close stdin, as a host ending its session does, and return whether
     /// stdout reached EOF within `within`.
     fn close(&mut self, within: Duration) -> bool {
@@ -5259,11 +5462,404 @@ fn alive(pid: u32) -> bool {
     Command::new("kill").args(["-0", &pid.to_string()]).status().is_ok_and(|s| s.success())
 }
 
+/// Removes this checkout's files from the runtime directory, which a
+/// Windows test cannot redirect to a temporary one.
+#[cfg(windows)]
+impl Drop for Project {
+    fn drop(&mut self) {
+        let Ok(identity) = mcpls_core::hooks::identity_for(&self.root()) else {
+            return;
+        };
+        let Some(dir) = identity.lock.parent() else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let prefix = format!("{}.", identity.hash);
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
+/// Closing the last session removes the backend after its timer, and the
+/// host sees EOF as soon as its frontend exits.
+#[cfg(unix)]
+#[test]
+fn closing_the_last_session_removes_the_backend() {
+    let project = Project::new(300);
+    let mut frontend = project.frontend();
+    let pid = project.backend_pid().unwrap();
+    assert!(frontend.close(Duration::from_secs(5)), "the host did not see EOF");
+    project.wait_for("the backend to exit", |p| p.backend_pid().is_none());
+    assert!(!alive(pid));
+}
+```
+
+The `cfg_attr` covers Windows, where this file's only test is gated off until Task 11 adds one. On Windows the frontend does not spawn a backend, so the lifecycle test is Unix-only; the checkout root is a fresh temporary directory, so its hash, and every file the backend leaves beside its lock, is unique to the test.
+
+- [ ] **Step 7: Run the tests**
+
+Run: `devrun task test`, then `devrun task test-e2e`
+Expected: PASS for both, including `closing_the_last_session_removes_the_backend`.
+
+- [ ] **Step 8: Verify and commit**
+
+Run: `devrun task verify`
+Expected: PASS.
+
+```bash
+git add crates/mcpls-cli crates/mcpls-core/tests/e2e/mcp_client.rs
+git commit -m "feat(cli): launch the frontend by default"
+```
+
+---
+
+### Task 10: the doctor reports the backend
+
+**Files:**
+- Modify: `crates/mcpls-core/src/hooks/protocol.rs:94-113` (`Response::Status`), `:254-273` (its wire test)
+- Modify: `crates/mcpls-core/src/hooks/service.rs` (`build_handler` status arm)
+- Modify: `crates/mcpls-core/src/bridge/translator/mod.rs:951-956` (`registered_server_ids`)
+- Modify: `crates/mcpls-core/src/backend/endpoint.rs` (`Endpoint::new` passes a status source)
+- Modify: `crates/mcpls-core/src/lib.rs` (in-process status source)
+- Modify: `crates/mcpls-cli/src/hook.rs` (doctor lines, `config_line`, fake owner `answer`, `test_doctor_reports_the_live_owners_root_pid_and_hook_activity`)
+- Modify: `crates/mcpls-cli/src/main.rs` (the doctor loads this checkout's configuration)
+- Modify: `plugin/README.md` (doctor section)
+
+**Interfaces:**
+- Consumes:
+  - `Runtime` (Task 6a): reads its private `translator: Arc<Translator>` and adds a private `started: Instant` field, set in `Runtime::start`.
+  - `build_handler(server, sweeper, location, stats, cancel)` (Task 4), whose signature this task changes, at its call sites: `Endpoint::new` in `backend/endpoint.rs` (Task 6b), `serve_hooks_in_process` in `lib.rs` (Tasks 6a and 6b), and the `HookHarness` in `hooks/service.rs` tests (Task 4).
+  - `Endpoint::new` building `attachments: Arc<Attachments>` and `Attachments::sessions(&self) -> Vec<String>` (Task 6b).
+  - `ServerConfig::fingerprint` (Task 3); `load_config(args: &Args, root: &Path) -> Result<ServerConfig>` in `crates/mcpls-cli/src/main.rs` (Task 9).
+  - `doctor(project_dir: &Path, root: &Path, identity: &SocketIdentity) -> String` and `doctor_scanning(project_dir, root, identity, prefix: &str) -> String` in `crates/mcpls-cli/src/hook.rs` (existing, printing `backend pid:` since Task 5), whose signatures this task extends.
+- Produces:
+  - `doctor(project_dir, root, identity, local_fingerprint: Option<&str>) -> String` and `doctor_scanning(project_dir, root, identity, prefix, local_fingerprint: Option<&str>) -> String`; `fn config_line(backend: &str, local: Option<&str>) -> String`.
+  - `Runtime::status_source(&self, sessions: impl Fn() -> Vec<String> + Send + Sync + 'static, config_fingerprint: String) -> hooks::StatusSource` (`pub(crate)`).
+  - `Response::Status` gains `#[serde(default)] version: String`, `uptime_ms: u64`, `sessions: Vec<String>`, `servers: Vec<String>`, `config_fingerprint: String`.
+  - `pub struct StatusExtras { pub version: String, pub uptime_ms: u64, pub sessions: Vec<String>, pub servers: Vec<String>, pub config_fingerprint: String }` and `pub type StatusSource = Arc<dyn Fn() -> StatusExtras + Send + Sync>` in `hooks::service`.
+  - `build_handler(..., stats: Arc<HookStats>, status: StatusSource, cancel)`.
+  - `Translator::registered_server_ids(&self) -> Vec<String>`, sorted.
+
+- [ ] **Step 1: Write the failing tests**
+
+In `crates/mcpls-core/src/hooks/protocol.rs`, replace `test_the_status_response_pins_the_wire_shape`'s literal and value with:
+
+```rust
+        let literal = r#"{"op":"status","hash":"abc123","socket":"mcpls.sock","pid":42,"owner":true,"root":"/work","hooks_seen":7,"version":"0.3.9","uptime_ms":61000,"sessions":["s1","connection-4"],"servers":["rust"],"config_fingerprint":"00000000000000ff"}"#;
+        let value = Response::Status {
+            hash: "abc123".to_string(),
+            socket: PathBuf::from("mcpls.sock"),
+            pid: 42,
+            owner: true,
+            root: PathBuf::from("/work"),
+            hooks_seen: 7,
+            version: "0.3.9".to_string(),
+            uptime_ms: 61_000,
+            sessions: vec!["s1".to_string(), "connection-4".to_string()],
+            servers: vec!["rust".to_string()],
+            config_fingerprint: "00000000000000ff".to_string(),
+        };
+```
+
+and add:
+
+```rust
+    /// A status from a build that predates the backend fields still parses.
+    #[test]
+    fn test_an_older_status_parses_with_empty_backend_fields() {
+        let literal = r#"{"op":"status","hash":"a","socket":"s","pid":1,"owner":true,"root":"/w","hooks_seen":0}"#;
+        let Response::Status { sessions, version, .. } =
+            serde_json::from_str::<Response>(literal).expect("deserialize")
+        else {
+            panic!("a status");
+        };
+        assert!(sessions.is_empty());
+        assert!(version.is_empty());
+    }
+```
+
+In `crates/mcpls-cli/src/hook.rs`, change `test_doctor_reports_the_live_owners_root_pid_and_hook_activity` to expect twelve lines: indexes 0 to 5 as today, then
+
+```rust
+        assert_eq!(lines[6], "backend: mcpls 0.3.9, up 1m1s");
+        assert_eq!(lines[7], "sessions: 2 attached (s1, connection-4)");
+        assert_eq!(lines[8], "language servers: rust");
+        assert_eq!(lines[9], "config: 00000000000000ff");
+        assert!(lines[10].starts_with("mcpls on PATH: "));
+        assert_eq!(lines[11], "watch scan: no eligible top-level paths; hidden entries excluded by default; ignore rules applied; host registration unverified");
+```
+
+with the fake owner's `answer` for `Request::Status` returning those backend fields (`version: "0.3.9"`, `uptime_ms: 61_000`, the two sessions, `["rust"]`, the fingerprint). Add a test:
+
+```rust
+    #[test]
+    fn test_backend_lines_for_an_idle_backend() {
+        assert_eq!(sessions_line(&[]), "sessions: none attached");
+        assert_eq!(servers_line(&[]), "language servers: none");
+        assert_eq!(uptime(0), "0s");
+        assert_eq!(uptime(3_725_000), "1h2m");
+    }
+
+    /// The doctor prints the backend's fingerprint beside the one this
+    /// build loads for the checkout, and says when they differ.
+    #[test]
+    fn test_the_config_line_marks_a_mismatch() {
+        assert_eq!(config_line("00000000000000ff", None), "config: 00000000000000ff");
+        assert_eq!(
+            config_line("00000000000000ff", Some("00000000000000ff")),
+            "config: 00000000000000ff, matches this build's"
+        );
+        assert_eq!(
+            config_line("00000000000000ff", Some("0000000000000001")),
+            "config: 00000000000000ff, differs from this build's 0000000000000001; the backend's is in effect"
+        );
+    }
+```
+
+- [ ] **Step 2: See them fail**
+
+Run: `devrun task check`
+Expected: FAIL to compile on the new fields and functions.
+
+- [ ] **Step 3: Extend the status**
+
+Add the five fields to `Response::Status` after `hooks_seen`, each `#[serde(default)]` and documented ("This mcpls's version", "How long the backend has run", "The sessions attached", "The language servers registered", "The configuration fingerprint the backend started with").
+
+In `crates/mcpls-core/src/hooks/service.rs`:
+
+```rust
+/// What a status answer reports beyond the socket itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StatusExtras {
+    /// This build's version.
+    pub version: String,
+    /// How long this process has served.
+    pub uptime_ms: u64,
+    /// The MCP sessions attached.
+    pub sessions: Vec<String>,
+    /// The language servers registered.
+    pub servers: Vec<String>,
+    /// The configuration fingerprint this process started with.
+    pub config_fingerprint: String,
+}
+
+/// Computes [`StatusExtras`] at the moment a status is asked for.
+pub type StatusSource = Arc<dyn Fn() -> StatusExtras + Send + Sync>;
+```
+
+`build_handler` takes `status: StatusSource` after `stats`; the `Request::Status` arm builds `let extras = status();` and fills the new fields from it. Export both from `hooks/mod.rs`.
+
+In `crates/mcpls-core/src/bridge/translator/mod.rs`, beside `registered_server_count`:
+
+```rust
+    /// The routing identities of every registered language server, sorted.
+    #[must_use]
+    pub fn registered_server_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = lock_std(&self.lsp_servers).keys().map(ToString::to_string).collect();
+        ids.sort();
+        ids
+    }
+```
+
+`Runtime` (Task 6a) keeps its `translator` private; add `pub(crate) fn status_source(&self, sessions: impl Fn() -> Vec<String> + Send + Sync + 'static, fingerprint: String) -> StatusSource` that captures `Instant::now()` taken in `Runtime::start` (store it as `started: Instant`) and `Arc::clone(&self.translator)`:
+
+```rust
+    pub(crate) fn status_source(
+        &self,
+        sessions: impl Fn() -> Vec<String> + Send + Sync + 'static,
+        config_fingerprint: String,
+    ) -> hooks::StatusSource {
+        let translator = Arc::clone(&self.translator);
+        let started = self.started;
+        Arc::new(move || hooks::StatusExtras {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            uptime_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            sessions: sessions(),
+            servers: translator.registered_server_ids(),
+            config_fingerprint: config_fingerprint.clone(),
+        })
+    }
+```
+
+In `Endpoint::new`, build `attachments` first and pass `runtime.status_source({ let attachments = Arc::clone(&attachments); move || attachments.sessions() }, config.fingerprint())`. In `serve_hooks_in_process` in `lib.rs`, pass `runtime.status_source(Vec::new, config.fingerprint())`. Tests that call `build_handler`, the `HookHarness` in `hooks/service.rs`, pass `Arc::new(StatusExtras::default)`.
+
+- [ ] **Step 4: Print it**
+
+In `crates/mcpls-cli/src/hook.rs` `doctor_scanning`'s answered-status arm, destructure the new fields and push after `hooks_seen_line`:
+
+```rust
+            lines.push(format!("backend: mcpls {version}, up {}", uptime(uptime_ms)));
+            lines.push(sessions_line(&sessions));
+            lines.push(servers_line(&servers));
+            lines.push(config_line(&config_fingerprint, local_fingerprint));
+```
+
+with
+
+```rust
+fn uptime(ms: u64) -> String {
+    let secs = ms / 1000;
+    match (secs / 3600, secs / 60 % 60, secs % 60) {
+        (0, 0, s) => format!("{s}s"),
+        (0, m, s) => format!("{m}m{s}s"),
+        (h, m, _) => format!("{h}h{m}m"),
+    }
+}
+
+fn sessions_line(sessions: &[String]) -> String {
+    if sessions.is_empty() {
+        "sessions: none attached".to_string()
+    } else {
+        format!("sessions: {} attached ({})", sessions.len(), sessions.join(", "))
+    }
+}
+
+fn servers_line(servers: &[String]) -> String {
+    if servers.is_empty() {
+        "language servers: none".to_string()
+    } else {
+        format!("language servers: {}", servers.join(", "))
+    }
+}
+
+/// The `config:` line: the backend's fingerprint, and whether the one this
+/// build loads for the checkout, the way a frontend would, agrees with it.
+fn config_line(backend: &str, local: Option<&str>) -> String {
+    match local {
+        None => format!("config: {backend}"),
+        Some(local) if local == backend => format!("config: {backend}, matches this build's"),
+        Some(local) => format!(
+            "config: {backend}, differs from this build's {local}; the backend's is in effect"
+        ),
+    }
+}
+```
+
+`doctor` and `doctor_scanning` each take a last parameter `local_fingerprint: Option<&str>`, which `doctor` passes through. Every existing test call of `doctor_scanning` passes `None` (`rg -n 'doctor_scanning\(' crates/mcpls-cli/src/hook.rs`), so their `config:` line stays the bare fingerprint and `lines[9]` above holds.
+
+In `crates/mcpls-cli/src/main.rs`, the `HookAction::Doctor` arm loads this checkout's configuration the way the frontend does, through `load_config`, which calls `ServerConfig::load_at` with the trust `--trust-project-config` or `MCPLS_TRUST_PROJECT_CONFIG` gives (clap reads both into `args.trust_project_config`) and honours `--config`. Replace its `let out = match ...` statement with:
+
+```rust
+                let local_fingerprint = load_config(&args, &root)
+                    .ok()
+                    .map(|config| config.fingerprint());
+                let out = match mcpls_core::hooks::identity_for(&root) {
+                    Ok(identity) => {
+                        hook::doctor(&project_dir, &root, &identity, local_fingerprint.as_deref())
+                            .await
+                    }
+                    Err(error) => hook::doctor_without_identity(&project_dir, &root, &error),
+                };
+```
+
+A configuration that fails to load leaves the line bare, because the doctor reports rather than fails. Loading can create the default global config file, as starting any session already does.
+
+Other doctor tests that assert an exact line count or the index of the PATH or watch-scan line for an answering owner move those indexes by four (`rg -n "lines\[|lines.len\(\)" crates/mcpls-cli/src/hook.rs`). Update the count and indexes; do not loosen them to `contains`.
+
+`HookAction::Doctor`'s help text in `crates/mcpls-cli/src/args.rs:142-144` becomes "Print the socket path, both directory hashes, the backend's pid, uptime, sessions, language servers and configuration, and whether mcpls resolves on PATH".
+
+Update the doctor example output in `plugin/README.md` to show the four new lines after `hooks seen:`.
+
+- [ ] **Step 5: Run the tests**
+
+Run: `devrun task test`
+Expected: PASS.
+
+- [ ] **Step 6: Verify and commit**
+
+Run: `devrun task verify`
+Expected: PASS.
+
+```bash
+git add crates plugin/README.md
+git commit -m "feat(doctor): report the backend's state"
+```
+
+---
+
+### Task 11: prove the lifecycle across real processes
+
+**Files:**
+- Modify: `crates/mcpls-cli/tests/backend.rs` (harness additions and the lifecycle tests)
+- Modify: `crates/mcpls-core/tests/e2e/protocol_tests.rs` (shared-backend records test)
+
+**Interfaces:**
+- Consumes: everything above, through the `mcpls` binary only, and the harness Task 9 created in `crates/mcpls-cli/tests/backend.rs`: `Project { dir, runtime, user }` with `new(idle_ms)`, `root()`, `config()`, `write_config(idle_ms, servers)`, `command(cwd)`, `frontend()`, `frontend_in(cwd, extra)`, `doctor()`, `backend_pid()`, `wait_for(what, ready)`; `Frontend { child, stdin, lines, next_id }` with `spawn`, `spawn_uninitialized`, `request`, `send`, `initialize`, `close(within)`; `next()`; `alive(pid)` (Unix).
+- Produces, in that file: `Project::spawns`, `Project::with_counting_server`, `Project::holds_for(what, window, holds)`, `Frontend::call_tool`, `line_count(path)`, `failure_text(call)`.
+
+These are the spec's Verification items that need processes. Items already proven elsewhere are not repeated: per-connection records (Task 1), per-connection subscriptions (Task 2), upgrade and trust decisions (Tasks 6b and 8a), exit ordering and the drain race (Tasks 6b and 8b), and the last session's close removing the backend (Task 9).
+
+- [ ] **Step 1: Extend the harness**
+
+In `crates/mcpls-cli/tests/backend.rs`, delete the `#![cfg_attr(windows, allow(dead_code))]` line. Add to `impl Project`:
+
+```rust
+    #[cfg(unix)]
+    fn spawns(&self) -> PathBuf {
+        self.root().join("spawns.txt")
+    }
+
+    /// A language server that records each start and never answers, so
+    /// the number of lines in `spawns.txt` is the number of servers mcpls
+    /// started.
+    #[cfg(unix)]
+    fn with_counting_server(self, idle_ms: u64) -> Self {
+        std::fs::write(self.root().join("marker.fake"), "").unwrap();
+        let script = format!("echo $$ >> '{}'; exec sleep 30", self.spawns().display());
+        self.write_config(
+            idle_ms,
+            &format!(
+                "\n[[lsp_servers]]\nlanguage_id = \"fake\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", {script:?}]\nfile_patterns = [\"**/*.fake\"]\ntimeout_seconds = 30\n\n[lsp_servers.heuristics]\nproject_markers = [\"marker.fake\"]\n"
+            ),
+        );
+        self
+    }
+
+    /// Assert `holds` stays true for the whole of `window`. For a start or
+    /// a replacement that must not happen, where no event marks its absence.
+    #[cfg(unix)]
+    fn holds_for(&self, what: &str, window: Duration, mut holds: impl FnMut(&Self) -> bool) {
+        let deadline = Instant::now() + window;
+        while Instant::now() < deadline {
+            assert!(holds(self), "{what} stopped holding: {}", self.doctor());
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+```
+
+Add to `impl Frontend`:
+
+```rust
+    fn call_tool(&mut self) -> Value {
+        self.request("tools/call", json!({"name": "get_server_logs", "arguments": {}}))
+    }
+```
+
+and after `alive`:
+
+```rust
 #[cfg(unix)]
 fn line_count(path: &Path) -> usize {
     std::fs::read_to_string(path).map_or(0, |text| text.lines().count())
 }
+
+/// The reason a failed call carries: a tool result's text, or a JSON-RPC
+/// error's message when the call was in flight as the backend died.
+#[cfg(unix)]
+fn failure_text(call: &Value) -> String {
+    call["result"]["content"][0]["text"]
+        .as_str()
+        .or_else(|| call["error"]["message"].as_str())
+        .unwrap_or_default()
+        .to_string()
+}
 ```
+
 
 Every test below ends by closing its frontends and waiting for the backend to exit, so none leaves a process behind.
 
@@ -5291,8 +5887,11 @@ fn two_sessions_share_one_backend_and_one_server() {
 
     assert_eq!(project.backend_pid(), Some(pid));
     assert!(project.doctor().contains("sessions: 2 attached"), "{}", project.doctor());
-    std::thread::sleep(Duration::from_secs(1));
-    assert_eq!(line_count(&project.spawns()), 1, "a second language server started");
+    // A second runtime would spawn its server as it starts, before its
+    // session answers; one idle period covers a start still in flight.
+    project.holds_for("one language server", Duration::from_millis(500), |p| {
+        line_count(&p.spawns()) == 1
+    });
     assert!(first.call_tool()["result"].is_object());
 
     first.close(Duration::from_secs(5));
@@ -5315,7 +5914,6 @@ fn two_worktrees_get_a_backend_each() {
         let mut command = two.command(&two.root());
         command
             .env("TMPDIR", one.runtime.path())
-            .env("TEMP", one.runtime.path())
             .env("USER", &one.user)
             .env("USERNAME", &one.user)
             .arg("--config")
@@ -5369,26 +5967,14 @@ fn a_killed_backend_is_reported_not_replaced() {
     let pid = project.backend_pid().unwrap();
 
     Command::new("kill").args(["-9", &pid.to_string()]).status().unwrap();
-    std::thread::sleep(Duration::from_millis(300));
+    project.wait_for("the killed backend to be gone", |_| !alive(pid));
     let call = frontend.call_tool();
-    assert_eq!(call["result"]["isError"], true, "{call}");
-    assert!(call["result"]["content"][0]["text"].as_str().unwrap().contains("stopped"));
-    std::thread::sleep(Duration::from_secs(1));
-    assert_eq!(line_count(&project.spawns()), 1);
-    assert_eq!(project.backend_pid(), None);
-}
-
-/// Closing the last session removes the backend after its timer, and the
-/// host sees EOF as soon as its frontend exits.
-#[cfg(unix)]
-#[test]
-fn closing_the_last_session_removes_the_backend() {
-    let project = Project::new(300);
-    let mut frontend = project.frontend();
-    let pid = project.backend_pid().unwrap();
-    assert!(frontend.close(Duration::from_secs(5)), "the host did not see EOF");
-    project.wait_for("the backend to exit", |p| p.backend_pid().is_none());
-    assert!(!alive(pid));
+    assert!(failure_text(&call).contains("stopped"), "{call}");
+    // No event marks a replacement that never starts; one idle period
+    // bounds the wait for one.
+    project.holds_for("no replacement backend", Duration::from_millis(500), |p| {
+        line_count(&p.spawns()) == 1 && p.backend_pid().is_none()
+    });
 }
 
 /// A deleted socket leaves attached sessions working, and the backend still
@@ -5407,11 +5993,7 @@ fn a_deleted_socket_does_not_stop_attached_sessions() {
     }
     assert_ne!(frontend.call_tool()["result"]["isError"], true);
     frontend.close(Duration::from_secs(5));
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while alive(pid) {
-        assert!(Instant::now() < deadline, "the backend outlived its idle timer");
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    project.wait_for("the backend to exit on its idle timer", |_| !alive(pid));
 }
 
 /// Codex ends a session by signalling the server's whole process group. The
@@ -5421,15 +6003,18 @@ fn a_deleted_socket_does_not_stop_attached_sessions() {
 fn a_group_signal_to_the_frontend_spares_the_backend() {
     use std::os::unix::process::CommandExt as _;
 
-    let project = Project::new(500);
+    // Long enough that the backend's idle exit cannot pass for the signal.
+    let project = Project::new(2_000);
     let mut command = project.command(&project.root());
     command.arg("--config").arg(project.config()).process_group(0);
-    let frontend = Frontend::spawn(command);
+    let mut frontend = Frontend::spawn(command);
     let pid = project.backend_pid().unwrap();
     let group = frontend.child.id();
 
     Command::new("kill").args(["-TERM", &format!("-{group}")]).status().unwrap();
-    std::thread::sleep(Duration::from_millis(500));
+    project.wait_for("the frontend to die of the group signal", |_| {
+        frontend.child.try_wait().is_ok_and(|status| status.is_some())
+    });
     assert!(alive(pid), "the backend died with the frontend's group");
     drop(frontend);
     project.wait_for("the backend to exit", |p| p.backend_pid().is_none());
@@ -5467,7 +6052,7 @@ fn a_hook_starts_the_backend_a_frontend_asked_for() {
     let project = Project::new(500);
     let mut frontend = project.frontend();
     let before = project.doctor();
-    assert!(before.contains("owner pid: none"), "{before}");
+    assert!(before.contains("backend pid: none"), "{before}");
 
     let status = project
         .command(&project.root())
@@ -5493,7 +6078,7 @@ fn a_hook_starts_the_backend_a_frontend_asked_for() {
 - [ ] **Step 3: Run them to see the lifecycle hold**
 
 Run: `devrun task test`
-Expected: PASS. A failure here is a defect in Tasks 5-10: reproduce it in that task's in-crate tests before fixing, rather than widening a timeout.
+Expected: PASS. A failure here is a defect in Tasks 5 to 10: reproduce it in that task's in-crate tests before fixing, rather than widening a timeout.
 
 - [ ] **Step 4: Replace the shared-record e2e test**
 
@@ -5581,7 +6166,7 @@ Expected: PASS.
 
 ```bash
 git add crates/mcpls-cli/tests/backend.rs crates/mcpls-core/tests/e2e/protocol_tests.rs
-git commit -m "test(backend): cover the lifecycle across processes"
+git commit -m "test(backend): cover the process lifecycle"
 ```
 
 ---
@@ -5592,6 +6177,10 @@ git commit -m "test(backend): cover the lifecycle across processes"
 - Modify: `docs/superpowers/specs/2026-09-12-shared-backend-design.md:3` (status), the Stages section's Stage 1 paragraph
 - Modify: `plugin/README.md` (how the MCP entry reaches a backend, `--no-backend`, `[backend]`, the Windows hook prerequisite)
 - Modify: `plugin/skills/mcpls/references/configuration.md` (`[backend]` table)
+
+**Interfaces:**
+- Consumes: the behaviour it documents: root discovery and `[backend] idle_shutdown_ms` (Task 3), the doctor's lines (Tasks 5 and 10), the Windows start request (Tasks 7 and 9), `--no-backend` (Task 9), and Decisions 1 and 13.
+- Produces: nothing a later task reads.
 
 - [ ] **Step 1: Update the spec's status**
 
@@ -5629,18 +6218,20 @@ git commit -m "docs: describe the shared backend"
 
 | Spec requirement (Stage 1 and Verification) | Task |
 |---|---|
-| Frontend relays both ways, including unsolicited notifications | 8 |
-| Frontend answers `initialize`/`tools/list` from the frozen surface, fails `tools/call` with the reason, fails in-flight requests | 8 |
-| Frontend never starts language servers of its own | 8, 11 (`a_killed_backend_is_reported_not_replaced`) |
-| Backend owns servers, documents, cache, records; many `mcp` connections plus hooks | 6 |
+| Frontend relays both ways, including unsolicited notifications | 8b |
+| Frontend answers `initialize`/`tools/list` from the frozen surface, fails `tools/call` with the reason (at once, also while waiting), fails in-flight requests | 8a (stub), 8b |
+| Frontend never starts language servers of its own | 8b, 11 (`a_killed_backend_is_reported_not_replaced`) |
+| Backend owns servers, documents, cache, records; many `mcp` connections plus hooks | 6a, 6b |
 | Frozen handshake: protocol, kind, root, session, fingerprint and source | 5 |
 | Spawn lock separate from the ownership lock; detached with streams redirected | 7 |
-| Windows: frontend asks, next hook starts | 7, 8, 9, 11 |
-| Upgrade: newer frontend evicts an idle older backend; mismatch repeated in `get_info` and every tool call otherwise; older frontend never evicts | 6, 8 |
-| Different fingerprint served and reported; different trust refused both ways | 5, 6, 8, 11 |
-| Idle shutdown, configurable, default 10 s; close streams before draining | 3, 6 |
-| `--no-backend` | 6, 9 |
-| Session identity from the handshake; no `from_env_or_process` in the server | 1, 6 |
+| Windows: frontend asks, next hook starts | 7, 8a, 9, 11 |
+| Upgrade: newer frontend evicts an idle older backend; mismatch repeated in `get_info` and every tool call otherwise; older frontend never evicts | 6b, 8a, 8b (`test_a_refusal_is_repeated_in_initialize_and_every_tool_call`) |
+| Different fingerprint served and named in the session's instructions | 6b (`test_a_different_fingerprint_is_served_and_named`) |
+| The doctor reports a fingerprint mismatch | 10 (`test_the_config_line_marks_a_mismatch`) |
+| Different trust refused both ways | 5, 6b, 8a, 11 |
+| Idle shutdown, configurable, default 10 s; close streams before draining | 3, 6b |
+| `--no-backend` | 5 (in-process refusal of `mcp`), 6b (`test_an_in_process_server_names_an_endpoint_already_held`), 9 |
+| Session identity from the handshake; no `from_env_or_process` in the server | 1, 6b |
 | Per-connection subscriptions; a failed notify prunes that peer | 2 |
 | Project config discovery at the root | 3 |
 | Deletions: owner, passive, demotion, forwarding | 4 |
@@ -5648,19 +6239,12 @@ git commit -m "docs: describe the shared backend"
 | Two sessions share one backend and one server; subdirectory joins | 11 |
 | Two worktrees get a backend each | 11 |
 | Racing frontends produce one backend | 7, 11 |
-| Closing the last session removes backend and servers, no orphans | 6, 11 |
-| Connect during the drain gets a new backend | 6 (`test_the_endpoint_is_free_before_the_runtime_drains`) |
+| Closing the last session removes backend and servers, no orphans | 6b, 9 (`closing_the_last_session_removes_the_backend`), 11 |
+| Connect during the drain gets a new backend | 6b (`test_the_endpoint_is_free_before_the_runtime_drains`, `test_a_handshake_during_the_drain_gets_no_reply`), 8b (`test_a_backend_closing_before_its_first_line_is_attached_again`) |
 | Socket deleted under a running backend | 11 |
-| Nothing the backend writes reaches the host; host sees EOF | 7, 11 |
+| Nothing the backend writes reaches the host; host sees EOF | 7, 9, 11 |
 | Two sessions read their own records | 1, 11 (e2e) |
 | Codex group cleanup spares the backend | 7, 11 |
 | Windows named pipe suite | CI runs `crates/mcpls-cli/tests/backend.rs` on Windows; only the Unix-gated tests are skipped there |
 
 Out of scope, per the spec's stages: the Codex `_meta` thread lookup (Stage 2), the watcher (Stage 3), last-writer attribution and record grace (Stage 4). The spec's "A Codex root and a subagent each read their own record" and "a connection returning inside the grace" verification items belong to those stages.
-
-## Unresolved questions
-
-1. **PR split.** Tasks 0 to 3 as one PR and Tasks 4 to 12 as a second is my recommendation. Say if you want the second split further, for example ending a PR after Task 6 with the backend unreachable from the CLI.
-2. **Doctor label.** The plan keeps `owner pid:` rather than renaming it `backend pid:`, to avoid rewriting every doctor assertion. Rename if the wording matters more than the churn.
-3. **Trust at the root.** With discovery at the checkout root, `--trust-project-config` in a session started in a subdirectory now trusts the checkout's `mcpls.toml`, which that session previously never read. That matches the spec, but it widens what one flag trusts.
-4. **Windows log and lock directory.** `%TEMP%\mcpls-<user>` is not owner-only the way the Unix runtime directory is. The pipe name is still what separates users; the log may carry file paths. Acceptable, or should the Windows directory sit under `%LOCALAPPDATA%` instead?
