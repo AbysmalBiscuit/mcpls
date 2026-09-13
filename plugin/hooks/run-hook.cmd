@@ -16,33 +16,40 @@ if "%~1"=="" (
 
 set "HOOK_DIR=%~dp0"
 
+REM Each branch jumps to :done because %ERRORLEVEL% inside a parenthesized
+REM block expands before the block runs, and a bare exit /b under cmd /c
+REM reports 0 rather than the hook's exit code.
+
 REM Try Git for Windows bash in standard locations
 if exist "C:\Program Files\Git\bin\bash.exe" (
     "C:\Program Files\Git\bin\bash.exe" "%HOOK_DIR%%~1" %2 %3 %4 %5 %6 %7 %8 %9
-    exit /b
+    goto :done
 )
 if exist "C:\Program Files (x86)\Git\bin\bash.exe" (
     "C:\Program Files (x86)\Git\bin\bash.exe" "%HOOK_DIR%%~1" %2 %3 %4 %5 %6 %7 %8 %9
-    exit /b
+    goto :done
 )
 
 REM Try bash on PATH (user-installed Git Bash, MSYS2, Cygwin)
 where bash >nul 2>nul
 if %ERRORLEVEL% equ 0 (
     bash "%HOOK_DIR%%~1" %2 %3 %4 %5 %6 %7 %8 %9
-    exit /b
+    goto :done
 )
 
 REM No bash. Fall back to a PowerShell twin of the hook where one exists, so a
 REM Windows host without Git for Windows still gets hooks that must run.
 if exist "%HOOK_DIR%%~1.ps1" (
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%HOOK_DIR%%~1.ps1" %2 %3 %4 %5 %6 %7 %8 %9
-    exit /b
+    goto :done
 )
 
 REM Bash-only hook with no bash: exit silently rather than error, so the
 REM session still starts. Every hook this plugin ships has a .ps1 twin.
 exit /b 0
+
+:done
+exit /b %ERRORLEVEL%
 CMDBLOCK
 
 # Unix: run the named script directly
