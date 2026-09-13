@@ -1,0 +1,4 @@
+# Bash reads a CRLF checkout as commands ending in \r, which Windows runners
+# with core.autocrlf would otherwise produce.
+plugin/bin/* text eol=lf
+tests/plugin/*.sh text eol=lf

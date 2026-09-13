@@ -24,6 +24,7 @@ jobs:
     outputs:
       run-full-ci: ${{ steps.classify.outputs.run-full-ci }}
       scripts: ${{ steps.filter.outputs.scripts }}
+      plugin: ${{ steps.filter.outputs.plugin }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
       - name: Filter changed paths
@@ -40,6 +41,10 @@ jobs:
               - '.cargo/**'
             scripts:
               - 'scripts/**'
+              - '.github/workflows/ci.yml'
+            plugin:
+              - 'plugin/**'
+              - 'tests/plugin/**'
               - '.github/workflows/ci.yml'
       - name: Classify changes
         id: classify
@@ -293,7 +298,7 @@ jobs:
   shellcheck:
     name: Shellcheck
     needs: detect-changes
-    if: needs.detect-changes.outputs.scripts == 'true'
+    if: needs.detect-changes.outputs.scripts == 'true' || needs.detect-changes.outputs.plugin == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -302,6 +307,26 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
       - name: Shellcheck install script
         run: shellcheck --shell=sh scripts/install.sh
+      - name: Shellcheck plugin launcher
+        run: shellcheck plugin/bin/mcpls tests/plugin/launcher.test.sh
+
+  plugin-launcher:
+    name: Plugin launcher (${{ matrix.os }})
+    needs: detect-changes
+    if: needs.detect-changes.outputs.plugin == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - name: Launcher tests
+        shell: bash
+        run: bash tests/plugin/launcher.test.sh
 
   security:
     name: Security Audit
@@ -349,7 +374,7 @@ jobs:
   ci-gate:
     name: CI Gate
     if: always()
-    needs: [fmt, clippy, build-tests, build, test, test-integration, test-e2e, msrv, docs, shellcheck, security, coverage]
+    needs: [fmt, clippy, build-tests, build, test, test-integration, test-e2e, msrv, docs, shellcheck, plugin-launcher, security, coverage]
     runs-on: ubuntu-latest
     timeout-minutes: 1
     steps:
@@ -366,6 +391,7 @@ jobs:
             "${{ needs.msrv.result }}"
             "${{ needs.docs.result }}"
             "${{ needs.shellcheck.result }}"
+            "${{ needs.plugin-launcher.result }}"
             "${{ needs.security.result }}"
             "${{ needs.coverage.result }}"
           )
