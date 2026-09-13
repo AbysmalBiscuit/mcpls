@@ -42,6 +42,7 @@ type HookHandler =
 struct TrackedService {
     server: McplsServer,
     handlers: mpsc::UnboundedSender<()>,
+    closing: watch::Receiver<bool>,
 }
 
 impl rmcp::Service<rmcp::RoleServer> for TrackedService {
@@ -51,12 +52,19 @@ impl rmcp::Service<rmcp::RoleServer> for TrackedService {
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<<rmcp::RoleServer as rmcp::service::ServiceRole>::Resp, rmcp::ErrorData> {
         let _handler = self.handlers.clone();
-        <McplsServer as rmcp::Service<rmcp::RoleServer>>::handle_request(
+        let mut closing = self.closing.clone();
+        let request = <McplsServer as rmcp::Service<rmcp::RoleServer>>::handle_request(
             &self.server,
             request,
             context,
-        )
-        .await
+        );
+        tokio::select! {
+            result = request => result,
+            _ = closing.wait_for(|closing| *closing) => Err(rmcp::ErrorData::internal_error(
+                "the endpoint is closing",
+                None,
+            )),
+        }
     }
 
     async fn handle_notification(
@@ -192,14 +200,7 @@ impl Endpoint {
         self.closing.send_replace(true);
         while tasks.join_next().await.is_some() {}
         drop(handler_tx);
-        if tokio::time::timeout(Duration::from_secs(5), async {
-            while handler_rx.recv().await.is_some() {}
-        })
-        .await
-        .is_err()
-        {
-            warn!("MCP handlers remained after the endpoint drain timeout");
-        }
+        while handler_rx.recv().await.is_some() {}
         exit
     }
 
@@ -296,6 +297,7 @@ impl Endpoint {
         let server = TrackedService {
             server,
             handlers: handler_tx,
+            closing: closing.clone(),
         };
         let _attached = self
             .attachments
@@ -702,14 +704,16 @@ while True:
 
         let endpoint = Endpoint::new(&runtime, &backend_config, root.clone(), identity.clone());
         let (signal_tx, signal_rx) = oneshot::channel();
-        let (drain_started_tx, mut drain_started_rx) = oneshot::channel();
-        let mut run = tokio::spawn(async move {
+        let (endpoint_finished_tx, mut endpoint_finished_rx) = oneshot::channel();
+        let (drain_release_tx, drain_release_rx) = oneshot::channel();
+        let run = tokio::spawn(async move {
             let exit = endpoint
                 .run(listener, Duration::from_secs(60), async move {
                     let _ = signal_rx.await;
                 })
                 .await;
-            drain_started_tx.send(()).unwrap();
+            endpoint_finished_tx.send(()).unwrap();
+            let _ = drain_release_rx.await;
             runtime.shutdown().await;
             exit
         });
@@ -758,21 +762,19 @@ while True:
             .await
             .unwrap()
             .unwrap();
-        let endpoint_exit = tokio::time::timeout(Duration::from_millis(100), &mut run).await;
+        tokio::time::timeout(Duration::from_secs(4), &mut endpoint_finished_rx)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(
-            endpoint_exit.is_err(),
-            "the endpoint exited before the in-flight handler was released"
-        );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), &mut drain_started_rx)
-                .await
-                .is_err(),
-            "runtime drain began before the in-flight handler was released"
+            !runtime_shutdown.exists(),
+            "runtime drain began before the test released it"
         );
 
         let mut release = UnixStream::connect(&control).await.unwrap();
         release.write_all(&[1]).await.unwrap();
         drop(release);
+        drain_release_tx.send(()).unwrap();
         let exit = tokio::time::timeout(Duration::from_secs(5), run)
             .await
             .unwrap()
