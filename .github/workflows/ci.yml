@@ -25,6 +25,7 @@ jobs:
       run-full-ci: ${{ steps.classify.outputs.run-full-ci }}
       scripts: ${{ steps.filter.outputs.scripts }}
       plugin: ${{ steps.filter.outputs.plugin }}
+      release: ${{ steps.filter.outputs.release }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
       - name: Filter changed paths
@@ -48,6 +49,11 @@ jobs:
             plugin:
               - 'plugin/**'
               - 'tests/plugin/**'
+              - '.github/workflows/ci.yml'
+            release:
+              - 'dist-workspace.toml'
+              - 'Cargo.toml'
+              - '.github/workflows/release.yml'
               - '.github/workflows/ci.yml'
       - name: Classify changes
         id: classify
@@ -313,6 +319,22 @@ jobs:
       - name: Shellcheck plugin launcher
         run: shellcheck plugin/bin/mcpls tests/plugin/launcher.test.sh
 
+  dist-check:
+    name: Release workflow matches dist config
+    needs: detect-changes
+    if: needs.detect-changes.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - name: Install dist
+        shell: bash
+        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh"
+      - name: Check release.yml
+        run: dist generate --check
+
   plugin-launcher:
     name: Plugin launcher (${{ matrix.os }})
     needs: detect-changes
@@ -377,7 +399,7 @@ jobs:
   ci-gate:
     name: CI Gate
     if: always()
-    needs: [fmt, clippy, build-tests, build, test, test-integration, test-e2e, msrv, docs, shellcheck, plugin-launcher, security, coverage]
+    needs: [fmt, clippy, build-tests, build, test, test-integration, test-e2e, msrv, docs, shellcheck, dist-check, plugin-launcher, security, coverage]
     runs-on: ubuntu-latest
     timeout-minutes: 1
     steps:
@@ -394,6 +416,7 @@ jobs:
             "${{ needs.msrv.result }}"
             "${{ needs.docs.result }}"
             "${{ needs.shellcheck.result }}"
+            "${{ needs.dist-check.result }}"
             "${{ needs.plugin-launcher.result }}"
             "${{ needs.security.result }}"
             "${{ needs.coverage.result }}"
