@@ -46,8 +46,7 @@ async fn main() {
                 // today's relative-path behaviour as the floor rather than
                 // turning it into a hard error.
                 let project_dir = dunce::canonicalize(&raw_project_dir).unwrap_or(raw_project_dir);
-                let root = mcpls_core::hooks::project_root(&project_dir)
-                    .unwrap_or_else(|_| project_dir.clone());
+                let root = hook::checkout_root(&project_dir);
                 // A failed `identity_for` (an unreachable directory, or an
                 // over-long socket path) must not suppress `SessionStart`:
                 // that arm never touches the socket, which is the entire
@@ -74,11 +73,10 @@ async fn main() {
                 let raw_project_dir = std::env::var_os("CLAUDE_PROJECT_DIR")
                     .map_or_else(|| std::path::PathBuf::from("."), std::path::PathBuf::from);
                 let project_dir = dunce::canonicalize(&raw_project_dir).unwrap_or(raw_project_dir);
-                let root = mcpls_core::hooks::project_root(&project_dir)
-                    .unwrap_or_else(|_| project_dir.clone());
+                let root = hook::checkout_root(&project_dir);
                 let out = match mcpls_core::hooks::identity_for(&root) {
-                    Ok(identity) => hook::doctor(&project_dir, &identity).await,
-                    Err(error) => hook::doctor_without_identity(&project_dir, &error),
+                    Ok(identity) => hook::doctor(&project_dir, &root, &identity).await,
+                    Err(error) => hook::doctor_without_identity(&project_dir, &root, &error),
                 };
                 println!("{out}");
             }

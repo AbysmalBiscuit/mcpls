@@ -231,8 +231,14 @@ const MAX_FOREIGN_CANDIDATES: usize = 16;
 ///
 /// Socket failures are silent in hooks; this command reports their cause.
 /// `SessionStart` separately warns when its watch-path scan is incomplete.
-pub async fn doctor(project_dir: &Path, identity: &SocketIdentity) -> String {
-    doctor_scanning(project_dir, identity, &foreign_scan_prefix()).await
+pub async fn doctor(project_dir: &Path, root: &Path, identity: &SocketIdentity) -> String {
+    doctor_scanning(project_dir, root, identity, &foreign_scan_prefix()).await
+}
+
+/// The checkout root enclosing `project_dir`, or `project_dir` itself when
+/// it cannot be resolved, so an unreachable directory still gets an answer.
+pub fn checkout_root(project_dir: &Path) -> PathBuf {
+    mcpls_core::hooks::project_root(project_dir).unwrap_or_else(|_| project_dir.to_path_buf())
 }
 
 /// `doctor`'s body, parameterized on the prefix its runtime-directory scan
@@ -243,9 +249,12 @@ pub async fn doctor(project_dir: &Path, identity: &SocketIdentity) -> String {
 /// machine-global, so a scan filtered on the real prefix would enumerate
 /// an actual mcpls running on the developer's own machine, not only the
 /// one the test bound itself.
-async fn doctor_scanning(project_dir: &Path, identity: &SocketIdentity, prefix: &str) -> String {
-    let root =
-        mcpls_core::hooks::project_root(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
+async fn doctor_scanning(
+    project_dir: &Path,
+    root: &Path,
+    identity: &SocketIdentity,
+    prefix: &str,
+) -> String {
     let mut lines = vec![
         format!("socket: {}", identity.socket.display()),
         format!("hook sees: {}", project_dir.display()),
@@ -312,7 +321,7 @@ async fn doctor_scanning(project_dir: &Path, identity: &SocketIdentity, prefix: 
     }
 
     lines.push(on_path_line(mcpls_on_path().as_deref()));
-    lines.push(watch_scan_line(&root));
+    lines.push(watch_scan_line(root));
 
     lines.join("\n")
 }
@@ -693,14 +702,18 @@ const PIPE_LISTINGS: usize = 3;
 /// exists and nothing answers it; this means no socket could ever exist
 /// here at all, on either side, which a user needs to be able to tell
 /// apart from a server that simply is not running right now.
-pub fn doctor_without_identity(project_dir: &Path, error: &mcpls_core::Error) -> String {
+pub fn doctor_without_identity(
+    project_dir: &Path,
+    root: &Path,
+    error: &mcpls_core::Error,
+) -> String {
     let lines = [
         format!("socket: none; could not derive an identity for this directory: {error}"),
         format!("hook sees: {} -> unknown", project_dir.display()),
         "server sees: nothing can run here; no socket exists to probe".to_string(),
         "owner pid: none".to_string(),
         on_path_line(mcpls_on_path().as_deref()),
-        watch_scan_line(project_dir),
+        watch_scan_line(root),
     ];
     lines.join("\n")
 }
@@ -1879,8 +1892,13 @@ mod tests {
         let socket_dir = tempfile::tempdir().expect("a temp dir");
         let identity = local_identity_for(project, socket_dir.path());
         let _owner = RecordingOwner::start_reporting_status(identity.clone(), project, hooks_seen);
-        let out =
-            super::doctor_scanning(project, &identity, &test_pipe_prefix(socket_dir.path())).await;
+        let out = super::doctor_scanning(
+            project,
+            &checkout_root(project),
+            &identity,
+            &test_pipe_prefix(socket_dir.path()),
+        )
+        .await;
         (out, identity)
     }
 
@@ -1888,8 +1906,13 @@ mod tests {
     async fn doctor_with_nothing_running(project: &Path) -> (String, SocketIdentity) {
         let socket_dir = tempfile::tempdir().expect("a temp dir");
         let identity = local_identity_for(project, socket_dir.path());
-        let out =
-            super::doctor_scanning(project, &identity, &test_pipe_prefix(socket_dir.path())).await;
+        let out = super::doctor_scanning(
+            project,
+            &checkout_root(project),
+            &identity,
+            &test_pipe_prefix(socket_dir.path()),
+        )
+        .await;
         (out, identity)
     }
 
@@ -1906,7 +1929,13 @@ mod tests {
         let identity = local_identity_for(project, socket_dir.path());
         let foreign_identity = local_identity_for(foreign, socket_dir.path());
         let _owner = RecordingOwner::start_reporting_status(foreign_identity, foreign, 0);
-        super::doctor_scanning(project, &identity, &test_pipe_prefix(socket_dir.path())).await
+        super::doctor_scanning(
+            project,
+            &checkout_root(project),
+            &identity,
+            &test_pipe_prefix(socket_dir.path()),
+        )
+        .await
     }
 
     /// Run the doctor for `project` against several real, unrelated
@@ -1922,7 +1951,13 @@ mod tests {
                 RecordingOwner::start_reporting_status(other_identity, other, 0)
             })
             .collect();
-        super::doctor_scanning(project, &identity, &test_pipe_prefix(socket_dir.path())).await
+        super::doctor_scanning(
+            project,
+            &checkout_root(project),
+            &identity,
+            &test_pipe_prefix(socket_dir.path()),
+        )
+        .await
     }
 
     /// Run the doctor for `project` where a real owner is running for
@@ -1963,7 +1998,13 @@ mod tests {
                 )
             })
             .collect();
-        super::doctor_scanning(project, &identity, &test_pipe_prefix(socket_dir.path())).await
+        super::doctor_scanning(
+            project,
+            &checkout_root(project),
+            &identity,
+            &test_pipe_prefix(socket_dir.path()),
+        )
+        .await
     }
 
     /// Run the doctor for `project` where the runtime directory holds
@@ -1986,7 +2027,13 @@ mod tests {
                 )
             })
             .collect();
-        super::doctor_scanning(project, &identity, &test_pipe_prefix(socket_dir.path())).await
+        super::doctor_scanning(
+            project,
+            &checkout_root(project),
+            &identity,
+            &test_pipe_prefix(socket_dir.path()),
+        )
+        .await
     }
 
     /// Run the doctor for `project` where the only reachable socket
@@ -1996,7 +2043,13 @@ mod tests {
         let identity = local_identity_for(project, socket_dir.path());
         let elsewhere_identity = local_identity_for(elsewhere, socket_dir.path());
         let _owner = RecordingOwner::start_reporting_non_owner(elsewhere_identity, elsewhere);
-        super::doctor_scanning(project, &identity, &test_pipe_prefix(socket_dir.path())).await
+        super::doctor_scanning(
+            project,
+            &checkout_root(project),
+            &identity,
+            &test_pipe_prefix(socket_dir.path()),
+        )
+        .await
     }
 
     /// Run the doctor for `project` against a real owner that accepts the
@@ -2006,7 +2059,13 @@ mod tests {
         let socket_dir = tempfile::tempdir().expect("a temp dir");
         let identity = local_identity_for(project, socket_dir.path());
         let _owner = RecordingOwner::start_silent(identity.clone());
-        super::doctor_scanning(project, &identity, &test_pipe_prefix(socket_dir.path())).await
+        super::doctor_scanning(
+            project,
+            &checkout_root(project),
+            &identity,
+            &test_pipe_prefix(socket_dir.path()),
+        )
+        .await
     }
 
     /// The same, with a second, real, related owner also present in the
@@ -2019,7 +2078,13 @@ mod tests {
         let _busy = RecordingOwner::start_silent(identity.clone());
         let related_identity = local_identity_for(related, socket_dir.path());
         let _related = RecordingOwner::start_reporting_status(related_identity, related, 0);
-        super::doctor_scanning(project, &identity, &test_pipe_prefix(socket_dir.path())).await
+        super::doctor_scanning(
+            project,
+            &checkout_root(project),
+            &identity,
+            &test_pipe_prefix(socket_dir.path()),
+        )
+        .await
     }
 
     /// Run the doctor for `project` against a real owner that answers
@@ -2028,7 +2093,13 @@ mod tests {
         let socket_dir = tempfile::tempdir().expect("a temp dir");
         let identity = local_identity_for(project, socket_dir.path());
         let _owner = RecordingOwner::start_answering_status_with_error(identity.clone(), message);
-        super::doctor_scanning(project, &identity, &test_pipe_prefix(socket_dir.path())).await
+        super::doctor_scanning(
+            project,
+            &checkout_root(project),
+            &identity,
+            &test_pipe_prefix(socket_dir.path()),
+        )
+        .await
     }
 
     /// Run the doctor for `project` against a real owner that answers
@@ -2038,7 +2109,13 @@ mod tests {
         let identity = local_identity_for(project, socket_dir.path());
         let _owner =
             RecordingOwner::start_answering_status_with_raw_line(identity.clone(), raw_line);
-        super::doctor_scanning(project, &identity, &test_pipe_prefix(socket_dir.path())).await
+        super::doctor_scanning(
+            project,
+            &checkout_root(project),
+            &identity,
+            &test_pipe_prefix(socket_dir.path()),
+        )
+        .await
     }
 
     /// Every line asserted by its exact text and position, not merely by
@@ -2094,6 +2171,7 @@ mod tests {
 
         let out = super::doctor_scanning(
             project.path(),
+            &checkout_root(project.path()),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
         )
@@ -2192,8 +2270,13 @@ mod tests {
         let socket_dir = tempfile::tempdir().expect("socket dir");
         let identity = local_identity_for(&root, socket_dir.path());
 
-        let out =
-            super::doctor_scanning(&nested, &identity, &test_pipe_prefix(socket_dir.path())).await;
+        let out = super::doctor_scanning(
+            &nested,
+            &checkout_root(&nested),
+            &identity,
+            &test_pipe_prefix(socket_dir.path()),
+        )
+        .await;
 
         let lines: Vec<_> = out.lines().collect();
         assert_eq!(lines[1], format!("hook sees: {}", nested.display()));
@@ -2219,9 +2302,13 @@ mod tests {
         let never_created = project.path().join("does-not-exist-mcpls-dir");
         let identity = local_identity_for(project.path(), &never_created);
 
-        let out =
-            super::doctor_scanning(project.path(), &identity, &test_pipe_prefix(&never_created))
-                .await;
+        let out = super::doctor_scanning(
+            project.path(),
+            &checkout_root(project.path()),
+            &identity,
+            &test_pipe_prefix(&never_created),
+        )
+        .await;
 
         assert_eq!(
             out.lines()
@@ -2388,8 +2475,13 @@ mod tests {
         let _first = RecordingOwner::start_reporting_status(first, parent.path(), 0);
         let _second = RecordingOwner::start_reporting_status(second, &child, 0);
 
-        let out =
-            super::doctor_scanning(&project, &identity, &test_pipe_prefix(socket_dir.path())).await;
+        let out = super::doctor_scanning(
+            &project,
+            &checkout_root(&project),
+            &identity,
+            &test_pipe_prefix(socket_dir.path()),
+        )
+        .await;
 
         let server_sees = out
             .lines()
@@ -2443,8 +2535,13 @@ mod tests {
             })
             .collect();
 
-        let out =
-            super::doctor_scanning(&project, &identity, &test_pipe_prefix(socket_dir.path())).await;
+        let out = super::doctor_scanning(
+            &project,
+            &checkout_root(&project),
+            &identity,
+            &test_pipe_prefix(socket_dir.path()),
+        )
+        .await;
 
         let server_sees = out
             .lines()
@@ -2561,7 +2658,9 @@ mod tests {
         let client = ClientOptions::new().open(&identity.socket).unwrap();
         server.connect().await.unwrap();
         let prefix = test_pipe_prefix(dir.path());
-        let out = super::doctor_scanning(dir.path(), &identity, &prefix).await;
+        let out =
+            super::doctor_scanning(dir.path(), &checkout_root(dir.path()), &identity, &prefix)
+                .await;
         assert!(
             out.contains(
                 "server sees: a socket answered nothing within 50ms; an owner may be busy"
@@ -2574,7 +2673,9 @@ mod tests {
         drop(server);
         tokio::task::yield_now().await;
         let _owner = RecordingOwner::start_reporting_status(identity.clone(), dir.path(), 1);
-        let out = super::doctor_scanning(dir.path(), &identity, &prefix).await;
+        let out =
+            super::doctor_scanning(dir.path(), &checkout_root(dir.path()), &identity, &prefix)
+                .await;
         assert!(
             out.contains(&format!("owner pid: {}", std::process::id())),
             "{out}"
@@ -2729,6 +2830,7 @@ mod tests {
 
         let out = super::doctor_scanning(
             project.path(),
+            &checkout_root(project.path()),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
         )
@@ -2930,6 +3032,7 @@ mod tests {
         let inaccessible = std::fs::read_dir(socket_dir.path()).is_err();
         let out = super::doctor_scanning(
             project.path(),
+            &checkout_root(project.path()),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
         )
@@ -3085,7 +3188,8 @@ mod tests {
         let missing = project.path().join("does-not-exist");
         let error = mcpls_core::hooks::identity_for(&missing).expect_err("an unreachable dir");
 
-        let out = super::doctor_without_identity(project.path(), &error);
+        let out =
+            super::doctor_without_identity(project.path(), &checkout_root(project.path()), &error);
 
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 6, "expected exactly six lines: {out}");
