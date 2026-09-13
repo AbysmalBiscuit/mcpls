@@ -23,8 +23,9 @@ mcpls hook doctor
 A working install prints something like:
 
 ```
-socket: /run/user/1000/mcpls/39df698ef1ac4f49.sock
-hook sees: /home/lev/project -> 39df698ef1ac4f49
+socket: /tmp/mcpls-lev/39df698ef1ac4f49.sock
+hook sees: /home/lev/project/crates/core
+root: /home/lev/project -> 39df698ef1ac4f49
 server sees: /home/lev/project -> 39df698ef1ac4f49
 owner pid: 2816002
 hooks seen: 3 request(s) since this owner started
@@ -35,10 +36,11 @@ watch scan: selected 4 top-level path(s); hidden entries excluded by default; ig
 Line by line:
 
 - **`socket:`** the socket path both the hook and the running server talk over. Informational; useful when checking permissions on the file itself.
-- **`hook sees:`** the project directory and its hash, as the hook process computes them from `CLAUDE_PROJECT_DIR`. If the directory looks wrong, the project was opened from an unexpected path (a symlink, a subdirectory, a second worktree): open it at its real, canonical root instead and run the doctor again.
-- **`server sees:`** what the running mcpls, if any, reports back. A healthy line repeats the hook's own directory and hash, as in the example above, confirming both sides agree. When no owner answers this project's own socket, the line takes one of four shapes instead:
+- **`hook sees:`** the directory the hook process reads from `CLAUDE_PROJECT_DIR`, canonicalized. Any directory inside the checkout works.
+- **`root:`** the checkout root that directory resolves to, and the hash the socket name comes from. The root is the nearest directory at or above the `hook sees:` directory holding a `.git` entry git would accept, stopping before the home directory, or that directory itself when none does. Every session started inside one checkout shares the root and so reaches one mcpls. A linked worktree or a submodule holds its own `.git` entry and is its own root. If the root looks wrong, look for a `.git` entry where you did not expect one, or a missing one where you did.
+- **`server sees:`** what the running mcpls, if any, reports back. A healthy line repeats the `root:` line's directory and hash, as in the example above, confirming both sides agree. When no owner answers this project's own socket, the line takes one of four shapes instead:
   - `no owner; nothing is listening on this project's socket`: nothing was found running anywhere nearby. Start mcpls for this project (open it in an MCP client that spawns it) and run the doctor again.
-  - `no owner for this directory; an mcpls is running for <root> (pid <pid>) instead`: a running mcpls was found, but for a directory that is an ancestor or descendant of this one, not this one. Check for a symlinked checkout, a multi-root workspace, or a `CLAUDE_PROJECT_DIR` pointing at a subdirectory, and restart that mcpls against the directory this project actually opens.
+  - `no owner for this directory; an mcpls is running for <root> (pid <pid>) instead`: a running mcpls was found, but for a directory that is an ancestor or descendant of this one, not this one. Check for a symlinked checkout, a nested checkout such as a submodule, or an mcpls started outside any checkout, and restart that mcpls from inside the checkout this project opens.
   - `no owner for this directory; N other mcpls instances are running, none for this directory or a parent of it` (singular wording, `1 other mcpls instance is running`, when there is exactly one): other mcpls processes exist on the machine, but none relate to this project, so the doctor does not name them (naming one would blame an innocent project for this one's silence). Start mcpls for this project the same way as the first case.
   - `no owner for this directory; could not scan for other mcpls instances: <reason>`: the scan itself failed, most likely a permissions problem on the runtime directory named in `socket:` above, so the doctor could not even tell the first three cases apart. Fix the reported `<reason>` and run the doctor again.
 
@@ -55,7 +57,7 @@ An operation that exceeds the owner's response deadline keeps running in the bac
 If mcpls cannot derive a socket identity for the project directory at all (an unreachable path, or a runtime directory deep enough that the resulting socket path exceeds the platform's length limit), the doctor prints a different shape entirely:
 
 ```
-socket: none; could not derive an identity for this directory: socket path exceeds the 107-byte platform limit (267 bytes): "/run/user/1000/very/deep/mcpls/39df698ef1ac4f49.sock"
+socket: none; could not derive an identity for this directory: socket path exceeds the 107-byte platform limit (267 bytes): "/home/lev/a/very/deep/temporary/directory/mcpls-lev/39df698ef1ac4f49.sock"
 hook sees: /home/lev/project -> unknown
 server sees: nothing can run here; no socket exists to probe
 owner pid: none
