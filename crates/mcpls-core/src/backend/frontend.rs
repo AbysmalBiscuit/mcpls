@@ -38,6 +38,7 @@ pub(crate) trait Door: Send + Sync + 'static {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Start {
     /// A backend process was spawned.
+    #[cfg_attr(windows, allow(dead_code))]
     Spawned,
     /// A hook was asked to spawn one.
     #[cfg_attr(not(windows), allow(dead_code))]

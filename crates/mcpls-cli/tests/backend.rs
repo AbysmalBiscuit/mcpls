@@ -243,6 +243,7 @@ impl Frontend {
         )
     }
 
+    #[cfg(unix)]
     fn pid(&self) -> u32 {
         self.child.id()
     }
