@@ -969,16 +969,7 @@ If every applicable language server fails to start, mcpls adopts a terminal empt
 }
 ```
 
-When several mcpls processes serve one project, one of them owns the project's diagnostics record and the others forward to it, so a session sees one record whichever process it is talking to. A nonempty `CLAUDE_CODE_SESSION_ID` deliberately names the shared record across the MCP and hook processes. An unset or empty variable uses a stable process-local fallback, so separate stdio processes keep separate records. A forwarding process answers the same object shape, with the owner's already-rendered report in `note` and `changed`/`cleared` empty. An owner that loses its lock demotes before serving a local footer or flush and forwards until it reacquires ownership. If it cannot reach the owner, `note` says so rather than reporting an empty diff, which would read as a clean workspace:
-
-```json
-{
-  "changed": [],
-  "cleared": [],
-  "omitted": 0,
-  "note": "src/main.rs:\n  12:5 error mismatched types"
-}
-```
+Every session in a checkout talks to that checkout's one backend, which keeps a separate diagnostics record per session. A session's frontend names its session in the handshake from a nonempty `CLAUDE_CODE_SESSION_ID`, and the hooks of that host session name the same one, so the tool and the hooks share a record. A connection that names no session gets a record of its own. When no backend is attached, the frontend fails the call and says why instead of returning an empty diff, which would read as a clean workspace.
 
 ### Notes
 
