@@ -5,8 +5,10 @@
 //! session's records.
 
 pub mod endpoint;
+pub mod frontend;
 pub mod handshake;
 pub mod spawn;
+mod stub;
 
 pub use endpoint::serve_backend;
 pub use handshake::{

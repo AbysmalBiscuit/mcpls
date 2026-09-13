@@ -39,6 +39,15 @@ use crate::bridge::{
 };
 use crate::config::{DiagnosticsConfig, ServerId, ToolKind};
 
+/// What every mcpls tells an agent about itself at `initialize`.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) const INSTRUCTIONS: &str = concat!(
+    "Universal MCP to LSP bridge. Exposes Language Server Protocol ",
+    "capabilities as MCP tools for semantic code intelligence. ",
+    "Supports hover, definition, references, diagnostics, rename, ",
+    "completions, symbols, and formatting."
+);
+
 /// MCP server that exposes LSP capabilities as tools.
 #[derive(Clone)]
 pub struct McplsServer {
@@ -1604,13 +1613,7 @@ impl ServerHandler for McplsServer {
             .build();
         let mut server_info = ServerInfo::new(capabilities);
         server_info.server_info = implementation;
-        let mut instructions = concat!(
-            "Universal MCP to LSP bridge. Exposes Language Server Protocol ",
-            "capabilities as MCP tools for semantic code intelligence. ",
-            "Supports hover, definition, references, diagnostics, rename, ",
-            "completions, symbols, and formatting."
-        )
-        .to_string();
+        let mut instructions = INSTRUCTIONS.to_string();
 
         if self.context.project_config_ignored {
             instructions.push_str(

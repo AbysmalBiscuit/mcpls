@@ -8,6 +8,7 @@ mod server;
 mod tools;
 
 pub(crate) use handlers::BridgeContext;
+pub(crate) use server::INSTRUCTIONS;
 pub use server::McplsServer;
 pub use tools::{
     CallHierarchyCallsParams, CompletionsParams, DiagnosticsParams, DocumentSymbolsParams,
