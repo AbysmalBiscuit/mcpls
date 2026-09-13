@@ -66,6 +66,14 @@ pub struct Args {
     #[arg(long, env = "MCPLS_TRUST_PROJECT_CONFIG", value_parser = parse_bool_flag)]
     pub trust_project_config: bool,
 
+    /// Serve this one session in-process instead of through the project's
+    /// shared backend.
+    ///
+    /// For debugging, and for hosts where a detached backend cannot run.
+    /// This process binds the project's endpoint for hooks if it is free.
+    #[arg(long, env = "MCPLS_NO_BACKEND", value_parser = parse_bool_flag)]
+    pub no_backend: bool,
+
     /// Logging level
     ///
     /// Valid values: trace, debug, info, warn, error
@@ -106,6 +114,14 @@ pub struct Args {
 /// launches; everything here is a one-shot utility that prints and exits.
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Serve a checkout's shared backend (started by the frontend)
+    #[command(hide = true)]
+    Backend {
+        /// The canonical checkout root to serve
+        #[arg(long, value_name = "DIR")]
+        root: PathBuf,
+    },
+
     /// Print a shell completion script to stdout
     ///
     /// Redirect it to wherever the shell reads completions from, for example:
@@ -217,6 +233,53 @@ mod tests {
     fn test_trust_project_config_flag() {
         let args = Args::parse_from(["mcpls", "--trust-project-config"]);
         assert!(args.trust_project_config);
+    }
+
+    #[test]
+    fn test_no_backend_flag() {
+        assert!(!Args::parse_from(["mcpls"]).no_backend);
+        assert!(Args::parse_from(["mcpls", "--no-backend"]).no_backend);
+    }
+
+    #[test]
+    fn test_backend_subcommand_takes_a_root() {
+        let args = Args::parse_from([
+            "mcpls",
+            "--log-level",
+            "debug",
+            "backend",
+            "--root",
+            "/work",
+        ]);
+        assert!(matches!(
+            args.command,
+            Some(Command::Backend { root }) if root == std::path::Path::new("/work")
+        ));
+        assert_eq!(args.log_level, "debug");
+    }
+
+    /// The arguments a frontend launches a backend with parse back into the
+    /// settings it launched it with.
+    #[test]
+    fn test_launch_arguments_round_trip_through_the_parser() {
+        let launch = mcpls_core::backend::BackendLaunch {
+            root: std::path::PathBuf::from("/work"),
+            config: Some(std::path::PathBuf::from("/etc/mcpls.toml")),
+            trust_project_config: true,
+            log_level: "trace".to_string(),
+            log_json: true,
+        };
+        let mut argv = vec![std::ffi::OsString::from("mcpls")];
+        argv.extend(launch.args());
+        let parsed = Args::parse_from(argv);
+        assert_eq!(
+            parsed.config.as_deref(),
+            Some(std::path::Path::new("/etc/mcpls.toml"))
+        );
+        assert!(parsed.trust_project_config);
+        assert_eq!(parsed.log_level, "trace");
+        assert!(parsed.log_json);
+        assert!(matches!(parsed.command, Some(Command::Backend { .. })));
     }
 
     #[test]

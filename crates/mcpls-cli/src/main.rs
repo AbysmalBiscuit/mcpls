@@ -54,6 +54,12 @@ async fn main() {
                 // its own when `identity` is `None` rather than the whole
                 // dispatch short-circuiting here.
                 let identity = mcpls_core::hooks::identity_for(&root).ok();
+                #[cfg(windows)]
+                if let (Some(identity), Ok(exe)) = (identity.as_ref(), std::env::current_exe()) {
+                    // The frontend cannot spawn a backend that outlives a
+                    // job-contained session, so it asks and a hook starts it.
+                    let _ = mcpls_core::backend::start_requested(identity, &exe).await;
+                }
                 let out = hook::dispatch_payload(&stdin, &root, identity.as_ref()).await;
                 // `print!` panics on a write failure (a closed stdout pipe
                 // reached past the `LineWriter`'s buffer), which would
@@ -117,25 +123,45 @@ async fn main() {
 async fn run(args: Args) -> Result<()> {
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "starting mcpls");
 
-    // Load configuration
-    let config = if let Some(config_path) = &args.config {
-        mcpls_core::ServerConfig::load_from(config_path)
-            .with_context(|| format!("failed to load config from {}", config_path.display()))?
-    } else {
-        let trust = if args.trust_project_config {
-            ProjectConfigTrust::Trusted
-        } else {
-            ProjectConfigTrust::Untrusted
-        };
-        mcpls_core::ServerConfig::load_with_trust(trust).context("failed to load configuration")?
-    };
+    if let Some(Command::Backend { root }) = &args.command {
+        let config = load_config(&args, root)?;
+        mcpls_core::backend::serve_backend(config, root.clone())
+            .await
+            .context("backend error")?;
+        return Ok(());
+    }
+
+    let cwd = std::env::current_dir().context("failed to read the working directory")?;
+    let root = mcpls_core::hooks::project_root(&cwd).unwrap_or(cwd);
+    let config = load_config(&args, &root)?;
 
     tracing::debug!(
         lsp_servers = config.lsp_servers.len(),
         "configuration loaded"
     );
 
-    // Select transport based on CLI flags.
+    #[cfg(feature = "transport-http")]
+    let in_process = args.no_backend || args.listen.is_some();
+    #[cfg(not(feature = "transport-http"))]
+    let in_process = args.no_backend;
+
+    if !in_process {
+        let stamp = mcpls_core::backend::ConfigStamp::of(&config);
+        let launch = mcpls_core::backend::BackendLaunch {
+            root,
+            config: args
+                .config
+                .as_ref()
+                .map(|path| dunce::canonicalize(path).unwrap_or_else(|_| path.clone())),
+            trust_project_config: args.trust_project_config,
+            log_level: args.log_level.clone(),
+            log_json: args.log_json,
+        };
+        mcpls_core::backend::run_frontend(mcpls_core::backend::FrontendOptions { launch, stamp })
+            .await;
+        return Ok(());
+    }
+
     let transport = {
         #[cfg(feature = "transport-http")]
         {
@@ -159,4 +185,18 @@ async fn run(args: Args) -> Result<()> {
 
     tracing::info!("mcpls shutdown complete");
     Ok(())
+}
+
+/// Load the configuration a session in `root` runs with.
+fn load_config(args: &Args, root: &std::path::Path) -> Result<mcpls_core::ServerConfig> {
+    if let Some(config_path) = &args.config {
+        return mcpls_core::ServerConfig::load_from(config_path)
+            .with_context(|| format!("failed to load config from {}", config_path.display()));
+    }
+    let trust = if args.trust_project_config {
+        ProjectConfigTrust::Trusted
+    } else {
+        ProjectConfigTrust::Untrusted
+    };
+    mcpls_core::ServerConfig::load_at(trust, root).context("failed to load configuration")
 }

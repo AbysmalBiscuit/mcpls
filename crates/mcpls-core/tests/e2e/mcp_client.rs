@@ -174,7 +174,7 @@ impl McpClient {
         let config_path = config_path
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("Invalid config path"))?;
-        let mut args = vec!["--config", config_path];
+        let mut args = vec!["--no-backend", "--config", config_path];
         if capture_stderr {
             args.extend(["--log-level", "info"]);
             Self::spawn_with_args_and_stderr(&args, true)
@@ -198,6 +198,10 @@ impl McpClient {
     fn spawn_with_args_and_stderr(args: &[&str], capture_stderr: bool) -> Result<Self> {
         let binary_path = binary_under_test()?;
         let cwd = tempfile::tempdir().context("failed to create a working directory")?;
+        let mut args = args.to_vec();
+        if !args.contains(&"--no-backend") {
+            args.insert(0, "--no-backend");
+        }
         let mut command = Command::new(binary_path);
         command.args(args).current_dir(cwd.path());
         Self::spawn_command(command, Some(cwd), capture_stderr)
