@@ -798,8 +798,19 @@ pub(crate) async fn serve_with_identity(
     let root = std::env::current_dir()
         .map_err(Error::Io)
         .and_then(|dir| hooks::project_root(&dir));
+    let hook_root_error = if config.diagnostics.hooks.enabled && identity_override.is_none() {
+        root.as_ref().err().map(ToString::to_string)
+    } else {
+        None
+    };
     let hook_root = root.as_ref().ok().cloned();
     let runtime = Runtime::start(&config, root).await?;
+    if let Some(error) = hook_root_error {
+        warn!(
+            "hooks are configured on but this project's socket identity could not be derived, \
+             so no socket is served: {error}"
+        );
+    }
     serve_hooks_in_process(&runtime, &config, identity_override, hook_root).await;
 
     let mcp_server = mcp::McplsServer::from_context(Arc::clone(&runtime.context));
