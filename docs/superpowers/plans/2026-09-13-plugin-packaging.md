@@ -1,5 +1,7 @@
 # Self-contained mcpls plugin implementation plan
 
+> **Superseded in part.** The launcher in Tasks 2, 3 and 5 and the release matrix in Task 6 are replaced by `2026-09-13-plugin-bootstrap.md`, which installs mcpls onto `PATH` with cargo-dist. Task 4 (`mcpls hook --host codex`) and the release-please setup in Task 6 still stand. The spec describes the current design.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Installing the mcpls plugin in Claude Code or Codex, with no mcpls on the machine, yields a working MCP server and hooks after one restart.
