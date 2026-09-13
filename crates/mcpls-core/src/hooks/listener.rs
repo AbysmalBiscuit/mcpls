@@ -65,7 +65,7 @@ pub struct HookListener {
 /// The mode changes through a no-follow directory handle, so a symlink or
 /// FIFO planted at `dir` fails the open instead of redirecting the change.
 #[cfg(not(windows))]
-fn ensure_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+pub(crate) fn ensure_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 
     std::fs::DirBuilder::new()

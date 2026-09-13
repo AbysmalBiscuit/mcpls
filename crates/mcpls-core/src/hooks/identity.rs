@@ -30,9 +30,30 @@ pub struct SocketIdentity {
     pub hash: String,
     /// The socket or named pipe to bind.
     pub socket: PathBuf,
-    /// The lock file whose holder owns `socket`. On Windows this is unused
-    /// and empty: `first_pipe_instance` makes the pipe itself exclusive.
+    /// The lock file whose holder owns `socket` on Unix. On Windows the pipe
+    /// itself is exclusive and this file is never locked, but the backend's
+    /// other files sit beside it.
     pub lock: PathBuf,
+}
+
+impl SocketIdentity {
+    /// The lock a frontend or hook holds while starting a backend.
+    #[must_use]
+    pub fn spawn_lock(&self) -> PathBuf {
+        self.lock.with_extension("spawn.lock")
+    }
+
+    /// Where a detached backend's standard error goes.
+    #[must_use]
+    pub fn log_file(&self) -> PathBuf {
+        self.lock.with_extension("log")
+    }
+
+    /// Where a Windows frontend asks the next hook to start a backend.
+    #[must_use]
+    pub fn start_request(&self) -> PathBuf {
+        self.lock.with_extension("start")
+    }
 }
 
 /// The stable identity hash for `dir`: 16 hex characters derived from its
@@ -170,7 +191,7 @@ pub fn identity_for(dir: &Path) -> Result<SocketIdentity> {
         let prefix = windows_pipe_prefix();
         Ok(SocketIdentity {
             socket: PathBuf::from(format!(r"\\.\pipe\{prefix}{hash}")),
-            lock: PathBuf::new(),
+            lock: runtime_dir().join(format!("{hash}.lock")),
             hash,
         })
     }
@@ -257,9 +278,9 @@ fn user_component(raw: Option<std::ffi::OsString>) -> Option<String> {
         .filter(|name| !name.is_empty())
 }
 
-/// Where sockets go on this platform: the system temporary directory, which
-/// honors `$TMPDIR` when set and otherwise falls back to the platform default,
-/// in a directory carrying the user.
+/// Where the socket, lock, spawn lock, log and start request go on Unix: the
+/// system temporary directory, which honors `$TMPDIR` when set and otherwise
+/// falls back to the platform default, in a directory carrying the user.
 ///
 /// `XDG_RUNTIME_DIR` would be the better directory, being a tmpfs the user
 /// owns and cleaned when the session ends, and it cannot be used. Codex
@@ -270,6 +291,28 @@ fn user_component(raw: Option<std::ffi::OsString>) -> Option<String> {
 #[cfg(not(windows))]
 fn runtime_dir() -> PathBuf {
     shared_temp_runtime_dir(current_user())
+}
+
+/// Where the lock, spawn lock, backend log and start request go on Windows:
+/// `mcpls` in the user's local application data folder.
+///
+/// `dirs` resolves that folder through `SHGetKnownFolderPath`, which ignores
+/// environment overrides, so a frontend and a hook launched by a harness
+/// with a different `%TEMP%` agree on the path. The profile folder's access
+/// control is already per-user.
+#[cfg(windows)]
+fn runtime_dir() -> PathBuf {
+    local_app_data_runtime_dir(dirs::data_local_dir(), current_user())
+}
+
+/// `mcpls` under `local`, or the shared temporary runtime directory for
+/// `user` when the platform names no local application data folder.
+#[cfg(any(windows, test))]
+fn local_app_data_runtime_dir(local: Option<PathBuf>, user: Option<String>) -> PathBuf {
+    local.map_or_else(
+        || shared_temp_runtime_dir(user),
+        |local| local.join("mcpls"),
+    )
 }
 
 /// The runtime directory under the system temporary directory -- `$TMPDIR`
@@ -283,7 +326,6 @@ fn runtime_dir() -> PathBuf {
 /// reason [`user_component`] does: the choice of directory is a rule about
 /// a name, and it can be exercised without a test setting a process-global
 /// variable, which this workspace cannot do at all.
-#[cfg(not(windows))]
 fn shared_temp_runtime_dir(user: Option<String>) -> PathBuf {
     user.map_or_else(
         || std::env::temp_dir().join("mcpls"),
@@ -295,6 +337,50 @@ fn shared_temp_runtime_dir(user: Option<String>) -> PathBuf {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_the_backend_files_sit_beside_the_lock() {
+        let identity = SocketIdentity {
+            hash: "abc".to_string(),
+            socket: PathBuf::from("/run/mcpls-ada/abc.sock"),
+            lock: PathBuf::from("/run/mcpls-ada/abc.lock"),
+        };
+        assert_eq!(
+            identity.spawn_lock(),
+            PathBuf::from("/run/mcpls-ada/abc.spawn.lock")
+        );
+        assert_eq!(identity.log_file(), PathBuf::from("/run/mcpls-ada/abc.log"));
+        assert_eq!(
+            identity.start_request(),
+            PathBuf::from("/run/mcpls-ada/abc.start")
+        );
+    }
+
+    /// Windows needs somewhere for the spawn lock and the backend log even
+    /// though the pipe itself provides exclusivity.
+    #[test]
+    #[cfg(windows)]
+    fn test_a_windows_identity_has_a_lock_path() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let identity = identity_for(dir.path()).expect("identity");
+        assert!(identity.lock.ends_with(format!("{}.lock", identity.hash)));
+    }
+
+    /// The Windows directory is a known folder, which no environment
+    /// variable redirects, and the shared temporary one only when the
+    /// platform names no such folder.
+    #[test]
+    fn test_the_windows_runtime_dir_is_under_local_app_data() {
+        let local = PathBuf::from("C:/Users/ada/AppData/Local");
+        assert_eq!(
+            local_app_data_runtime_dir(Some(local.clone()), Some("ada".to_string())),
+            local.join("mcpls")
+        );
+        assert_eq!(
+            local_app_data_runtime_dir(None, Some("ada".to_string())),
+            shared_temp_runtime_dir(Some("ada".to_string()))
+        );
+    }
 
     /// A child with distinct runtime variables must still derive its socket
     /// directory from `TMPDIR` and `USER`, rather than `XDG_RUNTIME_DIR`.
@@ -337,12 +423,9 @@ mod tests {
         );
     }
 
-    /// Unix only: `/tmp` is shared between everyone on the machine, so two
-    /// users at the same project path would otherwise bind one socket and mix
-    /// the second user's hooks and diagnostics with the first user's process,
-    /// the collision the Windows pipe name closes on the other platform.
+    /// The shared temporary fallback carries the user so two users on the
+    /// same machine do not collide on one endpoint.
     #[test]
-    #[cfg(not(windows))]
     fn test_a_shared_temp_runtime_dir_carries_the_user() {
         assert_eq!(
             shared_temp_runtime_dir(Some("ada".to_string())),

@@ -1,0 +1,422 @@
+//! Starting a backend: the arguments it runs with, the lock that keeps two
+//! starters from racing, and the detached spawn itself.
+//!
+//! On Unix a frontend spawns the backend. On Windows a host may place its
+//! MCP server in a job that kills every descendant when the session ends,
+//! so the frontend writes a start request and the next hook invocation,
+//! which runs outside that job, spawns it.
+
+use std::ffi::OsString;
+use std::fs::File;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+
+use crate::hooks::SocketIdentity;
+
+/// A backend log larger than this starts over when a backend is spawned.
+const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
+
+/// How long a hook waits to learn whether a backend already answers.
+const RUNNING_PROBE: Duration = Duration::from_millis(200);
+
+/// What a backend is started with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendLaunch {
+    /// The checkout root it serves, and its working directory.
+    pub root: PathBuf,
+    /// An explicit configuration file, already absolute.
+    pub config: Option<PathBuf>,
+    /// Whether the project's `mcpls.toml` is trusted.
+    pub trust_project_config: bool,
+    /// The log level.
+    pub log_level: String,
+    /// Whether logs are JSON.
+    pub log_json: bool,
+}
+
+impl BackendLaunch {
+    /// The command-line arguments that start this backend.
+    #[must_use]
+    pub fn args(&self) -> Vec<OsString> {
+        let mut args = Vec::new();
+        if let Some(config) = &self.config {
+            args.push("--config".into());
+            args.push(config.clone().into_os_string());
+        }
+        if self.trust_project_config {
+            args.push("--trust-project-config".into());
+        }
+        args.push("--log-level".into());
+        args.push(self.log_level.clone().into());
+        if self.log_json {
+            args.push("--log-json".into());
+        }
+        args.push("backend".into());
+        args.push("--root".into());
+        args.push(self.root.clone().into_os_string());
+        args
+    }
+}
+
+/// Held by whoever is starting a backend, so everyone else waits and then
+/// connects to it instead of starting a second.
+pub struct SpawnLock {
+    _file: File,
+}
+
+impl SpawnLock {
+    /// Take the lock at `path`, waiting up to `wait` for another holder.
+    /// `None` when the wait ran out.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the lock file cannot be created or locked for
+    /// a reason other than contention.
+    pub async fn acquire(path: &Path, wait: Duration) -> io::Result<Option<Self>> {
+        let deadline = Instant::now() + wait;
+        loop {
+            let attempt = path.to_path_buf();
+            let locked = tokio::task::spawn_blocking(move || try_lock(&attempt))
+                .await
+                .map_err(io::Error::other)??;
+            if locked.is_some() || Instant::now() >= deadline {
+                return Ok(locked);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+}
+
+fn try_lock(path: &Path) -> io::Result<Option<SpawnLock>> {
+    use fs4::fs_std::FileExt as _;
+
+    if let Some(parent) = path.parent() {
+        ensure_runtime_dir(parent)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(SpawnLock { _file: file })),
+        Err(error)
+            if error.kind() == io::ErrorKind::WouldBlock
+                || error.raw_os_error() == fs4::lock_contended_error().raw_os_error() =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Create the runtime directory, owner-only where the platform has modes.
+pub(crate) fn ensure_runtime_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(not(windows))]
+    {
+        crate::hooks::listener::ensure_private_dir(dir)
+    }
+    #[cfg(windows)]
+    {
+        std::fs::create_dir_all(dir)
+    }
+}
+
+/// Open the backend log for appending, starting it over past
+/// [`MAX_LOG_BYTES`].
+fn open_log(path: &Path) -> io::Result<File> {
+    if let Some(parent) = path.parent() {
+        ensure_runtime_dir(parent)?;
+    }
+    let oversized = std::fs::metadata(path).is_ok_and(|meta| meta.len() > MAX_LOG_BYTES);
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(!oversized)
+        .write(true)
+        .truncate(oversized)
+        .open(path)
+}
+
+/// Start `exe` as a backend for `launch`, detached from this process's
+/// standard streams and process group. Returns its pid.
+///
+/// # Errors
+///
+/// Returns an error when the log cannot be opened or the process cannot be
+/// spawned.
+pub fn spawn_detached(exe: &Path, launch: &BackendLaunch, log: &Path) -> io::Result<u32> {
+    spawn_detached_command(exe, launch.args(), &launch.root, log)
+}
+
+fn spawn_detached_command(
+    exe: &Path,
+    args: impl IntoIterator<Item = OsString>,
+    cwd: &Path,
+    log: &Path,
+) -> io::Result<u32> {
+    let mut command = Command::new(exe);
+    command
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(open_log(log)?))
+        .env_remove("CLAUDE_CODE_SESSION_ID");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+    let mut child = command.spawn()?;
+    let pid = child.id();
+    // Reaped here so an exiting backend never lingers as a zombie of this
+    // process.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(pid)
+}
+
+/// Ask the next hook invocation to start a backend for `launch`.
+///
+/// # Errors
+///
+/// Returns an error when the request cannot be written.
+pub fn request_start(identity: &SocketIdentity, launch: &BackendLaunch) -> io::Result<()> {
+    let path = identity.start_request();
+    if let Some(parent) = path.parent() {
+        ensure_runtime_dir(parent)?;
+    }
+    let pending = path.with_extension("start.tmp");
+    std::fs::write(
+        &pending,
+        serde_json::to_vec(launch).map_err(io::Error::other)?,
+    )?;
+    std::fs::rename(pending, path)
+}
+
+/// Start the backend a frontend asked for, when one asked and none runs.
+/// Returns whether this call spawned one.
+///
+/// # Errors
+///
+/// Returns an error when the request is unreadable or the spawn fails.
+pub async fn start_requested(identity: &SocketIdentity, exe: &Path) -> io::Result<bool> {
+    let request = identity.start_request();
+    if !request.exists() {
+        return Ok(false);
+    }
+    let Some(_lock) = SpawnLock::acquire(&identity.spawn_lock(), Duration::ZERO).await? else {
+        return Ok(false);
+    };
+    let Ok(bytes) = std::fs::read(&request) else {
+        return Ok(false);
+    };
+    let running = tokio::time::timeout(RUNNING_PROBE, crate::hooks::listener::connect(identity))
+        .await
+        .is_ok_and(|connected| connected.is_ok());
+    std::fs::remove_file(&request)?;
+    if running {
+        return Ok(false);
+    }
+    let launch: BackendLaunch = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+    spawn_detached(exe, &launch, &identity.log_file())?;
+    Ok(true)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    fn launch(root: &Path) -> BackendLaunch {
+        BackendLaunch {
+            root: root.to_path_buf(),
+            config: Some(PathBuf::from("/etc/mcpls.toml")),
+            trust_project_config: true,
+            log_level: "debug".to_string(),
+            log_json: true,
+        }
+    }
+
+    #[test]
+    fn test_the_launch_arguments_name_every_setting() {
+        let args = launch(Path::new("/work")).args();
+        let args: Vec<_> = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "--config",
+                "/etc/mcpls.toml",
+                "--trust-project-config",
+                "--log-level",
+                "debug",
+                "--log-json",
+                "backend",
+                "--root",
+                "/work",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_optional_launch_arguments_are_left_out() {
+        let bare = BackendLaunch {
+            config: None,
+            trust_project_config: false,
+            log_json: false,
+            ..launch(Path::new("/work"))
+        };
+        let args: Vec<_> = bare
+            .args()
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, ["--log-level", "debug", "backend", "--root", "/work"]);
+    }
+
+    #[tokio::test]
+    async fn test_the_spawn_lock_admits_one_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime").join("x.spawn.lock");
+        let first = SpawnLock::acquire(&path, Duration::ZERO).await.unwrap();
+        assert!(first.is_some());
+        assert!(
+            SpawnLock::acquire(&path, Duration::from_millis(100))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        drop(first);
+        assert!(
+            SpawnLock::acquire(&path, Duration::from_secs(2))
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_an_oversized_log_starts_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("x.log");
+        std::fs::write(
+            &log,
+            vec![b'x'; usize::try_from(MAX_LOG_BYTES).unwrap() + 1],
+        )
+        .unwrap();
+        drop(open_log(&log).unwrap());
+        assert_eq!(std::fs::metadata(&log).unwrap().len(), 0);
+
+        std::fs::write(&log, b"kept").unwrap();
+        drop(open_log(&log).unwrap());
+        assert_eq!(std::fs::read(&log).unwrap(), b"kept");
+    }
+
+    /// The backend leaves the frontend's process group, which is the group
+    /// Codex signals when a session ends.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_a_detached_child_leads_its_own_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("group");
+        let script = format!(
+            "exec awk '{{print $5 == $1}}' /proc/self/stat > '{}'",
+            out.display()
+        );
+        let pid = spawn_detached_command(
+            Path::new("/bin/sh"),
+            [OsString::from("-c"), OsString::from(script)],
+            dir.path(),
+            &dir.path().join("log"),
+        )
+        .unwrap();
+        assert!(pid > 0);
+        for _ in 0..100 {
+            if std::fs::read_to_string(&out).is_ok_and(|text| !text.is_empty()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(std::fs::read_to_string(&out).unwrap().trim(), "1");
+    }
+
+    #[tokio::test]
+    async fn test_no_request_starts_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = test_identity(dir.path());
+        assert!(
+            !start_requested(&identity, Path::new("/bin/true"))
+                .await
+                .unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_a_request_is_honoured_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = test_identity(dir.path());
+        request_start(&identity, &launch(dir.path())).unwrap();
+        assert!(identity.start_request().exists());
+
+        assert!(
+            start_requested(&identity, Path::new("/bin/true"))
+                .await
+                .unwrap()
+        );
+        assert!(!identity.start_request().exists());
+        assert!(
+            !start_requested(&identity, Path::new("/bin/true"))
+                .await
+                .unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_a_request_for_a_running_backend_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = test_identity(dir.path());
+        let _listener = crate::hooks::HookListener::acquire(&identity)
+            .await
+            .unwrap()
+            .unwrap();
+        request_start(&identity, &launch(dir.path())).unwrap();
+
+        assert!(
+            !start_requested(&identity, Path::new("/bin/false"))
+                .await
+                .unwrap()
+        );
+        assert!(!identity.start_request().exists());
+    }
+
+    fn test_identity(dir: &Path) -> SocketIdentity {
+        SocketIdentity {
+            hash: "t".to_string(),
+            #[cfg(not(windows))]
+            socket: dir.join("t.sock"),
+            #[cfg(windows)]
+            socket: PathBuf::from(format!(r"\\.\pipe\mcpls-spawn-test-{}", std::process::id())),
+            lock: dir.join("t.lock"),
+        }
+    }
+}

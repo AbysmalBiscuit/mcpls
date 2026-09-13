@@ -6,9 +6,11 @@
 
 pub mod endpoint;
 pub mod handshake;
+pub mod spawn;
 
 pub use endpoint::serve_backend;
 pub use handshake::{
     ConfigStamp, ConnectionKind, Handshake, HandshakeReply, PROTOCOL, Refusal, VERSION,
     compare_builds,
 };
+pub use spawn::{BackendLaunch, SpawnLock, request_start, spawn_detached, start_requested};
