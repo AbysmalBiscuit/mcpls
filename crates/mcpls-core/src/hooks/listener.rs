@@ -119,6 +119,12 @@ impl HookListener {
             .map_err(|e| Error::Transport(format!("the acquire task panicked: {e}")))?
     }
 
+    /// Wait for the next client, for a caller running its own accept loop.
+    #[allow(dead_code)]
+    pub(crate) async fn accept(&self) -> io::Result<Box<dyn HookStream>> {
+        self.transport.accept().await
+    }
+
     #[cfg(not(windows))]
     fn acquire_blocking(identity: &SocketIdentity) -> Result<Option<Self>> {
         let Some(lock) = Self::lock_file(identity)? else {

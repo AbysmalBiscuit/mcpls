@@ -575,15 +575,193 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     serve_with_identity(config, transport, None).await
 }
 
-/// The checkout root enclosing this process's working directory, and the
-/// socket identity derived from it, from one resolution rather than two, so
-/// a `Status` answer's `root` and `hash` describe the same directory by
-/// construction rather than by coincidence.
-fn canonicalized_root_identity() -> Result<(hooks::SocketIdentity, PathBuf), Error> {
-    let dir = std::env::current_dir().map_err(Error::Io)?;
-    let root = hooks::project_root(&dir)?;
-    let identity = hooks::identity_for(&root)?;
-    Ok((identity, root))
+/// Everything one mcpls process serves from, however many connections
+/// reach it: the language servers, the caches and every record.
+pub(crate) struct Runtime {
+    pub(crate) context: Arc<mcp::BridgeContext>,
+    pub(crate) sweeper: Arc<hooks::Sweeper>,
+    pub(crate) cancel_rx: tokio::sync::watch::Receiver<bool>,
+    translator: Arc<Translator>,
+    cancel_tx: tokio::sync::watch::Sender<bool>,
+    lsp_init_handle: Option<JoinHandle<()>>,
+}
+
+impl Runtime {
+    /// Validate `config`, resolve its workspace against `root`, start the
+    /// language servers in the background, and build the shared state.
+    ///
+    /// `root` is only consulted when a workspace root is empty or
+    /// relative, so an unreadable working directory does not block a
+    /// configuration whose roots are all absolute.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) async fn start(
+        config: &ServerConfig,
+        root: Result<PathBuf, Error>,
+    ) -> Result<Self, Error> {
+        config.validate()?;
+
+        let project_config_ignored = config.project_config_ignored;
+        let workspace_roots = if config.workspace.roots.is_empty()
+            || config.workspace.roots.iter().any(|root| root.is_relative())
+        {
+            resolve_workspace_roots(&config.workspace.roots, &root?)?
+        } else {
+            canonicalize_workspace_roots(&config.workspace.roots, Path::new(""))?
+        };
+        let extension_map = Arc::new(config.build_effective_extension_map());
+        let max_depth = Some(config.workspace.heuristics_max_depth);
+
+        // One registry for the process. The clients write it from their
+        // `registerCapability` arms and the translator reads it to decide whom
+        // to notify, so both sides must hold the same `Arc`.
+        let watch_registry = Arc::new(lsp::WatchRegistry::new());
+
+        let applicable_configs =
+            applicable_server_configs(config, &workspace_roots, max_depth, &watch_registry);
+
+        info!(
+            "Attempting to spawn {} applicable LSP server(s)...",
+            applicable_configs.len()
+        );
+
+        // Built over the applicable (post-heuristics) configs only: this is where
+        // #174's workspace-scoped routing rules (duplicate ServerId, conflicting
+        // `handles` claims) are enforced -- a startup error naming the
+        // conflicting `[[lsp_servers]]` entries, not a silent drop.
+        let router = ToolRouter::from_configs(applicable_configs.iter().map(|c| &c.server_config))?;
+        let floor_configs = applicable_configs
+            .iter()
+            .map(|config| config.server_config.clone())
+            .collect::<Vec<_>>();
+
+        // Built here (rather than alongside `subscriptions` below) so
+        // it can be handed to the translator, which uses it to invalidate a
+        // respawned server's stale cached diagnostics -- see
+        // `Translator::with_notification_cache`. Independent of `translator`
+        // itself, which holds no outer lock: the pump only ever locks this
+        // cache, so it never contends with a request handler running an
+        // in-flight LSP round-trip.
+        let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
+
+        let translator = build_translator(
+            config,
+            workspace_roots.clone(),
+            (*extension_map).clone(),
+            router,
+            Arc::clone(&notification_cache),
+            Arc::clone(&watch_registry),
+        );
+
+        // Mark applicable servers as "expected" so a tool call that arrives while
+        // its server is still initializing gets a clear "still initializing" error
+        // (instead of "no server configured"), telling the caller to wait and retry.
+        let expected_servers: HashSet<ServerId> = applicable_configs
+            .iter()
+            .map(|c| c.server_config.id())
+            .collect();
+        translator.set_expected_servers(expected_servers);
+
+        // Shared state, built BEFORE LSP initialization so the MCP server can answer
+        // `initialize` immediately. LSP servers (which can take minutes to initialize
+        // on a large solution, e.g. a 130-project Unity .sln via OmniSharp) are spawned
+        // in a background task and registered into this shared translator once ready.
+        // Blocking the MCP handshake on LSP init makes slow servers exceed the client's
+        // initialize-request timeout (Claude Code: ~60s) -> "Request timed out".
+        // Fixed for the server's lifetime: shared as a lock-free snapshot so
+        // cache-only handlers (e.g. `get_cached_diagnostics`, `read_resource`) can
+        // validate a path without locking `translator` below.
+        //
+        // `resolve_workspace_roots` canonicalizes before any consumer sees these
+        // paths. The snapshot can therefore stay allocation-only while preserving
+        // `diagnostic_path_in_workspace`'s canonical-root precondition and avoiding
+        // filesystem I/O on the hot per-notification path.
+        let workspace_roots_snapshot: Arc<[PathBuf]> = Arc::from(workspace_roots.clone());
+
+        let translator = Arc::new(translator);
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
+
+        // Cancellation for pump tasks: send `true` to request shutdown.
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+        let settle = Arc::new(bridge::ServerSettle::new(
+            Duration::from_millis(config.diagnostics.settle_quiet_ms),
+            Duration::from_millis(config.diagnostics.settle_deadline_ms),
+        ));
+        let delivery = Arc::new(Mutex::new(bridge::DiagnosticsDelivery::new(
+            config.diagnostics,
+        )));
+        let floors = Arc::new(bridge::FloorTable::new(&config.diagnostics, &floor_configs));
+
+        let sweeper = Arc::new(hooks::Sweeper::new(
+            Arc::clone(&translator),
+            hooks::PathFilter::new(
+                Arc::clone(&workspace_roots_snapshot),
+                Arc::clone(&extension_map),
+                Some(Arc::clone(&watch_registry)),
+            ),
+            Duration::from_millis(config.diagnostics.hooks.sweep_quiet_ms),
+            config.workspace.max_documents,
+        ));
+        tokio::spawn(Arc::clone(&sweeper).run(cancel_rx.clone()));
+
+        let pump_shared = PumpShared {
+            notification_cache: Arc::clone(&notification_cache),
+            subs: Arc::clone(&subscriptions),
+            workspace_roots: Arc::clone(&workspace_roots_snapshot),
+            document_tracker: Arc::clone(translator.document_tracker()),
+            settle: Arc::clone(&settle),
+            delivery: Arc::clone(&delivery),
+            floors: Arc::clone(&floors),
+        };
+
+        let lsp_init_handle = if applicable_configs.is_empty() {
+            warn!("No applicable LSP servers configured — starting in protocol-only mode");
+            // No server will ever be spawned, so `baseline_task` never runs and
+            // `has_baseline()` would stay false for the process's whole life.
+            // Adopt an empty baseline now: there is nothing starting up and
+            // nothing to report, so `get_new_diagnostics` should say exactly
+            // that instead of advising a retry that could never succeed.
+            delivery.lock().await.set_baseline(HashMap::new());
+            None
+        } else {
+            info!(
+                "Spawning {} LSP server(s) in the background...",
+                applicable_configs.len()
+            );
+            Some(spawn_lsp_servers_background(
+                applicable_configs,
+                Arc::clone(&translator),
+                cancel_rx.clone(),
+                pump_shared,
+            ))
+        };
+
+        info!("Starting MCP server with rmcp...");
+        let context = mcp::BridgeContext::new(
+            Arc::clone(&translator),
+            Arc::clone(&notification_cache),
+            Arc::clone(&workspace_roots_snapshot),
+            Arc::clone(&subscriptions),
+            project_config_ignored,
+            delivery,
+            floors,
+            config.diagnostics,
+            settle,
+        );
+        Ok(Self {
+            context: Arc::new(context),
+            sweeper,
+            cancel_rx,
+            translator,
+            cancel_tx,
+            lsp_init_handle,
+        })
+    }
+
+    /// Stop the background tasks and drain the language servers.
+    pub(crate) async fn shutdown(self) {
+        shutdown(&self.cancel_tx, &self.translator, self.lsp_init_handle).await;
+    }
 }
 
 /// [`serve_with`], with the project's hook socket identity supplied rather
@@ -600,7 +778,6 @@ fn canonicalized_root_identity() -> Result<(hooks::SocketIdentity, PathBuf), Err
 /// # Errors
 ///
 /// The same as [`serve_with`].
-#[allow(clippy::too_many_lines)]
 pub(crate) async fn serve_with_identity(
     config: ServerConfig,
     transport: Transport,
@@ -618,257 +795,14 @@ pub(crate) async fn serve_with_identity(
     // `ShutdownSignal`'s docs for why this must be a single instance carried
     // through by value rather than re-registered later.
     let shutdown_signal = ShutdownSignal::new();
+    let root = std::env::current_dir()
+        .map_err(Error::Io)
+        .and_then(|dir| hooks::project_root(&dir));
+    let hook_root = root.as_ref().ok().cloned();
+    let runtime = Runtime::start(&config, root).await?;
+    serve_hooks_in_process(&runtime, &config, identity_override, hook_root).await;
 
-    // `ServerConfig::load`/`load_from` already validate the TOML-loading
-    // path; this covers the other one -- a caller building `ServerConfig`
-    // programmatically (e.g. a library embedder) previously hit no
-    // diagnosable error here, only silent clamping at accessor level (e.g.
-    // `LspClient::request_timeout`). `serve` delegates to this function, so
-    // one call site here covers both public entry points (`serve` and
-    // `serve_with`); note this does mean a config loaded via the CLI's
-    // `load_from` -> `serve` path is validated twice (harmless -- `validate`
-    // is a pure check with no side effects beyond a `tracing::warn!` for a
-    // non-fatal duplicate-name case, which will simply log twice).
-    //
-    // Considered wrapping this in a `Validated<ServerConfig>` marker type to
-    // make "already validated" a compile-time guarantee instead of a runtime
-    // check here; rejected as unnecessary ceremony for a pre-1.0 API (#282).
-    config.validate()?;
-
-    let project_config_ignored = config.project_config_ignored;
-    // `ServerConfig::load_from` already rebases TOML-relative roots;
-    // empty roots and caller-built relative roots use the enclosing checkout.
-    // Absolute roots need no cwd lookup, so an unreadable cwd cannot block them.
-    let workspace_roots = if config.workspace.roots.is_empty()
-        || config.workspace.roots.iter().any(|root| root.is_relative())
-    {
-        let cwd = std::env::current_dir().map_err(Error::Io)?;
-        let workspace_base = hooks::project_root(&cwd)?;
-        resolve_workspace_roots(&config.workspace.roots, &workspace_base)?
-    } else {
-        // Every root is absolute already, so `base_dir` is never joined
-        // against inside `canonicalize_workspace_roots` -- pass an
-        // arbitrary placeholder rather than paying for `current_dir()`.
-        canonicalize_workspace_roots(&config.workspace.roots, Path::new(""))?
-    };
-    let extension_map = Arc::new(config.build_effective_extension_map());
-    let max_depth = Some(config.workspace.heuristics_max_depth);
-
-    // One registry for the process. The clients write it from their
-    // `registerCapability` arms and the translator reads it to decide whom
-    // to notify, so both sides must hold the same `Arc`.
-    let watch_registry = Arc::new(lsp::WatchRegistry::new());
-
-    let applicable_configs =
-        applicable_server_configs(&config, &workspace_roots, max_depth, &watch_registry);
-
-    info!(
-        "Attempting to spawn {} applicable LSP server(s)...",
-        applicable_configs.len()
-    );
-
-    // Built over the applicable (post-heuristics) configs only: this is where
-    // #174's workspace-scoped routing rules (duplicate ServerId, conflicting
-    // `handles` claims) are enforced -- a startup error naming the
-    // conflicting `[[lsp_servers]]` entries, not a silent drop.
-    let router = ToolRouter::from_configs(applicable_configs.iter().map(|c| &c.server_config))?;
-    let floor_configs = applicable_configs
-        .iter()
-        .map(|config| config.server_config.clone())
-        .collect::<Vec<_>>();
-
-    // Built here (rather than alongside `subscriptions` below) so
-    // it can be handed to the translator, which uses it to invalidate a
-    // respawned server's stale cached diagnostics -- see
-    // `Translator::with_notification_cache`. Independent of `translator`
-    // itself, which holds no outer lock: the pump only ever locks this
-    // cache, so it never contends with a request handler running an
-    // in-flight LSP round-trip.
-    let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
-
-    let translator = build_translator(
-        &config,
-        workspace_roots.clone(),
-        (*extension_map).clone(),
-        router,
-        Arc::clone(&notification_cache),
-        Arc::clone(&watch_registry),
-    );
-
-    // Mark applicable servers as "expected" so a tool call that arrives while
-    // its server is still initializing gets a clear "still initializing" error
-    // (instead of "no server configured"), telling the caller to wait and retry.
-    let expected_servers: HashSet<ServerId> = applicable_configs
-        .iter()
-        .map(|c| c.server_config.id())
-        .collect();
-    translator.set_expected_servers(expected_servers);
-
-    // Shared state, built BEFORE LSP initialization so the MCP server can answer
-    // `initialize` immediately. LSP servers (which can take minutes to initialize
-    // on a large solution, e.g. a 130-project Unity .sln via OmniSharp) are spawned
-    // in a background task and registered into this shared translator once ready.
-    // Blocking the MCP handshake on LSP init makes slow servers exceed the client's
-    // initialize-request timeout (Claude Code: ~60s) -> "Request timed out".
-    // Fixed for the server's lifetime: shared as a lock-free snapshot so
-    // cache-only handlers (e.g. `get_cached_diagnostics`, `read_resource`) can
-    // validate a path without locking `translator` below.
-    //
-    // `resolve_workspace_roots` canonicalizes before any consumer sees these
-    // paths. The snapshot can therefore stay allocation-only while preserving
-    // `diagnostic_path_in_workspace`'s canonical-root precondition and avoiding
-    // filesystem I/O on the hot per-notification path.
-    let workspace_roots_snapshot: Arc<[PathBuf]> = Arc::from(workspace_roots.clone());
-
-    let translator = Arc::new(translator);
-    let subscriptions = Arc::new(ResourceSubscriptions::new());
-
-    // Cancellation for pump tasks: send `true` to request shutdown.
-    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-
-    let settle = Arc::new(bridge::ServerSettle::new(
-        Duration::from_millis(config.diagnostics.settle_quiet_ms),
-        Duration::from_millis(config.diagnostics.settle_deadline_ms),
-    ));
-    let delivery = Arc::new(Mutex::new(bridge::DiagnosticsDelivery::new(
-        config.diagnostics,
-    )));
-    let floors = Arc::new(bridge::FloorTable::new(&config.diagnostics, &floor_configs));
-
-    // The hook socket is an optimization, not a requirement: a process that
-    // cannot derive its own identity still answers every MCP tool, so this
-    // must not turn an unreadable working directory into a startup failure.
-    //
-    // The identity and the root a `Status` answer reports both come from
-    // one root resolution, not independent resolutions: a directory that
-    // resolves for `identity_for` but not for a second, separate call
-    // would otherwise leave `root` silently blank while `hash` is fine.
-    let (hook_identity, hook_root) = if config.diagnostics.hooks.enabled {
-        identity_override.map_or_else(
-            || match canonicalized_root_identity() {
-                Ok((identity, root)) => (Some(identity), Some(root)),
-                Err(error) => {
-                    warn!(
-                        "hooks are configured on but this project's socket identity could not \
-                         be derived, so no socket is served: {error}"
-                    );
-                    (None, None)
-                }
-            },
-            |identity| {
-                // Test-only path (see this function's doc comment): there
-                // is no real startup directory tied to an injected
-                // identity, so this process's own cwd stands in. Nothing
-                // outside this crate's own tests reads `root` against a
-                // real directory on this path.
-                let root = std::env::current_dir()
-                    .ok()
-                    .and_then(|dir| dunce::canonicalize(&dir).ok())
-                    .unwrap_or_default();
-                (Some(identity), Some(root))
-            },
-        )
-    } else {
-        (None, None)
-    };
-
-    // A failure to acquire is not a failure to start: this process still
-    // answers every MCP tool, and only the hooks go unanswered.
-    let listener = match &hook_identity {
-        Some(identity) => match hooks::HookListener::acquire(identity).await {
-            Ok(Some(listener)) => Some(listener),
-            Ok(None) => {
-                warn!(
-                    "another mcpls holds this project's endpoint, so its hooks are answered there \
-                     rather than here"
-                );
-                None
-            }
-            Err(error) => {
-                warn!("the project's endpoint could not be bound, so no hooks are served: {error}");
-                None
-            }
-        },
-        None => None,
-    };
-
-    let sweeper = listener.as_ref().map(|_| {
-        let sweeper = Arc::new(hooks::Sweeper::new(
-            Arc::clone(&translator),
-            hooks::PathFilter::new(
-                Arc::clone(&workspace_roots_snapshot),
-                Arc::clone(&extension_map),
-                Some(Arc::clone(&watch_registry)),
-            ),
-            Duration::from_millis(config.diagnostics.hooks.sweep_quiet_ms),
-            config.workspace.max_documents,
-        ));
-        tokio::spawn(Arc::clone(&sweeper).run(cancel_rx.clone()));
-        sweeper
-    });
-
-    let pump_shared = PumpShared {
-        notification_cache: Arc::clone(&notification_cache),
-        subs: Arc::clone(&subscriptions),
-        workspace_roots: Arc::clone(&workspace_roots_snapshot),
-        document_tracker: Arc::clone(translator.document_tracker()),
-        settle: Arc::clone(&settle),
-        delivery: Arc::clone(&delivery),
-        floors: Arc::clone(&floors),
-    };
-
-    let lsp_init_handle = if applicable_configs.is_empty() {
-        warn!("No applicable LSP servers configured — starting in protocol-only mode");
-        // No server will ever be spawned, so `baseline_task` never runs and
-        // `has_baseline()` would stay false for the process's whole life.
-        // Adopt an empty baseline now: there is nothing starting up and
-        // nothing to report, so `get_new_diagnostics` should say exactly
-        // that instead of advising a retry that could never succeed.
-        delivery.lock().await.set_baseline(HashMap::new());
-        None
-    } else {
-        info!(
-            "Spawning {} LSP server(s) in the background...",
-            applicable_configs.len()
-        );
-        Some(spawn_lsp_servers_background(
-            applicable_configs,
-            Arc::clone(&translator),
-            cancel_rx.clone(),
-            pump_shared,
-        ))
-    };
-
-    info!("Starting MCP server with rmcp...");
-    let context = mcp::BridgeContext::new(
-        Arc::clone(&translator),
-        Arc::clone(&notification_cache),
-        Arc::clone(&workspace_roots_snapshot),
-        Arc::clone(&subscriptions),
-        project_config_ignored,
-        delivery,
-        floors,
-        config.diagnostics,
-        settle,
-    );
-    let context = Arc::new(context);
-    let mcp_server = mcp::McplsServer::from_context(Arc::clone(&context));
-
-    if let (Some(listener), Some(identity), Some(sweeper), Some(root)) =
-        (listener, hook_identity, sweeper, hook_root)
-    {
-        let handler = hooks::build_handler(
-            Arc::new(mcp::McplsServer::from_context(Arc::clone(&context))),
-            sweeper,
-            hooks::HookLocation { identity, root },
-            Arc::new(hooks::HookStats::default()),
-            cancel_rx.clone(),
-        );
-        let op_deadline = Duration::from_millis(config.diagnostics.hooks.op_deadline_ms);
-        tokio::spawn(log_hook_task_panic(async move {
-            let _ = listener.serve(handler, op_deadline, cancel_rx).await;
-        }));
-    }
+    let mcp_server = mcp::McplsServer::from_context(Arc::clone(&runtime.context));
     info!("MCPLS server initialized successfully");
 
     let result = match transport {
@@ -879,11 +813,67 @@ pub(crate) async fn serve_with_identity(
         #[cfg(feature = "transport-http")]
         Transport::Http(cfg) => run_http(mcp_server, cfg, shutdown_signal).await,
     };
-
-    shutdown(&cancel_tx, &translator, lsp_init_handle).await;
-
+    runtime.shutdown().await;
     info!("MCPLS server shutting down");
     result
+}
+
+/// Bind the project's endpoint for hooks when hooks are on and no other
+/// process holds it, and answer hooks from `runtime` until it is cancelled.
+async fn serve_hooks_in_process(
+    runtime: &Runtime,
+    config: &ServerConfig,
+    identity_override: Option<hooks::SocketIdentity>,
+    hook_root: Option<PathBuf>,
+) {
+    if !config.diagnostics.hooks.enabled {
+        return;
+    }
+    let identity = match identity_override.map_or_else(
+        || hook_root.as_deref().map(hooks::identity_for).transpose(),
+        |identity| Ok(Some(identity)),
+    ) {
+        Ok(Some(identity)) => identity,
+        Ok(None) => return,
+        Err(error) => {
+            warn!(
+                "hooks are configured on but this project's endpoint could not be derived: {error}"
+            );
+            return;
+        }
+    };
+    let listener = match hooks::HookListener::acquire(&identity).await {
+        Ok(Some(listener)) => listener,
+        Ok(None) => {
+            warn!(
+                "another mcpls holds this project's endpoint, so its hooks are answered there \
+                 rather than here"
+            );
+            return;
+        }
+        Err(error) => {
+            warn!("the project's endpoint could not be bound, so no hooks are served: {error}");
+            return;
+        }
+    };
+    let root = hook_root.unwrap_or_else(|| {
+        std::env::current_dir()
+            .ok()
+            .and_then(|dir| dunce::canonicalize(dir).ok())
+            .unwrap_or_default()
+    });
+    let handler = hooks::build_handler(
+        Arc::new(mcp::McplsServer::from_context(Arc::clone(&runtime.context))),
+        Arc::clone(&runtime.sweeper),
+        hooks::HookLocation { identity, root },
+        Arc::new(hooks::HookStats::default()),
+        runtime.cancel_rx.clone(),
+    );
+    let op_deadline = Duration::from_millis(config.diagnostics.hooks.op_deadline_ms);
+    let cancel = runtime.cancel_rx.clone();
+    tokio::spawn(log_hook_task_panic(async move {
+        let _ = listener.serve(handler, op_deadline, cancel).await;
+    }));
 }
 
 /// Run the hook socket task, reporting a panic instead of losing it. The
