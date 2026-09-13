@@ -2,12 +2,13 @@
 //! MCP sessions, hook calls and shutdown requests, and the idle timer that
 //! ends the process.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
 use crate::backend::handshake::{
@@ -36,6 +37,50 @@ pub(crate) enum Exit {
 
 type HookHandler =
     dyn Fn(Request) -> futures::future::BoxFuture<'static, Response> + Send + Sync + 'static;
+
+#[derive(Clone)]
+struct TrackedService {
+    server: McplsServer,
+    handlers: mpsc::UnboundedSender<()>,
+}
+
+impl rmcp::Service<rmcp::RoleServer> for TrackedService {
+    async fn handle_request(
+        &self,
+        request: <rmcp::RoleServer as rmcp::service::ServiceRole>::PeerReq,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<<rmcp::RoleServer as rmcp::service::ServiceRole>::Resp, rmcp::ErrorData> {
+        let _handler = self.handlers.clone();
+        <McplsServer as rmcp::Service<rmcp::RoleServer>>::handle_request(
+            &self.server,
+            request,
+            context,
+        )
+        .await
+    }
+
+    async fn handle_notification(
+        &self,
+        notification: <rmcp::RoleServer as rmcp::service::ServiceRole>::PeerNot,
+        context: rmcp::service::NotificationContext<rmcp::RoleServer>,
+    ) -> Result<(), rmcp::ErrorData> {
+        let _handler = self.handlers.clone();
+        <McplsServer as rmcp::Service<rmcp::RoleServer>>::handle_notification(
+            &self.server,
+            notification,
+            context,
+        )
+        .await
+    }
+
+    fn get_info(&self) -> <rmcp::RoleServer as rmcp::service::ServiceRole>::Info {
+        <McplsServer as rmcp::Service<rmcp::RoleServer>>::get_info(&self.server)
+    }
+
+    fn supported_protocol_versions(&self) -> Cow<'static, [rmcp::model::ProtocolVersion]> {
+        <McplsServer as rmcp::Service<rmcp::RoleServer>>::supported_protocol_versions(&self.server)
+    }
+}
 
 /// Run a backend until idle, shutdown, or signal, then drain it.
 ///
@@ -120,6 +165,7 @@ impl Endpoint {
         signal: impl std::future::Future<Output = ()>,
     ) -> Exit {
         let mut tasks = tokio::task::JoinSet::new();
+        let (handler_tx, mut handler_rx) = mpsc::unbounded_channel();
         let idle_expired = idle_expired(self.attachments.watch(), idle);
         let mut shutdown = self.shutdown.subscribe();
         tokio::pin!(idle_expired, signal);
@@ -133,7 +179,7 @@ impl Endpoint {
                 accepted = listener.accept() => match accepted {
                     Ok(stream) => {
                         while tasks.try_join_next().is_some() {}
-                        tasks.spawn(Arc::clone(&self).connection(stream));
+                        tasks.spawn(Arc::clone(&self).connection(stream, handler_tx.clone()));
                     }
                     Err(error) => {
                         warn!(%error, "the endpoint failed to accept a connection");
@@ -145,10 +191,23 @@ impl Endpoint {
         drop(listener);
         self.closing.send_replace(true);
         while tasks.join_next().await.is_some() {}
+        drop(handler_tx);
+        if tokio::time::timeout(Duration::from_secs(5), async {
+            while handler_rx.recv().await.is_some() {}
+        })
+        .await
+        .is_err()
+        {
+            warn!("MCP handlers remained after the endpoint drain timeout");
+        }
         exit
     }
 
-    async fn connection(self: Arc<Self>, mut stream: Box<dyn HookStream>) {
+    async fn connection(
+        self: Arc<Self>,
+        mut stream: Box<dyn HookStream>,
+        handler_tx: mpsc::UnboundedSender<()>,
+    ) {
         let Ok(Ok(request)) = tokio::time::timeout(
             handshake::HANDSHAKE_TIMEOUT,
             handshake::read::<_, Handshake>(&mut stream),
@@ -180,7 +239,7 @@ impl Endpoint {
                     _ = closing.wait_for(|closing| *closing) => {}
                 }
             }
-            ConnectionKind::Mcp => self.serve_mcp(stream, request, closing).await,
+            ConnectionKind::Mcp => self.serve_mcp(stream, request, closing, handler_tx).await,
             ConnectionKind::Shutdown => {
                 let _ = self.shutdown.send(true);
             }
@@ -218,6 +277,7 @@ impl Endpoint {
         stream: Box<dyn HookStream>,
         request: Handshake,
         mut closing: watch::Receiver<bool>,
+        handler_tx: mpsc::UnboundedSender<()>,
     ) {
         use rmcp::ServiceExt as _;
 
@@ -233,9 +293,13 @@ impl Endpoint {
             .with_notes(notes);
         let connection = server.connection();
         let subscriptions = Arc::clone(server.subscriptions());
+        let server = TrackedService {
+            server,
+            handlers: handler_tx,
+        };
         let _attached = self
             .attachments
-            .attach(connection, server.session().to_string());
+            .attach(connection, server.server.session().to_string());
 
         let running = tokio::select! {
             result = server.serve(stream) => match result {
@@ -524,10 +588,11 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn test_exit_closes_an_initialized_mcp_stream_before_runtime_drain() {
+    async fn test_endpoint_waits_for_an_initialized_mcp_handler_before_runtime_drain() {
         use std::collections::HashMap;
 
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::UnixStream;
         use tokio::sync::oneshot;
 
         let directory = tempfile::tempdir().unwrap();
@@ -538,9 +603,24 @@ mod tests {
         std::fs::write(
             &script,
             r#"import json
+import socket
 import sys
+import threading
 
-ready, hover = sys.argv[1:]
+ready, hover, control_path, runtime_shutdown = sys.argv[1:]
+
+release = threading.Event()
+control = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+control.bind(control_path)
+control.listen(1)
+
+def wait_for_release():
+    connection, _ = control.accept()
+    connection.recv(1)
+    release.set()
+    connection.close()
+
+threading.Thread(target=wait_for_release, daemon=True).start()
 
 def read_message():
     length = None
@@ -570,15 +650,20 @@ while True:
         send({"jsonrpc": "2.0", "id": message["id"], "result": {"capabilities": {"hoverProvider": True}}})
         open(ready, "w").close()
     elif method == "shutdown":
+        open(runtime_shutdown, "w").close()
         send({"jsonrpc": "2.0", "id": message["id"], "result": None})
     elif method == "textDocument/hover":
         open(hover, "w").close()
+        release.wait()
+        send({"jsonrpc": "2.0", "id": message["id"], "result": None})
 "#,
         )
         .unwrap();
 
         let ready = root.join("lsp-ready");
         let hover = root.join("hover-in-flight");
+        let control = root.join("release.sock");
+        let runtime_shutdown = root.join("runtime-shutdown");
         let mut backend_config = config(60_000);
         backend_config.workspace.roots = vec![root.clone()];
         backend_config.lsp_servers = vec![crate::config::LspServerConfig {
@@ -588,6 +673,8 @@ while True:
                 script.to_string_lossy().into_owned(),
                 ready.to_string_lossy().into_owned(),
                 hover.to_string_lossy().into_owned(),
+                control.to_string_lossy().into_owned(),
+                runtime_shutdown.to_string_lossy().into_owned(),
             ],
             env: HashMap::new(),
             file_patterns: vec!["**/*.rs".to_string()],
@@ -615,13 +702,17 @@ while True:
 
         let endpoint = Endpoint::new(&runtime, &backend_config, root.clone(), identity.clone());
         let (signal_tx, signal_rx) = oneshot::channel();
-        let run = tokio::spawn(Arc::clone(&endpoint).run(
-            listener,
-            Duration::from_secs(60),
-            async move {
-                let _ = signal_rx.await;
-            },
-        ));
+        let (drain_started_tx, mut drain_started_rx) = oneshot::channel();
+        let mut run = tokio::spawn(async move {
+            let exit = endpoint
+                .run(listener, Duration::from_secs(60), async move {
+                    let _ = signal_rx.await;
+                })
+                .await;
+            drain_started_tx.send(()).unwrap();
+            runtime.shutdown().await;
+            exit
+        });
 
         let mut stream = crate::hooks::listener::connect(&identity).await.unwrap();
         let request = Handshake::mcp(root.clone(), None, ConfigStamp::of(&backend_config));
@@ -662,20 +753,39 @@ while True:
         .unwrap();
 
         signal_tx.send(()).unwrap();
+        let mut closed = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut closed))
+            .await
+            .unwrap()
+            .unwrap();
+        let endpoint_exit = tokio::time::timeout(Duration::from_millis(100), &mut run).await;
+        assert!(
+            endpoint_exit.is_err(),
+            "the endpoint exited before the in-flight handler was released"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut drain_started_rx)
+                .await
+                .is_err(),
+            "runtime drain began before the in-flight handler was released"
+        );
+
+        let mut release = UnixStream::connect(&control).await.unwrap();
+        release.write_all(&[1]).await.unwrap();
+        drop(release);
         let exit = tokio::time::timeout(Duration::from_secs(5), run)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(exit, Exit::Signal);
-
-        let mut closed = Vec::new();
-        let stream_closed =
-            tokio::time::timeout(Duration::from_millis(100), stream.read_to_end(&mut closed))
-                .await
-                .is_ok();
         drop(stream);
-        runtime.shutdown().await;
-        assert!(stream_closed, "the MCP stream outlived the endpoint task");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !runtime_shutdown.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -838,7 +948,8 @@ while True:
         endpoint.closing.send_replace(true);
 
         let (mut client, server) = tokio::io::duplex(4096);
-        let task = tokio::spawn(Arc::clone(&endpoint).connection(Box::new(server)));
+        let (handler_tx, _handler_rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(Arc::clone(&endpoint).connection(Box::new(server), handler_tx));
         handshake::write(
             &mut client,
             &Handshake::mcp(root, None, ConfigStamp::of(&config(0))),
