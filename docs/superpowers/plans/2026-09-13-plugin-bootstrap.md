@@ -46,7 +46,7 @@
 **Interfaces:**
 - Produces: release assets `mcpls-installer.sh` and `mcpls-installer.ps1` on every `v<version>` release, which Task 2's bootstrap fetches.
 
-- [ ] **Step 1: Confirm the dist config**
+- [x] **Step 1: Confirm the dist config**
 
 `dist-workspace.toml` must read:
 
@@ -80,7 +80,7 @@ create-release = false
 inherits = "release"
 ```
 
-- [ ] **Step 2: Check the plan and the generated workflow**
+- [x] **Step 2: Check the plan and the generated workflow**
 
 Run: `env RUSTC_WRAPPER= dist plan`
 Expected: `mcpls-installer.sh`, `mcpls-installer.ps1`, and one archive per target in `dist-workspace.toml`, each holding only the `mcpls` binary.
@@ -88,7 +88,7 @@ Expected: `mcpls-installer.sh`, `mcpls-installer.ps1`, and one archive per targe
 Run: `env RUSTC_WRAPPER= dist generate --check`
 Expected: exit 0.
 
-- [ ] **Step 3: Fail CI when release.yml drifts from the config**
+- [x] **Step 3: Fail CI when release.yml drifts from the config**
 
 In `.github/workflows/ci.yml`, in the `detect-changes` job:
 - Under `outputs:`, after `plugin: ${{ steps.filter.outputs.plugin }}`, add `release: ${{ steps.filter.outputs.release }}`.
@@ -127,7 +127,7 @@ In the `ci-gate` job, add `dist-check` to `needs`, after `shellcheck`, and add `
 Run: `yq '.jobs.ci-gate.needs' .github/workflows/ci.yml`
 Expected: the list includes `dist-check`.
 
-- [ ] **Step 4: Commit the docs**
+- [x] **Step 4: Commit the docs**
 
 ```bash
 git add docs/superpowers/specs/2026-09-13-plugin-packaging-design.md docs/superpowers/plans/2026-09-13-plugin-packaging.md docs/superpowers/plans/2026-09-13-plugin-bootstrap.md
@@ -138,7 +138,7 @@ every entry runs the bare name.
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
 
-- [ ] **Step 5: Commit the release build**
+- [x] **Step 5: Commit the release build**
 
 ```bash
 git add dist-workspace.toml Cargo.toml .github/workflows/release.yml .github/workflows/ci.yml
@@ -165,7 +165,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Consumes: the installer asset names from Task 1.
 - Produces: `plugin/hooks/run-hook.cmd bootstrap-binaries <claude|codex>`, the command Task 3's hook files register.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `tests/plugin/bootstrap-binaries.test.sh`:
 
@@ -387,12 +387,12 @@ printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
 ```
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Run: `bash tests/plugin/bootstrap-binaries.test.sh`
 Expected: FAIL lines starting with `opt-out exits 0` (bash exits 127 because `plugin/hooks/bootstrap-binaries` does not exist), and a non-zero exit.
 
-- [ ] **Step 3: Write the bash bootstrap**
+- [x] **Step 3: Write the bash bootstrap**
 
 Create `plugin/hooks/bootstrap-binaries`:
 
@@ -513,7 +513,7 @@ rm -f "$failed" 2>/dev/null
 finish "mcpls ${version} was just installed, but this session started without it, so the MCP server and hooks are not using it yet. Tell the user to restart the session."
 ```
 
-- [ ] **Step 4: Write the PowerShell twin**
+- [x] **Step 4: Write the PowerShell twin**
 
 Create `plugin/hooks/bootstrap-binaries.ps1`. PowerShell sends `Write-Host` and an installer's output to the host's stdout under `-File`, so the install pipes every stream to stderr:
 
@@ -646,7 +646,7 @@ if ($status -ne 0) {
 Complete-Hook "mcpls $version was just installed, but this session started without it, so the MCP server and hooks are not using it yet. Tell the user to restart the session."
 ```
 
-- [ ] **Step 5: Write the polyglot wrapper**
+- [x] **Step 5: Write the polyglot wrapper**
 
 Create `plugin/hooks/run-hook.cmd`, copied from devkit with only its last comment changed:
 
@@ -711,7 +711,7 @@ Then mark both scripts executable:
 chmod +x plugin/hooks/bootstrap-binaries plugin/hooks/run-hook.cmd
 ```
 
-- [ ] **Step 6: Keep LF line endings**
+- [x] **Step 6: Keep LF line endings**
 
 In `.gitattributes`, after `plugin/bin/* text eol=lf`, add:
 
@@ -720,7 +720,7 @@ plugin/hooks/bootstrap-binaries text eol=lf
 plugin/hooks/run-hook.cmd text eol=lf
 ```
 
-- [ ] **Step 7: Run the test to verify it passes**
+- [x] **Step 7: Run the test to verify it passes**
 
 Run: `bash tests/plugin/bootstrap-binaries.test.sh`
 Expected: `0 failed` on the last line, exit 0.
@@ -728,7 +728,7 @@ Expected: `0 failed` on the last line, exit 0.
 Run: `shellcheck plugin/hooks/bootstrap-binaries tests/plugin/bootstrap-binaries.test.sh`
 Expected: no output, exit 0. Without a local `shellcheck`, `bunx --bun shellcheck` runs the same check.
 
-- [ ] **Step 8: Run the test in CI**
+- [x] **Step 8: Run the test in CI**
 
 In `.github/workflows/ci.yml`, replace the shellcheck job's last step:
 
@@ -752,7 +752,7 @@ In the `plugin-launcher` job, after the `Launcher tests` step, add:
         run: bash tests/plugin/bootstrap-binaries.test.sh
 ```
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add tests/plugin/bootstrap-binaries.test.sh plugin/hooks/bootstrap-binaries plugin/hooks/bootstrap-binaries.ps1 plugin/hooks/run-hook.cmd .gitattributes .github/workflows/ci.yml
@@ -779,7 +779,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Consumes: `plugin/hooks/run-hook.cmd bootstrap-binaries <claude|codex>` from Task 2.
 - Produces: the entry shapes Task 4's README describes.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 In `crates/mcpls-cli/tests/plugin_manifests.rs`, replace the module doc comment (lines 1-4) with:
 
@@ -884,12 +884,12 @@ fn test_every_entry_runs_mcpls_from_path() {
 }
 ```
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Run: `cargo nextest run -p mcpls test_every_entry_runs_mcpls_from_path`
 Expected: FAIL on the first assertion, because `plugin/.mcp.json` still names `${CLAUDE_PLUGIN_ROOT}/bin/mcpls`.
 
-- [ ] **Step 3: Point the registrations at mcpls**
+- [x] **Step 3: Point the registrations at mcpls**
 
 Replace `plugin/.mcp.json` with:
 
@@ -964,12 +964,12 @@ Replace `plugin/hooks/hooks-codex.json` with:
 
 `timeout` is the key both harnesses read, in seconds (Codex: `config/src/hook_config.rs`, `#[serde(rename = "timeout")]`). It must stay below the bootstrap's 10-minute stale-lock age, so a killed install's lock is stale by the time another session checks.
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `cargo nextest run -p mcpls --test plugin_manifests`
 Expected: 3 tests pass.
 
-- [ ] **Step 5: Remove the launcher**
+- [x] **Step 5: Remove the launcher**
 
 ```bash
 git rm plugin/bin/mcpls tests/plugin/launcher.test.sh
@@ -985,7 +985,7 @@ In `.github/workflows/ci.yml`:
 Run: `rg -n "plugin-launcher|launcher.test|bin/mcpls|MCPLS_BIN|MCPLS_HOME" .github .gitattributes plugin crates tests`
 Expected: no matches.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add plugin/.mcp.json plugin/.codex-plugin/plugin.json plugin/hooks/hooks.json plugin/hooks/hooks-codex.json crates/mcpls-cli/tests/plugin_manifests.rs .gitattributes .github/workflows/ci.yml
@@ -1006,7 +1006,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 **Interfaces:**
 - Consumes: the bootstrap behaviour from Task 2 and the entries from Task 3.
 
-- [ ] **Step 1: Rewrite the install section**
+- [x] **Step 1: Rewrite the install section**
 
 Replace the paragraph beginning "The plugin downloads the mcpls release" with:
 
@@ -1033,7 +1033,7 @@ set -gx PATH /path/to/mcpls/target/debug $PATH
 ```
 ````
 
-- [ ] **Step 2: Update the doctor's PATH line and the file list**
+- [x] **Step 2: Update the doctor's PATH line and the file list**
 
 Replace the `mcpls on PATH:` bullet with:
 
@@ -1053,7 +1053,7 @@ Replace the `.codex-plugin/plugin.json` bullet's first sentence with "`.codex-pl
 Run: `rg -n "launcher|MCPLS_BIN|MCPLS_HOME|bin/mcpls|MCP_TIMEOUT|downloads the mcpls" plugin/README.md`
 Expected: no matches.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add plugin/README.md
@@ -1064,7 +1064,7 @@ git commit -m "docs(plugin): describe the PATH bootstrap" -m "Co-Authored-By: Cl
 
 ### Task 5: Verify
 
-- [ ] **Step 1: Full local checks**
+- [x] **Step 1: Full local checks**
 
 Run: `devrun task verify`
 Expected: fmt-check, lint and tests pass.
