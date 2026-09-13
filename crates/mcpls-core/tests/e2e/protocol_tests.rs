@@ -569,6 +569,74 @@ fn i1_t5_successful_non_diagnostics_progress_does_not_hold_baseline() -> Result<
     Ok(())
 }
 
+/// Two sessions in one project share one backend. Sessions naming no host
+/// session keep their own records; sessions naming one share it.
+#[rstest::rstest]
+#[case::anonymous(None, true)]
+#[case::named(Some("shared-backend-session"), false)]
+#[tokio::test]
+#[ignore = "Requires mcpls binary built"]
+async fn e2e_shared_backend_keeps_records_per_session(
+    #[case] session: Option<&str>,
+    #[case] both_see_it: bool,
+) -> Result<()> {
+    let workspace = TempDir::new()?;
+    let root = dunce::canonicalize(workspace.path())?;
+    let script = diagnostics_fixture::write_diagnostics_server(&root)?;
+    let published_marker = root.join("published.marker");
+    let config_path = root.join("mcpls.toml");
+    let workspace_value = toml::Value::String(root.to_string_lossy().into_owned());
+    let args = toml_array(&[
+        script.to_string_lossy().into_owned(),
+        "shared-backend-probe".to_string(),
+        "shared-backend-hover".to_string(),
+        published_marker.to_string_lossy().into_owned(),
+    ]);
+    fs::write(
+        &config_path,
+        format!(
+            "[workspace]\nroots = [{workspace_value}]\n[backend]\nidle_shutdown_ms = 500\n[diagnostics]\nsettle_quiet_ms = 50\nsettle_deadline_ms = 5000\n\n[[lsp_servers]]\nlanguage_id = \"python\"\ncommand = \"python3\"\nargs = [{args}]\nfile_patterns = [\"**/*.py\"]\ndiagnostics_severity = \"warning\"\n\n[lsp_servers.heuristics]\nproject_markers = [\"main.py\"]\n"
+        ),
+    )?;
+    let file_path = root.join("main.py");
+    fs::write(&file_path, "def fixture():\n    return 1\n")?;
+    let config_arg = config_path
+        .to_str()
+        .context("fixture config must be UTF-8")?;
+
+    let mut first = McpClient::spawn_in_workspace(&["--config", config_arg], &root, session)?;
+    first.initialize()?;
+    wait_for_diagnostics_baseline(&mut first)?;
+    let mut second = McpClient::spawn_in_workspace(&["--config", config_arg], &root, session)?;
+    second.initialize()?;
+    wait_for_diagnostics_baseline(&mut second)?;
+
+    let hover = call_hover_when_ready(&mut first, &file_path)?;
+    assert!(hover.to_string().contains("shared-backend-hover"));
+    wait_for_marker(&published_marker)?;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let first_report = loop {
+        let report = first.call_tool("get_new_diagnostics", &json!({}))?;
+        if report.to_string().contains("shared-backend-probe") {
+            break report;
+        }
+        anyhow::ensure!(Instant::now() < deadline, "publication missing: {report}");
+        thread::sleep(Duration::from_millis(25));
+    };
+    let second_report = second.call_tool("get_new_diagnostics", &json!({}))?;
+    let first_repeat = first.call_tool("get_new_diagnostics", &json!({}))?;
+
+    assert!(first_report.to_string().contains("shared-backend-probe"));
+    assert_eq!(
+        second_report.to_string().contains("shared-backend-probe"),
+        both_see_it,
+        "{second_report}"
+    );
+    assert!(!first_repeat.to_string().contains("shared-backend-probe"));
+    Ok(())
+}
+
 /// Test the MCP initialize handshake.
 ///
 /// Validates that the server:
