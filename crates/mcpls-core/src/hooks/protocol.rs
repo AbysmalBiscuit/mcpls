@@ -110,6 +110,21 @@ pub enum Response {
         /// server that is up but has never been sent a hook apart from one
         /// that is actually wired up to a host.
         hooks_seen: u64,
+        /// This mcpls's version.
+        #[serde(default)]
+        version: String,
+        /// How long the backend has run.
+        #[serde(default)]
+        uptime_ms: u64,
+        /// The sessions attached.
+        #[serde(default)]
+        sessions: Vec<String>,
+        /// The language servers registered.
+        #[serde(default)]
+        servers: Vec<String>,
+        /// The configuration fingerprint the backend started with.
+        #[serde(default)]
+        config_fingerprint: String,
     },
     /// Reports a failure or a response deadline exceeded while work continues.
     Error {
@@ -253,7 +268,7 @@ mod tests {
 
     #[test]
     fn test_the_status_response_pins_the_wire_shape() {
-        let literal = r#"{"op":"status","hash":"abc123","socket":"mcpls.sock","pid":42,"owner":true,"root":"/work","hooks_seen":7}"#;
+        let literal = r#"{"op":"status","hash":"abc123","socket":"mcpls.sock","pid":42,"owner":true,"root":"/work","hooks_seen":7,"version":"0.3.9","uptime_ms":61000,"sessions":["s1","connection-4"],"servers":["rust"],"config_fingerprint":"00000000000000ff"}"#;
         let value = Response::Status {
             hash: "abc123".to_string(),
             socket: PathBuf::from("mcpls.sock"),
@@ -261,6 +276,11 @@ mod tests {
             owner: true,
             root: PathBuf::from("/work"),
             hooks_seen: 7,
+            version: "0.3.9".to_string(),
+            uptime_ms: 61_000,
+            sessions: vec!["s1".to_string(), "connection-4".to_string()],
+            servers: vec!["rust".to_string()],
+            config_fingerprint: "00000000000000ff".to_string(),
         };
         assert_eq!(
             serde_json::to_value(&value).expect("serialize"),
@@ -270,6 +290,20 @@ mod tests {
             serde_json::from_str::<Response>(literal).expect("deserialize"),
             value
         );
+    }
+
+    /// A status from a build that predates the backend fields still parses.
+    #[test]
+    fn test_an_older_status_parses_with_empty_backend_fields() {
+        let literal = r#"{"op":"status","hash":"a","socket":"s","pid":1,"owner":true,"root":"/w","hooks_seen":0}"#;
+        let Response::Status {
+            sessions, version, ..
+        } = serde_json::from_str::<Response>(literal).expect("deserialize")
+        else {
+            panic!("a status");
+        };
+        assert!(sessions.is_empty());
+        assert!(version.is_empty());
     }
 
     #[test]

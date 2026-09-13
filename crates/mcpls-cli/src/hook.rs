@@ -231,8 +231,20 @@ const MAX_FOREIGN_CANDIDATES: usize = 16;
 ///
 /// Socket failures are silent in hooks; this command reports their cause.
 /// `SessionStart` separately warns when its watch-path scan is incomplete.
-pub async fn doctor(project_dir: &Path, root: &Path, identity: &SocketIdentity) -> String {
-    doctor_scanning(project_dir, root, identity, &foreign_scan_prefix()).await
+pub async fn doctor(
+    project_dir: &Path,
+    root: &Path,
+    identity: &SocketIdentity,
+    local_fingerprint: Option<&str>,
+) -> String {
+    doctor_scanning(
+        project_dir,
+        root,
+        identity,
+        &foreign_scan_prefix(),
+        local_fingerprint,
+    )
+    .await
 }
 
 /// The checkout root enclosing `project_dir`, or `project_dir` itself when
@@ -254,6 +266,7 @@ async fn doctor_scanning(
     root: &Path,
     identity: &SocketIdentity,
     prefix: &str,
+    local_fingerprint: Option<&str>,
 ) -> String {
     let mut lines = vec![
         format!("socket: {}", identity.socket.display()),
@@ -268,12 +281,24 @@ async fn doctor_scanning(
             pid,
             root,
             hooks_seen,
+            version,
+            uptime_ms,
+            sessions,
+            servers,
+            config_fingerprint,
             owner: true,
             ..
         }) => {
             lines.push(format!("server sees: {} -> {hash}", root.display()));
             lines.push(format!("backend pid: {pid}"));
             lines.push(hooks_seen_line(hooks_seen));
+            lines.push(format!(
+                "backend: mcpls {version}, up {}",
+                uptime(uptime_ms)
+            ));
+            lines.push(sessions_line(&sessions));
+            lines.push(servers_line(&servers));
+            lines.push(config_line(&config_fingerprint, local_fingerprint));
         }
         // An owner deliberately explained itself; print that rather than
         // discarding it behind a timing guess.
@@ -380,6 +405,47 @@ fn hooks_seen_line(count: u64) -> String {
             .to_string()
     } else {
         format!("hooks seen: {count} request(s) since this owner started")
+    }
+}
+
+fn uptime(ms: u64) -> String {
+    let secs = ms / 1000;
+    match (secs / 3600, secs / 60 % 60, secs % 60) {
+        (0, 0, s) => format!("{s}s"),
+        (0, m, s) => format!("{m}m{s}s"),
+        (h, m, _) => format!("{h}h{m}m"),
+    }
+}
+
+fn sessions_line(sessions: &[String]) -> String {
+    if sessions.is_empty() {
+        "sessions: none attached".to_string()
+    } else {
+        format!(
+            "sessions: {} attached ({})",
+            sessions.len(),
+            sessions.join(", ")
+        )
+    }
+}
+
+fn servers_line(servers: &[String]) -> String {
+    if servers.is_empty() {
+        "language servers: none".to_string()
+    } else {
+        format!("language servers: {}", servers.join(", "))
+    }
+}
+
+/// The `config:` line: the backend's fingerprint, and whether the one this
+/// build loads for the checkout, the way a frontend would, agrees with it.
+fn config_line(backend: &str, local: Option<&str>) -> String {
+    match local {
+        None => format!("config: {backend}"),
+        Some(local) if local == backend => format!("config: {backend}, matches this build's"),
+        Some(local) => format!(
+            "config: {backend}, differs from this build's {local}; the backend's is in effect"
+        ),
     }
 }
 
@@ -1010,6 +1076,11 @@ mod tests {
                     owner: behavior.status_owner,
                     root: behavior.status_root.clone(),
                     hooks_seen: behavior.status_hooks_seen,
+                    version: "0.3.9".to_string(),
+                    uptime_ms: 61_000,
+                    sessions: vec!["s1".to_string(), "connection-4".to_string()],
+                    servers: vec!["rust".to_string()],
+                    config_fingerprint: "00000000000000ff".to_string(),
                 },
                 |message| Response::Error {
                     message: message.clone(),
@@ -1967,6 +2038,7 @@ mod tests {
             &checkout_root(project),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
+            None,
         )
         .await;
         (out, identity)
@@ -1981,6 +2053,7 @@ mod tests {
             &checkout_root(project),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
+            None,
         )
         .await;
         (out, identity)
@@ -2004,6 +2077,7 @@ mod tests {
             &checkout_root(project),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
+            None,
         )
         .await
     }
@@ -2026,6 +2100,7 @@ mod tests {
             &checkout_root(project),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
+            None,
         )
         .await
     }
@@ -2073,6 +2148,7 @@ mod tests {
             &checkout_root(project),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
+            None,
         )
         .await
     }
@@ -2102,6 +2178,7 @@ mod tests {
             &checkout_root(project),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
+            None,
         )
         .await
     }
@@ -2118,6 +2195,7 @@ mod tests {
             &checkout_root(project),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
+            None,
         )
         .await
     }
@@ -2134,6 +2212,7 @@ mod tests {
             &checkout_root(project),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
+            None,
         )
         .await
     }
@@ -2153,6 +2232,7 @@ mod tests {
             &checkout_root(project),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
+            None,
         )
         .await
     }
@@ -2168,6 +2248,7 @@ mod tests {
             &checkout_root(project),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
+            None,
         )
         .await
     }
@@ -2184,6 +2265,7 @@ mod tests {
             &checkout_root(project),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
+            None,
         )
         .await
     }
@@ -2198,6 +2280,7 @@ mod tests {
             &checkout_root(project),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
+            None,
         )
         .await
     }
@@ -2218,9 +2301,9 @@ mod tests {
         let root = mcpls_core::hooks::project_root(project.path()).expect("root");
 
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 8, "expected exactly eight lines: {out}");
+        assert_eq!(lines.len(), 12, "expected exactly twelve lines: {out}");
         assert_eq!(
-            lines[7],
+            lines[11],
             "watch scan: no eligible top-level paths; hidden entries excluded by default; ignore rules applied; host registration unverified"
         );
         assert_eq!(lines[0], format!("socket: {}", identity.socket.display()));
@@ -2235,7 +2318,37 @@ mod tests {
             lines[5],
             "hooks seen: 3 request(s) since this owner started"
         );
-        assert!(lines[6].starts_with("mcpls on PATH: "));
+        assert_eq!(lines[6], "backend: mcpls 0.3.9, up 1m1s");
+        assert_eq!(lines[7], "sessions: 2 attached (s1, connection-4)");
+        assert_eq!(lines[8], "language servers: rust");
+        assert_eq!(lines[9], "config: 00000000000000ff");
+        assert!(lines[10].starts_with("mcpls on PATH: "));
+    }
+
+    #[test]
+    fn test_backend_lines_for_an_idle_backend() {
+        assert_eq!(sessions_line(&[]), "sessions: none attached");
+        assert_eq!(servers_line(&[]), "language servers: none");
+        assert_eq!(uptime(0), "0s");
+        assert_eq!(uptime(3_725_000), "1h2m");
+    }
+
+    /// The doctor prints the backend's fingerprint beside the one this
+    /// build loads for the checkout, and says when they differ.
+    #[test]
+    fn test_the_config_line_marks_a_mismatch() {
+        assert_eq!(
+            config_line("00000000000000ff", None),
+            "config: 00000000000000ff"
+        );
+        assert_eq!(
+            config_line("00000000000000ff", Some("00000000000000ff")),
+            "config: 00000000000000ff, matches this build's"
+        );
+        assert_eq!(
+            config_line("00000000000000ff", Some("0000000000000001")),
+            "config: 00000000000000ff, differs from this build's 0000000000000001; the backend's is in effect"
+        );
     }
 
     /// A `Status` that does not claim ownership describes some other
@@ -2258,6 +2371,7 @@ mod tests {
             &checkout_root(project.path()),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
+            None,
         )
         .await;
 
@@ -2278,6 +2392,11 @@ mod tests {
                     owner: false,
                     root: other.path().to_path_buf(),
                     hooks_seen: 0,
+                    version: "0.3.9".to_string(),
+                    uptime_ms: 61_000,
+                    sessions: vec!["s1".to_string(), "connection-4".to_string()],
+                    servers: vec!["rust".to_string()],
+                    config_fingerprint: "00000000000000ff".to_string(),
                 }
             )
         );
@@ -2359,6 +2478,7 @@ mod tests {
             &checkout_root(&nested),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
+            None,
         )
         .await;
 
@@ -2391,6 +2511,7 @@ mod tests {
             &checkout_root(project.path()),
             &identity,
             &test_pipe_prefix(&never_created),
+            None,
         )
         .await;
 
@@ -2564,6 +2685,7 @@ mod tests {
             &checkout_root(&project),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
+            None,
         )
         .await;
 
@@ -2624,6 +2746,7 @@ mod tests {
             &checkout_root(&project),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
+            None,
         )
         .await;
 
@@ -2742,9 +2865,14 @@ mod tests {
         let client = ClientOptions::new().open(&identity.socket).unwrap();
         server.connect().await.unwrap();
         let prefix = test_pipe_prefix(dir.path());
-        let out =
-            super::doctor_scanning(dir.path(), &checkout_root(dir.path()), &identity, &prefix)
-                .await;
+        let out = super::doctor_scanning(
+            dir.path(),
+            &checkout_root(dir.path()),
+            &identity,
+            &prefix,
+            None,
+        )
+        .await;
         assert!(
             out.contains(
                 "server sees: a socket answered nothing within 50ms; an owner may be busy"
@@ -2757,9 +2885,14 @@ mod tests {
         drop(server);
         tokio::task::yield_now().await;
         let _owner = RecordingOwner::start_reporting_status(identity.clone(), dir.path(), 1);
-        let out =
-            super::doctor_scanning(dir.path(), &checkout_root(dir.path()), &identity, &prefix)
-                .await;
+        let out = super::doctor_scanning(
+            dir.path(),
+            &checkout_root(dir.path()),
+            &identity,
+            &prefix,
+            None,
+        )
+        .await;
         assert!(
             out.contains(&format!("backend pid: {}", std::process::id())),
             "{out}"
@@ -2938,6 +3071,7 @@ mod tests {
             &checkout_root(project.path()),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
+            None,
         )
         .await;
 
@@ -3140,6 +3274,7 @@ mod tests {
             &checkout_root(project.path()),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
+            None,
         )
         .await;
 

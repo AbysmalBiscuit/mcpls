@@ -19,5 +19,5 @@ pub use listener::{
     HookListener, ProbeOutcome, ServeExit, probe, send, send_and_acknowledge, send_many,
 };
 pub use protocol::{ChangeEvent, Request, Response};
-pub use service::{HookLocation, HookStats, build_handler};
+pub use service::{HookLocation, HookStats, StatusExtras, StatusSource, build_handler};
 pub use sweep::{SweepKind, Sweeper};

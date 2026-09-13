@@ -56,6 +56,24 @@ pub struct HookLocation {
     pub root: std::path::PathBuf,
 }
 
+/// What a status answer reports beyond the socket itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StatusExtras {
+    /// This build's version.
+    pub version: String,
+    /// How long this process has served.
+    pub uptime_ms: u64,
+    /// The MCP sessions attached.
+    pub sessions: Vec<String>,
+    /// The language servers registered.
+    pub servers: Vec<String>,
+    /// The configuration fingerprint this process started with.
+    pub config_fingerprint: String,
+}
+
+/// Computes [`StatusExtras`] at the moment a status is asked for.
+pub type StatusSource = Arc<dyn Fn() -> StatusExtras + Send + Sync>;
+
 /// The handler [`crate::hooks::listener::HookListener::serve`] runs,
 /// closing over the MCP server and the sweeper.
 ///
@@ -70,6 +88,7 @@ pub fn build_handler(
     sweeper: Arc<Sweeper>,
     location: HookLocation,
     stats: Arc<HookStats>,
+    source: StatusSource,
     cancel: watch::Receiver<bool>,
 ) -> impl Fn(Request) -> BoxFuture<'static, Response> + Send + Sync + 'static {
     move |request| {
@@ -77,6 +96,7 @@ pub fn build_handler(
         let sweeper = Arc::clone(&sweeper);
         let location = location.clone();
         let stats = Arc::clone(&stats);
+        let source = Arc::clone(&source);
         let cancelled = *cancel.borrow();
         Box::pin(async move {
             match request {
@@ -124,14 +144,22 @@ pub fn build_handler(
                     server.end_session(&SessionId::from(session)).await;
                     Response::EndSession
                 }
-                Request::Status => Response::Status {
-                    hash: location.identity.hash.clone(),
-                    socket: location.identity.socket.clone(),
-                    pid: std::process::id(),
-                    owner: true,
-                    root: location.root.clone(),
-                    hooks_seen: stats.hooks_seen(),
-                },
+                Request::Status => {
+                    let extras = source();
+                    Response::Status {
+                        hash: location.identity.hash.clone(),
+                        socket: location.identity.socket.clone(),
+                        pid: std::process::id(),
+                        owner: true,
+                        root: location.root.clone(),
+                        hooks_seen: stats.hooks_seen(),
+                        version: extras.version,
+                        uptime_ms: extras.uptime_ms,
+                        sessions: extras.sessions,
+                        servers: extras.servers,
+                        config_fingerprint: extras.config_fingerprint,
+                    }
+                }
             }
         })
     }
@@ -290,6 +318,7 @@ mod tests {
                         root: root.clone(),
                     },
                     Arc::clone(&stats),
+                    Arc::new(StatusExtras::default),
                     cancel_rx.clone(),
                 ),
                 Duration::from_millis(1500),
@@ -1111,6 +1140,7 @@ mod tests {
                 root: harness.dir.path().to_path_buf(),
             },
             Arc::new(HookStats::default()),
+            Arc::new(StatusExtras::default),
             cancel_rx,
         );
         cancel_tx.send(true).expect("cancel");

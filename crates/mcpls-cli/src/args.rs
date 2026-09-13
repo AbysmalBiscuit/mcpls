@@ -155,8 +155,9 @@ pub enum Command {
 /// What `mcpls hook` can do besides serving a hook invocation.
 #[derive(Debug, Subcommand)]
 pub enum HookAction {
-    /// Print the socket path, both directory hashes, the owner's pid and
-    /// liveness, and whether mcpls resolves on PATH
+    /// Print the socket path, both directory hashes, the backend's pid,
+    /// uptime, sessions, language servers and configuration, and whether
+    /// mcpls resolves on PATH
     Doctor,
 }
 

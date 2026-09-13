@@ -144,18 +144,24 @@ impl Endpoint {
         identity: SocketIdentity,
     ) -> Arc<Self> {
         let template = McplsServer::from_context(Arc::clone(&runtime.context));
+        let attachments = Arc::new(Attachments::default());
+        let status = {
+            let attachments = Arc::clone(&attachments);
+            runtime.status_source(move || attachments.sessions(), config.fingerprint())
+        };
         let handler = hooks::build_handler(
             Arc::new(template.clone()),
             Arc::clone(&runtime.sweeper),
             HookLocation { identity, root },
             Arc::new(HookStats::default()),
+            status,
             runtime.cancel_rx.clone(),
         );
         let handler: Arc<HookHandler> = Arc::new(handler);
         Arc::new(Self {
             template,
             handler,
-            attachments: Arc::new(Attachments::default()),
+            attachments,
             stamp: ConfigStamp::of(config),
             hooks_enabled: config.diagnostics.hooks.enabled,
             op_deadline: Duration::from_millis(config.diagnostics.hooks.op_deadline_ms),

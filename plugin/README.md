@@ -29,6 +29,10 @@ root: /home/lev/project -> 39df698ef1ac4f49
 server sees: /home/lev/project -> 39df698ef1ac4f49
 backend pid: 2816002
 hooks seen: 3 request(s) since this owner started
+backend: mcpls 0.3.9, up 1m1s
+sessions: 2 attached (s1, connection-4)
+language servers: rust
+config: 00000000000000ff
 mcpls on PATH: /home/lev/.cargo/bin/mcpls; launch not checked
 watch scan: selected 4 top-level path(s); hidden entries excluded by default; ignore rules applied; host registration unverified
 ```

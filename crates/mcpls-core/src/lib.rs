@@ -51,7 +51,7 @@ mod util;
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bridge::apply::Applier;
 use bridge::resources::make_uri;
@@ -584,6 +584,7 @@ pub(crate) struct Runtime {
     translator: Arc<Translator>,
     cancel_tx: tokio::sync::watch::Sender<bool>,
     lsp_init_handle: Option<JoinHandle<()>>,
+    started: Instant,
 }
 
 impl Runtime {
@@ -598,6 +599,7 @@ impl Runtime {
         config: &ServerConfig,
         root: Result<PathBuf, Error>,
     ) -> Result<Self, Error> {
+        let started = Instant::now();
         config.validate()?;
 
         let project_config_ignored = config.project_config_ignored;
@@ -755,6 +757,23 @@ impl Runtime {
             translator,
             cancel_tx,
             lsp_init_handle,
+            started,
+        })
+    }
+
+    pub(crate) fn status_source(
+        &self,
+        sessions: impl Fn() -> Vec<String> + Send + Sync + 'static,
+        config_fingerprint: String,
+    ) -> hooks::StatusSource {
+        let translator = Arc::clone(&self.translator);
+        let started = self.started;
+        Arc::new(move || hooks::StatusExtras {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            uptime_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            sessions: sessions(),
+            servers: translator.registered_server_ids(),
+            config_fingerprint: config_fingerprint.clone(),
         })
     }
 
@@ -872,6 +891,7 @@ async fn serve_hooks_in_process(
         Arc::clone(&runtime.sweeper),
         hooks::HookLocation { identity, root },
         Arc::new(hooks::HookStats::default()),
+        runtime.status_source(Vec::new, config.fingerprint()),
         runtime.cancel_rx.clone(),
     );
     let op_deadline = Duration::from_millis(config.diagnostics.hooks.op_deadline_ms);

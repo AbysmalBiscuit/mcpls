@@ -80,8 +80,14 @@ async fn main() {
                     .map_or_else(|| std::path::PathBuf::from("."), std::path::PathBuf::from);
                 let project_dir = dunce::canonicalize(&raw_project_dir).unwrap_or(raw_project_dir);
                 let root = hook::checkout_root(&project_dir);
+                let local_fingerprint = load_config(&args, &root)
+                    .ok()
+                    .map(|config| config.fingerprint());
                 let out = match mcpls_core::hooks::identity_for(&root) {
-                    Ok(identity) => hook::doctor(&project_dir, &root, &identity).await,
+                    Ok(identity) => {
+                        hook::doctor(&project_dir, &root, &identity, local_fingerprint.as_deref())
+                            .await
+                    }
                     Err(error) => hook::doctor_without_identity(&project_dir, &root, &error),
                 };
                 println!("{out}");

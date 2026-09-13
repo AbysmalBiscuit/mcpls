@@ -953,6 +953,17 @@ impl Translator {
         lock_std(&self.lsp_servers).len()
     }
 
+    /// The routing identities of every registered language server, sorted.
+    #[must_use]
+    pub fn registered_server_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = lock_std(&self.lsp_servers)
+            .keys()
+            .map(ToString::to_string)
+            .collect();
+        ids.sort();
+        ids
+    }
+
     /// Snapshot of currently open document paths, used for MCP resource listing.
     #[must_use]
     pub fn open_document_paths(&self) -> Vec<PathBuf> {
