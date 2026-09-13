@@ -17,6 +17,11 @@ use crate::config::DiagnosticsConfig;
 
 /// Shared context for all tool handlers.
 ///
+/// Holds the translator and subscription state. `Translator` uses interior
+/// mutability, with each field locking independently for its short section, so
+/// it is shared as a plain `Arc` with no outer lock. Concurrent tool calls can
+/// run their LSP round trips without serializing behind a single mutex.
+///
 /// The MCP peer handle for resource notifications lives in
 /// [`ResourceSubscriptions`], keyed by connection.
 pub struct BridgeContext {

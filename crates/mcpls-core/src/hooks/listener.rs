@@ -579,14 +579,15 @@ fn acknowledgement_for(requests: &[Request], responses: &[Response]) -> Option<R
 /// [`send`] and [`send_many`] collapse everything short of a clean answer
 /// into one `Err`, which is right for every hook arm that only cares
 /// whether it got an answer back. `mcpls hook doctor` needs the finer
-/// distinctions: a refused or missing socket has no owner, so looking for
-/// one running a different directory is the right next step; a socket
-/// that accepted the connection and then went quiet has an owner that is
-/// merely busy; and a socket whose exchange failed before a readable
-/// answer arrived is neither of those. Naming some other project as the
-/// cause of any but the first would be an accusation with no evidence
-/// behind it, and calling the last one "busy" would send the reader
-/// looking for load that is not there.
+/// distinctions: a `Refused` handshake means an owner answered and rejected
+/// this connection; `NoOwner` means the transport connection could not be
+/// made, so looking for one running a different directory is the right next
+/// step; `Busy` means an endpoint did not yield a complete handshake or
+/// request answer before the deadline; and `Unintelligible` means an
+/// accepted exchange failed before a usable response arrived. Naming some
+/// other project as the cause of any but `NoOwner` would be an accusation
+/// with no evidence behind it, and calling `Unintelligible` "busy" would send
+/// the reader looking for load that is not there.
 #[derive(Debug)]
 pub enum ProbeOutcome {
     /// The peer answered before the deadline with a `Response` this
@@ -595,29 +596,32 @@ pub enum ProbeOutcome {
     /// A server answered the handshake and refused this connection. The
     /// reply names its build, pid and why.
     Refused(HandshakeReply),
-    /// The connection itself could not be made: refused, or the socket
-    /// does not exist. Nobody owns this socket.
+    /// The transport connection could not be made. No handshake was
+    /// completed.
     NoOwner,
-    /// A connection was accepted, but no complete answer arrived before
-    /// the deadline. Something is there.
+    /// The endpoint did not yield a complete handshake or request answer
+    /// before the deadline. Something is there, or on Windows its only pipe
+    /// instance remained occupied.
     Busy,
-    /// A connection was accepted and the exchange then failed before a
-    /// readable answer arrived: the write failed, the read failed, the
-    /// peer hung up without answering, or what came back could not be
-    /// turned into a `Response`. Something holds the socket; the `Error`
-    /// carries which of the four happened. A wire shape this build does
-    /// not recognize lands in the last of them, and this protocol has
-    /// gained a required field more than once in this codebase's own
-    /// history, but the other three have nothing to do with versions.
+    /// A connection was accepted and the handshake or request exchange then
+    /// failed before a usable reply arrived: the write failed, the read
+    /// failed, the peer hung up without answering, or what came back could not
+    /// be parsed. Something holds the socket; the `Error` carries which of
+    /// the four happened. A wire shape this build does not recognize lands in
+    /// the last of them, and this protocol has gained a required field more
+    /// than once in this codebase's own history, but the other three have
+    /// nothing to do with versions.
     Unintelligible(Error),
 }
 
 /// Probe `identity`'s socket with one `request`.
 ///
-/// Distinguishes a refused or missing socket ([`ProbeOutcome::NoOwner`]),
-/// one that accepted the connection but did not answer within `timeout`
-/// ([`ProbeOutcome::Busy`]), and one whose exchange failed before a
-/// readable answer arrived ([`ProbeOutcome::Unintelligible`]).
+/// Distinguishes a handshake refusal ([`ProbeOutcome::Refused`]) from
+/// transport-level outcomes: no connection can be made
+/// ([`ProbeOutcome::NoOwner`]), the endpoint yields no complete handshake or
+/// request answer before `timeout` ([`ProbeOutcome::Busy`]), or an accepted
+/// connection exchange fails before a usable response
+/// ([`ProbeOutcome::Unintelligible`]).
 pub async fn probe(
     identity: &SocketIdentity,
     request: &Request,
