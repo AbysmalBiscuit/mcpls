@@ -266,11 +266,9 @@ fn user_component(raw: Option<std::ffi::OsString>) -> Option<String> {
 /// `XDG_RUNTIME_DIR` would be the better directory, being a tmpfs the user
 /// owns and cleaned when the session ends, and it cannot be used. Codex
 /// launches a stdio MCP server with a cleared environment and a fixed list
-/// that omits it, while its hook commands inherit the whole environment
-/// (`codex-rs/rmcp-client/src/utils.rs:122-134`;
-/// `codex-rs/hooks/src/engine/command_runner.rs:191`), so a server and a
-/// hook of one project would look for the socket in two different places on
-/// any host that sets it.
+/// that omits it, while its hook commands inherit the whole environment, so
+/// a server and a hook of one project would look for the socket in two
+/// different places on any host that sets it.
 #[cfg(not(windows))]
 fn runtime_dir() -> PathBuf {
     shared_temp_runtime_dir(current_user())
