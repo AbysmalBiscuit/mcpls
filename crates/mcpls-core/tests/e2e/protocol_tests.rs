@@ -634,6 +634,15 @@ async fn e2e_shared_backend_keeps_records_per_session(
         "{second_report}"
     );
     assert!(!first_repeat.to_string().contains("shared-backend-probe"));
+    let backend_pid = McpClient::backend_pid(&root)?.context("shared backend did not start")?;
+    drop(second);
+    drop(first);
+    McpClient::wait_for_backend_exit(&root)?;
+    assert_eq!(
+        McpClient::backend_pid(&root)?,
+        None,
+        "backend {backend_pid} remained"
+    );
     Ok(())
 }
 

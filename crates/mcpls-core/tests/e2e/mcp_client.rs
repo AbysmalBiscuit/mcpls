@@ -217,6 +217,7 @@ impl McpClient {
     ) -> Result<Self> {
         let mut command = Command::new(binary_under_test()?);
         command.args(args).current_dir(workspace);
+        command.env_remove("MCPLS_NO_BACKEND");
         match session {
             Some(session) => command.env("CLAUDE_CODE_SESSION_ID", session),
             None => command.env_remove("CLAUDE_CODE_SESSION_ID"),
@@ -597,6 +598,36 @@ impl McpClient {
     #[allow(dead_code)]
     pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         self.process.try_wait()
+    }
+
+    /// Query the backend selected for a workspace through hook doctor.
+    #[allow(dead_code)]
+    pub(crate) fn backend_pid(workspace: &Path) -> Result<Option<u32>> {
+        let output = Command::new(binary_under_test()?)
+            .args(["hook", "doctor"])
+            .current_dir(workspace)
+            .env_remove("MCPLS_NO_BACKEND")
+            .output()
+            .context("failed to query backend status")?;
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find_map(|line| line.strip_prefix("backend pid: "))
+            .and_then(|pid| pid.parse().ok()))
+    }
+
+    /// Wait until hook doctor reports no backend for a workspace.
+    #[allow(dead_code)]
+    pub(crate) fn wait_for_backend_exit(workspace: &Path) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if Self::backend_pid(workspace)?.is_none() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!("backend did not exit for {}", workspace.display());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 }
 

@@ -54,7 +54,7 @@ impl Project {
         .unwrap();
     }
 
-    fn command(&self, cwd: &Path) -> Command {
+    fn command_with_identity(cwd: &Path, runtime: &Path, user: &str) -> Command {
         let mut command = Command::cargo_bin("mcpls").unwrap();
         command
             .env_remove("MCPLS_LOG")
@@ -64,11 +64,15 @@ impl Project {
             .env_remove("MCPLS_NO_BACKEND")
             .env_remove("XDG_RUNTIME_DIR")
             .env_remove("CLAUDE_CODE_SESSION_ID")
-            .env("TMPDIR", self.runtime.path())
-            .env("USER", &self.user)
-            .env("USERNAME", &self.user)
+            .env("TMPDIR", runtime)
+            .env("USER", user)
+            .env("USERNAME", user)
             .current_dir(cwd);
         command
+    }
+
+    fn command(&self, cwd: &Path) -> Command {
+        Self::command_with_identity(cwd, self.runtime.path(), &self.user)
     }
 
     fn frontend(&self) -> Frontend {
@@ -115,9 +119,12 @@ impl Project {
 
     /// `mcpls hook doctor`'s report for this project.
     fn doctor(&self) -> String {
-        let output = self
-            .command(&self.root())
-            .env("CLAUDE_PROJECT_DIR", self.root())
+        Self::doctor_for(&self.root(), self.runtime.path(), &self.user)
+    }
+
+    fn doctor_for(root: &Path, runtime: &Path, user: &str) -> String {
+        let output = Self::command_with_identity(root, runtime, user)
+            .env("CLAUDE_PROJECT_DIR", root)
             .args(["hook", "doctor"])
             .output()
             .unwrap();
@@ -126,10 +133,26 @@ impl Project {
 
     /// The backend's pid, or `None` when nothing answers.
     fn backend_pid(&self) -> Option<u32> {
-        self.doctor()
+        Self::backend_pid_for(&self.root(), self.runtime.path(), &self.user)
+    }
+
+    fn backend_pid_for(root: &Path, runtime: &Path, user: &str) -> Option<u32> {
+        Self::doctor_for(root, runtime, user)
             .lines()
             .find_map(|line| line.strip_prefix("backend pid: "))
             .and_then(|pid| pid.parse().ok())
+    }
+
+    fn wait_for_backend_exit(root: &Path, runtime: &Path, user: &str, what: &str) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Self::backend_pid_for(root, runtime, user).is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {what}: {}",
+                Self::doctor_for(root, runtime, user)
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 
     fn wait_for(&self, what: &str, mut ready: impl FnMut(&Self) -> bool) {
@@ -267,8 +290,38 @@ fn alive(pid: u32) -> bool {
 }
 
 #[cfg(unix)]
+struct KillOnDrop(u32);
+
+#[cfg(unix)]
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if alive(self.0) {
+            let _ = Command::new("kill")
+                .args(["-TERM", &self.0.to_string()])
+                .status();
+        }
+    }
+}
+
+#[cfg(unix)]
 fn line_count(path: &Path) -> usize {
     std::fs::read_to_string(path).map_or(0, |text| text.lines().count())
+}
+
+#[cfg(unix)]
+fn last_pid(path: &Path) -> u32 {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .last()
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+fn assert_tool_success(call: &Value) {
+    assert!(call["result"].is_object(), "{call}");
+    assert_ne!(call["result"]["isError"], true, "{call}");
 }
 
 /// The reason a failed call carries: a tool result's text, or a JSON-RPC
@@ -342,7 +395,7 @@ fn two_sessions_share_one_backend_and_one_server() {
     std::fs::create_dir_all(&nested).unwrap();
     let started = Instant::now();
     let mut second = project.frontend_in(&nested, &[]);
-    assert!(second.call_tool()["result"].is_object());
+    assert_tool_success(&second.call_tool());
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "the second session waited on a start"
@@ -359,7 +412,7 @@ fn two_sessions_share_one_backend_and_one_server() {
     project.holds_for("one language server", Duration::from_millis(500), |p| {
         line_count(&p.spawns()) == 1
     });
-    assert!(first.call_tool()["result"].is_object());
+    assert_tool_success(&first.call_tool());
 
     first.close(Duration::from_secs(5));
     second.close(Duration::from_secs(5));
@@ -391,17 +444,29 @@ fn two_worktrees_get_a_backend_each() {
             .arg(two.config());
         command
     });
-    assert!(a.call_tool()["result"].is_object());
-    assert!(b.call_tool()["result"].is_object());
+    assert_tool_success(&a.call_tool());
+    assert_tool_success(&b.call_tool());
+    let first_pid = one.backend_pid().expect("the first backend");
+    let second_pid = Project::backend_pid_for(&two.root(), one.runtime.path(), &one.user)
+        .expect("the second backend");
+    assert_ne!(first_pid, second_pid);
     assert!(
         one.doctor().contains("sessions: 1 attached"),
         "{}",
         one.doctor()
     );
 
-    a.close(Duration::from_secs(5));
-    b.close(Duration::from_secs(5));
-    one.wait_for("both backends to exit", |p| p.backend_pid().is_none());
+    assert!(a.close(Duration::from_secs(5)));
+    assert!(b.close(Duration::from_secs(5)));
+    one.wait_for("the first backend to exit", |p| p.backend_pid().is_none());
+    Project::wait_for_backend_exit(
+        &two.root(),
+        one.runtime.path(),
+        &one.user,
+        "the second backend to exit",
+    );
+    assert!(!alive(first_pid));
+    assert!(!alive(second_pid));
 }
 
 /// Frontends racing from nothing start one backend, and none of them sees
@@ -421,8 +486,7 @@ fn racing_frontends_start_one_backend() {
         .map(|thread| thread.join().unwrap())
         .collect();
     for frontend in &mut frontends {
-        let call = frontend.call_tool();
-        assert_ne!(call["result"]["isError"], true, "{call}");
+        assert_tool_success(&frontend.call_tool());
     }
     assert!(
         project.doctor().contains("sessions: 4 attached"),
@@ -443,12 +507,14 @@ fn a_killed_backend_is_reported_not_replaced() {
     let project = Project::new(500).with_counting_server(500);
     let mut frontend = project.frontend();
     project.wait_for("the server to start", |p| line_count(&p.spawns()) == 1);
+    let _server_cleanup = KillOnDrop(last_pid(&project.spawns()));
     let pid = project.backend_pid().unwrap();
 
-    Command::new("kill")
+    let status = Command::new("kill")
         .args(["-9", &pid.to_string()])
         .status()
         .unwrap();
+    assert!(status.success(), "failed to kill backend {pid}");
     project.wait_for("the killed backend to be gone", |_| !alive(pid));
     let call = frontend.call_tool();
     assert!(failure_text(&call).contains("stopped"), "{call}");
@@ -480,7 +546,7 @@ fn a_deleted_socket_does_not_stop_attached_sessions() {
             std::fs::remove_file(path).unwrap();
         }
     }
-    assert_ne!(frontend.call_tool()["result"]["isError"], true);
+    assert_tool_success(&frontend.call_tool());
     frontend.close(Duration::from_secs(5));
     project.wait_for("the backend to exit on its idle timer", |_| !alive(pid));
 }
@@ -490,7 +556,7 @@ fn a_deleted_socket_does_not_stop_attached_sessions() {
 #[cfg(unix)]
 #[test]
 fn a_group_signal_to_the_frontend_spares_the_backend() {
-    use std::os::unix::process::CommandExt as _;
+    use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 
     // Long enough that the backend's idle exit cannot pass for the signal.
     let project = Project::new(2_000);
@@ -503,16 +569,23 @@ fn a_group_signal_to_the_frontend_spares_the_backend() {
     let pid = project.backend_pid().unwrap();
     let group = frontend.child.id();
 
-    Command::new("kill")
-        .args(["-TERM", &format!("-{group}")])
+    let status = Command::new("kill")
+        .args(["-TERM", "--", &format!("-{group}")])
         .status()
         .unwrap();
-    project.wait_for("the frontend to die of the group signal", |_| {
-        frontend
-            .child
-            .try_wait()
-            .is_ok_and(|status| status.is_some())
-    });
+    assert!(status.success(), "failed to signal frontend group {group}");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let frontend_status = loop {
+        if let Some(status) = frontend.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the frontend to die of the group signal"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(frontend_status.signal(), Some(15));
     assert!(alive(pid), "the backend died with the frontend's group");
     drop(frontend);
     project.wait_for("the backend to exit", |p| p.backend_pid().is_none());
@@ -533,7 +606,7 @@ fn a_trust_disagreement_is_refused_with_both_states() {
         command.arg("--trust-project-config");
         command
     });
-    assert_ne!(trusting.call_tool()["result"]["isError"], true);
+    assert_tool_success(&trusting.call_tool());
 
     let mut untrusting = Frontend::spawn_uninitialized(project.command(&project.root()));
     let init = untrusting.initialize();
@@ -576,7 +649,7 @@ fn a_hook_starts_the_backend_a_frontend_asked_for() {
         .unwrap();
     assert!(status.success());
     project.wait_for("the hook-started backend", |p| p.backend_pid().is_some());
-    assert_ne!(frontend.call_tool()["result"]["isError"], true);
+    assert_tool_success(&frontend.call_tool());
     frontend.close(Duration::from_secs(5));
     project.wait_for("the backend to exit", |p| p.backend_pid().is_none());
 }
