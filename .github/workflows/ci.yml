@@ -316,8 +316,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
       - name: Shellcheck install script
         run: shellcheck --shell=sh scripts/install.sh
-      - name: Shellcheck plugin launcher
-        run: shellcheck plugin/bin/mcpls tests/plugin/launcher.test.sh
+      - name: Shellcheck plugin scripts
+        run: shellcheck plugin/bin/mcpls tests/plugin/launcher.test.sh plugin/hooks/bootstrap-binaries tests/plugin/bootstrap-binaries.test.sh
 
   dist-check:
     name: Release workflow matches dist config
@@ -352,6 +352,9 @@ jobs:
       - name: Launcher tests
         shell: bash
         run: bash tests/plugin/launcher.test.sh
+      - name: Bootstrap tests
+        shell: bash
+        run: bash tests/plugin/bootstrap-binaries.test.sh
 
   security:
     name: Security Audit

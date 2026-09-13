@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# SessionStart hook: ensure the mcpls this plugin drives is on PATH and matches
+# the plugin's version, installing it from the matching GitHub release.
+#
+# Usage: bootstrap-binaries <claude|codex>
+#
+# The MCP server and every other hook run `mcpls` from PATH, and a plugin
+# install cannot place it there, so this runs at session start instead.
+#
+# Every path exits 0: a session must start even with no network. Both
+# harnesses read a SessionStart hook's stdout, so installer output goes to
+# stderr and stdout carries at most one context object telling the agent
+# when the binary does not match the plugin.
+
+set -uo pipefail
+
+[ "${MCPLS_NO_BOOTSTRAP:-}" = "1" ] && exit 0
+
+REPO_URL="https://github.com/AbysmalBiscuit/mcpls"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+MANIFEST="${PLUGIN_ROOT}/.claude-plugin/plugin.json"
+
+# Installs are serialised per harness, so the lock is named after it.
+case "${1:-}" in
+    claude | codex) harness="$1" ;;
+    *) harness=unknown ;;
+esac
+
+warn() { printf 'mcpls plugin: %s\n' "$1" >&2; }
+
+# Ends the hook, handing the agent a note when there is one.
+finish() {
+    if [ -n "${1:-}" ]; then
+        local note="${1//\\/\\\\}"
+        note="${note//\"/\\\"}"
+        printf '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"mcpls plugin: %s"}}\n' "$note"
+    fi
+    exit 0
+}
+
+version=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$MANIFEST" 2>/dev/null | head -n 1)
+if [ -z "$version" ]; then
+    warn "could not read a version from ${MANIFEST}; skipping the mcpls install"
+    exit 0
+fi
+
+release="${REPO_URL}/releases/tag/v${version}"
+state_dir="${XDG_STATE_HOME:-${HOME}/.local/state}/mcpls"
+stamp="${state_dir}/bootstrap-version"
+failed="${state_dir}/bootstrap-failed"
+lock="${state_dir}/install-${harness}.lock"
+
+installed="mcpls is not on PATH"
+if command -v mcpls >/dev/null 2>&1; then
+    recorded=$(cat "$stamp" 2>/dev/null || true)
+    [ "$recorded" = "$version" ] && exit 0
+    current=$(mcpls --version 2>/dev/null | sed -n 's/^mcpls \([^[:space:]]*\).*/\1/p' | head -n 1)
+    installed="the mcpls on PATH is ${current:-an unknown version}"
+    # An mcpls this hook did not install (cargo, a package manager, a source
+    # build). Record that and never overwrite it.
+    if [ -z "$recorded" ] || [ "$recorded" = external ]; then
+        mkdir -p "$state_dir" 2>/dev/null && printf 'external\n' >"$stamp" 2>/dev/null
+        [ "$current" = "$version" ] && exit 0
+        finish "${installed} but this plugin expects ${version}. The plugin did not install it and will not replace it. Tell the user to update mcpls with the installer from ${release}, or update the plugin, then restart the session."
+    fi
+    action="updating mcpls from ${current:-an unknown version} to ${version}"
+else
+    action="installing mcpls ${version}"
+fi
+
+if [ "$(cat "$failed" 2>/dev/null || true)" = "$version" ]; then
+    warn "install of ${version} failed previously; remove ${failed} to retry"
+    finish "installing mcpls ${version} failed in an earlier session, and ${installed}. Tell the user to run the installer from ${release}, or delete ${failed} and restart the session to retry."
+fi
+
+mkdir -p "$state_dir" 2>/dev/null
+# A lock older than the hook's timeout belongs to a session the harness killed.
+if [ -n "$(find "$lock" -maxdepth 0 -mmin +10 2>/dev/null)" ]; then
+    rmdir "$lock" 2>/dev/null
+fi
+if mkdir "$lock" 2>/dev/null; then
+    trap 'rmdir "$lock" 2>/dev/null' EXIT
+elif [ -d "$lock" ]; then
+    finish "another ${harness} session is installing mcpls ${version}, and ${installed}. Tell the user to restart the session once that install finishes."
+else
+    warn "could not create ${lock}; installing without a lock"
+fi
+
+warn "$action"
+
+case "$(uname -s 2>/dev/null || echo unknown)" in
+    MINGW* | MSYS* | CYGWIN*)
+        installer="${REPO_URL}/releases/download/v${version}/mcpls-installer.ps1"
+        powershell.exe -NoProfile -ExecutionPolicy Bypass \
+            -Command "irm ${installer} | iex" >&2
+        ;;
+    *)
+        installer="${REPO_URL}/releases/download/v${version}/mcpls-installer.sh"
+        curl --proto '=https' --tlsv1.2 -LsSf \
+            --connect-timeout 10 --max-time 300 "$installer" | sh >&2
+        ;;
+esac
+status=$?
+
+if [ "$status" -ne 0 ]; then
+    printf '%s\n' "$version" >"$failed" 2>/dev/null
+    warn "installer exited ${status}"
+    finish "installing mcpls ${version} failed, and ${installed}. Tell the user to run the installer from ${release}, or delete ${failed} and restart the session to retry."
+fi
+
+printf '%s\n' "$version" >"$stamp" 2>/dev/null
+rm -f "$failed" 2>/dev/null
+finish "mcpls ${version} was just installed, but this session started without it, so the MCP server and hooks are not using it yet. Tell the user to restart the session."
