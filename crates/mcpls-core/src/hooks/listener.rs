@@ -79,30 +79,17 @@ pub struct HookListener {
 
 /// Create `dir` if it is missing and make it owner-only.
 ///
-/// Reject symlinks and change permissions through a verified directory
-/// handle so a path replacement cannot redirect the permission change.
+/// The mode changes through a no-follow directory handle, so a symlink or
+/// FIFO planted at `dir` fails the open instead of redirecting the change.
 #[cfg(not(windows))]
 fn ensure_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(dir)?;
-    let metadata = std::fs::symlink_metadata(dir)?;
-    if !metadata.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "runtime directory must be a directory, not a symlink or file",
-        ));
-    }
-
-    let directory = open_private_dir(dir)?;
-    let opened = directory.metadata()?;
-    if (metadata.dev(), metadata.ino()) != (opened.dev(), opened.ino()) {
-        return Err(io::Error::other("runtime directory changed while opening"));
-    }
-    directory.set_permissions(std::fs::Permissions::from_mode(0o700))
+    open_private_dir(dir)?.set_permissions(std::fs::Permissions::from_mode(0o700))
 }
 
 #[cfg(not(windows))]
