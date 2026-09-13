@@ -1,0 +1,12 @@
+{
+  "name": "mcpls",
+  "owner": { "name": "Lev Velykoivanenko" },
+  "plugins": [
+    {
+      "name": "mcpls",
+      "source": "./plugin",
+      "description": "Language server intelligence and push diagnostics through mcpls",
+      "version": "0.3.9"
+    }
+  ]
+}

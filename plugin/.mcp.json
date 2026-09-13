@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "mcpls": {
-      "command": "mcpls",
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/mcpls",
       "args": []
     }
   }

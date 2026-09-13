@@ -36,6 +36,9 @@ jobs:
               - 'crates/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
+              - 'plugin/**'
+              - '.claude-plugin/**'
+              - '.agents/**'
             workflows:
               - '.github/workflows/**'
               - '.cargo/**'
