@@ -91,6 +91,10 @@ The Agent Plugins MCP schema expands `${PLUGIN_ROOT}` and `${PLUGIN_DATA}`, whic
 
 The legacy `.codex-plugin/plugin.json` format, which is also the format that loads hooks today, passes no `cwd` at all. The stdio launcher then falls back to Codex's own process working directory (`LocalStdioServerLauncher::new(runtime_context.local_process_cwd())` in `codex-mcp/src/rmcp_client.rs`), which is the project. That is the format to use, and the constraint is worth writing down because it reads like a step backwards: the legacy format is correct here precisely because it declines to set a working directory.
 
+Which format a plugin gets is not a field it declares. `find_plugin_manifest_path` in `utils/plugins/src/plugin_namespace.rs` looks for `plugin.json` at the plugin root and treats the plugin as Agent Plugins format only if that file exists and carries an `$schema` under `https://agent-plugins.org/schemas/`. Anything else falls through to `.codex-plugin/plugin.json`, `.claude-plugin/plugin.json` or `.cursor-plugin/plugin.json`, and is loaded as legacy. The cwd-constrained parse runs behind a `manifest_format == AgentPlugin` check in `core-plugins/src/loader.rs`, so it is skipped entirely.
+
+The practical rule this hands the implementer is a negative one: do not put a `plugin.json` at `plugin/`'s root. A schema-bearing one there silently switches the format, and the symptom is an mcpls indexing the plugin cache directory.
+
 What the legacy format costs is placeholder expansion. `${PLUGIN_ROOT}` in a legacy `.mcp.json` stays a literal string. The launcher has to be located some other way, and the plugin's own unpacked location under `$CODEX_HOME/plugins/cache/<marketplace>/<plugin>/<version>/` is derivable from environment Codex does export. The entry becomes a `sh -c` that computes the path and execs the launcher, with the same expression in `commandWindows` form for PowerShell. This is the ugliest part of the design and the first thing to delete if a future Codex release expands placeholders in the legacy path or relaxes the `cwd` rule in the new one.
 
 ## Hooks
@@ -167,3 +171,16 @@ Does Claude Code's marketplace `source` accept `./plugin`, or does the marketpla
 Should the launcher verify the downloaded archive's checksum against the published `.sha256` asset? It is a few lines and the assets already exist, but it is also downloading the checksum from the same host over the same TLS connection, so it catches truncation rather than tampering.
 
 Is a lock around the download worth it, or is the wasted bandwidth from a simultaneous cold start of several sessions acceptable, given it happens once per version?
+
+## Sources
+
+Codex publishes no prose documentation for its plugin manifests; the manifest and marketplace schemas are described in a reference file shipped inside its own plugin-creator skill, and everything else here was read from the source. Links are pinned to the tag these claims were checked against. To re-resolve against whatever version this workspace tracks now, run `docm info codex-cli` for the ref and read the same paths under its checkout.
+
+- [Plugin and marketplace JSON spec](https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/skills/src/assets/samples/plugin-creator/references/plugin-json-spec.md), the closest thing to a manifest reference, including the field guide and the validator's rules.
+- [Installing and updating](https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/skills/src/assets/samples/plugin-creator/references/installing-and-updating.md), the companion file covering install paths and the cache.
+- [`plugin_namespace.rs`](https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/utils/plugins/src/plugin_namespace.rs), where `find_plugin_manifest_path` decides which manifest file wins and therefore which format applies.
+- [`core-plugins/src/loader.rs`](https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/core-plugins/src/loader.rs), which loads a manifest's MCP servers and gates the Agent Plugins parse on the format.
+- [`codex-mcp/src/agent_plugin_config.rs`](https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/codex-mcp/src/agent_plugin_config.rs), the Agent Plugins MCP schema: placeholder expansion and the `cwd` containment rule.
+- [`codex-mcp/src/rmcp_client.rs`](https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/codex-mcp/src/rmcp_client.rs), where an stdio server with no declared `cwd` inherits Codex's own.
+- [`hooks/src/schema.rs`](https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/hooks/src/schema.rs), the hook event names and the payload fields each one carries.
+- [Agent Plugins v1 schema](https://github.com/agentplugins/agent-plugins-spec/blob/main/schemas/1.0.0/plugin.schema.json), the cross-vendor spec whose `$schema` URI is what switches a plugin into the newer format.
