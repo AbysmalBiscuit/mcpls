@@ -149,7 +149,7 @@ impl Translator {
         }
     }
 
-    /// Resolve the diagnostics server for `path` without requiring a client.
+    /// Resolve the effective diagnostics server for `path` without requiring a client.
     #[must_use]
     pub(crate) fn server_for_path(&self, path: &Path) -> Option<ServerId> {
         let language = detect_language(path, &self.extension_map);
@@ -158,10 +158,26 @@ impl Translator {
             candidates.push(base);
         }
 
-        let router = lock_std(&self.router);
-        candidates
-            .iter()
-            .find_map(|lang| router.resolve(lang, ToolKind::Diagnostics).cloned())
+        for lang in candidates {
+            let id = {
+                lock_std(&self.router)
+                    .resolve(lang, ToolKind::Diagnostics)
+                    .cloned()
+            };
+            let Some(id) = id else { continue };
+
+            if self.lifecycle_of(&id) == Some(ServerLifecycle::NotInstalled) {
+                let catch_all = { lock_std(&self.router).catch_all_for_language(lang).cloned() };
+                if let Some(catch_all) = catch_all
+                    && catch_all != id
+                    && self.lifecycle_of(&catch_all) != Some(ServerLifecycle::NotInstalled)
+                {
+                    return Some(catch_all);
+                }
+            }
+            return Some(id);
+        }
+        None
     }
 
     /// Validate `file_path`, then resolve its routed client via
@@ -422,6 +438,27 @@ mod tests {
 
         assert_eq!(id, catch_all_id);
         assert!(client.is_some());
+    }
+
+    #[test]
+    fn test_server_for_path_falls_back_when_diagnostics_server_is_not_installed() {
+        let mut narrow = LspServerConfig::rust_analyzer();
+        narrow.name = Some("rust-diagnostics".to_string());
+        narrow.handles = Some(vec![ToolKind::Diagnostics]);
+        let catch_all = LspServerConfig::rust_analyzer();
+        let router = ToolRouter::from_configs([&narrow, &catch_all])
+            .expect("distinct rust routes are valid");
+        let translator = translator_with_rust_route(router);
+        let narrow_id = ServerId::from("rust-diagnostics");
+        let catch_all_id = ServerId::from("rust");
+        translator.set_lifecycle(&narrow_id, ServerLifecycle::NotInstalled);
+        translator.set_lifecycle(&catch_all_id, ServerLifecycle::Idle);
+
+        assert_eq!(
+            translator.server_for_path(Path::new("/work/src/main.rs")),
+            Some(catch_all_id),
+            "the edit trigger must target the route document opening will use"
+        );
     }
 
     #[tokio::test]
