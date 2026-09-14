@@ -128,11 +128,6 @@ description = "Build workspace API documentation"
 run = ["cargo", "doc", "--workspace", "--no-deps", "--all-features", "--locked"]
 guard = true
 
-[tasks.hooks]
-description = "Point git at the repository's hook directory"
-run = ["git", "config", "core.hooksPath", ".githooks"]
-guard = true
-
 [tasks.clean]
 description = "Remove Cargo build artifacts"
 run = ["cargo", "clean"]
@@ -147,27 +142,106 @@ steps = [
     { task = "test-doc" },
 ]
 
+
+# refused by the rule above so the trailers cannot be forgotten.
+[tasks.commit]
+description = "Commit staged changes with a Conventional Commits message and agent co-author trailers"
+guard = false
+run = ["git", "commit", "-m", '''
+{{- commit_subject | trim }}
+{%- if commit_body | trim %}
+
+{{ commit_body | trim }}
+{%- endif %}
+{%- if coauthors | trim(" ;") %}
+{% for c in coauthors | split(";") | map("trim") | reject("eq", "") %}
+Co-authored-by: {{ c }}
+{%- endfor %}
+{%- endif %}
+''']
+
+# Same message, rewriting the last commit instead of adding one. Separate task
+# because a task's argv is fixed: an empty `--amend` slot would reach git as an
+# empty argument rather than disappearing.
+[tasks.commit-amend]
+description = "Rewrite the last commit with a fresh message and agent co-author trailers"
+guard = false
+run = ["git", "commit", "--amend", "-m", '''
+{{- commit_subject | trim }}
+{%- if commit_body | trim %}
+
+{{ commit_body | trim }}
+{%- endif %}
+{%- if coauthors | trim(" ;") %}
+{% for c in coauthors | split(";") | map("trim") | reject("eq", "") %}
+Co-authored-by: {{ c }}
+{%- endfor %}
+{%- endif %}
+''']
+
 [templates]
-pr_body = '''## TL;DR (human written)
-{% if issue is defined and issue and (issue_magic_word ~ " #" ~ issue) not in input %}
+pr_body = '''
+{%- set own = (issue_magic_word ~ " " ~ ("#" if issue and issue[0] in "0123456789" else "") ~ issue) if issue else "" -%}
+{%- set ref_lines = ((own ~ ";" ~ refs) if own else refs) | split(";") | map("trim") | reject("eq", "") | list -%}
+{%- set agent = agent_model or agent_harness -%}
+## TL;DR (human written)
+{{ human_tldr }}
+{%- if ref_lines %}
+
 ---
 
-{{ issue_magic_word }} #{{ issue }}
-{%- for extra in also_closes | replace(",", " ") | split %}
-{{ issue_magic_word }} #{{ extra | trim("#") }}
-{%- endfor %}
-{% endif %}
-{{ input }}
-{%- if agent_model or agent_harness %}
+{{ ref_lines | join("\n") }}
+{%- endif %}
+{%- if agent %}
+
+---
+
+## Agent summary (the rest is not human-written)
+{%- endif %}
+
+{{ input | trim }}
+{%- if agent %}
+
+---
+{%- if implemented_by | trim %}
+
+Implemented by {{ implemented_by | trim }}
+{%- endif %}
 
 🤖 Generated with {{ agent_model }}{% if agent_model and agent_harness %} via {% endif %}{{ agent_harness }}
-{%- endif %}'''
+{%- endif %}
+'''
 
 # Declared so the template above renders (an undefined name is a hard error)
 # and so `issue pr create --arg` accepts them: --arg is checked against this
 # table, not against the template.
 [templates.variables]
+
+# Subject line, body and `Co-Authored-By:` trailers of a `devrun task commit`
+# message. `coauthors` is `;`-separated, each entry a full `Name <email>`.
+commit_subject = ""
+commit_body = ""
+coauthors = ""
+
+# Filled by a human after the PR is open; agents leave it empty.
+human_tldr = ""
+
+# The worktree's own issue, supplied by the render context in a worktree that
+# `issue setup` created. Declared here so the template also renders outside one.
+issue = ""
+
+# Magic word for the worktree's own issue. `Closes` on a branch that finishes
+# it, `Refs` on one that does not.
 issue_magic_word = "Closes"
-also_closes = ""
+
+# Every other issue line, verbatim and `;`-separated, so one PR can mix
+# trackers and magic words:
+#   --arg refs='Closes ENG-1234; Closes #90; Refs #3'
+refs = ""
+
+# Attribution for the agent summary. `agent_harness` carries the markdown link
+# a harness wants in its credit line; `implemented_by` is the free-prose
+# sentence naming who did which part of the work.
 agent_model = ""
 agent_harness = ""
+implemented_by = ""
