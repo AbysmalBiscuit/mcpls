@@ -118,6 +118,30 @@ impl ServerSettle {
         state.owners_installed = true;
     }
 
+    /// Adds startup owners without dropping registrations made during initialization.
+    pub(crate) fn add_diagnostics_owners(&self, owners: impl IntoIterator<Item = ServerId>) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let owners: HashSet<_> = owners.into_iter().collect();
+        let mut all_owners = state.diagnostics_owners.clone();
+        all_owners.extend(owners);
+        state
+            .pending_owners
+            .retain(|owner| all_owners.contains(owner));
+        let replacement_owners = all_owners
+            .iter()
+            .filter(|owner| state.replacement_pending.contains(*owner))
+            .cloned()
+            .collect::<Vec<_>>();
+        state.pending_owners.extend(replacement_owners);
+        state.diagnostics_owners = all_owners
+            .into_iter()
+            .filter(|owner| !state.retired_servers.contains(owner))
+            .collect();
+        state.owners_installed = true;
+    }
+
     /// Re-install a diagnostics owner after a server replacement completed.
     pub(crate) fn register_diagnostics_owner(&self, server: &ServerId) {
         let Ok(mut state) = self.state.lock() else {
@@ -127,10 +151,20 @@ impl ServerSettle {
         state.pending_owners.remove(server);
         state.replacement_pending.remove(server);
         state.diagnostics_owners.insert(server.clone());
+        state.owners_installed = true;
         let progress = state.server_progress.entry(server.clone()).or_default();
         if progress.outstanding.is_empty() && progress.quiet_since.is_none() {
             progress.quiet_since = Some(Instant::now());
         }
+    }
+
+    /// Number of diagnostics owners currently participating in settle.
+    #[must_use]
+    pub fn diagnostics_owner_count(&self) -> usize {
+        let Ok(state) = self.state.lock() else {
+            return 0;
+        };
+        state.diagnostics_owners.len()
     }
 
     /// Keep a retiring diagnostics owner in the startup wait until its replacement is installed.
@@ -736,6 +770,67 @@ mod tests {
         settle.restart_deadline();
 
         assert!(settle.should_settle_at(Instant::now()));
+    }
+
+    #[test]
+    fn test_the_first_lazy_owner_installs_the_per_owner_decision() {
+        let settle = ServerSettle::new(Duration::from_millis(10), Duration::from_secs(300));
+        let noisy = ServerId::from("typescript");
+        let token = serde_json::json!("t1");
+        let start = Instant::now();
+
+        settle.begin(&noisy, &token);
+        settle.end_at(&noisy, &token, start);
+
+        let owner = ServerId::from("rust");
+        settle.register_diagnostics_owner(&owner);
+
+        assert!(
+            !settle.should_settle_at(start + Duration::from_millis(50)),
+            "a lazily registered owner that has not gone quiet keeps the baseline waiting"
+        );
+    }
+
+    #[test]
+    fn test_startup_owner_publication_preserves_a_lazy_owner_started_during_batch() {
+        let settle = ServerSettle::new(Duration::from_millis(10), Duration::from_secs(300));
+        let eager = ServerId::from("typescript");
+        let lazy = ServerId::from("rust");
+        let token = serde_json::json!("indexing");
+        let start = Instant::now();
+
+        settle.begin(&eager, &token);
+        settle.register_diagnostics_owner(&lazy);
+        settle.end_at(&eager, &token, start);
+
+        settle.add_diagnostics_owners([eager]);
+
+        assert!(
+            !settle.should_settle_at(start + Duration::from_millis(50)),
+            "the eager owner is quiet, but the lazy owner has not reported progress"
+        );
+    }
+
+    #[test]
+    fn test_startup_owner_publication_keeps_a_retiring_replacement_pending() {
+        let settle = ServerSettle::new(Duration::from_millis(10), Duration::from_secs(60));
+        let rust = ServerId::from("rust");
+        let python = ServerId::from("python");
+
+        settle.begin_diagnostics_replacement(&rust);
+        settle.forget_server(&rust);
+        settle.add_diagnostics_owners([rust, python]);
+        settle.restart_deadline();
+
+        assert_eq!(
+            settle.diagnostics_owner_count(),
+            1,
+            "a retired process is excluded from the active diagnostics owner count"
+        );
+        assert!(
+            !settle.should_settle_at(Instant::now() + NO_PROGRESS_GRACE * 2),
+            "the retired owner's active replacement stays pending until it registers or aborts"
+        );
     }
 
     #[test]

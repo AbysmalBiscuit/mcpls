@@ -161,6 +161,22 @@ impl DiagnosticsDelivery {
         self.baseline = Some(baseline);
     }
 
+    /// Fold a newly started owner's settled diagnostics into the existing
+    /// baseline and live session records.
+    ///
+    /// A key nobody holds yet is pre-existing for every session. A key a
+    /// session already holds belongs to that session's history, so replacing
+    /// it would hide a change the session has not been told about.
+    pub fn merge_baseline(&mut self, entries: HashMap<String, u64>) {
+        let baseline = self.baseline.get_or_insert_with(HashMap::new);
+        for (key, hash) in entries {
+            baseline.entry(key.clone()).or_insert(hash);
+            for record in self.sessions.values_mut() {
+                record.entry(key.clone()).or_insert(hash);
+            }
+        }
+    }
+
     /// Whether a baseline has been adopted yet.
     #[must_use]
     pub const fn has_baseline(&self) -> bool {
@@ -790,6 +806,68 @@ mod tests {
         assert!(
             report.changed.is_empty(),
             "the workspace already had this before the session started"
+        );
+    }
+
+    #[test]
+    fn test_a_merged_entry_is_not_reported_to_a_session_that_predates_it() {
+        let mut delivery = DiagnosticsDelivery::new(DiagnosticsConfig::default());
+        delivery.set_baseline(HashMap::new());
+        let session = SessionId::from("s".to_string());
+        let diags = vec![diagnostic(1, DiagnosticSeverity::ERROR, "boom")];
+        let entries = [entry("a.rs", &diags, SeverityFloor::Warning)];
+
+        assert!(delivery.flush(&session, &[]).changed.is_empty());
+
+        let hash = DiagnosticsDelivery::visible_hash(&diags, SeverityFloor::Warning)
+            .expect("an error is visible at the warning floor");
+        delivery.merge_baseline(HashMap::from([("a.rs".to_string(), hash)]));
+
+        assert!(
+            delivery.flush(&session, &entries).changed.is_empty(),
+            "a warning the workspace already had is not this session's work"
+        );
+    }
+
+    #[test]
+    fn test_a_change_after_a_merge_is_still_reported() {
+        let mut delivery = DiagnosticsDelivery::new(DiagnosticsConfig::default());
+        delivery.set_baseline(HashMap::new());
+        let session = SessionId::from("s".to_string());
+        let before = vec![diagnostic(1, DiagnosticSeverity::ERROR, "boom")];
+        let after = vec![diagnostic(2, DiagnosticSeverity::ERROR, "different")];
+
+        assert!(delivery.flush(&session, &[]).changed.is_empty());
+
+        let hash = DiagnosticsDelivery::visible_hash(&before, SeverityFloor::Warning)
+            .expect("an error is visible at the warning floor");
+        delivery.merge_baseline(HashMap::from([("a.rs".to_string(), hash)]));
+
+        let report = delivery.flush(&session, &[entry("a.rs", &after, SeverityFloor::Warning)]);
+        assert_eq!(report.changed.len(), 1);
+    }
+
+    #[test]
+    fn test_a_merge_does_not_rewrite_what_a_session_already_believes() {
+        let mut delivery = DiagnosticsDelivery::new(DiagnosticsConfig::default());
+        let known = vec![diagnostic(1, DiagnosticSeverity::ERROR, "boom")];
+        let later = vec![diagnostic(2, DiagnosticSeverity::ERROR, "different")];
+        let known_hash = DiagnosticsDelivery::visible_hash(&known, SeverityFloor::Warning)
+            .expect("an error is visible at the warning floor");
+        let later_hash = DiagnosticsDelivery::visible_hash(&later, SeverityFloor::Warning)
+            .expect("an error is visible at the warning floor");
+
+        delivery.set_baseline(HashMap::from([("a.rs".to_string(), known_hash)]));
+        let session = SessionId::from("s".to_string());
+        assert!(delivery.flush(&session, &[]).changed.is_empty());
+
+        delivery.merge_baseline(HashMap::from([("a.rs".to_string(), later_hash)]));
+
+        let report = delivery.flush(&session, &[entry("a.rs", &later, SeverityFloor::Warning)]);
+        assert_eq!(
+            report.changed.len(),
+            1,
+            "a key the session already holds is its own history, not a merge target"
         );
     }
 

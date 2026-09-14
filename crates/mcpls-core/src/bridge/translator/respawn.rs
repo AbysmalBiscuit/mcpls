@@ -320,8 +320,15 @@ impl Translator {
         };
 
         match self.install_server(&id, config).await {
-            Ok(()) => {
+            Ok(caches_diagnostics) => {
                 self.record_respawn_success(&id);
+                if caches_diagnostics && let Some(pumps) = self.notification_pumps.get() {
+                    tokio::spawn(crate::baseline_merge_task(
+                        pumps.shared().clone(),
+                        id.clone(),
+                        pumps.cancel_rx(),
+                    ));
+                }
                 guard.publish(ServerLifecycle::Running);
                 tracing::info!("LSP server '{id}' is running");
             }
@@ -338,7 +345,7 @@ impl Translator {
         }
     }
 
-    async fn install_server(&self, id: &ServerId, config: ServerInitConfig) -> Result<()> {
+    async fn install_server(&self, id: &ServerId, config: ServerInitConfig) -> Result<bool> {
         let language_id = config.server_config.language_id.clone();
 
         tracing::info!("starting LSP server '{id}'");
@@ -378,6 +385,13 @@ impl Translator {
             pumps.install(id.clone(), notification_rx, caches_diagnostics);
             if caches_diagnostics {
                 pumps.register_diagnostics_owner(id);
+                pumps.settle().restart_deadline();
+                if let Some(cache) = &self.notification_cache {
+                    cache
+                        .lock()
+                        .await
+                        .set_diagnostics_route_count(pumps.settle().diagnostics_owner_count());
+                }
                 if let Some(attempt) = replacement_attempt.as_mut() {
                     attempt.complete();
                 }
@@ -386,7 +400,7 @@ impl Translator {
         let old_server = lock_std(&self.lsp_servers).insert(id.clone(), new_server);
         lock_std(&self.lsp_clients).insert(id.clone(), new_client);
         drop(old_server);
-        Ok(())
+        Ok(caches_diagnostics)
     }
 
     async fn await_terminal_state(

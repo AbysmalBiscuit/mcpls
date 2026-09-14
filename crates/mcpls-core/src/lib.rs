@@ -276,12 +276,10 @@ pub(crate) struct RegisteredServers {
     pub(crate) diagnostics_flags: HashMap<ServerId, bool>,
 }
 
-/// Register initialized LSP servers with the translator, rebind the router to
-/// the set that actually initialized, and install notification pumps before
-/// publishing clients that can trigger a replacement.
+/// Registers successful servers, rebinds routing, and installs pumps before
+/// clients are published.
 ///
-/// `configs` supplies the `ServerInitConfig` for each applicable server, so
-/// the translator can spawn it later if needed (see `Translator::ensure_server`).
+/// `configs` retains each server's spawn configuration for lazy starts.
 pub(crate) fn register_servers(
     result: lsp::ServerInitResult,
     translator: &bridge::Translator,
@@ -1245,20 +1243,6 @@ fn spawn_lsp_servers_background(
         translator.set_expected_servers(retained_routes.clone());
         info!("Proceeding with {} LSP server(s)", server_count);
 
-        // Give each diagnostics-route server a fair share of the shared
-        // diagnostics cache budget now that the full set is known -- see
-        // `NotificationCache::set_diagnostics_route_count` (#266).
-        let diagnostics_route_count = registered
-            .diagnostics_flags
-            .values()
-            .filter(|&&is_route| is_route)
-            .count();
-        shared
-            .notification_cache
-            .lock()
-            .await
-            .set_diagnostics_route_count(diagnostics_route_count);
-
         let diagnostics_owners = registered
             .diagnostics_flags
             .iter()
@@ -1267,7 +1251,11 @@ fn spawn_lsp_servers_background(
             .collect::<Vec<_>>();
         #[cfg(all(test, unix))]
         recovery_tests::pause_before_owner_installation();
-        shared.settle.set_diagnostics_owners(diagnostics_owners);
+        shared.settle.add_diagnostics_owners(diagnostics_owners);
+        {
+            let mut cache = shared.notification_cache.lock().await;
+            cache.set_diagnostics_route_count(shared.settle.diagnostics_owner_count());
+        }
 
         // The settle deadline backstops indexing, which only starts here:
         // everything before this point -- config load, and every server's
@@ -1296,13 +1284,8 @@ fn spawn_lsp_servers_background(
 /// rather than by the process lifetime.
 const BASELINE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Adopt the current cache as the baseline once the servers have stayed
-/// quiet, so a session's first flush reports what happened since startup
-/// rather than everything the workspace already knew.
-///
-/// Spawned once per `serve_with` run, alongside (not inside) the per-server
-/// diagnostics pumps: the pumps run once per server, but the baseline is a
-/// single snapshot for the whole session.
+/// Adopts the current diagnostics cache after servers settle, so sessions do
+/// not report pre-existing workspace diagnostics as new work.
 async fn baseline_task(
     settle: Arc<bridge::ServerSettle>,
     cache: Arc<Mutex<NotificationCache>>,
@@ -1348,6 +1331,56 @@ async fn baseline_task(
                 recovery_tests::mark_baseline_adopted();
                 debug!("diagnostics baseline taken over {baseline_len} file(s)");
                 return;
+            }
+        }
+    }
+}
+
+async fn try_merge_settled_owner_baseline(shared: &PumpShared, owner: &ServerId) -> Option<usize> {
+    let has_baseline = shared.delivery.lock().await.has_baseline();
+    if !has_baseline || !shared.settle.should_settle() {
+        return None;
+    }
+
+    let entries: HashMap<String, u64> = {
+        let cache = shared.notification_cache.lock().await;
+        cache
+            .diagnostics_entries()
+            .into_iter()
+            .filter(|(_, _, entry_owner)| *entry_owner == owner)
+            .filter_map(|(key, info, entry_owner)| {
+                bridge::DiagnosticsDelivery::visible_hash(
+                    &info.diagnostics,
+                    shared.floors.for_server(entry_owner),
+                )
+                .map(|hash| (key.to_string(), hash))
+            })
+            .collect()
+    };
+    let merged = entries.len();
+    shared.delivery.lock().await.merge_baseline(entries);
+    Some(merged)
+}
+
+/// Merge one later-started owner's settled diagnostics into the baseline and
+/// the records of sessions that attached before that owner existed.
+pub(crate) async fn baseline_merge_task(
+    shared: PumpShared,
+    owner: ServerId,
+    mut cancel_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            result = cancel_rx.changed() => {
+                if result.is_err() || *cancel_rx.borrow() {
+                    return;
+                }
+            }
+            () = tokio::time::sleep(BASELINE_POLL_INTERVAL) => {
+                if let Some(merged) = try_merge_settled_owner_baseline(&shared, &owner).await {
+                    debug!("diagnostics baseline extended over {merged} file(s) for '{owner}'");
+                    return;
+                }
             }
         }
     }
@@ -1672,6 +1705,104 @@ mod tests {
     use bridge::{DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE};
 
     use super::*;
+
+    #[tokio::test]
+    async fn test_owner_baseline_waits_for_initial_adoption() {
+        use lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range, Uri};
+
+        use crate::config::{DiagnosticsConfig, SeverityFloor};
+
+        let owner = ServerId::from("typescript");
+        let config = DiagnosticsConfig::default();
+        let mut cache = NotificationCache::new();
+        let lazy_uri: Uri = "file:///lazy.ts".parse().unwrap();
+        let lazy_diagnostics = vec![Diagnostic {
+            range: Range {
+                start: Position::new(1, 0),
+                end: Position::new(1, 1),
+            },
+            severity: Some(DiagnosticSeverity::ERROR),
+            message: "lazy diagnostic".to_string(),
+            ..Default::default()
+        }];
+        cache.store_diagnostics(&owner, &lazy_uri, Some(1), lazy_diagnostics.clone());
+
+        let settle = Arc::new(bridge::ServerSettle::new(
+            Duration::ZERO,
+            Duration::from_secs(60),
+        ));
+        let token = serde_json::json!("indexing");
+        settle.begin(&owner, &token);
+        settle.end(&owner, &token);
+        settle.set_diagnostics_owners([owner.clone()]);
+
+        let shared = PumpShared {
+            notification_cache: Arc::new(Mutex::new(cache)),
+            subs: Arc::new(ResourceSubscriptions::new()),
+            workspace_roots: Arc::from(Vec::<PathBuf>::new()),
+            document_tracker: Arc::new(bridge::DocumentTracker::new(
+                bridge::ResourceLimits::default(),
+                HashMap::new(),
+            )),
+            settle,
+            delivery: Arc::new(Mutex::new(bridge::DiagnosticsDelivery::new(config))),
+            floors: Arc::new(bridge::FloorTable::new(&config, &[])),
+        };
+
+        assert_eq!(
+            super::try_merge_settled_owner_baseline(&shared, &owner).await,
+            None,
+            "a later owner's task must not create a baseline before initial adoption"
+        );
+        assert!(
+            !shared.delivery.lock().await.has_baseline(),
+            "the initial baseline task must remain the first publisher"
+        );
+
+        let eager_diagnostics = vec![Diagnostic {
+            range: Range {
+                start: Position::new(2, 0),
+                end: Position::new(2, 1),
+            },
+            severity: Some(DiagnosticSeverity::ERROR),
+            message: "eager diagnostic".to_string(),
+            ..Default::default()
+        }];
+        let eager_hash =
+            bridge::DiagnosticsDelivery::visible_hash(&eager_diagnostics, SeverityFloor::Warning)
+                .unwrap();
+        shared
+            .delivery
+            .lock()
+            .await
+            .set_baseline(HashMap::from([("eager.rs".to_string(), eager_hash)]));
+
+        assert_eq!(
+            super::try_merge_settled_owner_baseline(&shared, &owner).await,
+            Some(1)
+        );
+        let entries = [
+            bridge::FileEntry {
+                key: "eager.rs",
+                diagnostics: &eager_diagnostics,
+                floor: SeverityFloor::Warning,
+            },
+            bridge::FileEntry {
+                key: lazy_uri.as_str(),
+                diagnostics: &lazy_diagnostics,
+                floor: SeverityFloor::Warning,
+            },
+        ];
+        let report = shared
+            .delivery
+            .lock()
+            .await
+            .flush(&bridge::SessionId::from("session".to_string()), &entries);
+        assert!(
+            report.changed.is_empty(),
+            "initial adoption and the later owner merge both remain baseline state"
+        );
+    }
 
     #[test]
     fn test_diagnostic_path_in_workspace_empty_roots_allows_any_uri() {

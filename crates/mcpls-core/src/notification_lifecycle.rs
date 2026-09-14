@@ -86,6 +86,21 @@ impl NotificationPumps {
         }
     }
 
+    /// Shared cache and delivery state used by every notification pump.
+    pub(crate) const fn shared(&self) -> &PumpShared {
+        &self.shared
+    }
+
+    /// Shared settle state for every registered diagnostics owner.
+    pub(crate) fn settle(&self) -> &ServerSettle {
+        &self.shared.settle
+    }
+
+    /// Cancellation signal shared by every pump and baseline task.
+    pub(crate) fn cancel_rx(&self) -> watch::Receiver<bool> {
+        self.cancel.clone()
+    }
+
     pub(crate) fn install(
         &self,
         id: ServerId,
