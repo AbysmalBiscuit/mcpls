@@ -14,6 +14,16 @@ fn register_starting_configs(translator: &Translator, configs: &[lsp::ServerInit
     }
 }
 
+async fn wait_for_owner_baseline(settle: &bridge::ServerSettle, owner: &ServerId) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while settle.pending_diagnostics_baselines().contains(owner) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the diagnostics owner baseline merge must finish");
+}
+
 #[derive(Debug)]
 pub struct RegistrationPause {
     server_id: ServerId,
@@ -1165,7 +1175,7 @@ async fn recovery_scenario(startup: StartupMode) {
         );
         let abort_init = AbortOnDrop(&init);
         let server = mcp::McplsServer::new(Arc::clone(&translator), cache, Arc::from(vec![root.clone()]),
-            subs, false, Arc::clone(&delivery), floors, config.diagnostics, settle);
+            subs, false, Arc::clone(&delivery), floors, config.diagnostics, Arc::clone(&settle));
         let (server_io, client_io) = tokio::io::duplex(65_536);
         let started = tokio::spawn(async move { server.serve(server_io).await.unwrap() });
         let mut wire = BufStream::new(client_io);
@@ -1247,6 +1257,7 @@ async fn recovery_scenario(startup: StartupMode) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }).await.unwrap();
+        wait_for_owner_baseline(&settle, &ServerId::from("rust")).await;
         for generation in first_generation..first_generation + 2 {
             tokio::time::sleep(Duration::from_millis(1100)).await;
             std::fs::write(root.join(format!("rust.crash-{generation}")), "").unwrap();
@@ -1271,6 +1282,7 @@ async fn recovery_scenario(startup: StartupMode) {
                 }
             }).await.expect("replacement log sentinel must reach the public MCP tool");
             wait_cached(&mut wire, &python, "python-generation-1").await;
+            wait_for_owner_baseline(&settle, &ServerId::from("rust")).await;
             let first = call(&mut wire, "get_new_diagnostics", json!({})).await;
             assert!(first.to_string().contains(&sentinel), "{first}");
             let second = call(&mut wire, "get_new_diagnostics", json!({})).await;

@@ -3,7 +3,7 @@
 //! This module provides the MCP server that exposes LSP capabilities
 //! as MCP tools using the rmcp SDK.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -231,12 +231,9 @@ pub struct NewDiagnosticsResult {
     /// them back; the next call offers them again in full.
     pub omitted: usize,
     /// An explanation the payload's other fields can't carry on their own:
-    /// either that a real report isn't available yet (the language servers
-    /// are still settling, so a caller shouldn't mistake "too early to
-    /// tell" for "nothing changed"), or, on an otherwise real report, that
-    /// `omitted` is non-zero and a later call will offer those files again.
-    /// The two never overlap: the startup case returns before `omitted`
-    /// could be anything but zero.
+    /// some servers are still settling, or `omitted` is non-zero and a later
+    /// call will offer those files again. A report may be partial for both
+    /// reasons.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 }
@@ -369,22 +366,21 @@ fn footer_should_stop(
     settle.progress_epoch() == epoch_before
 }
 
-/// Build the `FileEntry` list a flush should see, borrowing straight out of
-/// a held cache guard rather than a cloned snapshot.
+/// Build the `FileEntry` list a delivery flush should consider.
 ///
-/// Excludes any entry whose URI `uri_to_path` can't map to a filesystem
-/// path *before* `flush` ever runs, rather than dropping it from the
-/// payload afterward: `flush` records a hash for every entry it is given,
-/// so a post-hoc drop would still mark the file delivered -- permanently
-/// hiding diagnostics that were in fact never shown to anyone.
+/// Unmappable URIs and owners with pending startup baselines are excluded
+/// before `flush`, which advances the record for every entry it receives.
 fn routable_entries_borrowed<'a>(
     cache: &'a NotificationCache,
     floors: &FloorTable,
+    pending_baselines: &HashSet<ServerId>,
 ) -> Vec<FileEntry<'a>> {
     cache
         .diagnostics_entries()
         .into_iter()
-        .filter(|(_, info, _)| uri_to_path(&info.uri).is_some())
+        .filter(|(_, info, owner)| {
+            !pending_baselines.contains(*owner) && uri_to_path(&info.uri).is_some()
+        })
         .map(|(key, info, owner)| FileEntry {
             key,
             diagnostics: &info.diagnostics,
@@ -1104,18 +1100,31 @@ impl McplsServer {
         session: &SessionId,
         advance: Advance,
     ) -> (NewDiagnosticsResult, Option<u64>) {
-        let (report, token, sources) = {
+        let (report, token, sources, baseline_pending) = {
             let mut delivery = self.context.delivery.lock().await;
             let cache = self.context.notification_cache.lock().await;
-            let entries = routable_entries_borrowed(&cache, &self.context.floors);
+            // A diagnostic publish also needs the cache lock, so this read
+            // covers owners that start while the call waits for either lock.
+            let pending_baselines = self.context.settle.pending_diagnostics_baselines();
+            let entries =
+                routable_entries_borrowed(&cache, &self.context.floors, &pending_baselines);
             let (report, token) = match advance {
                 Advance::Now => (delivery.flush(session, &entries), None),
                 Advance::OnAcknowledgement => delivery.stage(session, &entries),
             };
             let sources = source_map(&cache, &report);
-            (report, token, sources)
+            let baseline_pending = !pending_baselines.is_empty();
+            (report, token, sources, baseline_pending)
         };
-        (self.new_diagnostics_payload(&report, &sources).await, token)
+        let mut payload = self.new_diagnostics_payload(&report, &sources).await;
+        if baseline_pending {
+            let pending_note = "Diagnostics from a recently started language server are still settling; call again shortly.";
+            payload.note = Some(payload.note.map_or_else(
+                || pending_note.to_string(),
+                |note| format!("{pending_note} {note}"),
+            ));
+        }
+        (payload, token)
     }
 
     /// `session`'s flush, rendered as the text a hook prints, with the
@@ -2544,12 +2553,18 @@ mod tests {
             let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
             let (release_tx, release_rx) = tokio::sync::oneshot::channel();
             self.translator.install_resync_pause(reached_tx, release_rx);
+            let owner = ServerId::from("rust");
+            let baseline_generation = self.settle.diagnostics_baseline_generation(&owner);
             self.server
                 .context
                 .delivery
                 .lock()
                 .await
                 .set_baseline(HashMap::new());
+            if let Some(generation) = baseline_generation {
+                self.settle
+                    .finish_diagnostics_baseline_merge(&owner, generation);
+            }
 
             let (server_io, client_io) = tokio::io::duplex(65_536);
             let server = self.server.clone();
@@ -3932,16 +3947,20 @@ mod tests {
     /// Build a server for `get_new_diagnostics` tests with direct access to
     /// the cache and delivery `Arc`s it shares, so a test can seed the cache
     /// and the baseline independently of the tool calls under test.
-    fn new_diagnostics_test_server() -> (
-        McplsServer,
-        Arc<Mutex<NotificationCache>>,
-        Arc<Mutex<DiagnosticsDelivery>>,
-    ) {
+    struct NewDiagnosticsTestServer {
+        server: McplsServer,
+        notification_cache: Arc<Mutex<NotificationCache>>,
+        delivery: Arc<Mutex<DiagnosticsDelivery>>,
+        settle: Arc<ServerSettle>,
+    }
+
+    fn new_diagnostics_test_server() -> NewDiagnosticsTestServer {
         let translator = Arc::new(Translator::new());
         let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
         let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
         let subscriptions = Arc::new(ResourceSubscriptions::new());
         let (delivery, floors) = default_delivery_and_floors();
+        let settle = test_settle();
         let server = McplsServer::new(
             translator,
             Arc::clone(&notification_cache),
@@ -3951,9 +3970,14 @@ mod tests {
             Arc::clone(&delivery),
             floors,
             DiagnosticsConfig::default(),
-            test_settle(),
+            Arc::clone(&settle),
         );
-        (server, notification_cache, delivery)
+        NewDiagnosticsTestServer {
+            server,
+            notification_cache,
+            delivery,
+            settle,
+        }
     }
 
     fn diagnostic_at(message: &str) -> lsp_types::Diagnostic {
@@ -4006,7 +4030,7 @@ mod tests {
         );
         let floors = FloorTable::new(&crate::config::DiagnosticsConfig::default(), &[]);
 
-        let entries = routable_entries_borrowed(&cache, &floors);
+        let entries = routable_entries_borrowed(&cache, &floors, &HashSet::new());
 
         assert_eq!(
             entries.len(),
@@ -4073,7 +4097,12 @@ mod tests {
     /// the pre-existing error would incorrectly show up too.
     #[tokio::test]
     async fn test_new_diagnostics_does_not_seed_session_before_baseline_exists() {
-        let (server, notification_cache, delivery) = new_diagnostics_test_server();
+        let NewDiagnosticsTestServer {
+            server,
+            notification_cache,
+            delivery,
+            ..
+        } = new_diagnostics_test_server();
         let owner = crate::config::ServerId::from("rust");
 
         // No baseline yet: the tool must report "starting up", not a
@@ -4161,6 +4190,69 @@ mod tests {
         );
         assert_eq!(changed[0]["file_path"], new_file_path);
         assert_eq!(changed[0]["diagnostics"][0]["message"], "new error");
+    }
+
+    #[tokio::test]
+    async fn test_new_owner_startup_diagnostics_wait_for_baseline_merge() {
+        let NewDiagnosticsTestServer {
+            server,
+            notification_cache,
+            delivery,
+            settle,
+        } = new_diagnostics_test_server();
+        let owner = ServerId::from("rust");
+        #[cfg(windows)]
+        let uri: lsp_types::Uri = "file:///C:/workspace/startup.rs".parse().unwrap();
+        #[cfg(not(windows))]
+        let uri: lsp_types::Uri = "file:///workspace/startup.rs".parse().unwrap();
+
+        delivery.lock().await.set_baseline(HashMap::new());
+        let mut cache = notification_cache.lock().await;
+        let flush = server.get_new_diagnostics();
+        tokio::pin!(flush);
+        assert!(
+            futures::poll!(&mut flush).is_pending(),
+            "the diagnostics call must reach the held cache lock"
+        );
+
+        settle.register_diagnostics_owner(&owner);
+        let startup_diagnostics = vec![diagnostic_at("startup diagnostic")];
+        cache.store_diagnostics(&owner, &uri, Some(1), startup_diagnostics.clone());
+        drop(cache);
+
+        let report: serde_json::Value = serde_json::from_str(&flush.await.unwrap()).unwrap();
+
+        assert_eq!(
+            report["changed"].as_array().unwrap().len(),
+            0,
+            "diagnostics published during a new owner's startup are baseline state"
+        );
+        assert!(
+            report["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("still settling")),
+            "withheld startup diagnostics must not look like a clean workspace"
+        );
+
+        let generation = settle.diagnostics_baseline_generation(&owner).unwrap();
+        let hash = DiagnosticsDelivery::visible_hash(
+            &startup_diagnostics,
+            crate::config::SeverityFloor::Warning,
+        )
+        .unwrap();
+        delivery
+            .lock()
+            .await
+            .merge_baseline(HashMap::from([(uri.to_string(), hash)]));
+        assert!(settle.finish_diagnostics_baseline_merge(&owner, generation));
+
+        let report: serde_json::Value =
+            serde_json::from_str(&server.get_new_diagnostics().await.unwrap()).unwrap();
+        assert_eq!(
+            report["changed"].as_array().unwrap().len(),
+            0,
+            "settled startup diagnostics stay out of the session's changes"
+        );
     }
 
     #[tokio::test]

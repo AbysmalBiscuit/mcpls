@@ -322,10 +322,14 @@ impl Translator {
         match self.install_server(&id, config).await {
             Ok(caches_diagnostics) => {
                 self.record_respawn_success(&id);
-                if caches_diagnostics && let Some(pumps) = self.notification_pumps.get() {
+                if caches_diagnostics
+                    && let Some(pumps) = self.notification_pumps.get()
+                    && let Some(generation) = pumps.settle().diagnostics_baseline_generation(&id)
+                {
                     tokio::spawn(crate::baseline_merge_task(
                         pumps.shared().clone(),
                         id.clone(),
+                        generation,
                         pumps.cancel_rx(),
                     ));
                 }
@@ -366,7 +370,26 @@ impl Translator {
         } else {
             None
         };
-        let mut new_server = LspServer::spawn(config).await?;
+        let baseline_generation = if caches_diagnostics {
+            self.notification_pumps
+                .get()
+                .and_then(|pumps| pumps.settle().begin_diagnostics_baseline_merge(id))
+        } else {
+            None
+        };
+        let mut new_server = match LspServer::spawn(config).await {
+            Ok(server) => server,
+            Err(error) => {
+                if let (Some(pumps), Some(generation)) =
+                    (self.notification_pumps.get(), baseline_generation)
+                {
+                    pumps
+                        .settle()
+                        .finish_diagnostics_baseline_merge(id, generation);
+                }
+                return Err(error);
+            }
+        };
         let new_client = new_server.client().clone();
         let notification_rx = new_server.take_notification_rx();
         let old_client = lock_std(&self.lsp_clients).get(id).cloned();

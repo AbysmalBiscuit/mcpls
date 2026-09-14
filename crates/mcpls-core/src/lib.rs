@@ -177,7 +177,10 @@ pub(crate) async fn diagnostics_pump(
                 }
             }
             msg = rx.recv() => {
-                let Some(notif) = msg else { break };
+                let Some(notif) = msg else {
+                    shared.settle.server_exited(&server_id);
+                    break;
+                };
                 match notif {
                     LspNotification::PublishDiagnostics(p) => {
                         handle_publish_diagnostics(&server_id, caches_diagnostics, p, &shared).await;
@@ -1286,6 +1289,9 @@ const BASELINE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Adopts the current diagnostics cache after servers settle, so sessions do
 /// not report pre-existing workspace diagnostics as new work.
+// Keep the delivery and cache guards through baseline adoption so a flush
+// cannot record diagnostics between the snapshot and the baseline update.
+#[allow(clippy::significant_drop_tightening)]
 async fn baseline_task(
     settle: Arc<bridge::ServerSettle>,
     cache: Arc<Mutex<NotificationCache>>,
@@ -1307,9 +1313,10 @@ async fn baseline_task(
                 if !ready {
                     continue;
                 }
-                let baseline: HashMap<String, u64> = {
+                let baseline_len = {
+                    let mut delivery = delivery.lock().await;
                     let cache = cache.lock().await;
-                    cache
+                    let baseline: HashMap<String, u64> = cache
                         .diagnostics_entries()
                         .into_iter()
                         .filter_map(|(key, info, owner)| {
@@ -1319,14 +1326,16 @@ async fn baseline_task(
                             )
                             .map(|hash| (key.to_string(), hash))
                         })
-                        .collect()
+                        .collect();
+                    let baseline_len = baseline.len();
+                    settle.adopt_settled_diagnostics_baseline(|| {
+                        delivery.set_baseline(baseline);
+                        baseline_len
+                    })
                 };
-                let baseline_len = baseline.len();
-                // Cache guard is dropped above before delivery's is taken --
-                // the opposite of the flush's delivery-before-cache order,
-                // but safe here because this task never holds both locks at
-                // once.
-                delivery.lock().await.set_baseline(baseline);
+                let Some(baseline_len) = baseline_len else {
+                    continue;
+                };
                 #[cfg(all(test, unix))]
                 recovery_tests::mark_baseline_adopted();
                 debug!("diagnostics baseline taken over {baseline_len} file(s)");
@@ -1336,30 +1345,42 @@ async fn baseline_task(
     }
 }
 
-async fn try_merge_settled_owner_baseline(shared: &PumpShared, owner: &ServerId) -> Option<usize> {
-    let has_baseline = shared.delivery.lock().await.has_baseline();
-    if !has_baseline || !shared.settle.should_settle() {
+// Hold delivery -> cache through the generation-checked merge so a flush
+// cannot observe unbaselined diagnostics for this owner.
+#[allow(clippy::significant_drop_tightening)]
+async fn try_merge_settled_owner_baseline(
+    shared: &PumpShared,
+    owner: &ServerId,
+    generation: u64,
+) -> Option<usize> {
+    let mut delivery = shared.delivery.lock().await;
+    if !delivery.has_baseline() {
+        return None;
+    }
+    if !shared.settle.baseline_merge_is_current(owner, generation) {
         return None;
     }
 
-    let entries: HashMap<String, u64> = {
-        let cache = shared.notification_cache.lock().await;
-        cache
-            .diagnostics_entries()
-            .into_iter()
-            .filter(|(_, _, entry_owner)| *entry_owner == owner)
-            .filter_map(|(key, info, entry_owner)| {
-                bridge::DiagnosticsDelivery::visible_hash(
-                    &info.diagnostics,
-                    shared.floors.for_server(entry_owner),
-                )
-                .map(|hash| (key.to_string(), hash))
-            })
-            .collect()
-    };
+    let cache = shared.notification_cache.lock().await;
+    let entries: HashMap<String, u64> = cache
+        .diagnostics_entries()
+        .into_iter()
+        .filter(|(_, _, entry_owner)| *entry_owner == owner)
+        .filter_map(|(key, info, entry_owner)| {
+            bridge::DiagnosticsDelivery::visible_hash(
+                &info.diagnostics,
+                shared.floors.for_server(entry_owner),
+            )
+            .map(|hash| (key.to_string(), hash))
+        })
+        .collect();
     let merged = entries.len();
-    shared.delivery.lock().await.merge_baseline(entries);
-    Some(merged)
+    shared
+        .settle
+        .merge_settled_diagnostics_baseline(owner, generation, || {
+            delivery.merge_baseline(entries);
+            merged
+        })
 }
 
 /// Merge one later-started owner's settled diagnostics into the baseline and
@@ -1367,6 +1388,7 @@ async fn try_merge_settled_owner_baseline(shared: &PumpShared, owner: &ServerId)
 pub(crate) async fn baseline_merge_task(
     shared: PumpShared,
     owner: ServerId,
+    generation: u64,
     mut cancel_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     loop {
@@ -1377,7 +1399,12 @@ pub(crate) async fn baseline_merge_task(
                 }
             }
             () = tokio::time::sleep(BASELINE_POLL_INTERVAL) => {
-                if let Some(merged) = try_merge_settled_owner_baseline(&shared, &owner).await {
+                if !shared.settle.baseline_merge_is_current(&owner, generation) {
+                    return;
+                }
+                if let Some(merged) =
+                    try_merge_settled_owner_baseline(&shared, &owner, generation).await
+                {
                     debug!("diagnostics baseline extended over {merged} file(s) for '{owner}'");
                     return;
                 }
@@ -1735,6 +1762,7 @@ mod tests {
         settle.begin(&owner, &token);
         settle.end(&owner, &token);
         settle.set_diagnostics_owners([owner.clone()]);
+        let generation = settle.diagnostics_baseline_generation(&owner).unwrap();
 
         let shared = PumpShared {
             notification_cache: Arc::new(Mutex::new(cache)),
@@ -1750,7 +1778,7 @@ mod tests {
         };
 
         assert_eq!(
-            super::try_merge_settled_owner_baseline(&shared, &owner).await,
+            super::try_merge_settled_owner_baseline(&shared, &owner, generation).await,
             None,
             "a later owner's task must not create a baseline before initial adoption"
         );
@@ -1778,7 +1806,7 @@ mod tests {
             .set_baseline(HashMap::from([("eager.rs".to_string(), eager_hash)]));
 
         assert_eq!(
-            super::try_merge_settled_owner_baseline(&shared, &owner).await,
+            super::try_merge_settled_owner_baseline(&shared, &owner, generation).await,
             Some(1)
         );
         let entries = [
@@ -3329,6 +3357,45 @@ mod tests {
                 .await
                 .expect("pump did not exit within timeout")
                 .unwrap();
+        }
+
+        #[tokio::test]
+        async fn test_pump_releases_progress_when_notification_channel_closes() {
+            let owner = ServerId::from("rust");
+            let settle = make_settle();
+            settle.register_diagnostics_owner(&owner);
+            settle.begin(&owner, &serde_json::json!("indexing"));
+            assert!(!settle.should_settle());
+
+            let cache = make_cache();
+            let subs = make_subs();
+            let (tx, rx) = mpsc::channel::<LspNotification>(8);
+            let (_cancel_tx, cancel_rx) = watch::channel(false);
+            drop(tx);
+
+            diagnostics_pump(
+                owner.clone(),
+                rx,
+                cancel_rx,
+                true,
+                PumpShared {
+                    notification_cache: cache,
+                    subs,
+                    workspace_roots: no_workspace_roots(),
+                    document_tracker: make_tracker(),
+                    settle: Arc::clone(&settle),
+                    delivery: make_delivery(),
+                    floors: make_floors(),
+                },
+            )
+            .await;
+
+            assert!(settle.pending_diagnostics_baselines().contains(&owner));
+            assert_eq!(settle.diagnostics_owner_count(), 1);
+            assert!(
+                settle.should_settle_at(std::time::Instant::now() + Duration::from_secs(2)),
+                "closing the channel retires its progress token without retiring its route"
+            );
         }
 
         /// Regression test for #104: the pump must cache a notification promptly
