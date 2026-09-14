@@ -55,9 +55,9 @@ use std::time::{Duration, Instant};
 
 use bridge::apply::Applier;
 use bridge::resources::make_uri;
-use bridge::{NotificationCache, ResourceSubscriptions, Translator};
+use bridge::{NotificationCache, ResourceSubscriptions, ServerLifecycle, Translator};
 pub use config::{BackendConfig, ConfigSource, ProjectConfigTrust, ServerConfig};
-use config::{ServerId, ToolRouter};
+use config::{ServerId, SpawnPolicy, ToolRouter};
 pub use error::Error;
 use lsp::{LspNotification, LspServer, ServerInitConfig};
 use lsp_types::Uri;
@@ -662,6 +662,25 @@ impl Runtime {
             .map(|c| c.server_config.id())
             .collect();
         translator.set_expected_servers(expected_servers);
+        // Membership is the applicable set. A server is idle until
+        // something shows the session needs it; an eager one is already
+        // starting by the time any request can observe this.
+        for init_config in &applicable_configs {
+            let id = init_config.server_config.id();
+            let eager = init_config
+                .server_config
+                .effective_spawn(config.backend.spawn)
+                == SpawnPolicy::Eager;
+            translator.register_server_config(id.clone(), init_config.clone());
+            translator.set_lifecycle(
+                &id,
+                if eager {
+                    ServerLifecycle::Starting
+                } else {
+                    ServerLifecycle::Idle
+                },
+            );
+        }
 
         // Shared state, built BEFORE LSP initialization so the MCP server can answer
         // `initialize` immediately. LSP servers (which can take minutes to initialize

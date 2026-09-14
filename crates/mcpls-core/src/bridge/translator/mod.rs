@@ -14,6 +14,7 @@ use tokio::sync::Mutex;
 
 use self::clock::{Clock, SystemClock};
 use self::encoding_ctx::EncodingCtx;
+pub use self::lifecycle::ServerLifecycle;
 use self::respawn::RespawnBackoff;
 use crate::bridge::apply::{Applier, ApplySummary, EditPlan, InvalidationQueue};
 use crate::bridge::encoding::PositionEncoding;
@@ -30,6 +31,7 @@ mod diagnostics;
 mod dto;
 mod edits;
 mod encoding_ctx;
+mod lifecycle;
 mod navigation;
 mod respawn;
 mod routing;
@@ -107,6 +109,12 @@ pub struct Translator {
     /// `timeout_seconds` on every tool call that arrives while it is down.
     /// See [`Self::respawn_if_dead`].
     respawn_backoffs: Arc<StdMutex<HashMap<ServerId, RespawnBackoff>>>,
+    /// What each applicable server is doing. Membership is the applicable
+    /// set: a server absent from here is not configured for this checkout.
+    lifecycles: Arc<StdMutex<HashMap<ServerId, ServerLifecycle>>>,
+    /// Per-server broadcast of the field above, so a caller waiting on a
+    /// spawn learns the outcome without polling.
+    lifecycle_senders: Arc<StdMutex<lifecycle::LifecycleSenders>>,
     /// Diagnostics cache, shared with `serve_with`'s notification pump.
     ///
     /// `None` for a `Translator` built without [`Self::with_notification_cache`]
@@ -246,6 +254,8 @@ impl Translator {
             server_configs: Arc::new(StdMutex::new(HashMap::new())),
             respawn_locks: Arc::new(StdMutex::new(HashMap::new())),
             respawn_backoffs: Arc::new(StdMutex::new(HashMap::new())),
+            lifecycles: Arc::new(StdMutex::new(HashMap::new())),
+            lifecycle_senders: Arc::new(StdMutex::new(HashMap::new())),
             notification_cache: None,
             apply_sink_lock: Arc::new(Mutex::new(())),
             applier: Arc::new(Applier::new(Vec::new(), ApplyConfig::default())),
