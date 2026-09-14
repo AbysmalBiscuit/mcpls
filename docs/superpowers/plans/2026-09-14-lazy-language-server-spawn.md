@@ -66,14 +66,14 @@ Add to the `mod tests` block at the bottom of `crates/mcpls-core/src/config/serv
 ```rust
 #[test]
 fn test_a_server_without_a_spawn_key_follows_the_backend_default() {
-    let server = LspServerConfig::new("rust", "rust-analyzer");
+    let server = LspServerConfig::rust_analyzer();
     assert_eq!(server.effective_spawn(SpawnPolicy::Lazy), SpawnPolicy::Lazy);
     assert_eq!(server.effective_spawn(SpawnPolicy::Eager), SpawnPolicy::Eager);
 }
 
 #[test]
 fn test_a_server_spawn_key_overrides_the_backend_default() {
-    let mut server = LspServerConfig::new("rust", "rust-analyzer");
+    let mut server = LspServerConfig::rust_analyzer();
     server.spawn = Some(SpawnPolicy::Eager);
     assert_eq!(server.effective_spawn(SpawnPolicy::Lazy), SpawnPolicy::Eager);
 }
@@ -91,14 +91,18 @@ fn test_a_later_entry_merges_its_spawn_key_over_an_earlier_one() {
         spawn = "eager"
     "#;
     let parsed: ServerConfig = toml::from_str(toml).expect("parse");
-    let resolved = resolve_lsp_servers(parsed.lsp_servers).expect("resolve");
-    let rust = resolved
+    let rust = parsed
+        .lsp_servers
         .iter()
         .find(|server| server.language_id == "rust")
         .expect("a rust server");
     assert_eq!(rust.spawn, Some(SpawnPolicy::Eager));
 }
 ```
+
+`ServerConfig::lsp_servers` at `crates/mcpls-core/src/config/mod.rs:363` is already a `Vec<LspServerConfig>`: `deserialize_lsp_servers` at `:396` runs `resolve_lsp_servers` during parsing, so the merge under test has happened by the time `from_str` returns and there is nothing left to resolve.
+
+`LspServerConfig::rust_analyzer` is one of the named built-in constructors beside `builtin` at `crates/mcpls-core/src/config/server.rs:288`, and is what `test_serde_roundtrip` in the same module already uses. There is no `LspServerConfig::new`.
 
 Add to the `mod tests` block at the bottom of `crates/mcpls-core/src/config/mod.rs`:
 
@@ -116,7 +120,7 @@ fn test_the_backend_spawn_policy_is_read_from_config() {
 }
 ```
 
-If `LspServerConfig::new` or `resolve_lsp_servers` is not in scope or is named differently in those test modules, match whatever the neighbouring tests in the same file already use to build a server config. Do not invent a constructor.
+`spawn` also has to be added to the `PartialLspServerConfig` at `crates/mcpls-core/src/config/server.rs:413` and to its `merge` at `:531`, or the third test's second entry has nowhere to carry the key and the merge cannot apply it.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -234,10 +238,11 @@ devrun task commit --arg commit_subject='feat(config): add a spawn policy key' -
 - Create: `crates/mcpls-core/src/bridge/translator/lifecycle.rs`
 - Modify: `crates/mcpls-core/src/bridge/translator/mod.rs`
 - Modify: `crates/mcpls-core/src/bridge/mod.rs`
+- Modify: `crates/mcpls-core/src/lib.rs:658`
 - Modify: `Cargo.toml`, `crates/mcpls-core/Cargo.toml`
 
 **Interfaces:**
-- Consumes: `config::ServerId`.
+- Consumes: `config::ServerId`, `config::SpawnPolicy`, `LspServerConfig::effective_spawn`, `Translator::register_server_config`.
 - Produces: `bridge::ServerLifecycle` with variants `Idle`, `Starting`, `Running`, `NotInstalled`, `Failed`, deriving `Copy`, `PartialEq`, `Eq`, `Debug`, `Display`, `Serialize`, `Deserialize`, `EnumIter`. On `Translator`: `set_lifecycle(&self, id: &ServerId, state: ServerLifecycle)`, `begin_starting(&self, id: &ServerId) -> bool`, `lifecycle_of(&self, id: &ServerId) -> Option<ServerLifecycle>`, `lifecycles(&self) -> Vec<(ServerId, ServerLifecycle)>` sorted by id, and `subscribe_lifecycle(&self, id: &ServerId) -> watch::Receiver<ServerLifecycle>`.
 
 - [ ] **Step 1: Add the dependency**
@@ -341,6 +346,21 @@ mod tests {
             Some(ServerLifecycle::NotInstalled)
         );
     }
+
+    #[test]
+    fn test_a_server_absent_from_the_applicable_set_is_not_claimed() {
+        let translator = Translator::new();
+        assert!(!translator.begin_starting(&ServerId::from("rust")));
+        assert_eq!(translator.lifecycle_of(&ServerId::from("rust")), None);
+    }
+
+    #[test]
+    fn test_a_running_entry_is_claimable_because_death_is_not_published() {
+        let translator = Translator::new();
+        let id = ServerId::from("rust");
+        translator.set_lifecycle(&id, ServerLifecycle::Running);
+        assert!(translator.begin_starting(&id));
+    }
 }
 ```
 
@@ -394,39 +414,44 @@ pub enum ServerLifecycle {
 
 impl Translator {
     /// Record `state` for `id` and tell every subscriber.
+    ///
+    /// The map write and the broadcast both happen under the `lifecycles`
+    /// lock, so no reader can see a map and a watch that disagree. Two
+    /// writers racing here would otherwise be free to interleave into a
+    /// map saying `Starting` and a watch saying `Failed`, and a waiter
+    /// reading the watch would give up on a spawn that is still running.
     pub fn set_lifecycle(&self, id: &ServerId, state: ServerLifecycle) {
-        let sender = {
-            let mut senders = lock_std(&self.lifecycle_senders);
-            senders
-                .entry(id.clone())
-                .or_insert_with(|| watch::channel(state).0)
-                .clone()
-        };
-        lock_std(&self.lifecycles).insert(id.clone(), state);
-        sender.send_replace(state);
+        let mut states = lock_std(&self.lifecycles);
+        states.insert(id.clone(), state);
+        lock_std(&self.lifecycle_senders)
+            .entry(id.clone())
+            .or_insert_with(|| watch::channel(state).0)
+            .send_replace(state);
     }
 
     /// Claim the right to spawn `id`, moving it to `Starting`.
     ///
     /// Returns `true` to exactly one caller per spawn. A caller that gets
     /// `false` either lost the race, in which case the winner's task will
-    /// publish the outcome, or asked about a server whose state is already
-    /// settled. Holding the map lock across the read and the write is what
+    /// publish the outcome, or asked about a server that is already
+    /// starting, already missing its binary, or absent from the applicable
+    /// set. Holding the map lock across the read and the write is what
     /// makes this the single-flight test as well as a state change.
+    ///
+    /// `Running` is claimable because a process that exited leaves the map
+    /// saying `Running` until something asks: death is found by
+    /// `is_server_dead`, not published. The caller checks that first.
     pub fn begin_starting(&self, id: &ServerId) -> bool {
-        let sender = {
-            let mut states = lock_std(&self.lifecycles);
-            match states.get(id) {
-                Some(ServerLifecycle::Idle) | Some(ServerLifecycle::Failed) => {}
-                _ => return false,
-            }
-            states.insert(id.clone(), ServerLifecycle::Starting);
-            lock_std(&self.lifecycle_senders)
-                .entry(id.clone())
-                .or_insert_with(|| watch::channel(ServerLifecycle::Starting).0)
-                .clone()
-        };
-        sender.send_replace(ServerLifecycle::Starting);
+        let mut states = lock_std(&self.lifecycles);
+        match states.get(id) {
+            Some(ServerLifecycle::Idle | ServerLifecycle::Failed | ServerLifecycle::Running) => {}
+            _ => return false,
+        }
+        states.insert(id.clone(), ServerLifecycle::Starting);
+        lock_std(&self.lifecycle_senders)
+            .entry(id.clone())
+            .or_insert_with(|| watch::channel(ServerLifecycle::Starting).0)
+            .send_replace(ServerLifecycle::Starting);
         true
     }
 
@@ -464,7 +489,7 @@ impl Translator {
 pub(super) type LifecycleSenders = HashMap<ServerId, watch::Sender<ServerLifecycle>>;
 ```
 
-`begin_starting` takes the two locks in the order `lifecycles` then `lifecycle_senders`. Every other method in this file that takes both must use the same order. If `ServerId` does not already derive `Ord`, add `PartialOrd` and `Ord` to its derives where it is defined, since `lifecycles` sorts by it.
+Both writers take the two locks in the order `lifecycles` then `lifecycle_senders`, and broadcast before releasing either. Every other method in this file that takes both must do the same: the order prevents a deadlock, and holding `lifecycles` across the `send_replace` is what keeps the map and the watch telling one story. `send_replace` does not block or await, so nothing waits on a lock while holding these. If `ServerId` does not already derive `Ord`, add `PartialOrd` and `Ord` to its derives where it is defined, since `lifecycles` sorts by it.
 
 - [ ] **Step 6: Wire the module and the fields**
 
@@ -494,7 +519,39 @@ Initialize both in `Translator::new`:
             lifecycle_senders: Arc::new(StdMutex::new(HashMap::new())),
 ```
 
-- [ ] **Step 7: Run the tests to verify they pass**
+- [ ] **Step 7: Populate the map and the configs at setup**
+
+Membership is what makes a server applicable, so the map has to be filled in the same commit that introduces it. `ensure_server` in Task 4 refuses an id the map does not hold, and `register_server_config` is what a spawn reads its command from; leaving either to a later task would mean two commits in which a crashed server can no longer be replaced.
+
+In `crates/mcpls-core/src/lib.rs`, beside the `expected_servers` block at `:658`, which stays until Task 6 retires it:
+
+```rust
+        // Membership is the applicable set. A server is idle until
+        // something shows the session needs it; an eager one is already
+        // starting by the time any request can observe this.
+        for init_config in &applicable_configs {
+            let id = init_config.server_config.id();
+            let eager = init_config
+                .server_config
+                .effective_spawn(config.backend.spawn)
+                == SpawnPolicy::Eager;
+            translator.register_server_config(id.clone(), init_config.clone());
+            translator.set_lifecycle(
+                &id,
+                if eager {
+                    ServerLifecycle::Starting
+                } else {
+                    ServerLifecycle::Idle
+                },
+            );
+        }
+```
+
+An eager entry starts at `Starting`, not `Idle`: `spawn_batch` does not take the single-flight lock, so an entry left idle while the batch runs would let a request in that window start a second process for the same server.
+
+Nothing reads the map yet, so this commit changes no behaviour. It is here so that everything after it can assume the map is populated.
+
+- [ ] **Step 8: Run the tests to verify they pass**
 
 Run: `cargo nextest run -p mcpls-core lifecycle`
 Expected: PASS.
@@ -502,10 +559,10 @@ Expected: PASS.
 Run: `devrun task verify`
 Expected: PASS.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
-devrun task commit --arg commit_subject='feat(bridge): track a state per language server' --arg commit_body=$'A server is idle, starting, running, missing its binary, or failed.\nNothing writes the map yet beyond its own tests, and lsp_servers stays\nthe registry routing resolves against.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>'
+devrun task commit --arg commit_subject='feat(bridge): track a state per language server' --arg commit_body=$'A server is idle, starting, running, missing its binary, or failed.\nSetup fills the map from the applicable set and registers each spawn\nconfig beside it, so membership is what makes a server applicable.\nNothing reads the map yet, and lsp_servers stays the registry routing\nresolves against.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>'
 ```
 
 ---
@@ -563,7 +620,7 @@ Expected: FAIL to compile, `no method named is_missing_binary`.
 
 - [ ] **Step 3: Add the classifier**
 
-In `crates/mcpls-core/src/error.rs`, in the `impl Error` block:
+`crates/mcpls-core/src/error.rs` has no `impl Error` block: it holds the enum, its `Display`, and the `ServerSpawnFailure` struct beside them. Add one below the enum, before the test module:
 
 ```rust
     /// Whether this error means the server's command is not on `PATH`.
@@ -629,19 +686,40 @@ devrun task commit --arg commit_subject='feat(error): classify a missing server 
 **Files:**
 - Modify: `crates/mcpls-core/src/bridge/translator/respawn.rs:224`
 - Modify: `crates/mcpls-core/src/bridge/translator/mod.rs`
-- Modify: `crates/mcpls-core/src/bridge/translator/routing.rs:78`
-- Modify: `crates/mcpls-core/src/bridge/translator/symbols.rs:213`
+- Modify: `crates/mcpls-core/src/bridge/translator/routing.rs:77`
+- Modify: `crates/mcpls-core/src/bridge/translator/symbols.rs:212`
+- Modify: `crates/mcpls-core/src/lib.rs:682`, `:925`
 - Test: `crates/mcpls-core/src/bridge/translator/respawn.rs`'s `mod tests`
+- Test: `crates/mcpls-core/src/recovery_tests.rs:340`, `:825`
 
 **Interfaces:**
-- Consumes: `ServerLifecycle`, `Translator::begin_starting`, `Translator::set_lifecycle`, `Translator::subscribe_lifecycle`, `Error::is_missing_binary`.
-- Produces: `Translator::ensure_server(&self, id: &ServerId, budget: Option<Duration>) -> Result<()>`, and `Translator::set_self_handle(&self, handle: Weak<Translator>)`. `respawn_if_dead` no longer exists.
+- Consumes: `ServerLifecycle`, `Translator::begin_starting`, `Translator::set_lifecycle`, `Translator::subscribe_lifecycle`, `Translator::lifecycle_of`, `Error::is_missing_binary`.
+- Produces: `Translator::ensure_server(&self, id: &ServerId, budget: Option<Duration>) -> Result<()>`, `Translator::set_self_handle(&self, handle: Weak<Translator>)`, and `respawn::RESPAWN_WAIT`. `build_translator` returns `Arc<Translator>` instead of `Translator`. `respawn_if_dead` no longer exists.
 
 - [ ] **Step 1: Write the failing tests**
 
 Add to the `mod tests` block in `crates/mcpls-core/src/bridge/translator/respawn.rs`:
 
 ```rust
+/// The self handle is present, so an error here is the map check and not
+/// the missing-handle branch. Without the check this waits out the whole
+/// budget and reports `ServerInitializing`, inviting a retry of a spawn
+/// nobody started.
+#[tokio::test]
+async fn test_a_server_absent_from_the_applicable_set_is_not_started() {
+    let translator = Arc::new(Translator::new());
+    translator.set_self_handle(Arc::downgrade(&translator));
+    let id = ServerId::from("rust");
+
+    let err = translator
+        .ensure_server(&id, Some(Duration::from_millis(50)))
+        .await
+        .expect_err("an id nobody declared applicable cannot be started");
+
+    assert!(matches!(err, Error::ServerUnavailable { .. }));
+    assert_eq!(translator.lifecycle_of(&id), None);
+}
+
 #[tokio::test]
 async fn test_a_translator_with_no_self_handle_cannot_spawn() {
     let translator = Translator::new();
@@ -672,6 +750,9 @@ async fn test_a_missing_binary_state_is_reported_without_a_spawn() {
         translator.lifecycle_of(&id),
         Some(ServerLifecycle::NotInstalled)
     );
+    // Every real attempt records a failure, so an untouched backoff is
+    // what "no spawn attempt" looks like from outside.
+    assert_eq!(translator.respawn_backoff_remaining(&id), None);
 }
 
 #[tokio::test]
@@ -792,10 +873,11 @@ Rename the method and change its head. Everything from `self.forget_watch_regist
     ///
     /// # Errors
     ///
-    /// [`Error::ServerUnavailable`] when the command is not installed, when
-    /// the server is inside its respawn backoff, or when no config was
-    /// registered for `id`. [`Error::ServerInitializing`] when the spawn is
-    /// still running at the end of `budget`.
+    /// [`Error::ServerUnavailable`] when `id` is not applicable to this
+    /// checkout, when the command is not installed, when the server is
+    /// inside its respawn backoff, or when no config was registered for
+    /// `id`. [`Error::ServerInitializing`] when the spawn is still running
+    /// at the end of `budget`.
     pub(super) async fn ensure_server(
         &self,
         id: &ServerId,
@@ -805,17 +887,31 @@ Rename the method and change its head. Everything from `self.forget_watch_regist
             return Ok(());
         }
 
-        let mut states = self.subscribe_lifecycle(id);
-        match *states.borrow_and_update() {
-            ServerLifecycle::Running if !self.is_server_dead(id) => return Ok(()),
-            ServerLifecycle::NotInstalled => {
+        // Absence from the map is read before subscribing, because
+        // `subscribe_lifecycle` manufactures an `Idle` channel for an id it
+        // has never seen. Waiting on that channel would burn the whole
+        // budget on a spawn nobody started and then report the server as
+        // initializing, which is the one answer that invites a retry.
+        match self.lifecycle_of(id) {
+            None => {
+                return Err(Error::ServerUnavailable {
+                    server_id: id.clone(),
+                    reason: "not applicable to this workspace".to_string(),
+                });
+            }
+            Some(ServerLifecycle::NotInstalled) => {
                 return Err(Error::ServerUnavailable {
                     server_id: id.clone(),
                     reason: "command not found when it was last attempted".to_string(),
                 });
             }
-            _ => {}
+            Some(ServerLifecycle::Running) if !self.is_server_dead(id) => return Ok(()),
+            Some(_) => {}
         }
+
+        // Membership in the map implies a sender, since both writers create
+        // the channel under the same lock as the map entry.
+        let mut states = self.subscribe_lifecycle(id);
 
         self.reconcile_respawn_stability(id);
         if let Some(remaining) = self.respawn_backoff_remaining(id) {
@@ -926,27 +1022,195 @@ In the same `impl Translator` block:
 
 `install_server` is the existing body of `respawn_if_dead` from `self.forget_watch_registrations(id)` onward, extracted as `async fn install_server(&self, id: &ServerId, config: ServerInitConfig) -> Result<()>`, with its final `Ok(())` in place of the old `record_respawn_success` and log line, which now live in `run_spawn`. Move it verbatim: every comment in it explains an ordering constraint that still holds.
 
+One consequence of detaching is worth stating rather than fixing. `shutdown` at `crates/mcpls-core/src/lib.rs:1066` awaits the LSP init task and drains the server map, but it does not await a detached `run_spawn`. A spawn still in flight holds a strong `Arc<Translator>`, so it can finish and insert a fresh `LspServer` into a map that was already drained. The child is not orphaned: `kill_on_drop` at `crates/mcpls-core/src/lsp/lifecycle.rs:446` kills it when the translator drops, which is when the backend exits. So the window costs one extra process between the drain and process exit, and closing it would mean either a shutdown flag every install checks or a handle set `shutdown` awaits. Neither is worth it for a process that is about to die anyway.
+
 - [ ] **Step 7: Update the call sites**
 
-`crates/mcpls-core/src/bridge/translator/routing.rs:78` and `crates/mcpls-core/src/bridge/translator/symbols.rs:213` call `respawn_if_dead(&id).await?`. Both become:
+`crates/mcpls-core/src/bridge/translator/routing.rs:77` and `crates/mcpls-core/src/bridge/translator/symbols.rs:212` call `respawn_if_dead(&id).await?`. Both become:
 
 ```rust
         self.ensure_server(&id, Some(RESPAWN_WAIT)).await?;
 ```
 
-with, near the other constants in `respawn.rs` and re-exported to those modules:
+with, near the other constants in `respawn.rs`:
 
 ```rust
 /// How long a caller waits for a replacement before it is told to retry.
 ///
 /// A respawn of a server that was running has a warm cache behind it, so
 /// this is generous where the first-spawn budget in `routing.rs` is not.
-const RESPAWN_WAIT: Duration = Duration::from_secs(5);
+pub(super) const RESPAWN_WAIT: Duration = Duration::from_secs(5);
 ```
+
+`pub(super)` rather than private: both call sites are sibling modules under `translator`, so a private constant does not reach them. Import it in each as `use super::respawn::RESPAWN_WAIT;`.
 
 This keeps today's behaviour for a crashed server: the call waits and then either gets the replacement or is told to retry, where before it waited without a bound.
 
-- [ ] **Step 8: Run the tests to verify they pass**
+- [ ] **Step 8: Adapt the existing respawn tests**
+
+Eleven tests in this module call `respawn_if_dead` on a `Translator::new()` that has neither a self handle nor a map entry. Renaming the method is not enough: without a handle the spawn cannot start, and without a map entry `ensure_server` refuses the id. Production gets both from setup; a test that builds a translator by hand does them here.
+
+Add beside the other helpers in `mod tests`:
+
+```rust
+/// Make a hand-built translator able to spawn.
+///
+/// Setup does both of these in production: the `Arc` exists there, and
+/// the applicable set is written to the map before anything routes. A
+/// test that builds a `Translator` directly has neither, and without them
+/// `ensure_server` refuses the id rather than starting it.
+fn spawnable(translator: Translator, id: &ServerId) -> Arc<Translator> {
+    let translator = Arc::new(translator);
+    translator.set_self_handle(Arc::downgrade(&translator));
+    translator.set_lifecycle(id, ServerLifecycle::Idle);
+    translator
+}
+
+/// A command that exists but cannot be executed.
+///
+/// The spawn fails with `PermissionDenied`, which is not a missing
+/// binary, so the server lands on `Failed` and inside the respawn
+/// backoff. A command that does not exist at all lands on
+/// `NotInstalled` instead, which is permanent for the backend's life and
+/// never reaches the backoff these tests are about.
+fn write_unexecutable_command(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = dir.join("not_executable");
+    fs::write(&path, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    path
+}
+```
+
+Then work through the module:
+
+1. Every `let translator = Translator::new()...;` whose test later spawns becomes `let translator = spawnable(Translator::new()..., &id);`. That is every test except `test_respawn_if_dead_noop_when_server_alive`, which returns on the live-client fast path before the map is read, and so keeps its bare `Translator::new()` as proof that path is still taken. In `test_prepare_document_respawns_dead_server_through_shared_entry_point` the binding is `let mut translator`, and `set_workspace_roots` needs that `&mut`: call it before wrapping, then wrap.
+
+2. Every `translator.respawn_if_dead(&id).await` becomes `translator.ensure_server(&id, Some(RESPAWN_WAIT)).await`. In `test_respawn_if_dead_single_flights_concurrent_callers` that is both spawned tasks, and `Arc::new(Translator::new())` becomes `spawnable(Translator::new(), &id)`.
+
+3. Rename each test from `test_respawn_if_dead_*` to `test_ensure_server_*`, keeping the rest of the name. The doc comments above them explain invariants that still hold; leave them, except where step 4 changes the test.
+
+4. Rewrite `test_respawn_if_dead_propagates_spawn_failure`. `ensure_server` never propagates the spawn error: `run_spawn` records it as a state and `await_terminal_state` reports `ServerUnavailable`. What is worth testing is that the state distinguishes the two failure kinds.
+
+```rust
+        /// A spawn failure is reported as a state rather than propagated.
+        /// A command that is not on `PATH` is permanent for the backend's
+        /// life, so it lands on `NotInstalled` and not on `Failed`.
+        #[tokio::test]
+        async fn test_ensure_server_reports_a_missing_command_as_not_installed() {
+            let dir = TempDir::new().unwrap();
+            let script = write_crash_after_init_script(dir.path());
+            let id = ServerId::from("rust");
+            let config = stub_server_config("rust", &script);
+
+            let server = LspServer::spawn(config).await.unwrap();
+            let translator = spawnable(Translator::new(), &id);
+            translator.register_client(id.clone(), server.client().clone());
+            translator.register_server(id.clone(), server);
+            wait_until_dead(&translator, &id).await;
+
+            let mut broken = stub_server_config("rust", &script);
+            broken.server_config.command = "nonexistent-lsp-cmd-xyz".to_string();
+            translator.register_server_config(id.clone(), broken);
+
+            let err = translator
+                .ensure_server(&id, Some(RESPAWN_WAIT))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::ServerUnavailable { .. }),
+                "got {err:?}"
+            );
+            assert_eq!(
+                translator.lifecycle_of(&id),
+                Some(ServerLifecycle::NotInstalled)
+            );
+        }
+```
+
+5. Rewrite the two backoff tests. Both prove the first call really attempted and the second short-circuited, and both proved it by the error kind: the first was `Error::ServerSpawnFailed`, the second `Error::ServerUnavailable`. Both are now `ServerUnavailable`, so the witness moves to the backoff itself, which grows on every recorded failure. A second call that attempted would record a second failure and lengthen the window; one that short-circuited leaves it alone. The `FakeClock` does not advance on its own, so the comparison is exact rather than a timing guess.
+
+Both tests also swap `nonexistent-lsp-cmd-xyz` for `write_unexecutable_command(dir.path())`, with `args: vec![]`, because a command that does not exist lands on `NotInstalled` and never enters the backoff at all.
+
+```rust
+        /// A second call inside the backoff window must not attempt
+        /// another real spawn. The witness is the window itself: a
+        /// recorded failure lengthens it, so a window that is unchanged
+        /// across the second call is proof that call recorded nothing.
+        #[tokio::test]
+        async fn test_ensure_server_backs_off_after_repeated_failure() {
+            let dir = TempDir::new().unwrap();
+            let seed_script = write_crash_after_init_script(dir.path());
+            let id = ServerId::from("rust");
+            let seed_config = stub_server_config("rust", &seed_script);
+
+            let seed = LspServer::spawn(seed_config).await.unwrap();
+            let clock = Arc::new(FakeClock::new());
+            let translator = spawnable(
+                Translator::new().with_clock(Arc::clone(&clock) as Arc<dyn Clock>),
+                &id,
+            );
+            translator.register_client(id.clone(), seed.client().clone());
+            translator.register_server(id.clone(), seed);
+            wait_until_dead(&translator, &id).await;
+
+            let mut broken = stub_server_config("rust", &seed_script);
+            broken.server_config.command =
+                write_unexecutable_command(dir.path()).to_string_lossy().to_string();
+            broken.server_config.args = vec![];
+            translator.register_server_config(id.clone(), broken);
+
+            let err1 = translator
+                .ensure_server(&id, Some(RESPAWN_WAIT))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err1, Error::ServerUnavailable { .. }),
+                "first attempt should be a real (failed) spawn, got {err1:?}"
+            );
+            assert_eq!(translator.lifecycle_of(&id), Some(ServerLifecycle::Failed));
+            let window = translator
+                .respawn_backoff_remaining(&id)
+                .expect("a failed spawn opens a backoff window");
+
+            let err2 = translator
+                .ensure_server(&id, Some(RESPAWN_WAIT))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err2, Error::ServerUnavailable { .. }),
+                "second call within the backoff window must fail fast, got {err2:?}"
+            );
+            assert_eq!(
+                translator.respawn_backoff_remaining(&id),
+                Some(window),
+                "a second attempt would have recorded a second failure and \
+                 lengthened the window"
+            );
+        }
+```
+
+`test_respawn_if_dead_reattempts_once_backoff_window_elapses` takes the same two substitutions, keeps its `clock.advance(RESPAWN_BACKOFF_MAX)` and its working-config swap, and keeps its final `assert!(result.is_ok(), ...)`. `Failed` is a claimable state, so the third call starts a real spawn once the window has passed.
+
+6. `crates/mcpls-core/src/recovery_tests.rs:340` and `:825` build their translator with `build_translator` and drive `spawn_lsp_servers_background` directly, so a handle set only in `serve_with` leaves them unable to respawn and their crash-then-recover loops time out.
+
+Rather than repeating the handle at each call site, give it to every translator at the one place they are all built. `build_translator` at `crates/mcpls-core/src/lib.rs:925` returns a bare `Translator` today and each caller wraps it; make it return the `Arc` and set the handle before it returns:
+
+```rust
+) -> Arc<Translator> {
+    // ... unchanged body through `translator.set_workspace_roots(workspace_roots);`
+    let translator = Arc::new(translator);
+    translator.set_self_handle(Arc::downgrade(&translator));
+    translator
+}
+```
+
+Update its doc comment to say the returned translator can spawn, then drop `let translator = Arc::new(translator);` at `crates/mcpls-core/src/lib.rs:682` and the `Arc::new(...)` wrappers at `recovery_tests.rs:340` and `:825`. The test at `crates/mcpls-core/src/lib.rs:2023` reaches `applier_for` through the `Arc`'s deref and needs no change.
+
+This is also the answer to the cost the spec accepted when it chose a stored handle over threading `&Arc<Self>` through the call chain. That cost is real, and it lands as a setup step every hand-built translator must remember. Putting the step inside the shared constructor is what keeps it from becoming a fixture each new test rediscovers by watching a spawn silently fail.
+
+- [ ] **Step 9: Run the tests to verify they pass**
 
 Run: `cargo nextest run -p mcpls-core ensure_server`
 Expected: PASS.
@@ -954,10 +1218,13 @@ Expected: PASS.
 Run: `cargo nextest run -p mcpls-core respawn`
 Expected: PASS. The existing respawn tests exercise the same install sequence through the new entry point.
 
+Run: `cargo nextest run -p mcpls-core --test recovery_tests`
+Expected: PASS.
+
 Run: `devrun task verify`
 Expected: PASS.
 
-- [ ] **Step 9: Commit**
+- [ ] **Step 10: Commit**
 
 ```bash
 devrun task commit --arg commit_subject='refactor(bridge): generalize respawn to ensure' --arg commit_body=$'A never-spawned server and a crashed one are one operation from two\nstarting states. The spawn moves into a detached task so a caller that\nstops waiting does not destroy it, and a drop guard publishes a terminal\nstate for a task that ends without one, which would otherwise leave the\nserver starting for the life of the backend.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>'
@@ -971,14 +1238,16 @@ The diagnostics baseline is adopted once, after the startup batch, and seeds eve
 
 **Files:**
 - Modify: `crates/mcpls-core/src/bridge/delivery.rs:160`
-- Modify: `crates/mcpls-core/src/notification_lifecycle.rs`
+- Modify: `crates/mcpls-core/src/notification_lifecycle.rs:111`
+- Modify: `crates/mcpls-core/src/bridge/settle.rs:122`
 - Modify: `crates/mcpls-core/src/lib.rs:719`, `:1119`, `:1227`
-- Modify: `crates/mcpls-core/src/bridge/translator/respawn.rs`
+- Modify: `crates/mcpls-core/src/bridge/translator/respawn.rs:300`
 - Test: `crates/mcpls-core/src/bridge/delivery.rs`'s `mod tests`
+- Test: `crates/mcpls-core/src/bridge/settle.rs`'s `mod tests`
 
 **Interfaces:**
 - Consumes: `Translator::run_spawn`, `ServerSettle::register_diagnostics_owner`.
-- Produces: `DiagnosticsDelivery::merge_baseline(&mut self, entries: HashMap<String, u64>)`, `NotificationPumps::shared(&self) -> &PumpShared`, and `crate::baseline_merge_task(shared: PumpShared, owner: ServerId, cancel_rx: watch::Receiver<bool>)`.
+- Produces: `DiagnosticsDelivery::merge_baseline(&mut self, entries: HashMap<String, u64>)`, `NotificationPumps::shared(&self) -> &PumpShared`, `NotificationPumps::settle(&self) -> &ServerSettle`, `ServerSettle::diagnostics_owner_count(&self) -> usize`, and `crate::baseline_merge_task(shared: PumpShared, owner: ServerId, cancel_rx: watch::Receiver<bool>)`. `ServerSettle::register_diagnostics_owner` now also sets `owners_installed`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1145,13 +1414,54 @@ Add the accessor in `crates/mcpls-core/src/notification_lifecycle.rs`, in the `i
     }
 ```
 
-In `run_spawn` in `crates/mcpls-core/src/bridge/translator/respawn.rs`, in the `Ok(())` arm, after `record_respawn_success`:
+`install_server` already calls `pumps.register_diagnostics_owner(id)` at `crates/mcpls-core/src/bridge/translator/respawn.rs:300` when the server caches diagnostics, so the owner registration is there and does not need repeating. What is missing is the rest of what the startup path does after it registers owners. Both of the following go beside that call, inside the same `if caches_diagnostics` block:
+
+```rust
+                pumps.register_diagnostics_owner(id);
+                // The startup path does both of these after installing its
+                // owners, at `crates/mcpls-core/src/lib.rs:1181` and
+                // `:1200`. A lazily started owner arrives with no startup
+                // path behind it and needs them just as much: the fair
+                // share is computed from how many servers cache
+                // diagnostics, and the backstop has to cover this server's
+                // indexing rather than a window that opened when the
+                // backend did.
+                pumps.settle().restart_deadline();
+                if let Some(cache) = &self.notification_cache {
+                    cache
+                        .lock()
+                        .await
+                        .set_diagnostics_route_count(pumps.settle().diagnostics_owner_count());
+                }
+```
+
+Two small additions make that compile. `ServerSettle` gets a count:
+
+```rust
+    /// How many servers currently cache diagnostics, which is what the
+    /// cache divides its budget between.
+    #[must_use]
+    pub fn diagnostics_owner_count(&self) -> usize {
+        self.state
+            .lock()
+            .map_or(0, |state| state.diagnostics_owners.len())
+    }
+```
+
+And `register_diagnostics_owner` at `crates/mcpls-core/src/bridge/settle.rs:122` sets the flag that says owners exist:
+
+```rust
+        state.owners_installed = true;
+```
+
+Without that line, `should_settle_at` at `crates/mcpls-core/src/bridge/settle.rs:311` takes its workspace-wide branch, because on an all-lazy checkout `set_diagnostics_owners` never runs and nothing else sets the flag. That branch returns `true` outright once the deadline has passed, so the first owner to start after it would settle on its first poll and merge an empty set, and the next flush would report every warning the workspace already had as the agent's new work. `restart_deadline` above moves the deadline, and this line moves the decision to the per-owner branch that actually waits for this server to go quiet.
+
+Then, in `run_spawn`'s `Ok(())` arm, after `record_respawn_success`, start the merge:
 
 ```rust
                 if self.is_diagnostics_route_for(&id)
                     && let Some(pumps) = self.notification_pumps.get()
                 {
-                    pumps.register_diagnostics_owner(&id);
                     let shared = pumps.shared().clone();
                     let owner = id.clone();
                     tokio::spawn(crate::baseline_merge_task(
@@ -1162,7 +1472,41 @@ In `run_spawn` in `crates/mcpls-core/src/bridge/translator/respawn.rs`, in the `
                 }
 ```
 
-`is_diagnostics_route` takes a language id and a server id; `install_server` already computes both, so either pass the language through or add a thin `is_diagnostics_route_for(&self, id: &ServerId) -> bool` that looks the language up from `server_configs`. `cancel_rx` may need adding to `NotificationPumps` beside `shared`; it already holds one for its own tasks.
+`is_diagnostics_route` takes a language id and a server id; `install_server` already computes both, so either pass the language through or add a thin `is_diagnostics_route_for(&self, id: &ServerId) -> bool` that looks the language up from `server_configs`. `pumps.settle()` and `pumps.cancel_rx()` may need adding to `NotificationPumps` beside `shared`; it already holds both for its own tasks.
+
+Add a test to `crates/mcpls-core/src/bridge/settle.rs`'s `mod tests` for the state this turns on, since it is the whole reason the merge is not empty:
+
+```rust
+    /// On a checkout where nothing spawns eagerly, `set_diagnostics_owners`
+    /// never runs, so the first owner to register is what has to switch
+    /// the decision over to the per-owner branch. Left on the
+    /// workspace-wide branch, a backend whose other traffic has gone quiet
+    /// answers "settled" on behalf of a server that has not said anything
+    /// yet, and the merge that follows collects nothing.
+    #[test]
+    fn test_the_first_lazy_owner_installs_the_per_owner_decision() {
+        let settle = ServerSettle::new(Duration::from_millis(10), Duration::from_secs(300));
+        let noisy = ServerId::from("typescript");
+        let token = serde_json::json!("t1");
+        let start = Instant::now();
+
+        // Put the workspace-wide clock past its debounce, which is the
+        // state that makes that branch answer "settled".
+        settle.begin(&noisy, &token);
+        settle.end_at(&noisy, &token, start);
+
+        let owner = ServerId::from("rust");
+        settle.register_diagnostics_owner(&owner);
+
+        assert!(
+            !settle.should_settle_at(start + Duration::from_millis(50)),
+            "a lazily registered owner that has not gone quiet keeps the \
+             baseline waiting"
+        );
+    }
+```
+
+The owner has never reported progress, so the per-owner branch holds it for `NO_PROGRESS_GRACE` rather than `quiet_for`. Without the `owners_installed` line the workspace-wide branch answers instead, and 50ms is well past its 10ms debounce, so the assertion fails.
 
 - [ ] **Step 6: Move the two setup pieces**
 
@@ -1223,15 +1567,17 @@ devrun task commit --arg commit_subject='fix(bridge): extend the baseline per ow
 `expected_servers` answers "not registered yet, wait and retry" and is cleared when background initialization finishes. Lazy spawning has no such moment. This task populates the lifecycle map and `server_configs` during setup, binds the router to the applicable set, has the eager batch publish its outcomes, and moves the catch-all redirect to lookup time.
 
 **Files:**
-- Modify: `crates/mcpls-core/src/lib.rs:658`, `:775`, `:1143`, `:1161`
-- Modify: `crates/mcpls-core/src/bridge/translator/mod.rs:830`, `:938`
-- Modify: `crates/mcpls-core/src/bridge/translator/routing.rs:119`
-- Modify: `crates/mcpls-core/src/bridge/translator/symbols.rs:202`
-- Test: `crates/mcpls-core/src/bridge/translator/routing.rs`'s `mod tests`
+- Modify: `crates/mcpls-core/src/lib.rs:286`, `:658`, `:775`, `:1143`, `:1161`
+- Modify: `crates/mcpls-core/src/bridge/translator/mod.rs:88`, `:244`, `:808`, `:830`, `:841`, `:940`
+- Modify: `crates/mcpls-core/src/bridge/translator/routing.rs:95`, `:119`
+- Modify: `crates/mcpls-core/src/bridge/translator/symbols.rs:198`, `:202`, `:215`
+- Modify: `crates/mcpls-core/src/config/routing.rs:207`, and `:365` deleted
+- Test: `crates/mcpls-core/src/bridge/translator/routing.rs`'s `mod tests`, including `:357`
+- Test: `crates/mcpls-core/src/bridge/translator/symbols.rs:304`, `crates/mcpls-core/src/bridge/translator/mod.rs:1199` (deleted), `crates/mcpls-core/src/hooks/sweep.rs:425`, `crates/mcpls-core/src/lsp/lifecycle.rs:2226`
 
 **Interfaces:**
 - Consumes: `Translator::lifecycle_of`, `Translator::set_lifecycle`, `SpawnPolicy`, `ServerSpawnFailure::missing_binary`.
-- Produces: no new public surface. `set_expected_servers`, `clear_expected_servers` and the `expected_servers` field are gone. `rebind_router` is gone.
+- Produces: `ToolRouter::catch_all(&self, language_id: &str) -> Option<&ServerId>`. `register_servers` loses its `configs` parameter. `set_expected_servers`, `clear_expected_servers` and the `expected_servers` field are gone. `rebind_router` and `rebind_to_registered` are gone.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1288,39 +1634,9 @@ fn test_a_crashed_narrow_server_does_not_fall_through() {
 Run: `cargo nextest run -p mcpls-core catch_all`
 Expected: FAIL. The fall-through test resolves to `rust-narrow` and errors.
 
-- [ ] **Step 3: Populate the map and the configs at setup**
+- [ ] **Step 3: Delete the `expected_servers` population**
 
-In `crates/mcpls-core/src/lib.rs`, replace the `expected_servers` block at `:658` with:
-
-```rust
-        // Membership is the applicable set. A server is idle until
-        // something shows the session needs it; an eager one is already
-        // starting by the time any request can observe this.
-        for init_config in &applicable_configs {
-            let id = init_config.server_config.id();
-            let eager = init_config
-                .server_config
-                .effective_spawn(config.backend.spawn)
-                == SpawnPolicy::Eager;
-            translator.register_server_config(id.clone(), init_config.clone());
-            translator.set_lifecycle(
-                &id,
-                if eager {
-                    ServerLifecycle::Starting
-                } else {
-                    ServerLifecycle::Idle
-                },
-            );
-        }
-```
-
-An eager entry starts at `Starting`, not `Idle`: `spawn_batch` does not take the single-flight lock, so an entry left idle while the batch runs would let a request in that window start a second process for the same server.
-
-Then, after `let translator = Arc::new(translator);`:
-
-```rust
-        translator.set_self_handle(Arc::downgrade(&translator));
-```
+Task 2 already populates the lifecycle map and `server_configs` at `crates/mcpls-core/src/lib.rs:658`, and Task 4 already gave `build_translator` the self handle. What is left here is removing what the map replaces: delete the `expected_servers` set built at `:660` and the `set_expected_servers` call at `:664`, leaving the loop Task 2 added in their place.
 
 - [ ] **Step 4: Publish the batch's outcomes**
 
@@ -1328,14 +1644,17 @@ Then, after `let translator = Arc::new(translator);`:
 
 ```rust
         for failure in &result.failures {
-            translator.set_lifecycle(
-                &failure.server_id,
-                if failure.missing_binary {
-                    ServerLifecycle::NotInstalled
-                } else {
-                    ServerLifecycle::Failed
-                },
-            );
+            if failure.missing_binary {
+                translator.set_lifecycle(&failure.server_id, ServerLifecycle::NotInstalled);
+            } else {
+                // A batch failure is a failed attempt like any other, and
+                // `Failed` is a claimable state. Without the recorded
+                // failure, the first sweep after startup retries a server
+                // whose `initialize` timed out with no backoff at all, and
+                // keeps retrying it at a quarter of the quiet interval.
+                translator.record_respawn_failure(&failure.server_id);
+                translator.set_lifecycle(&failure.server_id, ServerLifecycle::Failed);
+            }
         }
 
         let server_count = result.server_count();
@@ -1347,15 +1666,68 @@ Then, after `let translator = Arc::new(translator);`:
 
 Do this rather than adding an `ids` field to `RegisteredServers`: `diagnostics_flags` is already built from `result.servers`, so a second list of the same keys would be two things to keep in step.
 
+`record_respawn_failure` lives in the `impl Translator` block in `crates/mcpls-core/src/bridge/translator/respawn.rs` and is private to that module. Widen it to `pub(crate)` for this call.
+
 On the `all_failed` path at `:1143`, publish the same failure states and delete the `rebind_router(&HashSet::new())` call. Delete both `clear_expected_servers` calls.
 
 - [ ] **Step 5: Retire the router rebind**
 
-`ToolRouter::from_configs` at `crates/mcpls-core/src/lib.rs:625` already builds the router from the applicable configs, which is the binding this design wants. Delete `Translator::rebind_router` and the `ToolRouter::rebind_to_registered` it calls, along with their tests. Nothing rebinds after setup.
+`ToolRouter::from_configs` at `crates/mcpls-core/src/lib.rs:633` already builds the router from the applicable configs, which is the binding this design wants. Delete `Translator::rebind_router` and the `ToolRouter::rebind_to_registered` it calls, along with their tests. Nothing rebinds after setup.
 
-The call to delete first is inside `register_servers` itself, at `crates/mcpls-core/src/lib.rs:292`. Its `register_server_config` call at `:313` also becomes redundant, since Step 3 registers every applicable config during setup; drop it and delete the local `registered` set if nothing else reads it.
+The call to delete first is inside `register_servers` itself, at `crates/mcpls-core/src/lib.rs:292`. Its `register_server_config` call at `:313` also becomes redundant, since Step 3 registers every applicable config during setup. Dropping it leaves the `configs` parameter unused, which is denied, so remove the parameter too and update both call sites: `crates/mcpls-core/src/lib.rs:1161` stops passing `&configs_by_id`, and `crates/mcpls-core/src/lsp/lifecycle.rs:2268` stops passing `&HashMap::new()`. The `warn!` about a missing respawn config goes with it, and so does the local `registered` set.
 
-- [ ] **Step 6: Resolve against the map**
+- [ ] **Step 6: Apply the same redirect to the diagnostics flag**
+
+`register_servers` computes `diagnostics_flags` from `is_diagnostics_route` at `crates/mcpls-core/src/bridge/translator/mod.rs:841`, which reads the router as it stands. Rebinding is what used to make that reflect who actually came up; without it, a narrow server that claimed `Diagnostics` and never started still wins the lookup, the language's catch-all is flagged `false`, its pump is installed with caching off, and the language's diagnostics go dark. Move the redirect into the accessor:
+
+```rust
+    #[must_use]
+    pub fn is_diagnostics_route(&self, language_id: &str, id: &ServerId) -> bool {
+        let (claimant, catch_all) = {
+            let router = lock_std(&self.router);
+            (
+                router.resolve(language_id, ToolKind::Diagnostics).cloned(),
+                router.catch_all(language_id).cloned(),
+            )
+        };
+        match claimant {
+            None => false,
+            Some(claimant) if claimant == *id => true,
+            // A claimant that has settled on a failure hands what it
+            // claimed to the language's catch-all, the way rebinding the
+            // router at startup used to.
+            //
+            // This is a wider rule than the one `get_client_for_file`
+            // applies, and deliberately: a routing answer is re-decided on
+            // every call, so a `Failed` server that recovers reclaims its
+            // route for free. This flag decides whether a pump caches
+            // diagnostics, and a pump is installed once. A catch-all
+            // flagged `false` while the claimant is down stays dark for
+            // the life of the backend.
+            Some(claimant) => {
+                matches!(
+                    self.lifecycle_of(&claimant),
+                    Some(ServerLifecycle::NotInstalled | ServerLifecycle::Failed)
+                ) && catch_all.as_ref() == Some(id)
+            }
+        }
+    }
+```
+
+`Starting` is not in that list, which is what keeps the ordinary case right: Step 4 publishes the batch's failures before `register_servers` runs but leaves every survivor at `Starting` until after it returns, so a claimant that did come up keeps its own flag and the catch-all does not also claim one.
+
+`test_register_servers_computes_diagnostics_flags_from_rebound_router` at `crates/mcpls-core/src/lsp/lifecycle.rs:2226` asserts exactly this behaviour and is the test that proves the move. It builds the router and never touches the map, so give it the state the batch would have published, before the `register_servers` call at `:2268`:
+
+```rust
+        translator.set_lifecycle(
+            &ServerId::from("pyright-diag"),
+            crate::bridge::ServerLifecycle::NotInstalled,
+        );
+```
+
+Rename it to `test_register_servers_redirects_the_flag_from_a_dead_claimant` and rewrite its doc comment: the flag is no longer computed from a rebound router, it is computed from a router that never moves plus the claimant's state.
+
+- [ ] **Step 7: Resolve against the map**
 
 In `crates/mcpls-core/src/bridge/translator/routing.rs`, replace the `expected_servers` arm of `get_client_for_file` with a match on the state, and add the catch-all fall-through:
 
@@ -1411,9 +1783,17 @@ In `crates/mcpls-core/src/bridge/translator/symbols.rs:202`, the `NothingRegiste
                 }
 ```
 
-The `expected_servers` check further down at `:215` becomes the same `lifecycle_of` match the routing path uses. Then delete the field, `set_expected_servers`, `clear_expected_servers`, and every test that only exercised them.
+The `expected_servers` check further down at `:215` becomes the same `lifecycle_of` match the routing path uses. Then delete the field at `crates/mcpls-core/src/bridge/translator/mod.rs:88`, its initializer at `:244`, `set_expected_servers` at `:808` and `clear_expected_servers` at `:813`.
 
-- [ ] **Step 7: Point the doctor at the map**
+Four test sites call those setters and must move to `set_lifecycle` in this same task, or the tree does not compile:
+
+- `crates/mcpls-core/src/bridge/translator/routing.rs:357` and `crates/mcpls-core/src/bridge/translator/symbols.rs:304` mark a server that has not registered. Both become `set_lifecycle(&id, ServerLifecycle::Starting)`, which is the state that set stood for.
+- `crates/mcpls-core/src/hooks/sweep.rs:425`, inside `initializing_sweeper`, becomes the same. Task 8 replaces that helper wholesale; this keeps it compiling until then.
+- `crates/mcpls-core/src/bridge/translator/mod.rs:1199`, `test_clear_expected_servers_reverts_to_no_server_after_all_routes_dropped`, tests the clearing moment itself. Lazy spawning has no such moment, which is the premise of this task, so delete it rather than translating it.
+
+Also update the stale references in the comments at `crates/mcpls-core/src/bridge/translator/routing.rs:95`, `crates/mcpls-core/src/bridge/translator/symbols.rs:198` and `:299`, and `crates/mcpls-core/src/config/routing.rs:207`, each of which names `expected_servers` as the thing that answers "still expected to register".
+
+- [ ] **Step 8: Point the doctor at the map**
 
 `crates/mcpls-core/src/lib.rs:775` passes `translator.registered_server_ids()` as the status response's `servers`. Change it to report from the lifecycle map, keeping the field's `Vec<String>` shape for now, so an untriggered server is listed rather than absent:
 
@@ -1427,7 +1807,7 @@ The `expected_servers` check further down at `:215` becomes the same `lifecycle_
 
 Task 9 changes the field's type. Splitting it here keeps this task's diff to one concern.
 
-- [ ] **Step 8: Run the tests to verify they pass**
+- [ ] **Step 9: Run the tests to verify they pass**
 
 Run: `cargo nextest run -p mcpls-core catch_all`
 Expected: PASS.
@@ -1435,7 +1815,7 @@ Expected: PASS.
 Run: `devrun task verify`
 Expected: PASS. Every test that asserted `ServerInitializing` now reaches it through the lifecycle map.
 
-- [ ] **Step 9: Commit**
+- [ ] **Step 10: Commit**
 
 ```bash
 devrun task commit --arg commit_subject='refactor(bridge): resolve against the state map' --arg commit_body=$'expected_servers answered "not registered yet, wait and retry" and was\ncleared when startup finished. Lazy spawning has no such moment, and a\nset left populated would report a missing binary as still initializing\nfor the life of the backend.\n\nThe router now binds to the applicable set at setup and is never rebound,\nso the catch-all redirect that rebinding performed moves to lookup time:\na route naming a server whose binary is missing falls through to the\nlanguage catch-all.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>'
@@ -1456,11 +1836,26 @@ devrun task commit --arg commit_subject='refactor(bridge): resolve against the s
 
 - [ ] **Step 1: Write the failing tests**
 
+`Translator::new` starts with an empty `extension_map`, and `detect_language` at `crates/mcpls-core/src/bridge/translator/state.rs:1228` answers `"plaintext"` for an extension it does not know. Every test here resolves a path, so every one of them needs the mapping or it fails on `NoServerForLanguage` before reaching the state match. The same applies to the Task 6 tests in this module.
+
 ```rust
+/// A translator that can resolve a `.rs` path and start what it resolves
+/// to. Without the extension mapping `detect_language` answers
+/// `"plaintext"` and every test here fails on `NoServerForLanguage`
+/// before it reaches the state it is about.
+fn routing_translator(router: ToolRouter) -> Arc<Translator> {
+    let translator = Arc::new(
+        Translator::new()
+            .with_router(router)
+            .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())])),
+    );
+    translator.set_self_handle(Arc::downgrade(&translator));
+    translator
+}
+
 #[tokio::test]
 async fn test_a_tool_call_on_an_idle_language_starts_its_server() {
-    let translator = Arc::new(Translator::new().with_router(router_for_rust()));
-    translator.set_self_handle(Arc::downgrade(&translator));
+    let translator = routing_translator(router_for_rust());
     translator.set_lifecycle(&ServerId::from("rust"), ServerLifecycle::Idle);
 
     let _ = translator
@@ -1475,8 +1870,7 @@ async fn test_a_tool_call_on_an_idle_language_starts_its_server() {
 
 #[tokio::test]
 async fn test_a_tool_call_on_an_unused_language_starts_nothing_else() {
-    let translator = Arc::new(Translator::new().with_router(router_for_rust_and_typescript()));
-    translator.set_self_handle(Arc::downgrade(&translator));
+    let translator = routing_translator(router_for_rust_and_typescript());
     translator.set_lifecycle(&ServerId::from("rust"), ServerLifecycle::Idle);
     translator.set_lifecycle(&ServerId::from("typescript"), ServerLifecycle::Idle);
 
@@ -1489,18 +1883,104 @@ async fn test_a_tool_call_on_an_unused_language_starts_nothing_else() {
         Some(ServerLifecycle::Idle)
     );
 }
+
+/// A server that failed once must stay reachable from the tool path. The
+/// backoff decides whether a retry is due, and nothing consults it unless
+/// the call reaches `ensure_server`, so a `Failed` state that short
+/// circuits here takes the language down for the life of the backend.
+///
+/// The state is `Failed` before and after, since this attempt fails too,
+/// so the witness is the backoff window: it opens only when an attempt
+/// records a failure, and a call that short-circuited records nothing.
+#[tokio::test]
+async fn test_a_tool_call_retries_a_server_that_failed_once() {
+    let translator = routing_translator(router_for_rust());
+    let id = ServerId::from("rust");
+    translator.set_lifecycle(&id, ServerLifecycle::Failed);
+    assert_eq!(translator.respawn_backoff_remaining(&id), None);
+
+    let _ = translator
+        .resolve_client_for_file(Path::new("/work/src/main.rs"), ToolKind::Hover)
+        .await;
+
+    assert!(
+        translator.respawn_backoff_remaining(&id).is_some(),
+        "the call claimed the spawn rather than reporting the old failure"
+    );
+}
+
+/// A narrow server whose binary is missing hands its tools to the
+/// language's catch-all, and under a lazy default that catch-all has not
+/// been started yet, so the fall-through has to start it rather than
+/// require a client that is not there.
+#[tokio::test]
+async fn test_a_missing_binary_starts_the_idle_catch_all() {
+    let translator = routing_translator(router_with_narrow_claim());
+    translator.set_lifecycle(&ServerId::from("rust-narrow"), ServerLifecycle::NotInstalled);
+    translator.set_lifecycle(&ServerId::from("rust"), ServerLifecycle::Idle);
+
+    let _ = translator
+        .resolve_client_for_file(Path::new("/work/src/main.rs"), ToolKind::Hover)
+        .await;
+
+    assert_ne!(
+        translator.lifecycle_of(&ServerId::from("rust")),
+        Some(ServerLifecycle::Idle)
+    );
+}
 ```
+
+These translators have a self handle but no registered config, so each spawn ends on `Failed` by way of the drop guard. That is why every assertion is `assert_ne!` against the starting state: the witness is that the call claimed the spawn, which is the thing this task adds. A test for a spawn that reaches a live process belongs with the harness that has one, in `respawn.rs`.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo nextest run -p mcpls-core tool_call`
-Expected: FAIL. The first assertion holds at `Idle` because nothing triggers a spawn.
+Expected: FAIL. Each state holds where it started, because nothing triggers a spawn.
 
 - [ ] **Step 3: Change the resolver's return type**
 
-`get_client_for_file` cannot hand back an identity for a server with no client while it returns `(ServerId, LspClient)`. Change its signature to `Result<(ServerId, Option<LspClient>)>`, and in the `Idle | Starting` arm added in Task 6, return `Ok((id, None))` rather than `Error::ServerInitializing`. The decision moves to the wrapper with the identity.
+`get_client_for_file` cannot hand back an identity for a server with no client while it returns `(ServerId, LspClient)`. Change its signature to `Result<(ServerId, Option<LspClient>)>`, and rewrite the state match Task 6 added so every state that a spawn could still change returns an identity instead of an error. Only a state nothing can act on stays an error:
 
-Move the tests that assert `ServerInitializing` from this method to `resolve_client_for_file`, and make them `#[tokio::test]`.
+```rust
+            match self.lifecycle_of(&id) {
+                // Every state a spawn could still change hands back an
+                // identity, and the wrapper decides what to do with it.
+                // A `Failed` server returning an error here would be the
+                // end of it: the backoff at `respawn_backoff_remaining`
+                // is what decides whether a retry is due, and nothing
+                // consults it unless `ensure_server` is reached. A server
+                // that never ran would then be dead to every tool call
+                // for the life of the backend, with only the sweep left
+                // to retry it.
+                Some(
+                    ServerLifecycle::Idle | ServerLifecycle::Starting | ServerLifecycle::Failed,
+                ) => return Ok((id, None)),
+                // A server whose binary is missing is never coming back
+                // for this backend, so the language's catch-all answers
+                // the tools it claimed, exactly as it would have if the
+                // route had been rebound at startup. The catch-all may
+                // itself be idle, which under a lazy default is the
+                // common case on first contact, so hand back whatever
+                // client it has and let the wrapper start it.
+                Some(ServerLifecycle::NotInstalled) => {
+                    let catch_all = lock_std(&self.router).catch_all(lang).cloned();
+                    if let Some(catch_all) = catch_all
+                        && catch_all != id
+                        && self.lifecycle_of(&catch_all) != Some(ServerLifecycle::NotInstalled)
+                    {
+                        let client = lock_std(&self.lsp_clients).get(&catch_all).cloned();
+                        return Ok((catch_all, client));
+                    }
+                    return Err(Error::ServerUnavailable {
+                        server_id: id,
+                        reason: "command not found".to_string(),
+                    });
+                }
+                Some(ServerLifecycle::Running) | None => {}
+            }
+```
+
+Task 6's `test_a_crashed_narrow_server_does_not_fall_through` asserted `ServerUnavailable` from this method. Its subject, that a crashed narrow server keeps its own route rather than conscripting the catch-all, is still true and still worth testing, but the witness moves: assert the returned identity is `rust-narrow` and the client is `None`. Move it and the tests that assert `ServerInitializing` to `resolve_client_for_file`, as `#[tokio::test]`.
 
 - [ ] **Step 4: Trigger from the wrapper**
 
@@ -1539,8 +2019,18 @@ const FIRST_SPAWN_BUDGET: Duration = Duration::from_millis(1_500);
 In `crates/mcpls-core/src/bridge/translator/symbols.rs`, `handle_workspace_symbol` resolves one server through `resolve_any` and then calls `ensure_server`. Change that call to pass the same budget:
 
 ```rust
-        self.ensure_server(&server_id, Some(FIRST_SPAWN_BUDGET)).await?;
+        // `WorkspaceServersInitializing` is what this path's callers
+        // already know to retry on, and it is the only one of the two that
+        // names no file, which a workspace-wide search does not have.
+        if let Err(err) = self.ensure_server(&server_id, Some(FIRST_SPAWN_BUDGET)).await {
+            return Err(match err {
+                Error::ServerInitializing { .. } => Error::WorkspaceServersInitializing,
+                other => other,
+            });
+        }
 ```
+
+`Error::WorkspaceServersInitializing` is the variant at `crates/mcpls-core/src/error.rs:100` that `crates/mcpls-core/src/bridge/translator/symbols.rs:205` already returns, and `:309` already asserts on. Propagating `ServerInitializing` instead would change what this tool answers.
 
 It ensures that one server and no others. `resolve_any` picks a single claimant and the handler queries exactly that one, so ensuring every applicable server would start rust-analyzer from a TypeScript-only session's symbol search for a result it would never contribute to.
 
@@ -1565,57 +2055,160 @@ devrun task commit --arg commit_subject='feat(bridge): start a server on a tool 
 ### Task 8: The edit trigger
 
 **Files:**
-- Modify: `crates/mcpls-core/src/hooks/sweep.rs:226`
-- Test: `crates/mcpls-core/src/hooks/sweep.rs`'s `mod tests`
+- Modify: `crates/mcpls-core/src/hooks/sweep.rs:226`, `:183`
+- Test: `crates/mcpls-core/src/hooks/sweep.rs`'s `mod tests`, including `TestSweeper` at `:374`, `sweeper_over` at `:427`, `initializing_sweeper` at `:415` (deleted), and `test_a_file_whose_server_is_still_starting_is_not_checked` at `:802` (rewritten)
 
 **Interfaces:**
-- Consumes: `Translator::ensure_server`, `Translator::lifecycle_of`, `Translator::server_for_path`.
-- Produces: nothing outside the module.
+- Consumes: `Translator::ensure_server`, `Translator::lifecycle_of`.
+- Produces: `Translator::server_for_path(&self, path: &Path) -> Option<ServerId>`, and `Sweeper::pending_paths` under `#[cfg(test)]`.
 
 - [ ] **Step 1: Write the failing tests**
 
+`TestSweeper` at `crates/mcpls-core/src/hooks/sweep.rs:374` holds `sweeper`, `dir` and `_cancel`, and its tests reach the translator only through the sweeper. These tests assert on lifecycle state, so add the field and hand it out:
+
 ```rust
-#[tokio::test]
-async fn test_an_edit_starts_the_language_server() {
-    let harness = sweep_harness_with_idle_rust().await;
-    harness.report("src/main.rs");
-
-    harness.sweeper.sweep().await;
-
-    assert_ne!(
-        harness.translator.lifecycle_of(&ServerId::from("rust")),
-        Some(ServerLifecycle::Idle)
-    );
-}
-
-#[tokio::test]
-async fn test_a_path_waiting_on_a_starting_server_is_swept_again() {
-    let harness = sweep_harness_with_idle_rust().await;
-    harness
-        .translator
-        .set_lifecycle(&ServerId::from("rust"), ServerLifecycle::Starting);
-    harness.report("src/main.rs");
-
-    harness.sweeper.sweep().await;
-
-    assert!(harness.sweeper.pending_paths().contains(&harness.path("src/main.rs")));
-}
-
-#[tokio::test]
-async fn test_a_deleted_path_starts_nothing() {
-    let harness = sweep_harness_with_idle_rust().await;
-    harness.report_deleted("src/gone.rs");
-
-    harness.sweeper.sweep().await;
-
-    assert_eq!(
-        harness.translator.lifecycle_of(&ServerId::from("rust")),
-        Some(ServerLifecycle::Idle)
-    );
-}
+    struct TestSweeper {
+        sweeper: Arc<Sweeper>,
+        translator: Arc<Translator>,
+        dir: TempDir,
+        _cancel: tokio::sync::watch::Sender<bool>,
+    }
 ```
 
-Build `sweep_harness_with_idle_rust` on whatever harness the neighbouring sweep tests already use, adding a lifecycle entry for `rust`. `pending_paths` is a `#[cfg(test)]` accessor on `Sweeper` reading `self.pending`; add it if it does not exist.
+`sweeper_over` already builds that `Arc<Translator>` to pass to `Sweeper::new`; bind it once and store it in both places. Then add a builder beside `test_sweeper`:
+
+```rust
+    /// A sweeper whose `rust` server is applicable and has never been
+    /// triggered, which is what a lazy backend looks like before the agent
+    /// touches the language.
+    fn idle_sweeper() -> TestSweeper {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let mut translator = Translator::new()
+            .with_extensions(HashMap::from([("rs".to_string(), SERVER.to_string())]))
+            .with_router(ToolRouter::catch_all([(
+                ServerId::from(SERVER),
+                SERVER.to_string(),
+            )]));
+        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+        let sweeper = sweeper_over(dir, translator, Duration::from_secs(60), usize::MAX);
+        sweeper
+            .translator
+            .set_lifecycle(&ServerId::from(SERVER), ServerLifecycle::Idle);
+        sweeper
+    }
+```
+
+Then the tests:
+
+```rust
+    /// This translator was built by hand and so has no self handle, which
+    /// means `ensure_server` publishes `Failed` rather than reaching a
+    /// process. That is enough for what this test is about: the witness is
+    /// that the sweep moved the server off `Idle` at all, which only the
+    /// trigger does.
+    #[tokio::test]
+    async fn test_an_edit_starts_the_language_server() {
+        let sweeper = idle_sweeper();
+        let path = sweeper.write("main.rs");
+        sweeper.enqueue(std::slice::from_ref(&path));
+
+        sweeper.sweep_now().await;
+
+        assert_ne!(
+            sweeper.translator.lifecycle_of(&ServerId::from(SERVER)),
+            Some(ServerLifecycle::Idle)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_path_waiting_on_a_starting_server_is_swept_again() {
+        let sweeper = idle_sweeper();
+        sweeper
+            .translator
+            .set_lifecycle(&ServerId::from(SERVER), ServerLifecycle::Starting);
+        let path = sweeper.write("main.rs");
+        sweeper.enqueue(std::slice::from_ref(&path));
+
+        sweeper.sweep_now().await;
+
+        assert!(
+            sweeper.pending_paths().contains(&path),
+            "a path whose server is still handshaking comes back on the \
+             next tick instead of being checked against a server that \
+             cannot answer yet"
+        );
+    }
+
+    /// A settled failure must not hold its paths back. `due` is true
+    /// whenever the pending set is non-empty and `last_arrival` has gone
+    /// quiet, and re-queueing does not touch `last_arrival`, so a path
+    /// held for a server that will never start would be re-queued on every
+    /// tick for the life of the backend. Worse than the spin, it would
+    /// never reach `queue_invalidations`, `open_untracked_document` or the
+    /// watched-files notification, so a server that registered a glob for
+    /// that path would never hear about it.
+    #[tokio::test]
+    async fn test_a_path_whose_server_is_not_installed_is_not_held_back() {
+        let sweeper = idle_sweeper();
+        sweeper
+            .translator
+            .set_lifecycle(&ServerId::from(SERVER), ServerLifecycle::NotInstalled);
+        let path = sweeper.write("main.rs");
+        sweeper.enqueue(std::slice::from_ref(&path));
+
+        sweeper.sweep_now().await;
+
+        assert!(
+            sweeper.pending_paths().is_empty(),
+            "a server whose binary is missing is not going to be there on \
+             the next tick either"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_deleted_path_starts_nothing() {
+        let sweeper = idle_sweeper();
+        sweeper.enqueue(&[sweeper.path("gone.rs")]);
+
+        sweeper.sweep_now().await;
+
+        assert_eq!(
+            sweeper.translator.lifecycle_of(&ServerId::from(SERVER)),
+            Some(ServerLifecycle::Idle)
+        );
+    }
+```
+
+`pending_paths` is a `#[cfg(test)]` accessor on `Sweeper` returning `lock_std(&self.pending).clone()`; add it beside `opened_count` at `crates/mcpls-core/src/hooks/sweep.rs:183`.
+
+Rewrite `test_a_file_whose_server_is_still_starting_is_not_checked` at `crates/mcpls-core/src/hooks/sweep.rs:802` in the same pass. Its subject is the state this task now handles by re-queueing rather than by a shortfall line, and its harness, `initializing_sweeper` at `:415`, is `idle_sweeper` plus the one `set_lifecycle` call Task 6 left it with. Replace both:
+
+```rust
+    /// Servers spawn in the background, so a file created moments after
+    /// startup routes to one that has not registered yet. Treating that
+    /// like a language nothing routes would leave the file unopened,
+    /// unsaved and unmentioned; it comes back on the next sweep instead.
+    #[tokio::test]
+    async fn test_a_file_whose_server_is_still_starting_comes_back() {
+        let sweeper = idle_sweeper();
+        sweeper
+            .translator
+            .set_lifecycle(&ServerId::from(SERVER), ServerLifecycle::Starting);
+        let path = sweeper.write("fresh.rs");
+        sweeper.enqueue(std::slice::from_ref(&path));
+        sweeper.sweep_now().await;
+
+        assert!(sweeper.pending_paths().contains(&path));
+        assert_eq!(sweeper.opened_count(), 0);
+        assert_eq!(
+            sweeper.last_shortfall(),
+            None,
+            "a path that is coming back is not a path that was skipped"
+        );
+    }
+```
+
+`initializing_sweeper` then has no callers; delete it.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -1640,8 +2233,13 @@ In `Sweeper::sweep`, after the `for path in paths` loop that fills `kinds`, `set
             let Some(id) = self.translator.server_for_path(path) else {
                 continue;
             };
-            if self.translator.lifecycle_of(&id) == Some(ServerLifecycle::Running) {
-                continue;
+            // An id absent from the map belongs to a translator that does
+            // not manage lifecycles at all, which is every harness that
+            // builds one by hand. Those paths go to the behaviour below
+            // rather than being held for a spawn nothing will publish.
+            match self.translator.lifecycle_of(&id) {
+                None | Some(ServerLifecycle::Running) => continue,
+                Some(_) => {}
             }
             // Fire and return. There is one sweeper for the backend and its
             // loop awaits each sweep in turn, so waiting here would hold
@@ -1649,11 +2247,20 @@ In `Sweeper::sweep`, after the `for path in paths` loop that fills `kinds`, `set
             // long as this handshake takes. The path comes back on the next
             // tick instead, which runs at a quarter of the quiet interval.
             let _ = self.translator.ensure_server(&id, None).await;
-            waiting.push(path.clone());
+            // Hold back only what is genuinely in flight. A settled failure
+            // is not going to be different on the next tick, and `due` is
+            // true for as long as the pending set is non-empty, so holding
+            // those paths would re-queue them every tick for the life of
+            // the backend. They would also never reach the rest of this
+            // sweep, so a server that registered a glob for them would
+            // stop hearing about them entirely.
+            if self.translator.lifecycle_of(&id) == Some(ServerLifecycle::Starting) {
+                waiting.push(path.clone());
+            }
         }
 ```
 
-Then, immediately before `self.translator.queue_invalidations(&settle);`, put those paths back and drop them from this pass:
+Then put those paths back and drop them from this pass. This block goes before the `for path in untracked` loop, not merely before `queue_invalidations`: that loop consumes `untracked`, so filtering after it would leave a held path already opened.
 
 ```rust
         if !waiting.is_empty() {
@@ -1667,9 +2274,9 @@ Then, immediately before `self.translator.queue_invalidations(&settle);`, put th
         }
 ```
 
-`untracked` is consumed by the loop above this point, so hoist that loop below this block or filter `untracked` before it runs. The ordering that works: build `kinds`, trigger and collect `waiting`, re-queue and filter, then run the open loop and `queue_invalidations`.
+The ordering that works: build `kinds`, trigger and collect `waiting`, re-queue and filter `settle` and `untracked`, then the headroom computation, the open loop, and `queue_invalidations`.
 
-`server_for_path` is a thin `Translator` method resolving a path's language to a `ServerId` through the router, without touching `lsp_clients`. Add it beside `get_client_for_file` if it does not exist, reusing `detect_language` and the same React base-language fallback.
+`server_for_path` does not exist yet. Add it beside `get_client_for_file` in `crates/mcpls-core/src/bridge/translator/routing.rs`: a thin method resolving a path's language to a `ServerId` through the router without touching `lsp_clients`, reusing `detect_language` and the same React base-language fallback that method already applies.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -1693,10 +2300,13 @@ The doctor cannot ship after the default flips: an idle server would read as abs
 
 **Files:**
 - Modify: `crates/mcpls-core/src/hooks/protocol.rs:123`, `:271`
+- Modify: `crates/mcpls-core/src/hooks/service.rs:69`, `:159`
 - Modify: `crates/mcpls-core/src/lib.rs:775`
-- Modify: `crates/mcpls-cli/src/hook.rs:462`
+- Modify: `crates/mcpls-cli/src/hook.rs:462`, and the `Response::Status` literals at `:1122` and `:2440`
 - Modify: `crates/mcpls-core/src/config/server.rs`
-- Test: the `mod tests` blocks in `protocol.rs` and `hook.rs`
+- Test: the `mod tests` blocks in `protocol.rs` and `hook.rs`, including the doctor assertion at `crates/mcpls-cli/src/hook.rs:2365`
+
+`servers` travels from the translator to the wire through `StatusExtras` at `crates/mcpls-core/src/hooks/service.rs:69`, which is copied into `Response::Status` at `:159`. Its `Vec<String>` becomes `Vec<ServerStatus>` in the same change, or the two ends disagree and nothing compiles.
 
 **Interfaces:**
 - Consumes: `ServerLifecycle`, `Translator::lifecycles`, `Translator::is_server_dead`.
@@ -1751,14 +2361,15 @@ fn test_the_servers_line_names_a_state_beside_each_server() {
         "language servers: rust (running), typescript (idle), lua (not installed)"
     );
 }
-
-#[test]
-fn test_the_servers_line_says_none_when_nothing_is_configured() {
-    assert_eq!(servers_line(&[]), "language servers: none");
-}
 ```
 
-Add a `status(id, state)` helper beside the other test helpers in that module.
+`servers_line` at `crates/mcpls-cli/src/hook.rs:462` takes `&[String]` today and takes `&[ServerStatus]` after this. Add a `status(id, state)` helper beside the other test helpers in that module. Do not add an empty-list test: `test_backend_lines_for_an_idle_backend` at `crates/mcpls-cli/src/hook.rs:2373` already asserts `servers_line(&[]) == "language servers: none"`, and that assertion holds unchanged.
+
+Two more sites in the same file carry the old shape. The `Response::Status` literals at `:1122` and `:2440` pass `servers: vec!["rust".to_string()]`; both become `vec![status("rust", ServerLifecycle::Running)]`. The doctor assertion at `:2365` reads `assert_eq!(lines[8], "language servers: rust")` and becomes:
+
+```rust
+        assert_eq!(lines[8], "language servers: rust (running)");
+```
 
 Add to `crates/mcpls-core/src/config/mod.rs`'s tests, replacing the Task 1 default assertion:
 
@@ -1879,3 +2490,5 @@ devrun task commit --arg commit_subject='feat: start language servers on first u
 1. `FIRST_SPAWN_BUDGET` is 1.5 seconds by guess. The spec's Open decisions section asks for a taplo and a lua-ls handshake measured on a cold cache before the constant is fixed. Measure during Task 7 and change the number there if it is wrong.
 2. `RESPAWN_WAIT` in Task 4 is new. Today a respawn waits without a bound, so five seconds is a behaviour change for a crashed server on a slow machine. If the e2e suite goes flaky around respawn, that constant is the first suspect.
 3. Task 6 deletes `ToolRouter::rebind_to_registered`. If something outside this repository calls it, that is a breaking change to a public item. Nothing in the workspace does.
+4. Several bullets on the spec's Verification list are claims about a running backend that no test here establishes: the swept file landing open on the first sweep after its server is running, one language's paths not being held behind another's handshake, a workspace symbol search from a TypeScript-only session, an edit and a tool call for one language producing one process, and `spawn = "eager"` on one server in an otherwise lazy checkout. Task 9 Step 8 walks them by hand. If any is worth pinning down, it belongs in the e2e suite rather than in a unit test, and that is a separate piece of work.
+5. `is_diagnostics_route` and `get_client_for_file` redirect on different rules: the flag falls through for a claimant that is `NotInstalled` or `Failed`, routing only for `NotInstalled`. The reason is in Task 6 Step 6, and it is real, but two rules for one redirect is the kind of thing that drifts. If a third caller ever needs the redirect, give it a name and one place to live.
