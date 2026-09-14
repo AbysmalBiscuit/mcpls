@@ -493,6 +493,21 @@ impl PartialLspServerConfig {
             .or_else(|| self.language_id.clone())
             .map(ServerId::from)
     }
+
+    const fn is_spawn_only_overlay(&self) -> bool {
+        self.command.is_none()
+            && self.args.is_none()
+            && self.env.is_none()
+            && self.file_patterns.is_none()
+            && self.initialization_options.is_none()
+            && self.timeout_seconds.is_none()
+            && self.spawn.is_some()
+            && self.request_timeout_seconds.is_none()
+            && self.heuristics.is_none()
+            && self.handles.is_none()
+            && self.enabled.is_none()
+            && self.diagnostics_severity.is_none()
+    }
 }
 
 /// Fold configuration entries onto the built-in servers.
@@ -506,9 +521,9 @@ impl PartialLspServerConfig {
 /// with the same id and a `command` appends another server, because two
 /// servers for one language, separated by their spawn heuristics, is a
 /// configuration mcpls supports (see `ToolRouter::from_configs`, which
-/// adjudicates the pair against the workspace). A later entry without a
-/// `command` overlays the already-resolved server rather than trying to
-/// define a new one with no binary.
+/// adjudicates the pair against the workspace). A later entry that only
+/// sets `spawn` overlays the already-resolved server; every other later
+/// entry still defines another server and therefore needs its own command.
 ///
 /// Overriding `command` drops the built-in's `args`, `env`, and
 /// `initialization_options`, because those belong to the binary being
@@ -539,8 +554,7 @@ pub fn resolve_lsp_servers(partials: Vec<PartialLspServerConfig>) -> Result<Vec<
 
         let existing = if claimed.contains(&id) {
             partial
-                .command
-                .is_none()
+                .is_spawn_only_overlay()
                 .then(|| resolved.iter().position(|server| server.id() == id))
                 .flatten()
         } else {
@@ -715,6 +729,20 @@ mod tests {
             .find(|server| server.language_id == "rust")
             .expect("a rust server");
         assert_eq!(rust.spawn, Some(SpawnPolicy::Eager));
+    }
+
+    #[test]
+    fn test_a_later_entry_without_spawn_still_needs_a_command() {
+        let toml = r#"
+            [[lsp_servers]]
+            language_id = "rust"
+            command = "rust-analyzer"
+
+            [[lsp_servers]]
+            language_id = "rust"
+            args = ["--stdio"]
+        "#;
+        assert!(toml::from_str::<ServerConfig>(toml).is_err());
     }
 
     #[test]
