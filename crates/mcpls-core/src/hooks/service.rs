@@ -1281,6 +1281,7 @@ mod tests {
             file_patterns: vec!["**/*.rs".to_string()],
             initialization_options: None,
             timeout_seconds: 30,
+            spawn: None,
             request_timeout_seconds: 30,
             heuristics: None,
             name: None,

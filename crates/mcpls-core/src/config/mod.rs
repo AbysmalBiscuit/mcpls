@@ -16,7 +16,7 @@ pub use routing::{NoServerReason, ServerId, ToolKind, ToolRouter};
 use serde::{Deserialize, Serialize};
 pub use server::{
     DEFAULT_HEURISTICS_MAX_DEPTH, LspServerConfig, MAX_TIMEOUT_SECONDS, PartialLspServerConfig,
-    ServerHeuristics, resolve_lsp_servers,
+    ServerHeuristics, SpawnPolicy, resolve_lsp_servers,
 };
 
 use crate::bridge::{DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE, ResourceLimits};
@@ -318,6 +318,14 @@ pub struct BackendConfig {
     /// alternate quickly.
     #[serde(default = "default_idle_shutdown_ms")]
     pub idle_shutdown_ms: u64,
+
+    /// When this backend's language servers start.
+    ///
+    /// Lazy holds a server back until the session touches its language,
+    /// which keeps a checkout's unused languages out of memory. Eager
+    /// starts every applicable server with the backend.
+    #[serde(default)]
+    pub spawn: SpawnPolicy,
 }
 
 const fn default_idle_shutdown_ms() -> u64 {
@@ -328,6 +336,7 @@ impl Default for BackendConfig {
     fn default() -> Self {
         Self {
             idle_shutdown_ms: default_idle_shutdown_ms(),
+            spawn: SpawnPolicy::default(),
         }
     }
 }
@@ -444,6 +453,7 @@ const DEFAULT_CONFIG_TEMPLATE: &str = r#"# mcpls configuration
 #
 # [backend]
 # idle_shutdown_ms = 10000
+# spawn = "eager"
 #
 # Built-in servers are active when their project markers are present. Copy an
 # example to override one, or set enabled = false to disable it.
@@ -1446,6 +1456,17 @@ mod tests {
         assert!(toml::from_str::<ServerConfig>("[backend]\nunknown = 1\n").is_err());
     }
 
+    #[test]
+    fn test_the_backend_spawn_policy_defaults_to_eager() {
+        assert_eq!(ServerConfig::default().backend.spawn, SpawnPolicy::Eager);
+    }
+
+    #[test]
+    fn test_the_backend_spawn_policy_is_read_from_config() {
+        let parsed: ServerConfig = toml::from_str("[backend]\nspawn = \"lazy\"\n").expect("parse");
+        assert_eq!(parsed.backend.spawn, SpawnPolicy::Lazy);
+    }
+
     fn toml_path_literal(path: &Path) -> String {
         toml::Value::String(path.to_string_lossy().into_owned()).to_string()
     }
@@ -2294,6 +2315,7 @@ mod tests {
                 file_patterns: vec!["**/*.c".to_string(), "**/*.h".to_string()],
                 initialization_options: None,
                 timeout_seconds: 30,
+                spawn: None,
                 request_timeout_seconds: 30,
                 heuristics: None,
                 name: None,
@@ -2324,6 +2346,7 @@ mod tests {
                 file_patterns: vec!["**/*.ts".to_string(), "**/*.tsx".to_string()],
                 initialization_options: None,
                 timeout_seconds: 30,
+                spawn: None,
                 request_timeout_seconds: 30,
                 heuristics: None,
                 name: None,
@@ -2354,6 +2377,7 @@ mod tests {
                 file_patterns: vec!["**/*.js".to_string(), "**/*.jsx".to_string()],
                 initialization_options: None,
                 timeout_seconds: 30,
+                spawn: None,
                 request_timeout_seconds: 30,
                 heuristics: None,
                 name: None,
@@ -2384,6 +2408,7 @@ mod tests {
                 file_patterns: vec!["**/*".to_string(), "**/*.{h,hpp}".to_string()],
                 initialization_options: None,
                 timeout_seconds: 30,
+                spawn: None,
                 request_timeout_seconds: 30,
                 heuristics: None,
                 name: None,

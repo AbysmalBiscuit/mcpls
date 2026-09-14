@@ -282,7 +282,7 @@ mcpls ships six built-in servers — rust-analyzer, pyright, the TypeScript lang
 
 Overriding `command` drops the built-in's `args`, `env`, and `initialization_options`, since those belong to the binary being replaced (pyright's `--stdio` means nothing to a different program) — `file_patterns` survive, since they describe the language rather than the binary.
 
-Two entries may name the same identity: the first merges onto the built-in (or founds a new server, if there is no matching built-in), and every subsequent one appends another server. `ToolRouter::from_configs` rejects two servers sharing one identity if both are applicable in the same workspace, so this only works when their `heuristics.project_markers` are mutually exclusive. To run two servers for one language that are applicable at the same time, give each a distinct `name` and split the tools between them with `handles` instead — see `name` and `handles` below.
+Two entries may name the same identity. The first merges onto the built-in, or founds a new server when there is no matching built-in. A later entry with `command` appends another server. A later entry without `command` overlays the already-resolved server. `ToolRouter::from_configs` rejects two servers sharing one identity if both are applicable in the same workspace, so appended entries only work when their `heuristics.project_markers` are mutually exclusive. To run two servers for one language that are applicable at the same time, give each a distinct `name` and split the tools between them with `handles` instead. See `name` and `handles` below.
 
 ### `language_id`
 
@@ -716,6 +716,7 @@ Pass `--no-backend` (or set `MCPLS_NO_BACKEND=true`) to serve one session entire
 ```toml
 [backend]
 idle_shutdown_ms = 10000
+spawn = "eager"
 ```
 
 ### `backend.idle_shutdown_ms`
@@ -724,6 +725,14 @@ idle_shutdown_ms = 10000
 **Default**: `10000`
 
 How long the backend waits after its last MCP session closes before it exits and stops its language servers. Hook connections do not keep it alive. The cost of a short value is a cold reindex for a session that opens just after the timer; raise it when sessions come and go in quick succession.
+
+### `backend.spawn`
+
+**Type**: String
+**Default**: `"eager"`
+**Options**: `"eager"`, `"lazy"`
+
+When language servers start. `"eager"` starts every applicable server with the backend. `"lazy"` holds a server back until a session touches its language. A `[[lsp_servers]]` entry can set `spawn` to override this backend default for that server.
 
 ## Environment Variables
 
