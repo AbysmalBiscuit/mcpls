@@ -72,18 +72,21 @@ impl<'a> DiagnosticsReplay<'a> {
         pumps: &'a crate::notification_lifecycle::NotificationPumps,
         owner: ServerId,
         generation: u64,
-    ) -> Self {
+    ) -> Option<Self> {
+        if !pumps.settle().claim_diagnostics_replay(&owner, generation) {
+            return None;
+        }
         tokio::spawn(crate::baseline_merge_task(
             pumps.shared().clone(),
             owner.clone(),
             generation,
             pumps.cancel_rx(),
         ));
-        Self {
+        Some(Self {
             pumps,
             owner,
             generation,
-        }
+        })
     }
 }
 
@@ -368,7 +371,7 @@ impl Translator {
                 pumps
                     .settle()
                     .diagnostics_baseline_generation(owner)
-                    .map(|generation| DiagnosticsReplay::new(pumps, owner.clone(), generation))
+                    .and_then(|generation| DiagnosticsReplay::new(pumps, owner.clone(), generation))
             })
             .into_iter()
             .collect();
@@ -396,11 +399,17 @@ impl Translator {
             }
             for owner in &desired {
                 if !active.contains(owner) {
-                    if !generations.iter().any(|replay| replay.owner == *owner)
+                    if (installed != Some(owner)
+                        || pumps
+                            .settle()
+                            .diagnostics_baseline_generation(owner)
+                            .is_none())
                         && let Some(generation) =
                             pumps.settle().begin_diagnostics_baseline_merge(owner)
+                        && let Some(replay) =
+                            DiagnosticsReplay::new(pumps, owner.clone(), generation)
                     {
-                        generations.push(DiagnosticsReplay::new(pumps, owner.clone(), generation));
+                        generations.push(replay);
                     }
                     pumps.register_diagnostics_owner(owner);
                 }
@@ -964,16 +973,24 @@ while True:
 
         #[tokio::test]
         async fn initial_baseline_waits_for_replacement_document_replay() {
-            replacement_replay_during_initial_baseline(false).await;
+            replacement_replay_during_initial_baseline(false, false).await;
         }
 
         #[tokio::test]
         async fn cancelled_replacement_replay_retains_partial_baseline_coverage() {
-            replacement_replay_during_initial_baseline(true).await;
+            replacement_replay_during_initial_baseline(true, false).await;
+        }
+
+        #[tokio::test]
+        async fn cancelled_queued_reconciliation_cannot_release_active_replay() {
+            replacement_replay_during_initial_baseline(false, true).await;
         }
 
         #[allow(clippy::too_many_lines)]
-        async fn replacement_replay_during_initial_baseline(cancel_replay: bool) {
+        async fn replacement_replay_during_initial_baseline(
+            cancel_replay: bool,
+            cancel_duplicate: bool,
+        ) {
             use tokio::sync::watch;
 
             use crate::bridge::translator::testing::fake_lsp_client;
@@ -1093,6 +1110,17 @@ while True:
                 crate::try_merge_settled_owner_baseline(&shared, &owner, generation).await,
                 None
             );
+
+            if cancel_duplicate {
+                let mut duplicate = Box::pin(translator.reconcile_diagnostics_owners(Some(&owner)));
+                assert!(futures::poll!(duplicate.as_mut()).is_pending());
+                drop(duplicate);
+                assert_eq!(
+                    crate::try_merge_settled_owner_baseline(&shared, &owner, generation).await,
+                    None,
+                    "cancelling a queued reconciliation must not release the active replay"
+                );
+            }
 
             shared.settle.begin(&owner, &serde_json::json!("replay"));
             if cancel_replay {

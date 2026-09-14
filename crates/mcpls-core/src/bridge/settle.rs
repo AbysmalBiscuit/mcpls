@@ -77,6 +77,7 @@ struct ServerProgress {
 #[derive(Debug)]
 struct PendingBaseline {
     generation: u64,
+    replay_claimed: bool,
     replay_complete: bool,
 }
 
@@ -174,6 +175,7 @@ impl ServerSettle {
             owner.clone(),
             PendingBaseline {
                 generation,
+                replay_claimed: false,
                 replay_complete: true,
             },
         );
@@ -190,10 +192,26 @@ impl ServerSettle {
             owner.clone(),
             PendingBaseline {
                 generation,
+                replay_claimed: false,
                 replay_complete: false,
             },
         );
         Some(generation)
+    }
+
+    /// Claim exclusive responsibility for replaying one pending generation.
+    pub(crate) fn claim_diagnostics_replay(&self, owner: &ServerId, generation: u64) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        let Some(pending) = state.pending_baselines.get_mut(owner) else {
+            return false;
+        };
+        if pending.generation != generation || pending.replay_claimed || pending.replay_complete {
+            return false;
+        }
+        pending.replay_claimed = true;
+        true
     }
 
     /// Make the pending generation eligible for adoption after its document replay finishes.
