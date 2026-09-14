@@ -61,6 +61,40 @@ struct SpawnGuard {
     armed: bool,
 }
 
+struct DiagnosticsReplay<'a> {
+    pumps: &'a crate::notification_lifecycle::NotificationPumps,
+    owner: ServerId,
+    generation: u64,
+}
+
+impl<'a> DiagnosticsReplay<'a> {
+    fn new(
+        pumps: &'a crate::notification_lifecycle::NotificationPumps,
+        owner: ServerId,
+        generation: u64,
+    ) -> Self {
+        tokio::spawn(crate::baseline_merge_task(
+            pumps.shared().clone(),
+            owner.clone(),
+            generation,
+            pumps.cancel_rx(),
+        ));
+        Self {
+            pumps,
+            owner,
+            generation,
+        }
+    }
+}
+
+impl Drop for DiagnosticsReplay<'_> {
+    fn drop(&mut self) {
+        self.pumps
+            .settle()
+            .complete_diagnostics_replay(&self.owner, self.generation);
+    }
+}
+
 impl SpawnGuard {
     fn publish(&mut self, state: ServerLifecycle) {
         self.armed = false;
@@ -329,6 +363,15 @@ impl Translator {
         let Some(pumps) = self.notification_pumps.get() else {
             return;
         };
+        let mut generations: Vec<_> = installed
+            .and_then(|owner| {
+                pumps
+                    .settle()
+                    .diagnostics_baseline_generation(owner)
+                    .map(|generation| DiagnosticsReplay::new(pumps, owner.clone(), generation))
+            })
+            .into_iter()
+            .collect();
         let _reconciliation = pumps.reconciliation.lock().await;
         let languages: Vec<_> = lock_std(&self.server_configs)
             .values()
@@ -341,7 +384,6 @@ impl Translator {
             .filter(|owner| installed_servers.contains(owner))
             .collect();
         let active = pumps.settle().diagnostics_owners();
-        let mut generations = Vec::new();
         {
             let mut cache = pumps.shared().notification_cache.lock().await;
             for owner in active
@@ -354,55 +396,51 @@ impl Translator {
             }
             for owner in &desired {
                 if !active.contains(owner) {
-                    let generation = if installed == Some(owner) {
-                        pumps.settle().diagnostics_baseline_generation(owner)
-                    } else {
-                        pumps.settle().begin_diagnostics_baseline_merge(owner)
-                    };
-                    pumps.register_diagnostics_owner(owner);
-                    if let Some(generation) = generation {
-                        generations.push((owner.clone(), generation));
+                    if !generations.iter().any(|replay| replay.owner == *owner)
+                        && let Some(generation) =
+                            pumps.settle().begin_diagnostics_baseline_merge(owner)
+                    {
+                        generations.push(DiagnosticsReplay::new(pumps, owner.clone(), generation));
                     }
-                } else if installed == Some(owner)
-                    && let Some(generation) = pumps.settle().diagnostics_baseline_generation(owner)
-                {
-                    generations.push((owner.clone(), generation));
+                    pumps.register_diagnostics_owner(owner);
                 }
             }
             pumps.settle().restart_deadline();
             cache.set_diagnostics_route_count(desired.len());
         }
-        for (owner, generation) in generations {
-            let client = lock_std(&self.lsp_clients).get(&owner).cloned();
+        for replay in generations {
+            let owner = &replay.owner;
+            if !desired.contains(owner)
+                || !pumps
+                    .settle()
+                    .baseline_merge_is_current(owner, replay.generation)
+            {
+                continue;
+            }
+            let client = lock_std(&self.lsp_clients).get(owner).cloned();
             if let Some(client) = client {
                 for path in self.document_tracker.open_paths() {
                     if self
                         .document_tracker
                         .snapshot(&path)
                         .is_none_or(|document| {
-                            self.diagnostics_owner(document.language_id()).as_ref() != Some(&owner)
+                            self.diagnostics_owner(document.language_id()).as_ref() != Some(owner)
                         })
                     {
                         continue;
                     }
-                    let result = if installed == Some(&owner) {
+                    let result = if installed == Some(owner) {
                         self.document_tracker
-                            .ensure_open(&path, &owner, &client)
+                            .ensure_open(&path, owner, &client)
                             .await
                     } else {
-                        self.document_tracker.reopen(&path, &owner, &client).await
+                        self.document_tracker.reopen(&path, owner, &client).await
                     };
                     if let Err(error) = result {
                         tracing::warn!(%owner, path = %path.display(), %error, "diagnostics baseline replay failed");
                     }
                 }
             }
-            tokio::spawn(crate::baseline_merge_task(
-                pumps.shared().clone(),
-                owner,
-                generation,
-                pumps.cancel_rx(),
-            ));
         }
     }
 
@@ -922,6 +960,210 @@ while True:
             ];
             running.timeout_seconds = 5;
             config.lsp_servers.push(running);
+        }
+
+        #[tokio::test]
+        async fn initial_baseline_waits_for_replacement_document_replay() {
+            replacement_replay_during_initial_baseline(false).await;
+        }
+
+        #[tokio::test]
+        async fn cancelled_replacement_replay_retains_partial_baseline_coverage() {
+            replacement_replay_during_initial_baseline(true).await;
+        }
+
+        #[allow(clippy::too_many_lines)]
+        async fn replacement_replay_during_initial_baseline(cancel_replay: bool) {
+            use tokio::sync::watch;
+
+            use crate::bridge::translator::testing::fake_lsp_client;
+            use crate::bridge::{FileEntry, SessionId};
+
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("main.rs");
+            fs::write(&path, "fn main() {}\n").unwrap();
+            let uri = crate::bridge::path_to_uri(&path).unwrap();
+            let mut init = stub_server_config("rust", &path);
+            init.server_config.command = "python3".into();
+            init.server_config.args = vec![
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/notification_generations.py"
+                )
+                .into(),
+                dir.path().join("rust").to_string_lossy().into(),
+                uri.as_str().into(),
+                "existing".into(),
+                "on-open".into(),
+            ];
+            let owner = init.server_config.id();
+            let healthy_init = stub_server_config("python", &path);
+            let (translator, cache, shared) = setup_initial_batch(
+                &crate::config::ServerConfig::default(),
+                dir.path(),
+                &[init, healthy_init],
+                &Arc::new(crate::lsp::WatchRegistry::new()),
+            );
+            let (old_client, _old_server) = fake_lsp_client();
+            translator.register_client(owner.clone(), old_client.clone());
+            translator
+                .document_tracker
+                .ensure_open(&path, &owner, &old_client)
+                .await
+                .unwrap();
+            let path_lock = translator.document_tracker.lock_path(&path).await;
+            let (_cancel, cancel_rx) = watch::channel(false);
+            translator
+                .notification_pumps
+                .set(crate::notification_lifecycle::NotificationPumps::new(
+                    shared.clone(),
+                    cancel_rx.clone(),
+                ))
+                .unwrap();
+            let healthy = ServerId::from("python");
+            let (_healthy_tx, healthy_rx) = tokio::sync::mpsc::channel(1);
+            translator
+                .notification_pumps
+                .get()
+                .unwrap()
+                .install(healthy.clone(), healthy_rx);
+            let healthy_uri = crate::bridge::path_to_uri(&dir.path().join("healthy.py")).unwrap();
+            cache.lock().await.store_diagnostics(
+                &healthy,
+                &healthy_uri,
+                None,
+                vec![lsp_types::Diagnostic {
+                    message: "healthy baseline".into(),
+                    ..lsp_types::Diagnostic::default()
+                }],
+            );
+            shared
+                .settle
+                .set_diagnostics_owners([owner.clone(), healthy.clone()]);
+            shared.settle.begin(&healthy, &serde_json::json!("startup"));
+            shared.settle.end(&healthy, &serde_json::json!("startup"));
+            shared.settle.begin(&owner, &serde_json::json!("startup"));
+            let mut initial_baseline = tokio::spawn(crate::baseline_task(
+                Arc::clone(&shared.settle),
+                Arc::clone(&cache),
+                Arc::clone(&shared.delivery),
+                Arc::clone(&shared.floors),
+                cancel_rx,
+            ));
+            let spawning = {
+                let translator = Arc::clone(&translator);
+                let owner = owner.clone();
+                tokio::spawn(async move { translator.run_spawn(owner).await })
+            };
+            wait_for_lifecycle(&translator, &owner, ServerLifecycle::Running).await;
+            let generation = shared
+                .settle
+                .diagnostics_baseline_generation(&owner)
+                .unwrap();
+            shared.settle.begin(&owner, &serde_json::json!("quiet"));
+            shared.settle.end_at(
+                &owner,
+                &serde_json::json!("quiet"),
+                Instant::now().checked_sub(Duration::from_secs(10)).unwrap(),
+            );
+            cache.lock().await.store_diagnostics(
+                &owner,
+                &uri,
+                None,
+                vec![lsp_types::Diagnostic {
+                    message: "partial replay".into(),
+                    ..lsp_types::Diagnostic::default()
+                }],
+            );
+            assert!(shared.settle.should_settle());
+            tokio::time::timeout(Duration::from_secs(2), &mut initial_baseline)
+                .await
+                .expect("a replaying owner must not block the healthy owner's initial baseline")
+                .unwrap();
+            assert!(
+                shared.settle.baseline_merge_is_current(&owner, generation),
+                "initial adoption must retain the generation while its replay waits for the path lock"
+            );
+            assert!(shared.delivery.lock().await.has_baseline());
+            assert_eq!(
+                shared.settle.diagnostics_baseline_generation(&healthy),
+                None
+            );
+            assert_eq!(
+                crate::try_merge_settled_owner_baseline(&shared, &owner, generation).await,
+                None
+            );
+
+            shared.settle.begin(&owner, &serde_json::json!("replay"));
+            if cancel_replay {
+                spawning.abort();
+                assert!(spawning.await.unwrap_err().is_cancelled());
+                drop(path_lock);
+            } else {
+                drop(path_lock);
+                spawning.await.unwrap();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while cache
+                        .lock()
+                        .await
+                        .get_diagnostics(uri.as_str())
+                        .unwrap()
+                        .diagnostics[0]
+                        .message
+                        != "existing"
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+            }
+            shared.settle.end(&owner, &serde_json::json!("replay"));
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while shared.settle.baseline_merge_is_current(&owner, generation) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(!shared.settle.baseline_merge_is_current(&owner, generation));
+            let cache = cache.lock().await;
+            let info = cache.get_diagnostics(uri.as_str()).unwrap();
+            assert_eq!(
+                info.diagnostics[0].message,
+                if cancel_replay {
+                    "partial replay"
+                } else {
+                    "existing"
+                }
+            );
+            let entries: Vec<_> = cache
+                .diagnostics_entries()
+                .into_iter()
+                .map(|(key, info, owner)| FileEntry {
+                    key,
+                    diagnostics: &info.diagnostics,
+                    floor: shared.floors.for_server(owner),
+                })
+                .collect();
+            assert_eq!(entries.len(), 2);
+            let report = shared
+                .delivery
+                .lock()
+                .await
+                .flush(&SessionId::named(Some("replay".into())).unwrap(), &entries);
+            drop(cache);
+            assert!(
+                report.changed.is_empty(),
+                "replayed diagnostics are existing baseline state"
+            );
+            translator
+                .notification_pumps
+                .get()
+                .unwrap()
+                .shutdown()
+                .await;
+            translator.shutdown_servers().await;
         }
 
         #[tokio::test]

@@ -1243,19 +1243,20 @@ async fn baseline_task(
                 let baseline_len = {
                     let mut delivery = delivery.lock().await;
                     let cache = cache.lock().await;
-                    let baseline: HashMap<String, u64> = cache
-                        .diagnostics_entries()
-                        .into_iter()
-                        .filter_map(|(key, info, owner)| {
-                            bridge::DiagnosticsDelivery::visible_hash(
-                                &info.diagnostics,
-                                floors.for_server(owner),
-                            )
-                            .map(|hash| (key.to_string(), hash))
-                        })
-                        .collect();
-                    let baseline_len = baseline.len();
-                    settle.adopt_settled_diagnostics_baseline(|| {
+                    settle.adopt_settled_diagnostics_baseline(|replaying| {
+                        let baseline: HashMap<String, u64> = cache
+                            .diagnostics_entries()
+                            .into_iter()
+                            .filter(|(_, _, owner)| !replaying.contains(*owner))
+                            .filter_map(|(key, info, owner)| {
+                                bridge::DiagnosticsDelivery::visible_hash(
+                                    &info.diagnostics,
+                                    floors.for_server(owner),
+                                )
+                                .map(|hash| (key.to_string(), hash))
+                            })
+                            .collect();
+                        let baseline_len = baseline.len();
                         delivery.set_baseline(baseline);
                         baseline_len
                     })

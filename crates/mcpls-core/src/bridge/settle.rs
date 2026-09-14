@@ -55,7 +55,7 @@ struct SettleState {
     pending_owners: HashSet<ServerId>,
     replacement_pending: HashSet<ServerId>,
     retired_servers: HashSet<ServerId>,
-    pending_baselines: HashMap<ServerId, u64>,
+    pending_baselines: HashMap<ServerId, PendingBaseline>,
     next_baseline_generation: u64,
     /// When the outstanding set last became empty. `None` until the first
     /// operation ends, so a process that has not yet heard from a server is
@@ -72,6 +72,12 @@ struct ServerProgress {
     outstanding: HashSet<String>,
     quiet_since: Option<Instant>,
     progress_seen: bool,
+}
+
+#[derive(Debug)]
+struct PendingBaseline {
+    generation: u64,
+    replay_complete: bool,
 }
 
 impl ServerSettle {
@@ -160,22 +166,46 @@ impl ServerSettle {
     }
 
     fn ensure_baseline_pending(state: &mut SettleState, owner: &ServerId) -> u64 {
-        if let Some(generation) = state.pending_baselines.get(owner) {
-            return *generation;
+        if let Some(pending) = state.pending_baselines.get(owner) {
+            return pending.generation;
         }
         let generation = Self::next_baseline_generation(state);
-        state.pending_baselines.insert(owner.clone(), generation);
+        state.pending_baselines.insert(
+            owner.clone(),
+            PendingBaseline {
+                generation,
+                replay_complete: true,
+            },
+        );
         generation
     }
 
-    /// Mark a diagnostics owner's next settled snapshot as baseline state.
+    /// Mark a diagnostics owner's next settled snapshot as baseline state awaiting document replay.
     pub(crate) fn begin_diagnostics_baseline_merge(&self, owner: &ServerId) -> Option<u64> {
         let Ok(mut state) = self.state.lock() else {
             return None;
         };
         let generation = Self::next_baseline_generation(&mut state);
-        state.pending_baselines.insert(owner.clone(), generation);
+        state.pending_baselines.insert(
+            owner.clone(),
+            PendingBaseline {
+                generation,
+                replay_complete: false,
+            },
+        );
         Some(generation)
+    }
+
+    /// Make the pending generation eligible for adoption after its document replay finishes.
+    pub(crate) fn complete_diagnostics_replay(&self, owner: &ServerId, generation: u64) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if let Some(pending) = state.pending_baselines.get_mut(owner)
+            && pending.generation == generation
+        {
+            pending.replay_complete = true;
+        }
     }
 
     /// Complete a baseline merge only if the same owner generation is pending.
@@ -187,7 +217,11 @@ impl ServerSettle {
         let Ok(mut state) = self.state.lock() else {
             return false;
         };
-        if state.pending_baselines.get(owner) != Some(&generation) {
+        if state
+            .pending_baselines
+            .get(owner)
+            .is_none_or(|pending| pending.generation != generation)
+        {
             return false;
         }
         state.pending_baselines.remove(owner);
@@ -208,13 +242,16 @@ impl ServerSettle {
             .ok()?
             .pending_baselines
             .get(owner)
-            .copied()
+            .map(|pending| pending.generation)
     }
 
     pub(crate) fn baseline_merge_is_current(&self, owner: &ServerId, generation: u64) -> bool {
-        self.state
-            .lock()
-            .is_ok_and(|state| state.pending_baselines.get(owner) == Some(&generation))
+        self.state.lock().is_ok_and(|state| {
+            state
+                .pending_baselines
+                .get(owner)
+                .is_some_and(|pending| pending.generation == generation)
+        })
     }
 
     /// Apply one owner's baseline while its generation is still pending and the workspace is settled.
@@ -227,7 +264,10 @@ impl ServerSettle {
         let Ok(mut state) = self.state.lock() else {
             return None;
         };
-        if state.pending_baselines.get(owner) != Some(&generation)
+        if state
+            .pending_baselines
+            .get(owner)
+            .is_none_or(|pending| pending.generation != generation || !pending.replay_complete)
             || !self.should_settle_locked(&state, Instant::now())
         {
             return None;
@@ -237,10 +277,10 @@ impl ServerSettle {
         Some(result)
     }
 
-    /// Adopt an initial baseline and release owners covered by the settled snapshot.
+    /// Adopt an initial baseline excluding replaying owners, retaining their pending generations.
     pub(crate) fn adopt_settled_diagnostics_baseline<T>(
         &self,
-        adopt: impl FnOnce() -> T,
+        adopt: impl FnOnce(&HashSet<ServerId>) -> T,
     ) -> Option<T> {
         let Ok(mut state) = self.state.lock() else {
             return None;
@@ -248,10 +288,18 @@ impl ServerSettle {
         if !self.should_settle_locked(&state, Instant::now()) {
             return None;
         }
-        let result = adopt();
+        let replaying = state
+            .pending_baselines
+            .iter()
+            .filter(|(_, pending)| !pending.replay_complete)
+            .map(|(owner, _)| owner.clone())
+            .collect();
+        let result = adopt(&replaying);
         let owners = state.diagnostics_owners.iter().cloned().collect::<Vec<_>>();
         for owner in owners {
-            state.pending_baselines.remove(&owner);
+            if !replaying.contains(&owner) {
+                state.pending_baselines.remove(&owner);
+            }
         }
         Some(result)
     }
@@ -1090,7 +1138,7 @@ mod tests {
         settle.set_diagnostics_owners([eager.clone()]);
         let late_generation = settle.begin_diagnostics_baseline_merge(&late).unwrap();
 
-        assert!(settle.adopt_settled_diagnostics_baseline(|| ()).is_some());
+        assert!(settle.adopt_settled_diagnostics_baseline(|_| ()).is_some());
 
         assert_eq!(settle.diagnostics_baseline_generation(&eager), None);
         assert_eq!(
@@ -1112,6 +1160,31 @@ mod tests {
         assert_eq!(settle.diagnostics_baseline_generation(&owner), Some(second));
         assert!(settle.finish_diagnostics_baseline_merge(&owner, second));
         assert_eq!(settle.diagnostics_baseline_generation(&owner), None);
+    }
+
+    #[test]
+    fn stale_replay_completion_cannot_ready_a_new_generation() {
+        let settle = ServerSettle::new(Duration::ZERO, Duration::from_secs(60));
+        let owner = ServerId::from("rust");
+        settle.register_diagnostics_owner(&owner);
+        settle.begin(&owner, &json!("indexing"));
+        settle.end(&owner, &json!("indexing"));
+        let first = settle.begin_diagnostics_baseline_merge(&owner).unwrap();
+        let second = settle.begin_diagnostics_baseline_merge(&owner).unwrap();
+        settle.complete_diagnostics_replay(&owner, first);
+        assert_eq!(
+            settle.adopt_settled_diagnostics_baseline(|replaying| replaying.contains(&owner)),
+            Some(true)
+        );
+        assert_eq!(
+            settle.merge_settled_diagnostics_baseline(&owner, second, || ()),
+            None
+        );
+        settle.complete_diagnostics_replay(&owner, second);
+        assert_eq!(
+            settle.merge_settled_diagnostics_baseline(&owner, second, || ()),
+            Some(())
+        );
     }
 
     #[test]
