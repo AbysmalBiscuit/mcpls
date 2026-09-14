@@ -48,7 +48,7 @@ mod recovery_tests;
 pub mod transport;
 mod util;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -270,37 +270,17 @@ async fn handle_publish_diagnostics(
     }
 }
 
-/// Diagnostics ownership after registration, used to divide the cache budget.
+/// Diagnostics ownership of the successfully registered servers.
 pub(crate) struct RegisteredServers {
-    /// Whether each server is the one the (rebound) router resolves
-    /// `ToolKind::Diagnostics` to for its language -- see #174 §8. Computed
-    /// here, right after the rebind, so it always reflects the post-rebind
-    /// router rather than a stale pre-rebind view.
+    /// Whether each server owns the diagnostics route for its language.
     pub(crate) diagnostics_flags: HashMap<ServerId, bool>,
 }
 
-/// Registers successful servers, rebinds routing, and installs pumps before
-/// clients are published.
-///
-/// `configs` retains each server's spawn configuration for lazy starts.
+/// Install notification pumps before publishing the successful clients.
 pub(crate) fn register_servers(
-    result: lsp::ServerInitResult,
-    translator: &bridge::Translator,
-    configs: &HashMap<ServerId, ServerInitConfig>,
-) -> RegisteredServers {
-    register_servers_with_retained_routes(result, translator, configs, &HashSet::new())
-}
-
-fn register_servers_with_retained_routes(
     mut result: lsp::ServerInitResult,
     translator: &bridge::Translator,
-    configs: &HashMap<ServerId, ServerInitConfig>,
-    retained_routes: &HashSet<ServerId>,
 ) -> RegisteredServers {
-    let mut registered: HashSet<ServerId> = result.servers.keys().cloned().collect();
-    registered.extend(translator.registered_live_client_ids());
-    registered.extend(retained_routes.iter().cloned());
-    translator.rebind_router(&registered);
     let diagnostics_flags: HashMap<_, _> = result
         .servers
         .iter()
@@ -320,13 +300,6 @@ fn register_servers_with_retained_routes(
 
     for (id, server) in result.servers {
         let client = server.client().clone();
-        if let Some(config) = configs.get(&id) {
-            translator.register_server_config(id.clone(), config.clone());
-        } else {
-            warn!(
-                "No respawn config registered for LSP server '{id}'; auto-respawn on crash will be unavailable for it"
-            );
-        }
         #[cfg(all(test, unix))]
         let registration_client = client.clone();
         // Workspace searches can respawn before looking up the client.
@@ -527,19 +500,14 @@ fn applicable_server_configs(
 fn partition_spawn_configs(
     config: &ServerConfig,
     applicable: &[ServerInitConfig],
-) -> (Vec<ServerInitConfig>, HashSet<ServerId>) {
+) -> Vec<ServerInitConfig> {
     let mut eager = Vec::new();
-    let mut lazy_ids = HashSet::new();
     for init in applicable {
-        let id = init.server_config.id();
-        match init.server_config.effective_spawn(config.backend.spawn) {
-            SpawnPolicy::Eager => eager.push(init.clone()),
-            SpawnPolicy::Lazy => {
-                lazy_ids.insert(id);
-            }
+        if init.server_config.effective_spawn(config.backend.spawn) == SpawnPolicy::Eager {
+            eager.push(init.clone());
         }
     }
-    (eager, lazy_ids)
+    eager
 }
 
 /// Start the MCPLS server with an explicit transport.
@@ -683,17 +651,8 @@ impl Runtime {
             Arc::clone(&watch_registry),
         );
 
-        // Mark applicable servers as "expected" so a tool call that arrives while
-        // its server is still initializing gets a clear "still initializing" error
-        // (instead of "no server configured"), telling the caller to wait and retry.
-        let expected_servers: HashSet<ServerId> = applicable_configs
-            .iter()
-            .map(|c| c.server_config.id())
-            .collect();
-        translator.set_expected_servers(expected_servers);
-        // Membership is the applicable set. A server is idle until
-        // something shows the session needs it; an eager one is already
-        // starting by the time any request can observe this.
+        // The lifecycle map records applicable servers before requests can
+        // observe the router or notification pumps.
         for init_config in &applicable_configs {
             let id = init_config.server_config.id();
             let eager = init_config
@@ -766,7 +725,7 @@ impl Runtime {
             notification_lifecycle::NotificationPumps::new(pump_shared.clone(), cancel_rx.clone())
         });
 
-        let (eager_configs, lazy_server_ids) = partition_spawn_configs(config, &applicable_configs);
+        let eager_configs = partition_spawn_configs(config, &applicable_configs);
 
         let lsp_init_handle = if applicable_configs.is_empty() {
             warn!("No applicable LSP servers configured — starting in protocol-only mode");
@@ -787,7 +746,6 @@ impl Runtime {
             );
             Some(spawn_lsp_servers_background(
                 eager_configs,
-                lazy_server_ids,
                 Arc::clone(&translator),
                 cancel_rx.clone(),
                 pump_shared,
@@ -828,7 +786,11 @@ impl Runtime {
             version: env!("CARGO_PKG_VERSION").to_string(),
             uptime_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             sessions: sessions(),
-            servers: translator.registered_server_ids(),
+            servers: translator
+                .lifecycles()
+                .into_iter()
+                .map(|(id, _)| id.to_string())
+                .collect(),
             config_fingerprint: config_fingerprint.clone(),
         })
     }
@@ -1155,31 +1117,25 @@ async fn shutdown(
     }
 }
 
-/// Spawn the applicable LSP servers in a background task and register them into
-/// the shared `translator` once ready.
+/// Spawn eager LSP servers in a background task and register them into the
+/// shared `translator` once ready.
 ///
 /// This intentionally does NOT block the caller: `serve_with` starts the MCP
 /// server immediately so its `initialize` handshake returns before slow language
 /// servers (e.g. `OmniSharp` on a large Unity solution, which can take minutes to
 /// load) finish initializing. Tool calls that arrive before a server has
 /// registered return a `ServerInitializing` error telling the caller to wait and
-/// retry. If every server fails, the "expected servers" set is cleared so those
-/// calls fall back to a plain "no server configured" error instead.
+/// retry. The lifecycle map retains each configured route's startup outcome.
 ///
 /// Returns the task's `JoinHandle` so [`shutdown`] can await startup and
 /// baseline processing. Notification pumps are owned by the translator.
 fn spawn_lsp_servers_background(
     applicable_configs: Vec<ServerInitConfig>,
-    retained_routes: HashSet<ServerId>,
     translator: Arc<Translator>,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
     shared: PumpShared,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let configs_by_id: HashMap<ServerId, ServerInitConfig> = applicable_configs
-            .iter()
-            .map(|c| (c.server_config.id(), c.clone()))
-            .collect();
         let result = LspServer::spawn_batch(&applicable_configs).await;
 
         for failure in &result.failures {
@@ -1200,16 +1156,6 @@ fn spawn_lsp_servers_background(
             for failure in &result.failures {
                 error!("Server initialization failed: {}", failure);
             }
-            // No server will register: rebind against an empty registered
-            // set so every route drops (one rule, no special case -- see
-            // `ToolRouter::rebind_to_registered`), then stop reporting
-            // "still initializing". This path returns before
-            // `register_servers` ever runs, so it needs its own rebind call;
-            // skipping it would leave every route pointed at a dead server.
-            let mut retained_routes = retained_routes.clone();
-            retained_routes.extend(translator.registered_live_client_ids());
-            translator.rebind_router(&retained_routes);
-            translator.set_expected_servers(retained_routes);
             shared.delivery.lock().await.set_baseline(HashMap::new());
             return;
         }
@@ -1226,24 +1172,10 @@ fn spawn_lsp_servers_background(
         }
 
         let server_count = result.server_count();
-        let registered = if retained_routes.is_empty() {
-            register_servers(result, &translator, &configs_by_id)
-        } else {
-            register_servers_with_retained_routes(
-                result,
-                &translator,
-                &configs_by_id,
-                &retained_routes,
-            )
-        };
+        let registered = register_servers(result, &translator);
         for id in registered.diagnostics_flags.keys() {
             translator.set_lifecycle(id, ServerLifecycle::Running);
         }
-        // Background initialization has completed; stop reporting "still
-        // initializing" (especially for servers that failed to spawn on
-        // partial success, which would otherwise return ServerInitializing
-        // forever instead of NoServerForLanguage/Tool).
-        translator.set_expected_servers(retained_routes.clone());
         info!("Proceeding with {} LSP server(s)", server_count);
 
         let diagnostics_owners = registered

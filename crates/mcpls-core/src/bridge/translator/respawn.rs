@@ -4,7 +4,6 @@
 //! process backs off exponentially instead of eating a fresh
 //! `timeout_seconds` on every tool call that arrives while it is down.
 
-use std::collections::HashSet;
 use std::sync::{Arc, Weak};
 use std::time::Instant;
 
@@ -280,21 +279,6 @@ impl Translator {
         lock_std(&self.lsp_servers)
             .get_mut(id)
             .is_none_or(|server| !matches!(server.has_exited(), Ok(true)))
-    }
-
-    /// Return registered clients that remain live across an initial-batch rebind.
-    pub(crate) fn registered_live_client_ids(&self) -> HashSet<ServerId> {
-        let clients = lock_std(&self.lsp_clients);
-        let mut servers = lock_std(&self.lsp_servers);
-        clients
-            .keys()
-            .filter(|id| {
-                servers
-                    .get_mut(*id)
-                    .is_none_or(|server| !matches!(server.has_exited(), Ok(true)))
-            })
-            .cloned()
-            .collect()
     }
 
     fn restore_running_if_live(&self, id: &ServerId) -> bool {
@@ -596,7 +580,7 @@ mod tests {
     // `windows-latest`.
     #[cfg(unix)]
     mod respawn_tests {
-        use std::collections::{HashMap, HashSet};
+        use std::collections::HashMap;
         use std::fs;
         use std::path::{Path, PathBuf};
 
@@ -881,7 +865,6 @@ while True:
             });
             let init_task = crate::spawn_lsp_servers_background(
                 applicable,
-                HashSet::new(),
                 Arc::clone(&translator),
                 cancel_rx,
                 shared,

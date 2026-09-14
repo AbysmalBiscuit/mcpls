@@ -422,7 +422,7 @@ mod tests {
                 SERVER.to_string(),
             )]));
         translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
-        translator.set_expected_servers(HashSet::from([server]));
+        translator.set_lifecycle(&server, crate::bridge::ServerLifecycle::Starting);
         sweeper_over(dir, translator, Duration::from_secs(60), usize::MAX)
     }
 

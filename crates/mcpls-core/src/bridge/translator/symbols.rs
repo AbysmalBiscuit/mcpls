@@ -5,10 +5,10 @@ use lsp_types::{
     WorkDoneProgressParams, WorkspaceSymbolParams as LspWorkspaceSymbolParams,
 };
 
-use super::Translator;
 use super::dto::{DocumentSymbolsResult, Location, Symbol, WorkspaceSymbol, WorkspaceSymbolResult};
 use super::encoding_ctx::EncodingCtx;
 use super::respawn::RESPAWN_WAIT;
+use super::{ServerLifecycle, Translator};
 use crate::bridge::lock_std;
 use crate::config::{NoServerReason, ToolKind};
 use crate::error::{Error, Result};
@@ -187,20 +187,13 @@ impl Translator {
         validate_workspace_symbol_params(&query, kind_filter.as_deref())?;
 
         // Workspace search has no document, so it resolves via `resolve_any`
-        // rather than a per-language route. If the resolved server is not
-        // registered yet but is expected, tell the caller to wait and retry
-        // rather than implying nothing is configured.
+        // rather than a per-language route.
         let server_id = lock_std(&self.router)
             .resolve_any(ToolKind::WorkspaceSymbols)
             .cloned()
             .map_err(|reason| match reason {
-                // `resolve_any` reports "nothing registered", which also
-                // covers a server that is configured but has not finished
-                // spawning yet -- check `expected_servers` (unavailable to
-                // `ToolRouter` itself) to tell the two apart, mirroring
-                // `get_client_for_file`'s `ServerInitializing` check below.
                 NoServerReason::NothingRegistered => {
-                    if lock_std(&self.expected_servers).is_empty() {
+                    if self.lifecycles().is_empty() {
                         Error::NoServerConfigured
                     } else {
                         Error::WorkspaceServersInitializing
@@ -212,14 +205,19 @@ impl Translator {
             })?;
         self.ensure_server(&server_id, Some(RESPAWN_WAIT)).await?;
         let client = lock_std(&self.lsp_clients).get(&server_id).cloned();
-        let client = client.ok_or_else(|| {
-            if lock_std(&self.expected_servers).contains(&server_id) {
-                Error::ServerInitializing {
-                    server_id: server_id.clone(),
-                }
-            } else {
-                Error::NoServerConfigured
-            }
+        let client = client.ok_or_else(|| match self.lifecycle_of(&server_id) {
+            Some(ServerLifecycle::Idle | ServerLifecycle::Starting) => Error::ServerInitializing {
+                server_id: server_id.clone(),
+            },
+            Some(ServerLifecycle::NotInstalled) => Error::ServerUnavailable {
+                server_id: server_id.clone(),
+                reason: "command not found".to_string(),
+            },
+            Some(ServerLifecycle::Failed) => Error::ServerUnavailable {
+                server_id: server_id.clone(),
+                reason: "failed to start".to_string(),
+            },
+            Some(ServerLifecycle::Running) | None => Error::NoServerConfigured,
         })?;
         self.require_capability(&server_id, "workspaceSymbolProvider", |caps| {
             matches!(
@@ -270,7 +268,7 @@ impl Translator {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::fs;
     use std::sync::Arc;
     use std::time::Duration;
@@ -294,15 +292,12 @@ mod tests {
         assert!(matches!(result, Err(Error::NoServerConfigured)));
     }
 
-    /// #242/S4 regression: a server is configured and still spawning (large
-    /// project load) rather than never having existed -- the router alone
-    /// cannot tell these apart (both look like "nothing registered"), so
-    /// `handle_workspace_symbol` must consult `expected_servers` to report
-    /// "still initializing" instead of the misleading "no server configured".
+    /// Lifecycle membership distinguishes a configured server from an empty
+    /// setup when no workspace-symbol route is available yet.
     #[tokio::test]
-    async fn test_handle_workspace_symbol_reports_initializing_when_expected_but_not_registered() {
+    async fn test_handle_workspace_symbol_reports_initializing_while_server_is_starting() {
         let translator = Translator::new();
-        translator.set_expected_servers(HashSet::from([ServerId::from("pyright")]));
+        translator.set_lifecycle(&ServerId::from("pyright"), ServerLifecycle::Starting);
 
         let result = translator
             .handle_workspace_symbol("test".to_string(), None, 100)

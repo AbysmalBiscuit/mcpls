@@ -2299,17 +2299,10 @@ mod tests {
         );
     }
 
-    /// #174 §8/S2 regression: `register_servers`'s diagnostics-cache flags
-    /// must be computed from the *rebound* router, not the pre-rebind view.
-    /// Sets up a `python` config where a narrow "diagnostics-only" server
-    /// (`pyright-diag`) is configured but never actually registers (as if
-    /// it failed to spawn), leaving only a catch-all (`pylsp`) live. Before
-    /// the fix, computing the flags from the pre-rebind router would resolve
-    /// `Diagnostics` to the dead `pyright-diag` for every survivor, so
-    /// `pylsp` would be flagged `false` and the diagnostics cache would go
-    /// silently dark for `python` despite a live server being available.
+    /// A missing narrow diagnostics claimant passes cache ownership to the
+    /// language catch-all when the registered server pumps are installed.
     #[tokio::test]
-    async fn test_register_servers_computes_diagnostics_flags_from_rebound_router() {
+    async fn test_register_servers_redirects_flags_from_a_missing_claimant() {
         use crate::bridge::Translator;
         use crate::config::{ServerId, ToolKind, ToolRouter};
 
@@ -2348,18 +2341,22 @@ mod tests {
         ];
         let router = ToolRouter::from_configs(&configs).unwrap();
         let translator = Translator::new().with_router(router);
+        translator.set_lifecycle(
+            &ServerId::from("pyright-diag"),
+            crate::bridge::ServerLifecycle::NotInstalled,
+        );
 
         // Only pylsp actually registers; pyright-diag never spawned.
         let mut result = ServerInitResult::new();
         result.add_server(pylsp_id.clone(), fake_lsp_server());
 
-        let registered = crate::register_servers(result, &translator, &HashMap::new());
+        let registered = crate::register_servers(result, &translator);
 
         assert_eq!(
             registered.diagnostics_flags.get(&pylsp_id),
             Some(&true),
-            "pylsp must inherit the diagnostics route once pyright-diag is \
-             known dead, and the flag must reflect that post-rebind state"
+            "pylsp must inherit the diagnostics route when the narrow claimant \
+             is missing"
         );
     }
 }

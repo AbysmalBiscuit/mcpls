@@ -461,13 +461,8 @@ async fn replacement_owner_scenario(order: ReplacementOwnerOrder, attempt: Repla
         translator.notification_pumps.get_or_init(|| {
             notification_lifecycle::NotificationPumps::new(shared.clone(), cancel_rx.clone())
         });
-        let init = spawn_lsp_servers_background(
-            configs,
-            HashSet::new(),
-            Arc::clone(&translator),
-            cancel_rx,
-            shared,
-        );
+        let init =
+            spawn_lsp_servers_background(configs, Arc::clone(&translator), cancel_rx, shared);
         let abort_init = AbortOnDrop(&init);
         let server = mcp::McplsServer::new(
             Arc::clone(&translator),
@@ -1168,7 +1163,6 @@ async fn recovery_scenario(startup: StartupMode) {
         });
         let init = spawn_lsp_servers_background(
             configs,
-            HashSet::new(),
             Arc::clone(&translator),
             cancel_rx,
             shared,

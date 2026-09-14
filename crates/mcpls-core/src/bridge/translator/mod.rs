@@ -6,7 +6,7 @@
 //! registration, shutdown); actual tool-call handling lives in the sibling
 //! modules below, grouped by domain.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
@@ -84,13 +84,8 @@ pub struct Translator {
     /// Custom file extension to language ID mappings. Read-only after
     /// `serve()` setup, so no lock is needed.
     extension_map: Arc<HashMap<String, String>>,
-    /// Servers that are configured + applicable but may not have finished
-    /// initializing yet (background init). Used to return a clear "still
-    /// initializing" error instead of "no server configured".
-    expected_servers: Arc<StdMutex<HashSet<ServerId>>>,
     /// Per-tool routing table: resolves `(language, tool)` to a `ServerId`.
-    /// Locked independently so `rebind_router` (called from a background
-    /// task once registration completes) never contends with an in-flight
+    /// Locked independently so route lookup never contends with an in-flight
     /// LSP round trip.
     router: Arc<StdMutex<ToolRouter>>,
     /// Configs needed to spawn each applicable server, keyed by routing
@@ -244,7 +239,6 @@ impl Translator {
             resource_limits: ResourceLimits::default(),
             workspace_roots: Arc::new(Vec::new()),
             extension_map: Arc::new(HashMap::new()),
-            expected_servers: Arc::new(StdMutex::new(HashSet::new())),
             router: Arc::new(StdMutex::new(ToolRouter::default())),
             server_configs: Arc::new(StdMutex::new(HashMap::new())),
             respawn_backoffs: Arc::new(StdMutex::new(HashMap::new())),
@@ -815,17 +809,6 @@ impl Translator {
         }
     }
 
-    /// Mark the set of servers that are expected (configured + applicable)
-    /// but may still be initializing in the background.
-    pub fn set_expected_servers(&self, servers: HashSet<ServerId>) {
-        *lock_std(&self.expected_servers) = servers;
-    }
-
-    /// Clear the expected-servers set (e.g. after background init failed).
-    pub fn clear_expected_servers(&self) {
-        lock_std(&self.expected_servers).clear();
-    }
-
     /// Install the per-tool routing table built from the applicable configs.
     ///
     /// Only called during single-owner setup, before the translator is
@@ -836,13 +819,6 @@ impl Translator {
         self
     }
 
-    /// Rebind the routing table to the set of servers that actually
-    /// registered, dropping or redirecting routes to servers that failed to
-    /// spawn. See `ToolRouter::rebind_to_registered` for the full semantics.
-    pub fn rebind_router(&self, registered: &HashSet<ServerId>) {
-        lock_std(&self.router).rebind_to_registered(registered);
-    }
-
     /// Whether `id` is the server the router currently resolves
     /// `ToolKind::Diagnostics` to for `language_id`.
     ///
@@ -851,7 +827,25 @@ impl Translator {
     /// the router's lock guard outside this module.
     #[must_use]
     pub fn is_diagnostics_route(&self, language_id: &str, id: &ServerId) -> bool {
-        lock_std(&self.router).resolve(language_id, ToolKind::Diagnostics) == Some(id)
+        let (claimant, catch_all) = {
+            let router = lock_std(&self.router);
+            (
+                router.resolve(language_id, ToolKind::Diagnostics).cloned(),
+                router.catch_all_for_language(language_id).cloned(),
+            )
+        };
+        match claimant {
+            None => false,
+            Some(claimant) if claimant == *id => true,
+            // A pump caches diagnostics for its lifetime, so a failed narrow
+            // claimant must transfer cache ownership to the catch-all now.
+            Some(claimant) => {
+                matches!(
+                    self.lifecycle_of(&claimant),
+                    Some(ServerLifecycle::NotInstalled | ServerLifecycle::Failed)
+                ) && catch_all.as_ref() == Some(id)
+            }
+        }
     }
 
     /// Negotiated [`PositionEncoding`] of the registered server `id`, or the
@@ -1061,15 +1055,14 @@ impl Default for Translator {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::path::PathBuf;
 
     use tokio::time::Duration;
 
     use self::testing::TranslatorHarness;
     use super::*;
-    use crate::bridge::state::detect_language;
-    use crate::config::{ServerId, ToolKind, ToolRouter};
+    use crate::config::{ServerId, ToolKind};
     use crate::error::Error;
 
     #[test]
@@ -1203,32 +1196,6 @@ mod tests {
             0,
             "all registered servers must be drained"
         );
-    }
-
-    #[test]
-    fn test_clear_expected_servers_reverts_to_no_server_after_all_routes_dropped() {
-        // Mirrors the real `serve_with` flow: `rebind_router` (called from
-        // `register_servers`/the all-failed path) drops routes to servers
-        // that never registered, then `clear_expected_servers` runs under
-        // the same lock. Subsequent lookups must fall back to
-        // NoServerForLanguage rather than keep implying the server is still
-        // on its way.
-        let path = PathBuf::from("/ws/Assets/Scripts/Player.cs");
-        let lang = detect_language(&path, &HashMap::new());
-        let id = ServerId::from(lang.clone());
-
-        let translator = Translator::new().with_router(ToolRouter::catch_all([(id.clone(), lang)]));
-        let mut expected = HashSet::new();
-        expected.insert(id);
-        translator.set_expected_servers(expected);
-
-        translator.rebind_router(&HashSet::new());
-        translator.clear_expected_servers();
-
-        let err = translator
-            .get_client_for_file(&path, ToolKind::Hover)
-            .unwrap_err();
-        assert!(matches!(err, Error::NoServerForLanguage(_)));
     }
 
     #[test]

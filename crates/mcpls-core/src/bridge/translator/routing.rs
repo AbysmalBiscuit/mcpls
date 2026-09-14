@@ -3,8 +3,8 @@
 
 use std::path::{Path, PathBuf};
 
-use super::Translator;
 use super::respawn::RESPAWN_WAIT;
+use super::{ServerLifecycle, Translator};
 use crate::bridge::lock_std;
 use crate::bridge::state::detect_language;
 use crate::config::{ServerId, ToolKind, base_language_id};
@@ -83,18 +83,9 @@ impl Translator {
         Ok((id, client))
     }
 
-    /// Resolve the server that should handle `tool` for the file at `path`,
-    /// returning both its routing identity and a cloned client.
+    /// Resolve the configured server and client for `path` and `tool`.
     ///
-    /// Tries the file's detected language first, then (if that has no route)
-    /// its React base language (`.tsx` falling back from `typescriptreact` to
-    /// `typescript`, and similarly for `.jsx`) -- in that order, so an
-    /// explicit `typescriptreact` server still wins over the `typescript`
-    /// fallback when both are configured.
-    ///
-    /// Locks `router`, `lsp_clients`, and (on the not-yet-registered path)
-    /// `expected_servers` only for their respective lookups — every guard is
-    /// dropped before this method returns.
+    /// Tries the detected language first, then its React base language.
     pub(super) fn get_client_for_file(
         &self,
         path: &Path,
@@ -110,26 +101,44 @@ impl Translator {
             let resolved = lock_std(&self.router).resolve(lang, tool).cloned();
             let Some(id) = resolved else { continue };
 
-            let found = lock_std(&self.lsp_clients).get(&id).cloned();
-            if let Some(client) = found {
-                return Ok((id, client));
+            let lifecycle = self.lifecycle_of(&id);
+            if lifecycle != Some(ServerLifecycle::NotInstalled) {
+                let found = lock_std(&self.lsp_clients).get(&id).cloned();
+                if let Some(client) = found {
+                    return Ok((id, client));
+                }
             }
-            // A route naming a server that is still initializing (e.g. a
-            // large Unity solution loading via OmniSharp) -- tell the caller
-            // to wait and retry rather than implying no server is configured.
-            if lock_std(&self.expected_servers).contains(&id) {
-                return Err(Error::ServerInitializing { server_id: id });
+            match lifecycle {
+                Some(ServerLifecycle::Idle | ServerLifecycle::Starting) => {
+                    return Err(Error::ServerInitializing { server_id: id });
+                }
+                Some(ServerLifecycle::NotInstalled) => {
+                    let catch_all =
+                        { lock_std(&self.router).catch_all_for_language(lang).cloned() };
+                    if let Some(catch_all) = catch_all
+                        && catch_all != id
+                        && self.lifecycle_of(&catch_all) != Some(ServerLifecycle::NotInstalled)
+                        && let Some(client) = lock_std(&self.lsp_clients).get(&catch_all).cloned()
+                    {
+                        return Ok((catch_all, client));
+                    }
+                    return Err(Error::ServerUnavailable {
+                        server_id: id,
+                        reason: "command not found".to_string(),
+                    });
+                }
+                Some(ServerLifecycle::Failed) => {
+                    return Err(Error::ServerUnavailable {
+                        server_id: id,
+                        reason: "failed to start".to_string(),
+                    });
+                }
+                Some(ServerLifecycle::Running) | None => {}
             }
-            // Unreachable once registration has rebound the router
-            // (`Translator::rebind_router`) -- a route can only name a
-            // registered server after that point. Logged rather than
-            // `debug_assert!`-panicked: this method is reachable by any
-            // library consumer calling `with_router` without registering
-            // matching clients, not just internal misuse.
-            tracing::error!(
-                "router route names server '{id}' for tool '{tool}' that is neither \
-                 registered nor expected"
-            );
+            // A route without a client is normally an initialization error
+            // handled above. Log the inconsistent case for library callers
+            // that build a router without registering matching clients.
+            tracing::error!("router route names server '{id}' for tool '{tool}' without a client");
             return Err(Error::NoServerForTool {
                 language_id: (*lang).to_string(),
                 tool,
@@ -322,7 +331,7 @@ impl Translator {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::fs;
     use std::sync::Arc;
 
@@ -344,23 +353,87 @@ mod tests {
     type JsonValue = serde_json::Value;
 
     #[test]
-    fn test_get_client_for_file_server_initializing_when_expected() {
-        // A configured/applicable language whose LSP client has not registered
-        // yet (large solution still loading via OmniSharp) must surface
-        // ServerInitializing — "wait and retry" — not NoServerForLanguage.
+    fn test_a_starting_server_asks_the_caller_to_retry() {
+        // A configured server whose LSP client has not registered yet must
+        // surface ServerInitializing so the caller waits and retries.
         let path = PathBuf::from("/ws/Assets/Scripts/Player.cs");
         let lang = detect_language(&path, &HashMap::new());
         let id = ServerId::from(lang.clone());
 
         let translator = Translator::new().with_router(ToolRouter::catch_all([(id.clone(), lang)]));
-        let mut expected = HashSet::new();
-        expected.insert(id.clone());
-        translator.set_expected_servers(expected);
+        translator.set_lifecycle(&id, ServerLifecycle::Starting);
 
         let err = translator
             .get_client_for_file(&path, ToolKind::Hover)
             .unwrap_err();
         assert!(matches!(err, Error::ServerInitializing { server_id } if server_id == id));
+    }
+
+    fn router_with_narrow_rust_claim() -> ToolRouter {
+        let mut narrow = LspServerConfig::rust_analyzer();
+        narrow.name = Some("rust-narrow".to_string());
+        narrow.handles = Some(vec![ToolKind::Hover]);
+        let catch_all = LspServerConfig::rust_analyzer();
+        ToolRouter::from_configs([&narrow, &catch_all]).expect("distinct rust routes are valid")
+    }
+
+    fn translator_with_rust_route(router: ToolRouter) -> Translator {
+        Translator::new()
+            .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]))
+            .with_router(router)
+    }
+
+    #[tokio::test]
+    async fn test_a_missing_binary_falls_through_to_the_catch_all() {
+        let translator = translator_with_rust_route(router_with_narrow_rust_claim());
+        let narrow_id = ServerId::from("rust-narrow");
+        let catch_all_id = ServerId::from("rust");
+        translator.set_lifecycle(&narrow_id, ServerLifecycle::NotInstalled);
+        translator.set_lifecycle(&catch_all_id, ServerLifecycle::Running);
+        let (client, _server) = fake_lsp_client();
+        translator.register_client(catch_all_id.clone(), client);
+
+        let (id, _) = translator
+            .get_client_for_file(Path::new("/work/src/main.rs"), ToolKind::Hover)
+            .expect("the catch-all answers for a server that is not installed");
+
+        assert_eq!(id, catch_all_id);
+    }
+
+    #[tokio::test]
+    async fn test_a_missing_binary_uses_the_catch_all_even_with_a_stale_client() {
+        let translator = translator_with_rust_route(router_with_narrow_rust_claim());
+        let narrow_id = ServerId::from("rust-narrow");
+        let catch_all_id = ServerId::from("rust");
+        let (stale_client, _stale_server) = fake_lsp_client();
+        let (catch_all_client, _catch_all_server) = fake_lsp_client();
+        translator.register_client(narrow_id.clone(), stale_client);
+        translator.register_client(catch_all_id.clone(), catch_all_client);
+        translator.set_lifecycle(&narrow_id, ServerLifecycle::NotInstalled);
+        translator.set_lifecycle(&catch_all_id, ServerLifecycle::Running);
+
+        let (id, _) = translator
+            .get_client_for_file(Path::new("/work/src/main.rs"), ToolKind::Hover)
+            .expect("a stale client cannot override a missing-binary outcome");
+
+        assert_eq!(id, catch_all_id);
+    }
+
+    #[tokio::test]
+    async fn test_a_crashed_narrow_server_does_not_fall_through() {
+        let translator = translator_with_rust_route(router_with_narrow_rust_claim());
+        let narrow_id = ServerId::from("rust-narrow");
+        let catch_all_id = ServerId::from("rust");
+        translator.set_lifecycle(&narrow_id, ServerLifecycle::Failed);
+        translator.set_lifecycle(&catch_all_id, ServerLifecycle::Running);
+        let (client, _server) = fake_lsp_client();
+        translator.register_client(catch_all_id, client);
+
+        let err = translator
+            .get_client_for_file(Path::new("/work/src/main.rs"), ToolKind::Hover)
+            .expect_err("a server expected back keeps its own route");
+
+        assert!(matches!(err, Error::ServerUnavailable { .. }));
     }
 
     #[test]
