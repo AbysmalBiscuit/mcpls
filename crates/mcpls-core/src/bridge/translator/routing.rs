@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use super::Translator;
+use super::respawn::RESPAWN_WAIT;
 use crate::bridge::lock_std;
 use crate::bridge::state::detect_language;
 use crate::config::{ServerId, ToolKind, base_language_id};
@@ -74,7 +75,7 @@ impl Translator {
         tool: ToolKind,
     ) -> Result<(ServerId, LspClient)> {
         let (id, client) = self.get_client_for_file(path, tool)?;
-        self.respawn_if_dead(&id).await?;
+        self.ensure_server(&id, Some(RESPAWN_WAIT)).await?;
         let client = lock_std(&self.lsp_clients)
             .get(&id)
             .cloned()

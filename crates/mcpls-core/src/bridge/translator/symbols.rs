@@ -8,6 +8,7 @@ use lsp_types::{
 use super::Translator;
 use super::dto::{DocumentSymbolsResult, Location, Symbol, WorkspaceSymbol, WorkspaceSymbolResult};
 use super::encoding_ctx::EncodingCtx;
+use super::respawn::RESPAWN_WAIT;
 use crate::bridge::lock_std;
 use crate::config::{NoServerReason, ToolKind};
 use crate::error::{Error, Result};
@@ -209,7 +210,7 @@ impl Translator {
                     tool: ToolKind::WorkspaceSymbols,
                 },
             })?;
-        self.respawn_if_dead(&server_id).await?;
+        self.ensure_server(&server_id, Some(RESPAWN_WAIT)).await?;
         let client = lock_std(&self.lsp_clients).get(&server_id).cloned();
         let client = client.ok_or_else(|| {
             if lock_std(&self.expected_servers).contains(&server_id) {

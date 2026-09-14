@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
 use tokio::sync::Mutex;
 
@@ -93,21 +93,14 @@ pub struct Translator {
     /// task once registration completes) never contends with an in-flight
     /// LSP round trip.
     router: Arc<StdMutex<ToolRouter>>,
-    /// Configs needed to respawn a server if its process dies later, keyed
-    /// by routing identity. Populated once per server right after a
-    /// successful spawn (see [`Self::register_server_config`]); the respawn
-    /// path ([`Self::respawn_if_dead`]) is the only reader.
+    /// Configs needed to spawn each applicable server, keyed by routing
+    /// identity. Registered during setup before any server starts; read by
+    /// `ensure_server`'s detached spawn task.
     server_configs: Arc<StdMutex<HashMap<ServerId, ServerInitConfig>>>,
-    /// Per-server single-flight lock so concurrent callers that both observe
-    /// a dead process don't race to respawn it independently -- the loser
-    /// waits for the winner's attempt to finish (success or failure) and
-    /// then re-reads whatever ended up registered. See
-    /// [`Self::respawn_if_dead`].
-    respawn_locks: Arc<StdMutex<HashMap<ServerId, Arc<Mutex<()>>>>>,
     /// Consecutive respawn failures and last-attempt time per server, so a
     /// crash-looping server backs off instead of eating a fresh
     /// `timeout_seconds` on every tool call that arrives while it is down.
-    /// See [`Self::respawn_if_dead`].
+    /// See `ensure_server`.
     respawn_backoffs: Arc<StdMutex<HashMap<ServerId, RespawnBackoff>>>,
     /// What each applicable server is doing. Membership is the applicable
     /// set: a server absent from here is not configured for this checkout.
@@ -115,10 +108,12 @@ pub struct Translator {
     /// Per-server broadcast of the field above, so a caller waiting on a
     /// spawn learns the outcome without polling.
     lifecycle_senders: Arc<StdMutex<lifecycle::LifecycleSenders>>,
+    /// A weak handle used by detached server-spawn tasks.
+    self_handle: OnceLock<Weak<Self>>,
     /// Diagnostics cache, shared with `serve_with`'s notification pump.
     ///
     /// `None` for a `Translator` built without [`Self::with_notification_cache`]
-    /// (e.g. most unit tests). When present, [`Self::respawn_if_dead`] uses
+    /// (e.g. most unit tests). When present, [`Self::ensure_server`] uses
     /// it to invalidate a respawned server's stale cached diagnostics --
     /// see that method's docs for why that matters.
     notification_cache: Option<Arc<Mutex<NotificationCache>>>,
@@ -252,10 +247,10 @@ impl Translator {
             expected_servers: Arc::new(StdMutex::new(HashSet::new())),
             router: Arc::new(StdMutex::new(ToolRouter::default())),
             server_configs: Arc::new(StdMutex::new(HashMap::new())),
-            respawn_locks: Arc::new(StdMutex::new(HashMap::new())),
             respawn_backoffs: Arc::new(StdMutex::new(HashMap::new())),
             lifecycles: Arc::new(StdMutex::new(HashMap::new())),
             lifecycle_senders: Arc::new(StdMutex::new(HashMap::new())),
+            self_handle: OnceLock::new(),
             notification_cache: None,
             apply_sink_lock: Arc::new(Mutex::new(())),
             applier: Arc::new(Applier::new(Vec::new(), ApplyConfig::default())),
@@ -301,6 +296,13 @@ impl Translator {
     /// shared, so this replaces the `Arc` wholesale rather than locking.
     pub fn set_workspace_roots(&mut self, roots: Vec<PathBuf>) {
         self.workspace_roots = Arc::new(roots);
+    }
+
+    /// Give the translator a handle to itself, so a spawn can outlive the
+    /// call that asked for it. Called once during setup, where the `Arc`
+    /// already exists.
+    pub fn set_self_handle(&self, handle: Weak<Self>) {
+        let _ = self.self_handle.set(handle);
     }
 
     /// Give the translator a handle to the shared diagnostics cache, so the
@@ -942,11 +944,9 @@ impl Translator {
         lock_std(&self.lsp_servers).insert(id.into(), server);
     }
 
-    /// Store the config needed to respawn `id` if its process dies later.
+    /// Store the config needed to spawn `id` during setup.
     ///
-    /// Called once per server, right after a successful spawn (see the
-    /// crate-root `register_servers`); [`Self::respawn_if_dead`] is the only
-    /// reader.
+    /// The initial batch also refreshes this after successful registration.
     pub(crate) fn register_server_config(&self, id: impl Into<ServerId>, config: ServerInitConfig) {
         lock_std(&self.server_configs).insert(id.into(), config);
     }

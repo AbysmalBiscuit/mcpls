@@ -4,19 +4,26 @@
 //! process backs off exponentially instead of eating a fresh
 //! `timeout_seconds` on every tool call that arrives while it is down.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Instant;
 
+#[cfg(test)]
 use tokio::sync::Mutex;
-use tokio::time::Duration;
+use tokio::time::{Duration, Instant as TokioInstant};
 
-use super::Translator;
+use super::{ServerLifecycle, Translator};
 use crate::bridge::lock_std;
 use crate::config::ServerId;
 use crate::error::{Error, Result};
-use crate::lsp::LspServer;
+use crate::lsp::{LspServer, ServerInitConfig};
 
-/// Tracks respawn attempts for one server, so [`Translator::respawn_if_dead`]
+/// How long a caller waits for a replacement before it is told to retry.
+///
+/// A respawn of a server that was running has a warm cache behind it, so
+/// this is generous where the first-spawn budget in `routing.rs` is not.
+pub(super) const RESPAWN_WAIT: Duration = Duration::from_secs(5);
+
+/// Tracks respawn attempts for one server, so [`Translator::ensure_server`]
 /// can back off a crash-looping process instead of retrying it on every
 /// single tool call.
 #[derive(Debug, Clone, Copy)]
@@ -46,6 +53,35 @@ const RESPAWN_BACKOFF_BASE: Duration = Duration::from_secs(1);
 /// Upper bound on the exponential backoff delay between respawn attempts.
 const RESPAWN_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
+/// Publishes a terminal state for a spawn that ended without one.
+struct SpawnGuard {
+    translator: Arc<Translator>,
+    id: ServerId,
+    armed: bool,
+}
+
+impl SpawnGuard {
+    fn publish(&mut self, state: ServerLifecycle) {
+        self.armed = false;
+        self.translator.set_lifecycle(&self.id, state);
+    }
+}
+
+impl Drop for SpawnGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        tracing::error!(
+            "spawn task for LSP server '{}' ended without an outcome",
+            self.id
+        );
+        self.translator.record_respawn_failure(&self.id);
+        self.translator
+            .set_lifecycle(&self.id, ServerLifecycle::Failed);
+    }
+}
+
 impl Translator {
     /// Whether the server tracked under `id` is registered and has exited.
     ///
@@ -55,25 +91,12 @@ impl Translator {
     /// should react to -- and for any `try_wait` error, on the conservative
     /// assumption that a health check that itself failed should not trigger
     /// a respawn.
+    #[cfg(test)]
     pub(crate) fn is_server_dead(&self, id: &ServerId) -> bool {
         lock_std(&self.lsp_servers)
             .get_mut(id)
             .and_then(|server| server.has_exited().ok())
             .unwrap_or(false)
-    }
-
-    /// Return the shared single-flight lock for `id`, creating it on first
-    /// use.
-    ///
-    /// Two concurrent callers racing to respawn the same server both get a
-    /// clone of the *same* underlying `Mutex`, so awaiting it actually
-    /// serializes them instead of letting both proceed independently.
-    fn respawn_lock(&self, id: &ServerId) -> Arc<Mutex<()>> {
-        Arc::clone(
-            lock_std(&self.respawn_locks)
-                .entry(id.clone())
-                .or_insert_with(|| Arc::new(Mutex::new(()))),
-        )
     }
 
     /// Remaining backoff delay before `id` may be respawned again, or
@@ -82,7 +105,7 @@ impl Translator {
     /// Only consults recorded *failures* -- a server with no recorded
     /// attempt is never backed off. A server whose last attempt "succeeded"
     /// is reconciled by [`Self::reconcile_respawn_stability`] (called by
-    /// [`Self::respawn_if_dead`] before this) into either a failure (died
+    /// [`Self::ensure_server`] before this) into either a failure (died
     /// again too soon) or removed entirely (proven stable), so by the time
     /// this runs, a lingering "succeeded" entry never reaches here.
     fn respawn_backoff_remaining(&self, id: &ServerId) -> Option<Duration> {
@@ -102,7 +125,7 @@ impl Translator {
     }
 
     /// Records a failed respawn attempt for `id`, extending its backoff.
-    fn record_respawn_failure(&self, id: &ServerId) {
+    pub(crate) fn record_respawn_failure(&self, id: &ServerId) {
         let mut backoffs = lock_std(&self.respawn_backoffs);
         let entry = backoffs
             .entry(id.clone())
@@ -155,107 +178,154 @@ impl Translator {
     ///   fresh, unbacked-off start, spawning one child process per tool
     ///   call forever.
     fn reconcile_respawn_stability(&self, id: &ServerId) {
-        let Some(entry) = lock_std(&self.respawn_backoffs).get(id).copied() else {
+        let mut backoffs = lock_std(&self.respawn_backoffs);
+        let Some(entry) = backoffs.get(id).copied() else {
             return;
         };
         if !entry.last_attempt_succeeded {
             return;
         }
-        if self
-            .clock
-            .now()
-            .saturating_duration_since(entry.last_attempt)
-            >= RESPAWN_BACKOFF_BASE
-        {
-            lock_std(&self.respawn_backoffs).remove(id);
-        } else {
-            let mut backoffs = lock_std(&self.respawn_backoffs);
-            if let Some(current) = backoffs.get_mut(id) {
-                current.consecutive_failures = current.consecutive_failures.saturating_add(1);
-                current.last_attempt = self.clock.now();
-                current.last_attempt_succeeded = false;
-            }
+        let now = self.clock.now();
+        if now.saturating_duration_since(entry.last_attempt) >= RESPAWN_BACKOFF_BASE {
+            backoffs.remove(id);
+        } else if let Some(current) = backoffs.get_mut(id) {
+            current.consecutive_failures = current.consecutive_failures.saturating_add(1);
+            current.last_attempt = now;
+            current.last_attempt_succeeded = false;
         }
+        drop(backoffs);
     }
 
-    /// Detect whether the server routed to `id` has crashed and, if so,
-    /// eagerly respawn and re-initialize it before returning.
-    ///
-    /// A no-op if `id` names a server that was never registered (routing
-    /// resolved to it, but it hasn't started yet or never will) or is still
-    /// alive.
-    ///
-    /// # Concurrency
-    ///
-    /// Multiple callers can race in here for the same `id` -- e.g. two tool
-    /// calls landing back-to-back right after the process dies. They
-    /// single-flight on [`Self::respawn_lock`]: the first to acquire it
-    /// performs the actual respawn; everyone else waits for that attempt to
-    /// finish (or fail), rechecks, and finds nothing left to do.
-    ///
-    /// Requests still parked in the dead client's `pending_requests` are
-    /// failed immediately via [`LspClient::fail_pending_requests`] instead
-    /// of being left to time out on their own.
-    ///
-    /// The respawned process has no memory of any document the old one had
-    /// open, so this also clears `document_tracker`'s per-server sync
-    /// history for `id` -- otherwise `ensure_open` would send `didChange`
-    /// instead of `didOpen` for a document the new process never saw. Any
-    /// diagnostics cached from the old connection are invalidated (see
-    /// [`Self::with_notification_cache`]) rather than left to be merged into
-    /// fresh pulls as if still current.
-    ///
-    /// The old notification task is terminated before its cache is invalidated.
-    /// The replacement resumes the session's notification processing and preserves
-    /// the original delivery baseline.
-    ///
-    /// A crash-looping server (repeated respawn failures) backs off
-    /// exponentially (`RESPAWN_BACKOFF_BASE` up to `RESPAWN_BACKOFF_MAX`)
-    /// instead of retrying on every single tool call, each of which would
-    /// otherwise cost up to a full `timeout_seconds` inside `initialize`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::ServerUnavailable`] if no respawn config was ever
-    /// registered for `id`, or if it is currently within its backoff
-    /// window. Returns whatever error `LspServer::spawn` produced (e.g. its
-    /// command is no longer on `PATH`, or `initialize` fails again) if an
-    /// actual respawn attempt failed.
-    pub(super) async fn respawn_if_dead(&self, id: &ServerId) -> Result<()> {
-        if !self.is_server_dead(id) {
+    /// Start `id` when it has no live client, then wait for its lifecycle outcome.
+    /// `None` returns after starting; `Some(d)` waits at most `d`.
+    pub(super) async fn ensure_server(
+        &self,
+        id: &ServerId,
+        budget: Option<Duration>,
+    ) -> Result<()> {
+        if self.has_live_client(id) {
             return Ok(());
         }
 
-        let lock = self.respawn_lock(id);
-        let _guard = lock.lock().await;
-
-        // Another caller may have already respawned it while we waited.
-        if !self.is_server_dead(id) {
-            return Ok(());
+        // Check membership before subscribing: subscribing creates an Idle
+        // channel for unknown ids, which would otherwise wait for a spawn
+        // that nobody started.
+        match self.lifecycle_of(id) {
+            None => {
+                return Err(Error::ServerUnavailable {
+                    server_id: id.clone(),
+                    reason: "not applicable to this workspace".to_string(),
+                });
+            }
+            Some(ServerLifecycle::NotInstalled) => {
+                return Err(Error::ServerUnavailable {
+                    server_id: id.clone(),
+                    reason: "command not found when it was last attempted".to_string(),
+                });
+            }
+            Some(_) => {}
         }
+
+        let mut states = self.subscribe_lifecycle(id);
 
         self.reconcile_respawn_stability(id);
-
         if let Some(remaining) = self.respawn_backoff_remaining(id) {
-            tracing::warn!(
-                "LSP server '{id}' is crash-looping, backing off for {remaining:?} \
-                 before the next respawn attempt"
-            );
             return Err(Error::ServerUnavailable {
                 server_id: id.clone(),
                 reason: format!("crash-looping, retry in {remaining:?}"),
             });
         }
 
-        let Some(config) = lock_std(&self.server_configs).get(id).cloned() else {
-            return Err(Error::ServerUnavailable {
-                server_id: id.clone(),
-                reason: "no respawn config registered for this server".to_string(),
-            });
+        if self.begin_starting(id) {
+            // A caller can read Starting while the active spawn finishes,
+            // then claim the newly published Running state. Check again
+            // after the claim so that race does not launch a duplicate.
+            if self.restore_running_if_live(id) {
+                return Ok(());
+            }
+
+            self.reconcile_respawn_stability(id);
+            if let Some(remaining) = self.respawn_backoff_remaining(id) {
+                self.set_lifecycle(id, ServerLifecycle::Failed);
+                return Err(Error::ServerUnavailable {
+                    server_id: id.clone(),
+                    reason: format!("crash-looping, retry in {remaining:?}"),
+                });
+            }
+
+            let Some(translator) = self.self_handle.get().and_then(Weak::upgrade) else {
+                self.record_respawn_failure(id);
+                self.set_lifecycle(id, ServerLifecycle::Failed);
+                return Err(Error::ServerUnavailable {
+                    server_id: id.clone(),
+                    reason: "this translator cannot start a server".to_string(),
+                });
+            };
+            let spawn_id = id.clone();
+            tokio::spawn(async move { translator.run_spawn(spawn_id).await });
+        }
+
+        let Some(budget) = budget else {
+            return Ok(());
         };
+        self.await_terminal_state(id, &mut states, budget).await
+    }
+
+    fn has_live_client(&self, id: &ServerId) -> bool {
+        if !lock_std(&self.lsp_clients).contains_key(id) {
+            return false;
+        }
+        // Registration publishes the client immediately before the server.
+        lock_std(&self.lsp_servers)
+            .get_mut(id)
+            .is_none_or(|server| !matches!(server.has_exited(), Ok(true)))
+    }
+
+    fn restore_running_if_live(&self, id: &ServerId) -> bool {
+        if self.has_live_client(id) {
+            self.set_lifecycle(id, ServerLifecycle::Running);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Run the spawn attempt claimed by `begin_starting`.
+    async fn run_spawn(self: Arc<Self>, id: ServerId) {
+        let mut guard = SpawnGuard {
+            translator: Arc::clone(&self),
+            id: id.clone(),
+            armed: true,
+        };
+
+        let Some(config) = lock_std(&self.server_configs).get(&id).cloned() else {
+            tracing::error!("no spawn config registered for LSP server '{id}'");
+            return;
+        };
+
+        match self.install_server(&id, config).await {
+            Ok(()) => {
+                self.record_respawn_success(&id);
+                guard.publish(ServerLifecycle::Running);
+                tracing::info!("LSP server '{id}' is running");
+            }
+            Err(err) => {
+                self.record_respawn_failure(&id);
+                let state = if err.is_missing_binary() {
+                    ServerLifecycle::NotInstalled
+                } else {
+                    ServerLifecycle::Failed
+                };
+                tracing::error!("LSP server '{id}' failed to start: {err}");
+                guard.publish(state);
+            }
+        }
+    }
+
+    async fn install_server(&self, id: &ServerId, config: ServerInitConfig) -> Result<()> {
         let language_id = config.server_config.language_id.clone();
 
-        tracing::warn!("LSP server '{id}' has crashed, respawning");
+        tracing::info!("starting LSP server '{id}'");
         // Cleared before the replacement is spawned, not after: the fresh
         // process registers its own watchers during the `initialize`
         // handshake, and a clear running afterwards would drop those along
@@ -273,13 +343,7 @@ impl Translator {
         } else {
             None
         };
-        let mut new_server = match LspServer::spawn(config).await {
-            Ok(server) => server,
-            Err(err) => {
-                self.record_respawn_failure(id);
-                return Err(err);
-            }
-        };
+        let mut new_server = LspServer::spawn(config).await?;
         let new_client = new_server.client().clone();
         let notification_rx = new_server.take_notification_rx();
         let old_client = lock_std(&self.lsp_clients).get(id).cloned();
@@ -306,10 +370,43 @@ impl Translator {
         let old_server = lock_std(&self.lsp_servers).insert(id.clone(), new_server);
         lock_std(&self.lsp_clients).insert(id.clone(), new_client);
         drop(old_server);
-        self.record_respawn_success(id);
-
-        tracing::info!("LSP server '{id}' respawned successfully");
         Ok(())
+    }
+
+    async fn await_terminal_state(
+        &self,
+        id: &ServerId,
+        states: &mut tokio::sync::watch::Receiver<ServerLifecycle>,
+        budget: Duration,
+    ) -> Result<()> {
+        let deadline = TokioInstant::now() + budget;
+        loop {
+            let state = *states.borrow_and_update();
+            match state {
+                ServerLifecycle::Running => return Ok(()),
+                ServerLifecycle::NotInstalled => {
+                    return Err(Error::ServerUnavailable {
+                        server_id: id.clone(),
+                        reason: "command not found".to_string(),
+                    });
+                }
+                ServerLifecycle::Failed => {
+                    return Err(Error::ServerUnavailable {
+                        server_id: id.clone(),
+                        reason: "failed to start".to_string(),
+                    });
+                }
+                ServerLifecycle::Idle | ServerLifecycle::Starting => {}
+            }
+            if tokio::time::timeout_at(deadline, states.changed())
+                .await
+                .is_err()
+            {
+                return Err(Error::ServerInitializing {
+                    server_id: id.clone(),
+                });
+            }
+        }
     }
 }
 
@@ -317,8 +414,16 @@ impl Translator {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::bridge::translator::ServerLifecycle;
     use crate::bridge::translator::clock::{Clock, FakeClock};
     use crate::config::ServerId;
+
+    fn spawnable(translator: Translator, id: &ServerId) -> Arc<Translator> {
+        let translator = Arc::new(translator);
+        translator.set_self_handle(Arc::downgrade(&translator));
+        translator.set_lifecycle(id, ServerLifecycle::Idle);
+        translator
+    }
 
     #[test]
     fn test_respawn_backoff_remaining_returns_none_once_delay_elapsed() {
@@ -363,39 +468,91 @@ mod tests {
         );
     }
 
-    // These three are pure logic (no process spawning), so they run on
-    // every platform rather than being swept under `respawn_tests`'s
-    // `#[cfg(unix)]` gate below -- otherwise Windows CI would have zero
-    // #249 coverage at all.
-    #[test]
-    fn test_respawn_lock_is_shared_across_lookups_for_same_id() {
-        let translator = Translator::new();
-        let id = ServerId::from("rust");
-
-        let first = translator.respawn_lock(&id);
-        let second = translator.respawn_lock(&id);
-
-        assert!(
-            Arc::ptr_eq(&first, &second),
-            "two lookups for the same id must return the same underlying lock, \
-             otherwise concurrent respawns would not actually be serialized"
-        );
-    }
-
-    #[test]
-    fn test_respawn_lock_differs_across_ids() {
-        let translator = Translator::new();
-
-        let rust_lock = translator.respawn_lock(&ServerId::from("rust"));
-        let python_lock = translator.respawn_lock(&ServerId::from("python"));
-
-        assert!(!Arc::ptr_eq(&rust_lock, &python_lock));
-    }
-
     #[test]
     fn test_is_server_dead_false_when_not_registered() {
         let translator = Translator::new();
         assert!(!translator.is_server_dead(&ServerId::from("rust")));
+    }
+
+    #[tokio::test]
+    async fn test_a_server_absent_from_the_applicable_set_is_not_started() {
+        let translator = Arc::new(Translator::new());
+        translator.set_self_handle(Arc::downgrade(&translator));
+        let id = ServerId::from("rust");
+
+        let err = translator
+            .ensure_server(&id, Some(Duration::from_millis(50)))
+            .await
+            .expect_err("an id nobody declared applicable cannot be started");
+
+        assert!(matches!(err, Error::ServerUnavailable { .. }));
+        assert_eq!(translator.lifecycle_of(&id), None);
+    }
+
+    #[tokio::test]
+    async fn test_a_translator_with_no_self_handle_cannot_spawn() {
+        let translator = Translator::new();
+        let id = ServerId::from("rust");
+        translator.set_lifecycle(&id, ServerLifecycle::Idle);
+
+        let err = translator
+            .ensure_server(&id, Some(Duration::from_millis(50)))
+            .await
+            .expect_err("a translator built without a self handle cannot spawn");
+
+        assert!(matches!(err, Error::ServerUnavailable { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_a_missing_binary_state_is_reported_without_a_spawn() {
+        let translator = Translator::new();
+        let id = ServerId::from("rust");
+        translator.set_lifecycle(&id, ServerLifecycle::NotInstalled);
+
+        let err = translator
+            .ensure_server(&id, Some(Duration::from_millis(50)))
+            .await
+            .expect_err("a server whose binary is missing is unavailable");
+
+        assert!(matches!(err, Error::ServerUnavailable { .. }));
+        assert_eq!(
+            translator.lifecycle_of(&id),
+            Some(ServerLifecycle::NotInstalled)
+        );
+        assert_eq!(translator.respawn_backoff_remaining(&id), None);
+    }
+
+    #[tokio::test]
+    async fn test_a_spawn_that_ends_without_publishing_lands_on_failed() {
+        let translator = Arc::new(Translator::new());
+        translator.set_self_handle(Arc::downgrade(&translator));
+        let id = ServerId::from("rust");
+        translator.set_lifecycle(&id, ServerLifecycle::Idle);
+
+        let _ = translator
+            .ensure_server(&id, Some(Duration::from_secs(1)))
+            .await;
+
+        assert_eq!(translator.lifecycle_of(&id), Some(ServerLifecycle::Failed));
+    }
+
+    #[tokio::test]
+    async fn test_a_budget_that_expires_leaves_the_spawn_running() {
+        let translator = Arc::new(Translator::new());
+        translator.set_self_handle(Arc::downgrade(&translator));
+        let id = ServerId::from("rust");
+        translator.set_lifecycle(&id, ServerLifecycle::Starting);
+
+        let err = translator
+            .ensure_server(&id, Some(Duration::from_millis(10)))
+            .await
+            .expect_err("a starting server outlasting its budget asks for a retry");
+
+        assert!(matches!(err, Error::ServerInitializing { .. }));
+        assert_eq!(
+            translator.lifecycle_of(&id),
+            Some(ServerLifecycle::Starting)
+        );
     }
 
     // Gated `#[cfg(unix)]`: this module's fake-LSP-server test double is a
@@ -482,6 +639,15 @@ sleep __SLEEP__
             }
         }
 
+        fn write_unexecutable_command(dir: &Path) -> PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+
+            let path = dir.join("not_executable");
+            fs::write(&path, "#!/bin/sh\nexit 1\n").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+            path
+        }
+
         /// Polls `is_server_dead` until it reports `true`, bounding the wait
         /// so a broken script fails the test instead of hanging it.
         async fn wait_until_dead(translator: &Translator, id: &ServerId) {
@@ -497,8 +663,236 @@ sleep __SLEEP__
             .expect("seed server never reported as exited");
         }
 
+        async fn wait_for_lifecycle(
+            translator: &Translator,
+            id: &ServerId,
+            expected: ServerLifecycle,
+        ) {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if translator.lifecycle_of(id) == Some(expected) {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("server lifecycle did not reach the expected state");
+        }
+
+        fn setup_initial_batch(
+            config: &crate::config::ServerConfig,
+            root: &Path,
+            applicable: &[ServerInitConfig],
+            watch_registry: &Arc<crate::lsp::WatchRegistry>,
+        ) -> (
+            Arc<Translator>,
+            Arc<Mutex<crate::bridge::NotificationCache>>,
+            crate::PumpShared,
+        ) {
+            let router =
+                ToolRouter::from_configs(applicable.iter().map(|init| &init.server_config))
+                    .unwrap();
+            let notification_cache = Arc::new(Mutex::new(crate::bridge::NotificationCache::new()));
+            let translator = crate::build_translator(
+                config,
+                vec![root.to_path_buf()],
+                HashMap::new(),
+                router,
+                Arc::clone(&notification_cache),
+                Arc::clone(watch_registry),
+            );
+            for init in applicable {
+                let id = init.server_config.id();
+                translator.register_server_config(id.clone(), init.clone());
+                translator.set_lifecycle(&id, ServerLifecycle::Starting);
+            }
+            let shared = crate::PumpShared {
+                notification_cache: Arc::clone(&notification_cache),
+                subs: Arc::new(crate::bridge::ResourceSubscriptions::new()),
+                workspace_roots: Arc::from(vec![root.to_path_buf()]),
+                document_tracker: Arc::clone(translator.document_tracker()),
+                settle: Arc::new(crate::bridge::ServerSettle::new(
+                    Duration::from_millis(10),
+                    Duration::from_millis(5000),
+                )),
+                delivery: Arc::new(Mutex::new(crate::bridge::DiagnosticsDelivery::new(
+                    config.diagnostics,
+                ))),
+                floors: Arc::new(crate::bridge::FloorTable::new(
+                    &config.diagnostics,
+                    &config.lsp_servers,
+                )),
+            };
+            (translator, notification_cache, shared)
+        }
+
+        fn add_initial_batch_fixture(config: &mut crate::config::ServerConfig, root: &Path) {
+            let source = root.join("main.rs");
+            fs::write(&source, "fn main() {}\n").unwrap();
+            let fixture = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/notification_generations.py"
+            );
+            let control = root.join("rust");
+            let initialized = root.join("rust.initialized");
+            let published = root.join("rust.published");
+            let initialize_attempt = root.join("rust.initialize-attempt");
+            let mut running = LspServerConfig::rust_analyzer();
+            running.heuristics = None;
+            running.command = "python3".to_string();
+            running.args = vec![
+                fixture.to_string(),
+                control.display().to_string(),
+                crate::bridge::path_to_uri(&source).unwrap().to_string(),
+                "rust".to_string(),
+                "default".to_string(),
+                "0".to_string(),
+                "0".to_string(),
+                initialized.display().to_string(),
+                published.display().to_string(),
+                initialize_attempt.display().to_string(),
+            ];
+            running.timeout_seconds = 5;
+            config.lsp_servers.push(running);
+        }
+
+        async fn run_initial_batch(
+            applicable: Vec<ServerInitConfig>,
+            translator: Arc<Translator>,
+            shared: crate::PumpShared,
+        ) {
+            let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+            let init_task = crate::spawn_lsp_servers_background(
+                applicable,
+                Arc::clone(&translator),
+                cancel_rx,
+                shared,
+            );
+            tokio::time::timeout(Duration::from_secs(10), init_task)
+                .await
+                .expect("the initial batch should finish within its spawn budget")
+                .expect("the background batch should not panic");
+            let _ = cancel_tx.send(true);
+            translator.shutdown_servers().await;
+        }
+
         #[tokio::test]
-        async fn test_respawn_if_dead_noop_when_server_alive() {
+        async fn test_background_spawn_batch_publishes_lifecycle_outcomes() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let dir = TempDir::new().unwrap();
+            let root = dunce::canonicalize(dir.path()).unwrap();
+            let non_executable = root.join("not_executable");
+            fs::write(&non_executable, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(&non_executable, fs::Permissions::from_mode(0o644)).unwrap();
+
+            let mut config = crate::config::ServerConfig::default();
+            config.workspace.roots = vec![root.clone()];
+            config.diagnostics.hooks.enabled = false;
+            add_initial_batch_fixture(&mut config, &root);
+
+            let mut missing = LspServerConfig::pyright();
+            missing.heuristics = None;
+            missing.name = Some("missing".to_string());
+            missing.command = "mcpls-missing-command-for-lifecycle-test".to_string();
+            missing.args.clear();
+
+            let mut denied = LspServerConfig::typescript();
+            denied.heuristics = None;
+            denied.name = Some("denied".to_string());
+            denied.command = non_executable.display().to_string();
+            denied.args.clear();
+            config.lsp_servers.extend([missing, denied]);
+
+            let watch_registry = Arc::new(crate::lsp::WatchRegistry::new());
+            let applicable = crate::applicable_server_configs(
+                &config,
+                std::slice::from_ref(&root),
+                None,
+                &watch_registry,
+            );
+            let (translator, _cache, shared) =
+                setup_initial_batch(&config, &root, &applicable, &watch_registry);
+            run_initial_batch(applicable, Arc::clone(&translator), shared).await;
+
+            let rust_id = ServerId::from("rust");
+            let missing_id = ServerId::from("missing");
+            let denied_id = ServerId::from("denied");
+            assert_eq!(
+                translator.lifecycle_of(&rust_id),
+                Some(ServerLifecycle::Running)
+            );
+            assert_eq!(
+                translator.lifecycle_of(&missing_id),
+                Some(ServerLifecycle::NotInstalled)
+            );
+            assert_eq!(
+                translator.lifecycle_of(&denied_id),
+                Some(ServerLifecycle::Failed)
+            );
+
+            let backoff = translator
+                .ensure_server(&denied_id, Some(Duration::ZERO))
+                .await
+                .expect_err("a failed initial spawn must enter backoff");
+            assert!(matches!(backoff, Error::ServerUnavailable { .. }));
+        }
+
+        #[tokio::test]
+        async fn test_all_failed_initial_batch_publishes_failures_before_returning() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let dir = TempDir::new().unwrap();
+            let root = dunce::canonicalize(dir.path()).unwrap();
+            let non_executable = root.join("not_executable");
+            fs::write(&non_executable, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(&non_executable, fs::Permissions::from_mode(0o644)).unwrap();
+
+            let mut config = crate::config::ServerConfig::default();
+            config.workspace.roots = vec![root.clone()];
+            config.diagnostics.hooks.enabled = false;
+            let mut missing = LspServerConfig::pyright();
+            missing.heuristics = None;
+            missing.name = Some("missing".to_string());
+            missing.command = "mcpls-missing-command-for-lifecycle-test".to_string();
+            missing.args.clear();
+            let mut denied = LspServerConfig::typescript();
+            denied.heuristics = None;
+            denied.name = Some("denied".to_string());
+            denied.command = non_executable.display().to_string();
+            denied.args.clear();
+            config.lsp_servers = vec![missing, denied];
+
+            let watch_registry = Arc::new(crate::lsp::WatchRegistry::new());
+            let applicable = crate::applicable_server_configs(
+                &config,
+                std::slice::from_ref(&root),
+                None,
+                &watch_registry,
+            );
+            let (translator, _cache, shared) =
+                setup_initial_batch(&config, &root, &applicable, &watch_registry);
+            run_initial_batch(applicable, Arc::clone(&translator), shared).await;
+
+            assert_eq!(
+                translator.lifecycle_of(&ServerId::from("missing")),
+                Some(ServerLifecycle::NotInstalled)
+            );
+            assert_eq!(
+                translator.lifecycle_of(&ServerId::from("denied")),
+                Some(ServerLifecycle::Failed)
+            );
+            assert!(matches!(
+                translator
+                    .ensure_server(&ServerId::from("denied"), Some(Duration::ZERO))
+                    .await,
+                Err(Error::ServerUnavailable { .. })
+            ));
+        }
+
+        #[tokio::test]
+        async fn test_ensure_server_noop_when_server_alive() {
             let dir = TempDir::new().unwrap();
             let script = write_responder_script(dir.path(), 1);
             let id = ServerId::from("rust");
@@ -514,23 +908,31 @@ sleep __SLEEP__
             // instead of quietly succeeding -- so `Ok(())` here is proof
             // the alive fast path skipped respawning entirely.
 
-            assert!(translator.respawn_if_dead(&id).await.is_ok());
+            assert!(
+                translator
+                    .ensure_server(&id, Some(RESPAWN_WAIT))
+                    .await
+                    .is_ok()
+            );
         }
 
         #[tokio::test]
-        async fn test_respawn_if_dead_errors_when_no_config_registered() {
+        async fn test_ensure_server_errors_when_no_config_registered() {
             let dir = TempDir::new().unwrap();
             let script = write_crash_after_init_script(dir.path());
             let id = ServerId::from("rust");
             let config = stub_server_config("rust", &script);
 
             let server = LspServer::spawn(config).await.unwrap();
-            let translator = Translator::new();
+            let translator = spawnable(Translator::new(), &id);
             translator.register_client(id.clone(), server.client().clone());
             translator.register_server(id.clone(), server);
             wait_until_dead(&translator, &id).await;
 
-            let err = translator.respawn_if_dead(&id).await.unwrap_err();
+            let err = translator
+                .ensure_server(&id, Some(RESPAWN_WAIT))
+                .await
+                .unwrap_err();
             assert!(
                 matches!(err, Error::ServerUnavailable { .. }),
                 "got {err:?}"
@@ -538,26 +940,34 @@ sleep __SLEEP__
         }
 
         #[tokio::test]
-        async fn test_respawn_if_dead_propagates_spawn_failure() {
+        async fn test_ensure_server_reports_a_missing_command_as_not_installed() {
             let dir = TempDir::new().unwrap();
             let script = write_crash_after_init_script(dir.path());
             let id = ServerId::from("rust");
             let seed_config = stub_server_config("rust", &script);
 
             let server = LspServer::spawn(seed_config).await.unwrap();
-            let translator = Translator::new();
+            let translator = spawnable(Translator::new(), &id);
             translator.register_client(id.clone(), server.client().clone());
             translator.register_server(id.clone(), server);
             wait_until_dead(&translator, &id).await;
 
             let mut broken = stub_server_config("rust", &script);
             broken.server_config.command = "nonexistent-lsp-cmd-xyz".to_string();
+            broken.server_config.args.clear();
             translator.register_server_config(id.clone(), broken);
 
-            let err = translator.respawn_if_dead(&id).await.unwrap_err();
+            let err = translator
+                .ensure_server(&id, Some(RESPAWN_WAIT))
+                .await
+                .unwrap_err();
             assert!(
-                matches!(err, Error::ServerSpawnFailed { .. }),
+                matches!(err, Error::ServerUnavailable { .. }),
                 "got {err:?}"
+            );
+            assert_eq!(
+                translator.lifecycle_of(&id),
+                Some(ServerLifecycle::NotInstalled)
             );
         }
 
@@ -570,12 +980,12 @@ sleep __SLEEP__
         /// first run only, exits right after answering `initialize`
         /// (simulating "was alive, then crashed"); every later invocation
         /// answers and then sleeps, standing in for a healthy replacement.
-        /// If single-flighting were broken, both concurrent callers would
+        /// If the lifecycle claim gate were broken, both callers would
         /// spawn their own replacement and the invocation count would be
         /// 3 (seed + two independent respawns) instead of 2 (seed + one
         /// shared respawn).
         #[tokio::test]
-        async fn test_respawn_if_dead_single_flights_concurrent_callers() {
+        async fn test_ensure_server_single_flights_concurrent_callers() {
             let dir = TempDir::new().unwrap();
             let marker = dir.path().join("marker");
             let counter = dir.path().join("invocations");
@@ -601,7 +1011,7 @@ fi
             let config = stub_server_config("rust", &script_path);
 
             let seed = LspServer::spawn(config.clone()).await.unwrap();
-            let translator = Arc::new(Translator::new());
+            let translator = spawnable(Translator::new(), &id);
             translator.register_client(id.clone(), seed.client().clone());
             translator.register_server(id.clone(), seed);
             translator.register_server_config(id.clone(), config);
@@ -610,8 +1020,8 @@ fi
             let (t1, id1) = (Arc::clone(&translator), id.clone());
             let (t2, id2) = (Arc::clone(&translator), id.clone());
             let (r1, r2) = tokio::join!(
-                tokio::spawn(async move { t1.respawn_if_dead(&id1).await }),
-                tokio::spawn(async move { t2.respawn_if_dead(&id2).await }),
+                tokio::spawn(async move { t1.ensure_server(&id1, Some(RESPAWN_WAIT)).await }),
+                tokio::spawn(async move { t2.ensure_server(&id2, Some(RESPAWN_WAIT)).await }),
             );
             assert!(r1.unwrap().is_ok());
             assert!(r2.unwrap().is_ok());
@@ -625,16 +1035,48 @@ fi
             );
         }
 
-        /// #249 S2 regression: a second `respawn_if_dead` call within the
-        /// backoff window must fail fast via `Error::ServerUnavailable`
-        /// instead of repeating a real spawn attempt -- proven by the
-        /// *kind* of error changing between the two calls, not by timing:
-        /// the first call's failure is the genuine `LspServer::spawn` error
-        /// (`Error::ServerSpawnFailed`, from a command that does not
-        /// exist), and the second, immediately following, is the distinct
-        /// backoff error.
         #[tokio::test]
-        async fn test_respawn_if_dead_backs_off_after_repeated_failure() {
+        async fn test_ensure_server_rechecks_a_live_server_after_claim() {
+            let dir = TempDir::new().unwrap();
+            let script = write_responder_script(dir.path(), 1);
+            let id = ServerId::from("rust");
+            let server = LspServer::spawn(stub_server_config("rust", &script))
+                .await
+                .unwrap();
+            let translator = spawnable(Translator::new(), &id);
+            translator.register_client(id.clone(), server.client().clone());
+            translator.register_server(id.clone(), server);
+            translator.set_lifecycle(&id, ServerLifecycle::Running);
+
+            assert!(translator.begin_starting(&id));
+            assert!(translator.restore_running_if_live(&id));
+            assert_eq!(translator.lifecycle_of(&id), Some(ServerLifecycle::Running));
+
+            translator.shutdown_servers().await;
+        }
+
+        #[tokio::test]
+        async fn test_ensure_server_without_budget_returns_before_spawn_finishes() {
+            let dir = TempDir::new().unwrap();
+            let script = write_responder_script(dir.path(), 1);
+            let id = ServerId::from("rust");
+            let translator = spawnable(Translator::new(), &id);
+            translator.register_server_config(id.clone(), stub_server_config("rust", &script));
+
+            translator.ensure_server(&id, None).await.unwrap();
+
+            assert_eq!(
+                translator.lifecycle_of(&id),
+                Some(ServerLifecycle::Starting)
+            );
+            wait_for_lifecycle(&translator, &id, ServerLifecycle::Running).await;
+            translator.shutdown_servers().await;
+        }
+
+        /// A second call inside the backoff window must not attempt another
+        /// real spawn. The unchanged window proves it short-circuited.
+        #[tokio::test]
+        async fn test_ensure_server_backs_off_after_repeated_failure() {
             let dir = TempDir::new().unwrap();
             let seed_script = write_crash_after_init_script(dir.path());
             let id = ServerId::from("rust");
@@ -642,36 +1084,57 @@ fi
 
             let seed = LspServer::spawn(seed_config).await.unwrap();
             let clock = Arc::new(FakeClock::new());
-            let translator = Translator::new().with_clock(Arc::clone(&clock) as Arc<dyn Clock>);
+            let translator = spawnable(
+                Translator::new().with_clock(Arc::clone(&clock) as Arc<dyn Clock>),
+                &id,
+            );
             translator.register_client(id.clone(), seed.client().clone());
             translator.register_server(id.clone(), seed);
             wait_until_dead(&translator, &id).await;
 
             let mut broken = stub_server_config("rust", &seed_script);
-            broken.server_config.command = "nonexistent-lsp-cmd-xyz".to_string();
+            broken.server_config.command = write_unexecutable_command(dir.path())
+                .to_string_lossy()
+                .to_string();
+            broken.server_config.args.clear();
             translator.register_server_config(id.clone(), broken);
 
-            let err1 = translator.respawn_if_dead(&id).await.unwrap_err();
+            let err1 = translator
+                .ensure_server(&id, Some(RESPAWN_WAIT))
+                .await
+                .unwrap_err();
             assert!(
-                matches!(err1, Error::ServerSpawnFailed { .. }),
+                matches!(err1, Error::ServerUnavailable { .. }),
                 "first attempt should be a real (failed) spawn, got {err1:?}"
             );
+            assert_eq!(translator.lifecycle_of(&id), Some(ServerLifecycle::Failed));
+            let window = translator
+                .respawn_backoff_remaining(&id)
+                .expect("a failed spawn opens a backoff window");
 
-            let err2 = translator.respawn_if_dead(&id).await.unwrap_err();
+            let err2 = translator
+                .ensure_server(&id, Some(RESPAWN_WAIT))
+                .await
+                .unwrap_err();
             assert!(
                 matches!(err2, Error::ServerUnavailable { .. }),
                 "second call within the backoff window must fail fast \
                  without attempting another real spawn, got {err2:?}"
             );
+            assert_eq!(
+                translator.respawn_backoff_remaining(&id),
+                Some(window),
+                "a second attempt would have recorded a second failure and lengthened the window"
+            );
         }
 
         /// #292 regression: once the backoff window has elapsed, the next
-        /// `respawn_if_dead` call must actually attempt a fresh respawn
+        /// `ensure_server` call must actually attempt a fresh spawn
         /// instead of continuing to fail fast -- proven by swapping in a
         /// config that succeeds and observing `Ok(())`, not merely a
         /// different error kind.
         #[tokio::test]
-        async fn test_respawn_if_dead_reattempts_once_backoff_window_elapses() {
+        async fn test_ensure_server_reattempts_once_backoff_window_elapses() {
             let dir = TempDir::new().unwrap();
             let seed_script = write_crash_after_init_script(dir.path());
             let id = ServerId::from("rust");
@@ -679,22 +1142,34 @@ fi
 
             let seed = LspServer::spawn(seed_config).await.unwrap();
             let clock = Arc::new(FakeClock::new());
-            let translator = Translator::new().with_clock(Arc::clone(&clock) as Arc<dyn Clock>);
+            let translator = spawnable(
+                Translator::new().with_clock(Arc::clone(&clock) as Arc<dyn Clock>),
+                &id,
+            );
             translator.register_client(id.clone(), seed.client().clone());
             translator.register_server(id.clone(), seed);
             wait_until_dead(&translator, &id).await;
 
             let mut broken = stub_server_config("rust", &seed_script);
-            broken.server_config.command = "nonexistent-lsp-cmd-xyz".to_string();
+            broken.server_config.command = write_unexecutable_command(dir.path())
+                .to_string_lossy()
+                .to_string();
+            broken.server_config.args.clear();
             translator.register_server_config(id.clone(), broken);
 
-            let err1 = translator.respawn_if_dead(&id).await.unwrap_err();
+            let err1 = translator
+                .ensure_server(&id, Some(RESPAWN_WAIT))
+                .await
+                .unwrap_err();
             assert!(
-                matches!(err1, Error::ServerSpawnFailed { .. }),
+                matches!(err1, Error::ServerUnavailable { .. }),
                 "first attempt should be a real (failed) spawn, got {err1:?}"
             );
 
-            let err2 = translator.respawn_if_dead(&id).await.unwrap_err();
+            let err2 = translator
+                .ensure_server(&id, Some(RESPAWN_WAIT))
+                .await
+                .unwrap_err();
             assert!(
                 matches!(err2, Error::ServerUnavailable { .. }),
                 "second call within the backoff window must still fail fast, got {err2:?}"
@@ -707,10 +1182,10 @@ fi
             translator
                 .register_server_config(id.clone(), stub_server_config("rust", &working_script));
 
-            let result = translator.respawn_if_dead(&id).await;
+            let result = translator.ensure_server(&id, Some(RESPAWN_WAIT)).await;
             assert!(
                 result.is_ok(),
-                "once the backoff window has elapsed, respawn_if_dead must actually \
+                "once the backoff window has elapsed, ensure_server must actually \
                  reattempt a respawn instead of continuing to short-circuit, got {result:?}"
             );
         }
@@ -723,7 +1198,7 @@ fi
         /// looked like a fresh, unbacked-off start, spawning one child
         /// process per tool call forever.
         #[tokio::test]
-        async fn test_respawn_if_dead_backs_off_after_quick_recrash_following_success() {
+        async fn test_ensure_server_backs_off_after_quick_recrash_following_success() {
             let dir = TempDir::new().unwrap();
             let seed_script = write_crash_after_init_script(dir.path());
             let id = ServerId::from("rust");
@@ -731,7 +1206,10 @@ fi
 
             let seed = LspServer::spawn(seed_config).await.unwrap();
             let clock = Arc::new(FakeClock::new());
-            let translator = Translator::new().with_clock(Arc::clone(&clock) as Arc<dyn Clock>);
+            let translator = spawnable(
+                Translator::new().with_clock(Arc::clone(&clock) as Arc<dyn Clock>),
+                &id,
+            );
             translator.register_client(id.clone(), seed.client().clone());
             translator.register_server(id.clone(), seed);
             wait_until_dead(&translator, &id).await;
@@ -742,12 +1220,15 @@ fi
             translator.register_server_config(id.clone(), stub_server_config("rust", &seed_script));
 
             translator
-                .respawn_if_dead(&id)
+                .ensure_server(&id, Some(RESPAWN_WAIT))
                 .await
                 .expect("the replacement completes initialize, so this attempt succeeds");
             wait_until_dead(&translator, &id).await;
 
-            let err = translator.respawn_if_dead(&id).await.unwrap_err();
+            let err = translator
+                .ensure_server(&id, Some(RESPAWN_WAIT))
+                .await
+                .unwrap_err();
             assert!(
                 matches!(err, Error::ServerUnavailable { .. }),
                 "a respawn that dies again within the stability window must \
@@ -775,7 +1256,7 @@ fi
         /// replaced a workspace-wide `clear_all_diagnostics` that used to
         /// wipe every language's cache on any single server's respawn.
         #[tokio::test]
-        async fn test_respawn_if_dead_clears_diagnostics_cache_when_diagnostics_route() {
+        async fn test_ensure_server_clears_diagnostics_cache_when_diagnostics_route() {
             let dir = TempDir::new().unwrap();
             let seed_script = write_crash_after_init_script(dir.path());
             let id = ServerId::from("rust");
@@ -784,9 +1265,12 @@ fi
             let seed = LspServer::spawn(seed_config).await.unwrap();
 
             let cache = Arc::new(Mutex::new(crate::bridge::NotificationCache::new()));
-            let translator = Translator::new()
-                .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]))
-                .with_notification_cache(Arc::clone(&cache));
+            let translator = spawnable(
+                Translator::new()
+                    .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]))
+                    .with_notification_cache(Arc::clone(&cache)),
+                &id,
+            );
             translator.register_client(id.clone(), seed.client().clone());
             translator.register_server(id.clone(), seed);
 
@@ -815,7 +1299,10 @@ fi
             translator
                 .register_server_config(id.clone(), stub_server_config("rust", &respawn_script));
 
-            translator.respawn_if_dead(&id).await.unwrap();
+            translator
+                .ensure_server(&id, Some(RESPAWN_WAIT))
+                .await
+                .unwrap();
 
             let guard = cache.lock().await;
             assert!(
@@ -841,11 +1328,11 @@ fi
         /// that narrowed its watch keeps being told about files it no
         /// longer wants, for the life of the mcpls process.
         ///
-        /// Drives a real `respawn_if_dead` rather than calling
+        /// Drives a real `ensure_server` rather than calling
         /// `forget_watch_registrations` directly, so deleting the clear
         /// from the respawn path fails this.
         #[tokio::test]
-        async fn test_respawn_if_dead_clears_that_server_s_watch_registrations() {
+        async fn test_ensure_server_clears_that_server_s_watch_registrations() {
             let dir = TempDir::new().unwrap();
             let seed_script = write_crash_after_init_script(dir.path());
             let id = ServerId::from("rust");
@@ -856,7 +1343,10 @@ fi
                 .unwrap();
 
             let registry = Arc::new(crate::lsp::WatchRegistry::new());
-            let translator = Translator::new().with_watch_registry(Arc::clone(&registry));
+            let translator = spawnable(
+                Translator::new().with_watch_registry(Arc::clone(&registry)),
+                &id,
+            );
             translator.register_client(id.clone(), seed.client().clone());
             translator.register_server(id.clone(), seed);
 
@@ -877,7 +1367,10 @@ fi
             translator
                 .register_server_config(id.clone(), stub_server_config("rust", &respawn_script));
 
-            translator.respawn_if_dead(&id).await.unwrap();
+            translator
+                .ensure_server(&id, Some(RESPAWN_WAIT))
+                .await
+                .unwrap();
 
             assert!(
                 registry
@@ -904,7 +1397,7 @@ fi
         /// would wipe out a healthy, still-running diagnostics server's
         /// valid entries for the same files.
         #[tokio::test]
-        async fn test_respawn_if_dead_does_not_clear_cache_when_not_diagnostics_route() {
+        async fn test_ensure_server_does_not_clear_cache_when_not_diagnostics_route() {
             use crate::config::LspServerConfig;
 
             let dir = TempDir::new().unwrap();
@@ -952,9 +1445,12 @@ fi
             let router = ToolRouter::from_configs(configs.iter()).unwrap();
 
             let cache = Arc::new(Mutex::new(crate::bridge::NotificationCache::new()));
-            let translator = Translator::new()
-                .with_router(router)
-                .with_notification_cache(Arc::clone(&cache));
+            let translator = spawnable(
+                Translator::new()
+                    .with_router(router)
+                    .with_notification_cache(Arc::clone(&cache)),
+                &hover_id,
+            );
             translator.register_client(hover_id.clone(), seed.client().clone());
             translator.register_server(hover_id.clone(), seed);
 
@@ -977,7 +1473,10 @@ fi
             respawn_config.server_config.language_id = "rust".to_string();
             translator.register_server_config(hover_id.clone(), respawn_config);
 
-            translator.respawn_if_dead(&hover_id).await.unwrap();
+            translator
+                .ensure_server(&hover_id, Some(RESPAWN_WAIT))
+                .await
+                .unwrap();
 
             assert!(
                 cache
@@ -994,7 +1493,7 @@ fi
         /// dead-server branch is actually reached through the shared
         /// entry point every public tool handler (`handle_hover`,
         /// `handle_definition`, ...) funnels through -- not just through
-        /// the private `respawn_if_dead`/`is_server_dead` calls the other
+        /// the private `ensure_server`/`is_server_dead` calls the other
         /// tests in this module make directly.
         #[tokio::test]
         async fn test_prepare_document_respawns_dead_server_through_shared_entry_point() {
@@ -1012,6 +1511,7 @@ fi
                 .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]))
                 .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
             translator.set_workspace_roots(vec![workspace.to_path_buf()]);
+            let translator = spawnable(translator, &id);
             translator.register_client(id.clone(), seed.client().clone());
             translator.register_server(id.clone(), seed);
             wait_until_dead(&translator, &id).await;

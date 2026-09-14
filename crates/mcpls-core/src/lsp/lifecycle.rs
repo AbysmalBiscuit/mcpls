@@ -881,7 +881,7 @@ fn workspace_folder(root: &Path) -> Result<WorkspaceFolder> {
 /// [`LspServer::new_for_test_with_encoding`]'s live `cat`: the shutdown-path
 /// tests this feeds drive `shutdown_servers`, which waits `CHILD_EXIT_GRACE`
 /// on a child that is still running. They do not route calls through
-/// `respawn_if_dead`, so the dead-server reading that breaks a routed call
+/// `ensure_server`, so the dead-server reading that breaks a routed call
 /// costs them nothing.
 ///
 /// `pub` rather than private to this module's own `tests` (`lifecycle` is a
@@ -944,7 +944,7 @@ impl LspServer {
     ///
     /// `child` is a `cat` blocked on a piped stdin rather than anything that
     /// returns on its own: `has_exited` reads it, and a server that looks
-    /// dead sends every routed call through `respawn_if_dead`, which fails
+    /// dead sends every routed call through `ensure_server`, which fails
     /// with `ServerUnavailable` since a fixture registers no respawn config.
     #[allow(clippy::unwrap_used)]
     pub(crate) fn new_for_test_with_encoding(

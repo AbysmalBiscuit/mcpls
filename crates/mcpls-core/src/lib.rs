@@ -280,9 +280,8 @@ pub(crate) struct RegisteredServers {
 /// the set that actually initialized, and install notification pumps before
 /// publishing clients that can trigger a replacement.
 ///
-/// `configs` supplies the `ServerInitConfig` each surviving server was
-/// spawned from, keyed by routing identity, so the translator can respawn it
-/// later if its process dies (see `Translator::respawn_if_dead`).
+/// `configs` supplies the `ServerInitConfig` for each applicable server, so
+/// the translator can spawn it later if needed (see `Translator::ensure_server`).
 pub(crate) fn register_servers(
     mut result: lsp::ServerInitResult,
     translator: &bridge::Translator,
@@ -698,7 +697,6 @@ impl Runtime {
         // filesystem I/O on the hot per-notification path.
         let workspace_roots_snapshot: Arc<[PathBuf]> = Arc::from(workspace_roots.clone());
 
-        let translator = Arc::new(translator);
         let subscriptions = Arc::new(ResourceSubscriptions::new());
 
         // Cancellation for pump tasks: send `true` to request shutdown.
@@ -948,7 +946,7 @@ fn build_translator(
     router: ToolRouter,
     notification_cache: Arc<Mutex<NotificationCache>>,
     watch_registry: Arc<lsp::WatchRegistry>,
-) -> Translator {
+) -> Arc<Translator> {
     let applier = Arc::new(Applier::new(workspace_roots.clone(), config.apply.clone()));
     let mut translator = Translator::new()
         .with_resource_limits(config.workspace.resource_limits())
@@ -958,6 +956,8 @@ fn build_translator(
         .with_watch_registry(watch_registry)
         .with_applier(applier);
     translator.set_workspace_roots(workspace_roots);
+    let translator = Arc::new(translator);
+    translator.set_self_handle(Arc::downgrade(&translator));
     translator
 }
 
@@ -1145,6 +1145,16 @@ fn spawn_lsp_servers_background(
             .collect();
         let result = LspServer::spawn_batch(&applicable_configs).await;
 
+        for failure in &result.failures {
+            let state = if failure.missing_binary {
+                ServerLifecycle::NotInstalled
+            } else {
+                translator.record_respawn_failure(&failure.server_id);
+                ServerLifecycle::Failed
+            };
+            translator.set_lifecycle(&failure.server_id, state);
+        }
+
         if result.all_failed() {
             error!(
                 "All {} configured LSP server(s) failed to initialize",
@@ -1178,6 +1188,9 @@ fn spawn_lsp_servers_background(
 
         let server_count = result.server_count();
         let registered = register_servers(result, &translator, &configs_by_id);
+        for id in registered.diagnostics_flags.keys() {
+            translator.set_lifecycle(id, ServerLifecycle::Running);
+        }
         // Background initialization has completed; stop reporting "still
         // initializing" (especially for servers that failed to spawn on
         // partial success, which would otherwise return ServerInitializing
