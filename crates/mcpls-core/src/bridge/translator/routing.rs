@@ -149,6 +149,21 @@ impl Translator {
         }
     }
 
+    /// Resolve the diagnostics server for `path` without requiring a client.
+    #[must_use]
+    pub(crate) fn server_for_path(&self, path: &Path) -> Option<ServerId> {
+        let language = detect_language(path, &self.extension_map);
+        let mut candidates: Vec<&str> = vec![language.as_str()];
+        if let Some(base) = base_language_id(&language) {
+            candidates.push(base);
+        }
+
+        let router = lock_std(&self.router);
+        candidates
+            .iter()
+            .find_map(|lang| router.resolve(lang, ToolKind::Diagnostics).cloned())
+    }
+
     /// Validate `file_path`, then resolve its routed client via
     /// [`Self::resolve_client_for_file`] (respawn-aware), without opening
     /// the document.

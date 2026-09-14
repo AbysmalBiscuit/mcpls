@@ -236,7 +236,7 @@ impl Translator {
 
     /// Start `id` when it has no live client, then wait for its lifecycle outcome.
     /// `None` returns after starting; `Some(d)` waits at most `d`.
-    pub(super) async fn ensure_server(
+    pub(crate) async fn ensure_server(
         &self,
         id: &ServerId,
         budget: Option<Duration>,

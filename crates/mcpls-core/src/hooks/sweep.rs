@@ -19,7 +19,7 @@ use lsp_types::FileChangeType;
 use tokio::sync::watch;
 use tokio::time::Instant;
 
-use crate::bridge::{OpenOutcome, Translator, lock_std};
+use crate::bridge::{OpenOutcome, ServerLifecycle, Translator, lock_std};
 use crate::hooks::filters::PathFilter;
 
 /// What a stat says a pending path actually is.
@@ -196,6 +196,35 @@ impl Sweeper {
         lock_std(&self.pending).len()
     }
 
+    /// The paths waiting for the next sweep. Test-only.
+    #[cfg(test)]
+    pub(crate) fn pending_paths(&self) -> HashSet<PathBuf> {
+        lock_std(&self.pending).clone()
+    }
+
+    async fn ensure_servers_for_edits(&self, kinds: &[(PathBuf, SweepKind)]) -> Vec<PathBuf> {
+        let mut waiting = Vec::new();
+        for (path, kind) in kinds {
+            if *kind == SweepKind::Deleted || !self.filter.routable_extension(path) {
+                continue;
+            }
+            let Some(id) = self.translator.server_for_path(path) else {
+                continue;
+            };
+            match self.translator.lifecycle_of(&id) {
+                None | Some(ServerLifecycle::Running) => continue,
+                Some(_) => {}
+            }
+
+            // Do not hold this sweeper behind one language's cold start.
+            let _ = self.translator.ensure_server(&id, None).await;
+            if self.translator.lifecycle_of(&id) == Some(ServerLifecycle::Starting) {
+                waiting.push(path.clone());
+            }
+        }
+        waiting
+    }
+
     /// A receiver that changes once the next sweep completes.
     ///
     /// Subscribe before triggering the activity under test, then await
@@ -249,6 +278,21 @@ impl Sweeper {
             } else {
                 settle.push(path);
             }
+        }
+
+        // Run before opening untracked paths: changed tracked files skip the
+        // later open trigger.
+        let waiting = self.ensure_servers_for_edits(&kinds).await;
+
+        if !waiting.is_empty() {
+            let mut pending = lock_std(&self.pending);
+            for path in &waiting {
+                pending.insert(path.clone());
+            }
+            drop(pending);
+            // Filter before the open loop consumes untracked paths.
+            settle.retain(|path| !waiting.contains(path));
+            untracked.retain(|path| !waiting.contains(path));
         }
 
         let open_count = tracker.open_paths().len();
@@ -355,7 +399,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::bridge::{ResourceLimits, Translator, TranslatorHarness};
+    use crate::bridge::{ResourceLimits, ServerLifecycle, Translator, TranslatorHarness};
     use crate::config::{ServerId, ToolRouter};
 
     /// The language and server id every served test uses.
@@ -373,6 +417,7 @@ mod tests {
     /// auto-advance straight past.
     struct TestSweeper {
         sweeper: Arc<Sweeper>,
+        translator: Arc<Translator>,
         dir: TempDir,
         _cancel: tokio::sync::watch::Sender<bool>,
     }
@@ -409,21 +454,23 @@ mod tests {
         sweeper_over(dir, Translator::new(), quiet_for, max_documents)
     }
 
-    /// A sweeper whose router names a server that has not registered yet --
-    /// the state mcpls is in while it spawns its servers in the background,
-    /// and the state a file created moments after startup meets.
-    fn initializing_sweeper() -> TestSweeper {
+    /// A sweeper whose `rust` server is applicable and has never been
+    /// triggered, which is what a lazy backend looks like before the agent
+    /// touches the language.
+    fn idle_sweeper() -> TestSweeper {
         let dir = tempfile::tempdir().expect("a temp dir");
-        let server = ServerId::from(SERVER);
         let mut translator = Translator::new()
             .with_extensions(HashMap::from([("rs".to_string(), SERVER.to_string())]))
             .with_router(ToolRouter::catch_all([(
-                server.clone(),
+                ServerId::from(SERVER),
                 SERVER.to_string(),
             )]));
         translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
-        translator.set_lifecycle(&server, crate::bridge::ServerLifecycle::Starting);
-        sweeper_over(dir, translator, Duration::from_secs(60), usize::MAX)
+        let sweeper = sweeper_over(dir, translator, Duration::from_secs(60), usize::MAX);
+        sweeper
+            .translator
+            .set_lifecycle(&ServerId::from(SERVER), ServerLifecycle::Idle);
+        sweeper
     }
 
     fn sweeper_over(
@@ -437,8 +484,9 @@ mod tests {
             Arc::new(HashMap::from([("rs".to_string(), SERVER.to_string())])),
             None,
         );
+        let translator = Arc::new(translator);
         let sweeper = Arc::new(Sweeper::new(
-            Arc::new(translator),
+            Arc::clone(&translator),
             filter,
             quiet_for,
             max_documents,
@@ -447,6 +495,7 @@ mod tests {
         tokio::spawn(Arc::clone(&sweeper).run(cancel_rx));
         TestSweeper {
             sweeper,
+            translator,
             dir,
             _cancel: cancel_tx,
         }
@@ -798,22 +847,111 @@ mod tests {
         assert!(sweeper.notifications().is_empty());
     }
 
+    /// A hand-built translator has no spawn handle, so a trigger publishes
+    /// `Failed`. Keeping the document tracked isolates the trigger from the
+    /// separate open path for created files.
     #[tokio::test]
-    async fn test_a_file_whose_server_is_still_starting_is_not_checked() {
-        let sweeper = initializing_sweeper();
+    async fn test_an_edit_starts_the_language_server() {
+        let sweeper = idle_sweeper();
+        let path = sweeper.write("main.rs");
+        let (transport, _fake_server) = crate::test_support::fake_lsp_transport();
+        let client = crate::lsp::LspClient::from_transport(
+            crate::config::LspServerConfig::rust_analyzer(),
+            transport,
+        );
+        sweeper
+            .translator
+            .document_tracker()
+            .ensure_open(&path, &ServerId::from(SERVER), &client)
+            .await
+            .expect("seed a tracked document");
+        sweeper
+            .translator
+            .set_lifecycle(&ServerId::from(SERVER), ServerLifecycle::Idle);
+        sweeper.enqueue(std::slice::from_ref(&path));
+
+        sweeper.sweep_now().await;
+
+        assert_ne!(
+            sweeper.translator.lifecycle_of(&ServerId::from(SERVER)),
+            Some(ServerLifecycle::Idle)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_path_waiting_on_a_starting_server_is_swept_again() {
+        let sweeper = idle_sweeper();
+        sweeper
+            .translator
+            .set_lifecycle(&ServerId::from(SERVER), ServerLifecycle::Starting);
+        let path = sweeper.write("main.rs");
+        sweeper.enqueue(std::slice::from_ref(&path));
+
+        sweeper.sweep_now().await;
+
+        assert!(
+            sweeper.pending_paths().contains(&path),
+            "a path whose server is still handshaking comes back on the \
+             next tick instead of being checked against a server that \
+             cannot answer yet"
+        );
+    }
+
+    /// A terminal state is not retried forever: pending work stays due after
+    /// its quiet period, so re-queueing it on every tick would starve watcher
+    /// notifications.
+    #[tokio::test]
+    async fn test_a_path_whose_server_is_not_installed_is_not_held_back() {
+        let sweeper = idle_sweeper();
+        sweeper
+            .translator
+            .set_lifecycle(&ServerId::from(SERVER), ServerLifecycle::NotInstalled);
+        let path = sweeper.write("main.rs");
+        sweeper.enqueue(std::slice::from_ref(&path));
+
+        sweeper.sweep_now().await;
+
+        assert!(
+            sweeper.pending_paths().is_empty(),
+            "a server whose binary is missing is not going to be there on \
+             the next tick either"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_deleted_path_starts_nothing() {
+        let sweeper = idle_sweeper();
+        sweeper.enqueue(&[sweeper.path("gone.rs")]);
+
+        sweeper.sweep_now().await;
+
+        assert_eq!(
+            sweeper.translator.lifecycle_of(&ServerId::from(SERVER)),
+            Some(ServerLifecycle::Idle)
+        );
+    }
+
+    /// Servers spawn in the background, so a file created moments after
+    /// startup routes to one that has not registered yet. Treating that
+    /// like a language nothing routes would leave the file unopened,
+    /// unsaved and unmentioned; it comes back on the next sweep instead.
+    #[tokio::test]
+    async fn test_a_file_whose_server_is_still_starting_comes_back() {
+        let sweeper = idle_sweeper();
+        sweeper
+            .translator
+            .set_lifecycle(&ServerId::from(SERVER), ServerLifecycle::Starting);
         let path = sweeper.write("fresh.rs");
         sweeper.enqueue(std::slice::from_ref(&path));
         sweeper.sweep_now().await;
 
-        assert_eq!(
-            sweeper.last_shortfall().expect("a shortfall line"),
-            "1 file(s) not checked: they could not be opened",
-            "servers spawn in the background, so a file created moments \
-             after startup routes to one that has not registered yet; \
-             treating that like a language nothing routes leaves the file \
-             unopened, unsaved, and unmentioned"
-        );
+        assert!(sweeper.pending_paths().contains(&path));
         assert_eq!(sweeper.opened_count(), 0);
+        assert_eq!(
+            sweeper.last_shortfall(),
+            None,
+            "a path that is coming back is not a path that was skipped"
+        );
     }
 
     #[tokio::test]
