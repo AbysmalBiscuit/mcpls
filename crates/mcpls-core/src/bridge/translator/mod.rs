@@ -830,14 +830,9 @@ impl Translator {
         self
     }
 
-    /// Whether `id` is the server the router currently resolves
-    /// `ToolKind::Diagnostics` to for `language_id`.
-    ///
-    /// Purpose-built for `register_servers`, which needs this to compute the
-    /// diagnostics-cache filter passed into each pump task, without exposing
-    /// the router's lock guard outside this module.
+    /// Resolve the nonterminal diagnostics claimant or its usable catch-all.
     #[must_use]
-    pub fn is_diagnostics_route(&self, language_id: &str, id: &ServerId) -> bool {
+    pub fn diagnostics_owner(&self, language_id: &str) -> Option<ServerId> {
         let (claimant, catch_all) = {
             let router = lock_std(&self.router);
             (
@@ -845,18 +840,19 @@ impl Translator {
                 router.catch_all_for_language(language_id).cloned(),
             )
         };
-        match claimant {
-            None => false,
-            Some(claimant) if claimant == *id => true,
-            // A pump caches diagnostics for its lifetime, so a failed narrow
-            // claimant must transfer cache ownership to the catch-all now.
-            Some(claimant) => {
-                matches!(
-                    self.lifecycle_of(&claimant),
-                    Some(ServerLifecycle::NotInstalled | ServerLifecycle::Failed)
-                ) && catch_all.as_ref() == Some(id)
-            }
-        }
+        let usable = |id: &ServerId| {
+            !matches!(
+                self.lifecycle_of(id),
+                Some(ServerLifecycle::NotInstalled | ServerLifecycle::Failed)
+            )
+        };
+        claimant.filter(usable).or_else(|| catch_all.filter(usable))
+    }
+
+    /// Whether `id` currently owns diagnostics for this language.
+    #[must_use]
+    pub fn is_diagnostics_route(&self, language_id: &str, id: &ServerId) -> bool {
+        self.diagnostics_owner(language_id).as_ref() == Some(id)
     }
 
     /// Negotiated [`PositionEncoding`] of the registered server `id`, or the
@@ -1083,6 +1079,74 @@ mod tests {
         assert_eq!(translator.workspace_roots.len(), 0);
         assert_eq!(lock_std(&translator.lsp_clients).len(), 0);
         assert_eq!(lock_std(&translator.lsp_servers).len(), 0);
+    }
+
+    #[test]
+    fn diagnostics_ownership_excludes_terminal_claimants() {
+        let configs: Vec<crate::config::LspServerConfig> =
+            toml::from_str::<crate::config::ServerConfig>(
+                r#"
+[[lsp_servers]]
+language_id = "rust"
+name = "wide"
+command = "wide"
+[[lsp_servers]]
+language_id = "rust"
+name = "narrow"
+command = "narrow"
+handles = ["diagnostics"]
+"#,
+            )
+            .unwrap()
+            .lsp_servers
+            .into_iter()
+            .filter(|config| config.name.is_some())
+            .collect();
+        let translator = Translator::new().with_router(ToolRouter::from_configs(&configs).unwrap());
+        let narrow = configs[1].id();
+        let wide = configs[0].id();
+        for narrow_state in [
+            ServerLifecycle::Idle,
+            ServerLifecycle::Starting,
+            ServerLifecycle::Running,
+            ServerLifecycle::Failed,
+            ServerLifecycle::NotInstalled,
+        ] {
+            for wide_state in [
+                ServerLifecycle::Idle,
+                ServerLifecycle::Starting,
+                ServerLifecycle::Running,
+                ServerLifecycle::Failed,
+                ServerLifecycle::NotInstalled,
+            ] {
+                translator.set_lifecycle(&narrow, narrow_state);
+                translator.set_lifecycle(&wide, wide_state);
+                let narrow_usable = !matches!(
+                    narrow_state,
+                    ServerLifecycle::Failed | ServerLifecycle::NotInstalled
+                );
+                let wide_usable = !matches!(
+                    wide_state,
+                    ServerLifecycle::Failed | ServerLifecycle::NotInstalled
+                );
+                assert_eq!(
+                    translator.is_diagnostics_route("rust", &narrow),
+                    narrow_usable,
+                    "{narrow_state:?}/{wide_state:?}"
+                );
+                assert_eq!(
+                    translator.is_diagnostics_route("rust", &wide),
+                    !narrow_usable && wide_usable,
+                    "{narrow_state:?}/{wide_state:?}"
+                );
+            }
+        }
+        let translator =
+            Translator::new().with_router(ToolRouter::catch_all([(wide.clone(), "rust".into())]));
+        for state in [ServerLifecycle::Failed, ServerLifecycle::NotInstalled] {
+            translator.set_lifecycle(&wide, state);
+            assert!(!translator.is_diagnostics_route("rust", &wide));
+        }
     }
 
     #[test]

@@ -305,20 +305,10 @@ impl Translator {
         };
 
         match self.install_server(&id, config).await {
-            Ok(caches_diagnostics) => {
+            Ok(()) => {
                 self.record_respawn_success(&id);
-                if caches_diagnostics
-                    && let Some(pumps) = self.notification_pumps.get()
-                    && let Some(generation) = pumps.settle().diagnostics_baseline_generation(&id)
-                {
-                    tokio::spawn(crate::baseline_merge_task(
-                        pumps.shared().clone(),
-                        id.clone(),
-                        generation,
-                        pumps.cancel_rx(),
-                    ));
-                }
                 guard.publish(ServerLifecycle::Running);
+                self.reconcile_diagnostics_owners(Some(&id)).await;
                 tracing::info!("LSP server '{id}' is running");
             }
             Err(err) => {
@@ -330,11 +320,93 @@ impl Translator {
                 };
                 tracing::error!("LSP server '{id}' failed to start: {err}");
                 guard.publish(state);
+                self.reconcile_diagnostics_owners(None).await;
             }
         }
     }
 
-    async fn install_server(&self, id: &ServerId, config: ServerInitConfig) -> Result<bool> {
+    async fn reconcile_diagnostics_owners(&self, installed: Option<&ServerId>) {
+        let Some(pumps) = self.notification_pumps.get() else {
+            return;
+        };
+        let _reconciliation = pumps.reconciliation.lock().await;
+        let languages: Vec<_> = lock_std(&self.server_configs)
+            .values()
+            .map(|config| config.server_config.language_id.clone())
+            .collect();
+        let installed_servers = pumps.installed_servers();
+        let desired: std::collections::HashSet<_> = languages
+            .iter()
+            .filter_map(|language| self.diagnostics_owner(language))
+            .filter(|owner| installed_servers.contains(owner))
+            .collect();
+        let active = pumps.settle().diagnostics_owners();
+        let mut generations = Vec::new();
+        {
+            let mut cache = pumps.shared().notification_cache.lock().await;
+            for owner in active
+                .iter()
+                .chain(installed_servers.iter())
+                .filter(|owner| !desired.contains(*owner))
+            {
+                pumps.settle().unregister_diagnostics_owner(owner);
+                cache.clear_server_diagnostics(owner);
+            }
+            for owner in &desired {
+                if !active.contains(owner) {
+                    let generation = if installed == Some(owner) {
+                        pumps.settle().diagnostics_baseline_generation(owner)
+                    } else {
+                        pumps.settle().begin_diagnostics_baseline_merge(owner)
+                    };
+                    pumps.register_diagnostics_owner(owner);
+                    if let Some(generation) = generation {
+                        generations.push((owner.clone(), generation));
+                    }
+                } else if installed == Some(owner)
+                    && let Some(generation) = pumps.settle().diagnostics_baseline_generation(owner)
+                {
+                    generations.push((owner.clone(), generation));
+                }
+            }
+            pumps.settle().restart_deadline();
+            cache.set_diagnostics_route_count(desired.len());
+        }
+        for (owner, generation) in generations {
+            let client = lock_std(&self.lsp_clients).get(&owner).cloned();
+            if let Some(client) = client {
+                for path in self.document_tracker.open_paths() {
+                    if self
+                        .document_tracker
+                        .snapshot(&path)
+                        .is_none_or(|document| {
+                            self.diagnostics_owner(document.language_id()).as_ref() != Some(&owner)
+                        })
+                    {
+                        continue;
+                    }
+                    let result = if installed == Some(&owner) {
+                        self.document_tracker
+                            .ensure_open(&path, &owner, &client)
+                            .await
+                    } else {
+                        self.document_tracker.reopen(&path, &owner, &client).await
+                    };
+                    if let Err(error) = result {
+                        tracing::warn!(%owner, path = %path.display(), %error, "diagnostics baseline replay failed");
+                    }
+                }
+            }
+            tokio::spawn(crate::baseline_merge_task(
+                pumps.shared().clone(),
+                owner,
+                generation,
+                pumps.cancel_rx(),
+            ));
+        }
+    }
+
+    async fn install_server(&self, id: &ServerId, config: ServerInitConfig) -> Result<()> {
         let language_id = config.server_config.language_id.clone();
 
         tracing::info!("starting LSP server '{id}'");
@@ -390,7 +462,6 @@ impl Translator {
 
         self.document_tracker.forget_server(id);
         if let Some(pumps) = self.notification_pumps.get() {
-            pumps.install(id.clone(), notification_rx, caches_diagnostics);
             if caches_diagnostics {
                 pumps.register_diagnostics_owner(id);
                 pumps.settle().restart_deadline();
@@ -404,11 +475,12 @@ impl Translator {
                     attempt.complete();
                 }
             }
+            pumps.install(id.clone(), notification_rx);
         }
         let old_server = lock_std(&self.lsp_servers).insert(id.clone(), new_server);
         lock_std(&self.lsp_clients).insert(id.clone(), new_client);
         drop(old_server);
-        Ok(caches_diagnostics)
+        Ok(())
     }
 
     async fn await_terminal_state(
@@ -792,7 +864,7 @@ while True:
             let translator = crate::build_translator(
                 config,
                 vec![root.to_path_buf()],
-                HashMap::new(),
+                HashMap::from([("rs".into(), "rust".into())]),
                 router,
                 Arc::clone(&notification_cache),
                 Arc::clone(watch_registry),
@@ -850,6 +922,297 @@ while True:
             ];
             running.timeout_seconds = 5;
             config.lsp_servers.push(running);
+        }
+
+        #[tokio::test]
+        #[allow(clippy::too_many_lines)]
+        async fn running_catch_all_reseeds_baseline_after_narrow_spawn_failure() {
+            use tokio::io::BufReader;
+            use tokio::sync::{mpsc, watch};
+
+            use crate::bridge::translator::testing::{fake_lsp_client, read_framed_message};
+            use crate::bridge::{FileEntry, SessionId};
+            use crate::lsp::LspNotification;
+
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("main.rs");
+            fs::write(&path, "fn main() {}\n").unwrap();
+            let second_path = dir.path().join("second.rs");
+            fs::write(&second_path, "fn second() {}\n").unwrap();
+            let script = write_responder_script(dir.path(), 1);
+            let mut wide_config = stub_server_config("rust", &script);
+            wide_config.server_config.name = Some("wide".into());
+            let mut narrow_config = wide_config.clone();
+            narrow_config.server_config.name = Some("narrow".into());
+            narrow_config.server_config.handles = Some(vec![ToolKind::Diagnostics]);
+            narrow_config.server_config.command =
+                dir.path().join("missing").to_string_lossy().into();
+            let wide = wide_config.server_config.id();
+            let narrow = narrow_config.server_config.id();
+            let config = crate::config::ServerConfig::default();
+            let registry = Arc::new(crate::lsp::WatchRegistry::new());
+            let (translator, cache, shared) = setup_initial_batch(
+                &config,
+                dir.path(),
+                &[wide_config, narrow_config.clone()],
+                &registry,
+            );
+            let (client, mut server) = fake_lsp_client();
+            translator.register_client(wide.clone(), client.clone());
+            translator.set_lifecycle(&wide, ServerLifecycle::Running);
+            translator.set_lifecycle(&narrow, ServerLifecycle::Idle);
+            let (_cancel, cancel_rx) = watch::channel(false);
+            translator
+                .notification_pumps
+                .set(crate::notification_lifecycle::NotificationPumps::new(
+                    shared.clone(),
+                    cancel_rx,
+                ))
+                .unwrap();
+            let pumps = translator.notification_pumps.get().unwrap();
+            let (tx, rx) = mpsc::channel(10);
+            pumps.install(wide.clone(), rx);
+            let (narrow_tx, narrow_rx) = mpsc::channel(10);
+            pumps.install(narrow.clone(), narrow_rx);
+            shared.settle.set_diagnostics_owners([narrow.clone()]);
+            shared.delivery.lock().await.set_baseline(HashMap::new());
+            let uri = translator
+                .document_tracker
+                .ensure_open(&path, &wide, &client)
+                .await
+                .unwrap();
+            let second_uri = translator
+                .document_tracker
+                .ensure_open(&second_path, &wide, &client)
+                .await
+                .unwrap();
+            let mut frames = BufReader::new(&mut server.write_stdout);
+            assert_eq!(
+                read_framed_message(&mut frames).await["method"],
+                "textDocument/didOpen"
+            );
+            assert_eq!(
+                read_framed_message(&mut frames).await["method"],
+                "textDocument/didOpen"
+            );
+            let publish = |message: &str| {
+                LspNotification::PublishDiagnostics(lsp_types::PublishDiagnosticsParams {
+                    uri: uri.clone(),
+                    version: None,
+                    diagnostics: vec![lsp_types::Diagnostic {
+                        message: message.into(),
+                        severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+                        range: lsp_types::Range::new(
+                            lsp_types::Position::new(0, 0),
+                            lsp_types::Position::new(0, 1),
+                        ),
+                        ..lsp_types::Diagnostic::default()
+                    }],
+                })
+            };
+            narrow_tx.send(publish("stale narrow")).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while cache.lock().await.get_diagnostics(uri.as_str()).is_none() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            tx.send(publish("existing")).await.unwrap();
+            tx.send(LspNotification::Progress {
+                token: serde_json::json!("old"),
+                value: serde_json::json!({"kind":"begin"}),
+            })
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while shared.settle.progress_epoch() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            shared.settle.end_at(
+                &wide,
+                &serde_json::json!("old"),
+                Instant::now().checked_sub(Duration::from_secs(10)).unwrap(),
+            );
+            assert_eq!(
+                cache
+                    .lock()
+                    .await
+                    .get_diagnostics(uri.as_str())
+                    .unwrap()
+                    .diagnostics[0]
+                    .message,
+                "stale narrow"
+            );
+
+            Arc::clone(&translator).run_spawn(narrow.clone()).await;
+            assert_eq!(
+                translator.lifecycle_of(&narrow),
+                Some(ServerLifecycle::NotInstalled)
+            );
+            assert_eq!(shared.settle.diagnostics_owner_count(), 1);
+            assert!(
+                shared
+                    .settle
+                    .diagnostics_baseline_generation(&wide)
+                    .is_some()
+            );
+            assert!(
+                cache.lock().await.get_diagnostics(uri.as_str()).is_none(),
+                "a failed owner's cached diagnostics must be cleared"
+            );
+            let mut replayed = HashMap::<String, Vec<String>>::new();
+            for _ in 0..4 {
+                let message =
+                    tokio::time::timeout(Duration::from_secs(1), read_framed_message(&mut frames))
+                        .await
+                        .unwrap();
+                replayed
+                    .entry(
+                        message["params"]["textDocument"]["uri"]
+                            .as_str()
+                            .unwrap()
+                            .into(),
+                    )
+                    .or_default()
+                    .push(message["method"].as_str().unwrap().into());
+            }
+            for tracked_uri in [&uri, &second_uri] {
+                assert_eq!(
+                    replayed.remove(tracked_uri.as_str()).unwrap(),
+                    ["textDocument/didClose", "textDocument/didOpen"]
+                );
+            }
+            assert!(replayed.is_empty());
+            crate::test_support::assert_no_frame_within(
+                &mut frames,
+                Duration::from_millis(5),
+                "one reopen per tracked document",
+            )
+            .await;
+            tx.send(publish("existing")).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while shared
+                    .settle
+                    .diagnostics_baseline_generation(&wide)
+                    .is_some()
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let session = SessionId::named(Some("transfer".into())).unwrap();
+            {
+                let cache = cache.lock().await;
+                let info = cache.get_diagnostics(uri.as_str()).unwrap();
+                let report = shared.delivery.lock().await.flush(
+                    &session,
+                    &[FileEntry {
+                        key: uri.as_str(),
+                        diagnostics: &info.diagnostics,
+                        floor: shared.floors.for_server(&wide),
+                    }],
+                );
+                drop(cache);
+                assert!(
+                    report.changed.is_empty(),
+                    "existing diagnostics must seed the promoted baseline"
+                );
+            }
+            tx.send(publish("changed")).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let cache = cache.lock().await;
+                    if cache.get_diagnostics(uri.as_str()).unwrap().diagnostics[0].message
+                        == "changed"
+                    {
+                        break;
+                    }
+                    drop(cache);
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            {
+                let cache = cache.lock().await;
+                let info = cache.get_diagnostics(uri.as_str()).unwrap();
+                let report = shared.delivery.lock().await.flush(
+                    &session,
+                    &[FileEntry {
+                        key: uri.as_str(),
+                        diagnostics: &info.diagnostics,
+                        floor: shared.floors.for_server(&wide),
+                    }],
+                );
+                drop(cache);
+                assert_eq!(report.changed.len(), 1);
+            }
+            narrow_config.server_config.command = "python3".into();
+            narrow_config.server_config.args = vec![
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/notification_generations.py"
+                )
+                .into(),
+                dir.path().join("narrow").to_string_lossy().into(),
+                uri.as_str().into(),
+                "changed".into(),
+                "on-open".into(),
+            ];
+            translator.register_server_config(narrow.clone(), narrow_config);
+            translator.set_lifecycle(&narrow, ServerLifecycle::Starting);
+            Arc::clone(&translator).run_spawn(narrow.clone()).await;
+            assert!(translator.is_diagnostics_route("rust", &narrow));
+            assert_eq!(shared.settle.diagnostics_owner_count(), 1);
+            assert_ne!(
+                cache.lock().await.diagnostics_owner(uri.as_str()),
+                Some(&wide)
+            );
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while shared
+                    .settle
+                    .diagnostics_baseline_generation(&narrow)
+                    .is_some()
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            {
+                let cache = cache.lock().await;
+                let info = cache
+                    .get_diagnostics(uri.as_str())
+                    .expect("recovered server receives tracked documents");
+                assert_eq!(info.diagnostics[0].message, "changed");
+                let entries: Vec<_> = cache
+                    .diagnostics_entries()
+                    .into_iter()
+                    .map(|(key, info, owner)| FileEntry {
+                        key,
+                        diagnostics: &info.diagnostics,
+                        floor: shared.floors.for_server(owner),
+                    })
+                    .collect();
+                assert_eq!(
+                    entries.len(),
+                    2,
+                    "every tracked document is replayed to the recovered process"
+                );
+                let report = shared.delivery.lock().await.flush(&session, &entries);
+                drop(cache);
+                assert!(
+                    report.changed.is_empty(),
+                    "replayed diagnostics seed the recovered owner's baseline"
+                );
+            }
+            pumps.shutdown().await;
+            translator.shutdown_servers().await;
         }
 
         async fn run_initial_batch(

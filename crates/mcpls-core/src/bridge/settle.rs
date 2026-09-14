@@ -264,13 +264,37 @@ impl ServerSettle {
         state.retired_servers.remove(server);
         state.pending_owners.remove(server);
         state.replacement_pending.remove(server);
-        state.diagnostics_owners.insert(server.clone());
+        let newly_active = state.diagnostics_owners.insert(server.clone());
         state.owners_installed = true;
         Self::ensure_baseline_pending(&mut state, server);
         let progress = state.server_progress.entry(server.clone()).or_default();
-        if progress.outstanding.is_empty() && progress.quiet_since.is_none() {
+        if progress.outstanding.is_empty() && (newly_active || progress.quiet_since.is_none()) {
             progress.quiet_since = Some(Instant::now());
         }
+    }
+
+    /// Whether this server currently owns cached diagnostics.
+    #[must_use]
+    pub fn owns_diagnostics(&self, server: &ServerId) -> bool {
+        self.state
+            .lock()
+            .is_ok_and(|state| state.diagnostics_owners.contains(server))
+    }
+
+    pub(crate) fn diagnostics_owners(&self) -> HashSet<ServerId> {
+        self.state
+            .lock()
+            .map(|state| state.diagnostics_owners.clone())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn unregister_diagnostics_owner(&self, server: &ServerId) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        state.diagnostics_owners.remove(server);
+        state.pending_owners.remove(server);
+        state.pending_baselines.remove(server);
     }
 
     /// Number of diagnostics owners currently participating in settle.
@@ -584,6 +608,22 @@ mod tests {
              and indexing has not started yet"
         );
         assert!(settle.should_settle_at(quiet_began + Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn promoted_owner_rearms_existing_quiet_clock() {
+        let settle = settle();
+        let owner = ServerId::from("wide");
+        settle.set_diagnostics_owners([]);
+        settle.begin(&owner, &json!("index"));
+        settle.end_at(
+            &owner,
+            &json!("index"),
+            Instant::now().checked_sub(Duration::from_secs(10)).unwrap(),
+        );
+        settle.register_diagnostics_owner(&owner);
+        settle.restart_deadline();
+        assert!(!settle.should_settle());
     }
 
     #[test]

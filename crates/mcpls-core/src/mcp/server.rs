@@ -2520,7 +2520,6 @@ mod tests {
                 server_id,
                 notification_rx,
                 cancel_rx,
-                true,
                 crate::PumpShared {
                     notification_cache: cache,
                     subs: subscriptions,

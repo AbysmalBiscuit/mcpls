@@ -17,7 +17,7 @@ initialize_attempt_marker = Path(options[5]) if len(options) > 5 else None
 counter = Path(control + ".generation")
 generation = int(counter.read_text()) + 1 if counter.exists() else 1
 counter.write_text(str(generation))
-sentinel = f"{label}-generation-{generation}"
+sentinel = label if mode == "on-open" else f"{label}-generation-{generation}"
 publish_started = False
 
 
@@ -94,13 +94,16 @@ while True:
             send({"method": "$/progress", "params": {
                 "token": "reporting", "value": {"kind": "end"}
             }})
-        if mode == "reporting-then-silent" and generation > 1:
+        if mode == "on-open" or (mode == "reporting-then-silent" and generation > 1):
             pass
         elif mode == "silent":
             time.sleep(startup_delay)
             publish()
         else:
             publish()
+    elif method == "textDocument/didOpen" and mode == "on-open":
+        uri = request["params"]["textDocument"]["uri"]
+        publish()
     elif method == "textDocument/diagnostic":
         send({"id": request["id"], "result": {"kind": "full", "items": []}})
     elif method == "workspace/symbol":

@@ -164,7 +164,6 @@ pub(crate) async fn diagnostics_pump(
     server_id: ServerId,
     mut rx: tokio::sync::mpsc::Receiver<LspNotification>,
     mut cancel_rx: tokio::sync::watch::Receiver<bool>,
-    caches_diagnostics: bool,
     shared: PumpShared,
 ) {
     loop {
@@ -183,7 +182,7 @@ pub(crate) async fn diagnostics_pump(
                 };
                 match notif {
                     LspNotification::PublishDiagnostics(p) => {
-                        handle_publish_diagnostics(&server_id, caches_diagnostics, p, &shared).await;
+                        handle_publish_diagnostics(&server_id, p, &shared).await;
                     }
                     LspNotification::LogMessage(m) => {
                         let mut cache = shared.notification_cache.lock().await;
@@ -214,19 +213,9 @@ pub(crate) async fn diagnostics_pump(
 /// line-count lint.
 async fn handle_publish_diagnostics(
     server_id: &ServerId,
-    caches_diagnostics: bool,
     p: lsp_types::PublishDiagnosticsParams,
     shared: &PumpShared,
 ) {
-    // Only the server the router resolves `Diagnostics` to for this
-    // notification's language caches (and notifies subscribers of) it --
-    // see #174 §8. A server that was never the diagnostics route, or lost
-    // it without a live catch-all to rebind to, is not the authoritative
-    // source for this language's diagnostics; skip publishing so it doesn't
-    // overwrite (or spuriously notify about) another server's cache entry.
-    if !caches_diagnostics {
-        return;
-    }
     if !diagnostic_path_in_workspace(&p.uri, &shared.workspace_roots) {
         debug!(
             "dropping diagnostics for out-of-workspace URI: {}",
@@ -247,6 +236,9 @@ async fn handle_publish_diagnostics(
     }
     {
         let mut cache = shared.notification_cache.lock().await;
+        if !shared.settle.owns_diagnostics(server_id) {
+            return;
+        }
         cache.store_diagnostics(server_id, &p.uri, p.version, p.diagnostics);
     }
 
@@ -294,7 +286,10 @@ pub(crate) fn register_servers(
     for (id, server) in &mut result.servers {
         let rx = server.take_notification_rx();
         if let Some(pumps) = translator.notification_pumps.get() {
-            pumps.install(id.clone(), rx, diagnostics_flags[id]);
+            if diagnostics_flags[id] {
+                pumps.register_diagnostics_owner(id);
+            }
+            pumps.install(id.clone(), rx);
         }
     }
 
@@ -2821,10 +2816,12 @@ mod tests {
         }
 
         fn make_settle() -> Arc<bridge::ServerSettle> {
-            Arc::new(bridge::ServerSettle::new(
+            let settle = Arc::new(bridge::ServerSettle::new(
                 Duration::from_secs(1),
                 Duration::from_secs(600),
-            ))
+            ));
+            settle.register_diagnostics_owner(&ServerId::from("rust"));
+            settle
         }
 
         fn make_delivery() -> Arc<Mutex<bridge::DiagnosticsDelivery>> {
@@ -2917,7 +2914,6 @@ mod tests {
                 ServerId::from("rust"),
                 rx,
                 cancel_rx,
-                true,
                 PumpShared {
                     notification_cache: make_cache(),
                     subs: Arc::clone(&subs),
@@ -2972,7 +2968,6 @@ mod tests {
                 ServerId::from("rust"),
                 rx,
                 cancel_rx,
-                true,
                 PumpShared {
                     notification_cache: make_cache(),
                     subs: Arc::clone(&subs),
@@ -3033,7 +3028,6 @@ mod tests {
                 ServerId::from("rust"),
                 rx,
                 cancel_rx,
-                true,
                 PumpShared {
                     notification_cache: c,
                     subs: Arc::clone(&subs),
@@ -3091,7 +3085,6 @@ mod tests {
                 ServerId::from("rust"),
                 rx,
                 cancel_rx,
-                true,
                 PumpShared {
                     notification_cache: c,
                     subs: Arc::clone(&subs),
@@ -3165,7 +3158,6 @@ mod tests {
                 ServerId::from("rust"),
                 rx,
                 cancel_rx,
-                true,
                 PumpShared {
                     notification_cache: Arc::clone(&cache),
                     subs: Arc::clone(&subs),
@@ -3240,7 +3232,6 @@ mod tests {
                 ServerId::from("rust"),
                 rx,
                 cancel_rx,
-                true,
                 PumpShared {
                     notification_cache: cache,
                     subs,
@@ -3272,7 +3263,6 @@ mod tests {
                 ServerId::from("rust"),
                 rx,
                 cancel_rx,
-                true,
                 PumpShared {
                     notification_cache: cache,
                     subs,
@@ -3309,7 +3299,6 @@ mod tests {
                 owner.clone(),
                 rx,
                 cancel_rx,
-                true,
                 PumpShared {
                     notification_cache: cache,
                     subs,
@@ -3363,7 +3352,6 @@ mod tests {
                 ServerId::from("rust"),
                 rx,
                 cancel_rx,
-                true,
                 PumpShared {
                     notification_cache: Arc::clone(&cache),
                     subs,
@@ -3434,7 +3422,6 @@ mod tests {
                 ServerId::from("rust"),
                 rx,
                 cancel_rx,
-                true,
                 PumpShared {
                     notification_cache: Arc::clone(&cache),
                     subs,
@@ -3511,7 +3498,6 @@ mod tests {
                 ServerId::from("rust"),
                 rx,
                 cancel_rx,
-                true,
                 PumpShared {
                     notification_cache: Arc::clone(&cache),
                     subs,
@@ -3568,7 +3554,6 @@ mod tests {
                 ServerId::from("rust"),
                 rx,
                 cancel_rx,
-                true,
                 PumpShared {
                     notification_cache: Arc::clone(&cache),
                     subs,
@@ -3619,7 +3604,6 @@ mod tests {
                 ServerId::from("rust"),
                 rx,
                 cancel_rx,
-                true,
                 PumpShared {
                     notification_cache: cache,
                     subs,

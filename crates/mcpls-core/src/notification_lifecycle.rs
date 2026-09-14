@@ -15,6 +15,7 @@ pub struct NotificationPumps {
     shared: PumpShared,
     cancel: watch::Receiver<bool>,
     state: StdMutex<PumpState>,
+    pub(crate) reconciliation: Mutex<()>,
 }
 
 #[derive(Default)]
@@ -83,6 +84,7 @@ impl NotificationPumps {
             shared,
             cancel,
             state: StdMutex::new(PumpState::default()),
+            reconciliation: Mutex::new(()),
         }
     }
 
@@ -101,12 +103,7 @@ impl NotificationPumps {
         self.cancel.clone()
     }
 
-    pub(crate) fn install(
-        &self,
-        id: ServerId,
-        rx: mpsc::Receiver<LspNotification>,
-        caches_diagnostics: bool,
-    ) {
+    pub(crate) fn install(&self, id: ServerId, rx: mpsc::Receiver<LspNotification>) {
         let mut state = lock_std(&self.state);
         if state.closed {
             return;
@@ -115,12 +112,15 @@ impl NotificationPumps {
             id.clone(),
             rx,
             self.cancel.clone(),
-            caches_diagnostics,
             self.shared.clone(),
         ));
         state
             .tasks
             .insert(id, Arc::new(Mutex::new(PumpTask(Some(task)))));
+    }
+
+    pub(crate) fn installed_servers(&self) -> Vec<ServerId> {
+        lock_std(&self.state).tasks.keys().cloned().collect()
     }
 
     pub(crate) fn register_diagnostics_owner(&self, id: &ServerId) {
@@ -140,6 +140,14 @@ impl NotificationPumps {
         let task = lock_std(&self.state).tasks.get(id).cloned();
         if let Some(task) = task {
             task.lock().await.retire().await;
+            let mut state = lock_std(&self.state);
+            if state
+                .tasks
+                .get(id)
+                .is_some_and(|current| Arc::ptr_eq(current, &task))
+            {
+                state.tasks.remove(id);
+            }
         }
         self.shared.settle.forget_server(id);
         #[cfg(all(test, unix))]
@@ -195,6 +203,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn installed_pump_follows_ownership_transfers() {
+        let shared = shared();
+        let cache = Arc::clone(&shared.notification_cache);
+        let settle = Arc::clone(&shared.settle);
+        settle.set_diagnostics_owners([]);
+        let (_cancel, cancel_rx) = watch::channel(false);
+        let pumps = NotificationPumps::new(shared, cancel_rx);
+        let id = ServerId::from("wide");
+        let uri: Uri = "file:///workspace/main.rs".parse().unwrap();
+        let (tx, rx) = mpsc::channel(1);
+        pumps.install(id.clone(), rx);
+        for (message, owns) in [("unowned", false), ("baseline", true), ("revoked", false)] {
+            if owns {
+                settle.register_diagnostics_owner(&id);
+            } else {
+                settle.set_diagnostics_owners([]);
+            }
+            tx.send(LspNotification::PublishDiagnostics(
+                PublishDiagnosticsParams {
+                    uri: uri.clone(),
+                    version: None,
+                    diagnostics: vec![Diagnostic {
+                        message: message.into(),
+                        ..Diagnostic::default()
+                    }],
+                },
+            ))
+            .await
+            .unwrap();
+            tx.send(LspNotification::Progress {
+                token: serde_json::json!(message),
+                value: serde_json::json!({"kind":"begin"}),
+            })
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                let target = match message {
+                    "unowned" => 1,
+                    "baseline" => 2,
+                    _ => 3,
+                };
+                while settle.progress_epoch() < target {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let guard = cache.lock().await;
+            let found = guard.get_diagnostics(uri.as_str());
+            if message == "unowned" {
+                assert!(found.is_none());
+            } else {
+                assert_eq!(found.unwrap().diagnostics[0].message, "baseline");
+            }
+            drop(guard);
+        }
+        pumps.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn pump_retirement_prevents_queued_publish_repopulating_cache() {
         let shared = shared();
         let cache = Arc::clone(&shared.notification_cache);
@@ -204,7 +272,8 @@ mod tests {
         let id = ServerId::from("rust");
         let uri: Uri = "file:///workspace/main.rs".parse().unwrap();
         let (tx, rx) = mpsc::channel(1);
-        pumps.install(id.clone(), rx, true);
+        pumps.register_diagnostics_owner(&id);
+        pumps.install(id.clone(), rx);
         tx.send(LspNotification::PublishDiagnostics(
             PublishDiagnosticsParams {
                 uri: uri.clone(),
@@ -289,7 +358,7 @@ mod tests {
         let (_cancel, cancel_rx) = watch::channel(false);
         let pumps = NotificationPumps::new(shared(), cancel_rx.clone());
         let (tx, rx) = mpsc::channel(1);
-        pumps.install(ServerId::from("rust"), rx, true);
+        pumps.install(ServerId::from("rust"), rx);
         drop(pumps);
         tokio::time::timeout(Duration::from_secs(2), tx.closed())
             .await
@@ -297,11 +366,11 @@ mod tests {
 
         let pumps = NotificationPumps::new(shared(), cancel_rx);
         let (tx, rx) = mpsc::channel(1);
-        pumps.install(ServerId::from("rust"), rx, true);
+        pumps.install(ServerId::from("rust"), rx);
         pumps.shutdown().await;
         assert!(tx.is_closed());
         let (late_tx, late_rx) = mpsc::channel(1);
-        pumps.install(ServerId::from("python"), late_rx, true);
+        pumps.install(ServerId::from("python"), late_rx);
         assert!(
             late_tx.is_closed(),
             "startup must not install a pump after shutdown"
