@@ -283,11 +283,22 @@ pub(crate) struct RegisteredServers {
 /// `configs` supplies the `ServerInitConfig` for each applicable server, so
 /// the translator can spawn it later if needed (see `Translator::ensure_server`).
 pub(crate) fn register_servers(
-    mut result: lsp::ServerInitResult,
+    result: lsp::ServerInitResult,
     translator: &bridge::Translator,
     configs: &HashMap<ServerId, ServerInitConfig>,
 ) -> RegisteredServers {
-    let registered: HashSet<ServerId> = result.servers.keys().cloned().collect();
+    register_servers_with_retained_routes(result, translator, configs, &HashSet::new())
+}
+
+fn register_servers_with_retained_routes(
+    mut result: lsp::ServerInitResult,
+    translator: &bridge::Translator,
+    configs: &HashMap<ServerId, ServerInitConfig>,
+    retained_routes: &HashSet<ServerId>,
+) -> RegisteredServers {
+    let mut registered: HashSet<ServerId> = result.servers.keys().cloned().collect();
+    registered.extend(translator.registered_live_client_ids());
+    registered.extend(retained_routes.iter().cloned());
     translator.rebind_router(&registered);
     let diagnostics_flags: HashMap<_, _> = result
         .servers
@@ -512,6 +523,24 @@ fn applicable_server_configs(
         .collect()
 }
 
+fn partition_spawn_configs(
+    config: &ServerConfig,
+    applicable: &[ServerInitConfig],
+) -> (Vec<ServerInitConfig>, HashSet<ServerId>) {
+    let mut eager = Vec::new();
+    let mut lazy_ids = HashSet::new();
+    for init in applicable {
+        let id = init.server_config.id();
+        match init.server_config.effective_spawn(config.backend.spawn) {
+            SpawnPolicy::Eager => eager.push(init.clone()),
+            SpawnPolicy::Lazy => {
+                lazy_ids.insert(id);
+            }
+        }
+    }
+    (eager, lazy_ids)
+}
+
 /// Start the MCPLS server with an explicit transport.
 ///
 /// Performs all shared setup (workspace discovery, LSP spawning, translator
@@ -732,6 +761,11 @@ impl Runtime {
             delivery: Arc::clone(&delivery),
             floors: Arc::clone(&floors),
         };
+        translator.notification_pumps.get_or_init(|| {
+            notification_lifecycle::NotificationPumps::new(pump_shared.clone(), cancel_rx.clone())
+        });
+
+        let (eager_configs, lazy_server_ids) = partition_spawn_configs(config, &applicable_configs);
 
         let lsp_init_handle = if applicable_configs.is_empty() {
             warn!("No applicable LSP servers configured — starting in protocol-only mode");
@@ -742,13 +776,17 @@ impl Runtime {
             // that instead of advising a retry that could never succeed.
             delivery.lock().await.set_baseline(HashMap::new());
             None
+        } else if eager_configs.is_empty() {
+            delivery.lock().await.set_baseline(HashMap::new());
+            None
         } else {
             info!(
                 "Spawning {} LSP server(s) in the background...",
-                applicable_configs.len()
+                eager_configs.len()
             );
             Some(spawn_lsp_servers_background(
-                applicable_configs,
+                eager_configs,
+                lazy_server_ids,
                 Arc::clone(&translator),
                 cancel_rx.clone(),
                 pump_shared,
@@ -1131,13 +1169,11 @@ async fn shutdown(
 /// baseline processing. Notification pumps are owned by the translator.
 fn spawn_lsp_servers_background(
     applicable_configs: Vec<ServerInitConfig>,
+    retained_routes: HashSet<ServerId>,
     translator: Arc<Translator>,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
     shared: PumpShared,
 ) -> JoinHandle<()> {
-    translator.notification_pumps.get_or_init(|| {
-        notification_lifecycle::NotificationPumps::new(shared.clone(), cancel_rx.clone())
-    });
     tokio::spawn(async move {
         let configs_by_id: HashMap<ServerId, ServerInitConfig> = applicable_configs
             .iter()
@@ -1169,8 +1205,10 @@ fn spawn_lsp_servers_background(
             // "still initializing". This path returns before
             // `register_servers` ever runs, so it needs its own rebind call;
             // skipping it would leave every route pointed at a dead server.
-            translator.rebind_router(&HashSet::new());
-            translator.clear_expected_servers();
+            let mut retained_routes = retained_routes.clone();
+            retained_routes.extend(translator.registered_live_client_ids());
+            translator.rebind_router(&retained_routes);
+            translator.set_expected_servers(retained_routes);
             shared.delivery.lock().await.set_baseline(HashMap::new());
             return;
         }
@@ -1187,7 +1225,16 @@ fn spawn_lsp_servers_background(
         }
 
         let server_count = result.server_count();
-        let registered = register_servers(result, &translator, &configs_by_id);
+        let registered = if retained_routes.is_empty() {
+            register_servers(result, &translator, &configs_by_id)
+        } else {
+            register_servers_with_retained_routes(
+                result,
+                &translator,
+                &configs_by_id,
+                &retained_routes,
+            )
+        };
         for id in registered.diagnostics_flags.keys() {
             translator.set_lifecycle(id, ServerLifecycle::Running);
         }
@@ -1195,7 +1242,7 @@ fn spawn_lsp_servers_background(
         // initializing" (especially for servers that failed to spawn on
         // partial success, which would otherwise return ServerInitializing
         // forever instead of NoServerForLanguage/Tool).
-        translator.clear_expected_servers();
+        translator.set_expected_servers(retained_routes.clone());
         info!("Proceeding with {} LSP server(s)", server_count);
 
         // Give each diagnostics-route server a fair share of the shared

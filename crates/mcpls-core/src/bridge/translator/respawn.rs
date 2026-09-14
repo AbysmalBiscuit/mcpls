@@ -4,6 +4,7 @@
 //! process backs off exponentially instead of eating a fresh
 //! `timeout_seconds` on every tool call that arrives while it is down.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Weak};
 use std::time::Instant;
 
@@ -281,6 +282,21 @@ impl Translator {
             .is_none_or(|server| !matches!(server.has_exited(), Ok(true)))
     }
 
+    /// Return registered clients that remain live across an initial-batch rebind.
+    pub(crate) fn registered_live_client_ids(&self) -> HashSet<ServerId> {
+        let clients = lock_std(&self.lsp_clients);
+        let mut servers = lock_std(&self.lsp_servers);
+        clients
+            .keys()
+            .filter(|id| {
+                servers
+                    .get_mut(*id)
+                    .is_none_or(|server| !matches!(server.has_exited(), Ok(true)))
+            })
+            .cloned()
+            .collect()
+    }
+
     fn restore_running_if_live(&self, id: &ServerId) -> bool {
         if self.has_live_client(id) {
             self.set_lifecycle(id, ServerLifecycle::Running);
@@ -536,25 +552,6 @@ mod tests {
         assert_eq!(translator.lifecycle_of(&id), Some(ServerLifecycle::Failed));
     }
 
-    #[tokio::test]
-    async fn test_a_budget_that_expires_leaves_the_spawn_running() {
-        let translator = Arc::new(Translator::new());
-        translator.set_self_handle(Arc::downgrade(&translator));
-        let id = ServerId::from("rust");
-        translator.set_lifecycle(&id, ServerLifecycle::Starting);
-
-        let err = translator
-            .ensure_server(&id, Some(Duration::from_millis(10)))
-            .await
-            .expect_err("a starting server outlasting its budget asks for a retry");
-
-        assert!(matches!(err, Error::ServerInitializing { .. }));
-        assert_eq!(
-            translator.lifecycle_of(&id),
-            Some(ServerLifecycle::Starting)
-        );
-    }
-
     // Gated `#[cfg(unix)]`: this module's fake-LSP-server test double is a
     // hand-written `sh` script (POSIX parameter expansion, `printf`-framed
     // LSP responses, file-based invocation counters), which has no
@@ -562,7 +559,7 @@ mod tests {
     // `windows-latest`.
     #[cfg(unix)]
     mod respawn_tests {
-        use std::collections::HashMap;
+        use std::collections::{HashMap, HashSet};
         use std::fs;
         use std::path::{Path, PathBuf};
 
@@ -611,6 +608,52 @@ sleep __SLEEP__
             )
             .unwrap();
             script_path
+        }
+
+        fn write_delayed_counting_server(dir: &Path) -> (PathBuf, PathBuf) {
+            let script_path = dir.join("delayed_counting_server.py");
+            let invocation_path = dir.join("invocations");
+            let body = r#"import json, os, pathlib, sys, time
+
+counter = pathlib.Path(sys.argv[1])
+with counter.open("a") as invocations:
+    invocations.write(f"{os.getpid()}\n")
+    invocations.flush()
+
+def receive():
+    length = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        if line in (b"\r\n", b"\n"):
+            break
+        key, value = line.decode().split(":", 1)
+        if key.lower() == "content-length":
+            length = int(value.strip())
+    return json.loads(sys.stdin.buffer.read(length))
+
+def send(message):
+    body = json.dumps(message).encode()
+    sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+    sys.stdout.buffer.flush()
+
+while True:
+    message = receive()
+    if message is None:
+        break
+    if message.get("method") == "initialize":
+        time.sleep(0.2)
+        send({"jsonrpc": "2.0", "id": message["id"], "result": {
+            "capabilities": {"positionEncoding": "utf-16"}
+        }})
+    elif message.get("method") == "shutdown":
+        send({"jsonrpc": "2.0", "id": message["id"], "result": None})
+    elif message.get("method") == "exit":
+        break
+"#;
+            fs::write(&script_path, body).unwrap();
+            (script_path, invocation_path)
         }
 
         fn stub_server_config(id: &str, script: &Path) -> ServerInitConfig {
@@ -678,6 +721,36 @@ sleep __SLEEP__
             })
             .await
             .expect("server lifecycle did not reach the expected state");
+        }
+
+        #[tokio::test]
+        async fn test_a_budget_that_expires_leaves_the_spawn_running() {
+            let dir = TempDir::new().unwrap();
+            let (script, invocation_path) = write_delayed_counting_server(dir.path());
+            let id = ServerId::from("rust");
+            let mut config = stub_server_config("rust", &script);
+            config.server_config.command = "python3".to_string();
+            config.server_config.args = vec![
+                script.to_string_lossy().into_owned(),
+                invocation_path.to_string_lossy().into_owned(),
+            ];
+            let translator = spawnable(Translator::new(), &id);
+            translator.register_server_config(id.clone(), config);
+
+            let err = translator
+                .ensure_server(&id, Some(Duration::from_millis(10)))
+                .await
+                .expect_err("a delayed spawn outlasting its budget asks for a retry");
+            assert!(matches!(err, Error::ServerInitializing { .. }));
+            assert_eq!(
+                translator.lifecycle_of(&id),
+                Some(ServerLifecycle::Starting)
+            );
+
+            wait_for_lifecycle(&translator, &id, ServerLifecycle::Running).await;
+            let invocations = fs::read_to_string(invocation_path).unwrap();
+            assert_eq!(invocations.lines().count(), 1, "{invocations:?}");
+            translator.shutdown_servers().await;
         }
 
         fn setup_initial_batch(
@@ -763,8 +836,15 @@ sleep __SLEEP__
             shared: crate::PumpShared,
         ) {
             let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+            translator.notification_pumps.get_or_init(|| {
+                crate::notification_lifecycle::NotificationPumps::new(
+                    shared.clone(),
+                    cancel_rx.clone(),
+                )
+            });
             let init_task = crate::spawn_lsp_servers_background(
                 applicable,
+                HashSet::new(),
                 Arc::clone(&translator),
                 cancel_rx,
                 shared,

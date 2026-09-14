@@ -448,8 +448,16 @@ async fn replacement_owner_scenario(order: ReplacementOwnerOrder, attempt: Repla
             floors: Arc::clone(&floors),
         };
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        let init =
-            spawn_lsp_servers_background(configs, Arc::clone(&translator), cancel_rx, shared);
+        translator.notification_pumps.get_or_init(|| {
+            notification_lifecycle::NotificationPumps::new(shared.clone(), cancel_rx.clone())
+        });
+        let init = spawn_lsp_servers_background(
+            configs,
+            HashSet::new(),
+            Arc::clone(&translator),
+            cancel_rx,
+            shared,
+        );
         let abort_init = AbortOnDrop(&init);
         let server = mcp::McplsServer::new(
             Arc::clone(&translator),
@@ -832,6 +840,271 @@ async fn recovery_workspace_symbols_during_startup_preserve_live_client() {
     recovery_scenario(StartupMode::BetweenPublications).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
+async fn lazy_server_triggered_during_initial_batch_spawns_once() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dunce::canonicalize(dir.path()).unwrap();
+    let control = root.join("control");
+    std::fs::create_dir(&control).unwrap();
+    let script = root.join("fake_lsp.py");
+    let python_file = root.join("main.py");
+    let typescript_file = root.join("main.ts");
+    std::fs::write(&python_file, "pass\n").unwrap();
+    std::fs::write(&typescript_file, "const value = 1;\n").unwrap();
+    let symbol_uri = bridge::path_to_uri(&python_file).unwrap().to_string();
+    std::fs::write(
+        &script,
+        r#"import json, os, pathlib, sys, time
+
+control = pathlib.Path(sys.argv[1])
+role = sys.argv[2]
+symbol_uri = sys.argv[3]
+with (control / f"{role}.pids").open("a") as count:
+    count.write(f"{os.getpid()}\n")
+    count.flush()
+
+def receive():
+    length = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        if line in (b"\r\n", b"\n"):
+            break
+        key, value = line.decode().split(":", 1)
+        if key.lower() == "content-length":
+            length = int(value.strip())
+    return json.loads(sys.stdin.buffer.read(length))
+
+def send(message):
+    body = json.dumps(message).encode()
+    sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+    sys.stdout.buffer.flush()
+
+while True:
+    message = receive()
+    if message is None:
+        break
+    method = message.get("method")
+    if method == "initialize":
+        if role == "eager":
+            (control / "eager.initializing").write_text(str(os.getpid()))
+            while not (control / "eager.release").exists():
+                time.sleep(0.01)
+        send({"jsonrpc": "2.0", "id": message["id"], "result": {
+            "capabilities": {"positionEncoding": "utf-16", "workspaceSymbolProvider": True}
+        }})
+    elif method == "workspace/symbol":
+        send({"jsonrpc": "2.0", "id": message["id"], "result": [{
+            "name": f"{role}-{os.getpid()}",
+            "kind": 12,
+            "location": {"uri": symbol_uri, "range": {
+                "start": {"line": 0, "character": 0},
+                "end": {"line": 0, "character": 1}
+            }},
+            "containerName": role
+        }]})
+    elif method == "shutdown":
+        send({"jsonrpc": "2.0", "id": message["id"], "result": None})
+    elif method == "exit":
+        break
+"#,
+    )
+    .unwrap();
+
+    let make_server =
+        |mut config: crate::config::LspServerConfig, role: &str, spawn: SpawnPolicy| {
+            config.command = "python3".to_string();
+            config.args = vec![
+                script.to_string_lossy().into_owned(),
+                control.to_string_lossy().into_owned(),
+                role.to_string(),
+                symbol_uri.clone(),
+            ];
+            config.heuristics = None;
+            config.spawn = Some(spawn);
+            config
+        };
+    let mut eager = make_server(
+        crate::config::LspServerConfig::rust_analyzer(),
+        "eager",
+        SpawnPolicy::Eager,
+    );
+    eager.handles = Some(vec![crate::config::ToolKind::Hover]);
+    let lazy = make_server(
+        crate::config::LspServerConfig::pyright(),
+        "lazy",
+        SpawnPolicy::Lazy,
+    );
+    let mut untouched_lazy = make_server(
+        crate::config::LspServerConfig::typescript(),
+        "untouched-lazy",
+        SpawnPolicy::Lazy,
+    );
+    untouched_lazy.handles = Some(vec![crate::config::ToolKind::Hover]);
+
+    let mut config = ServerConfig::default();
+    config.workspace.roots = vec![root.clone()];
+    config.diagnostics.hooks.enabled = false;
+    config.lsp_servers = vec![eager, lazy, untouched_lazy];
+    let runtime = Runtime::start(&config, Ok(root.clone())).await.unwrap();
+
+    let eager_started = tokio::time::timeout(Duration::from_secs(5), async {
+        while !control.join("eager.initializing").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    let first_symbols = if eager_started.is_ok() {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            runtime
+                .translator
+                .handle_workspace_symbol("race".to_string(), None, 10),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .map(|result| {
+            result
+                .symbols
+                .into_iter()
+                .map(|symbol| symbol.name)
+                .collect::<Vec<_>>()
+        })
+    } else {
+        None
+    };
+
+    std::fs::write(control.join("eager.release"), "release").unwrap();
+    let eager_running = tokio::time::timeout(Duration::from_secs(10), async {
+        while runtime.translator.lifecycle_of(&ServerId::from("rust"))
+            != Some(ServerLifecycle::Running)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok();
+    let second_symbols = if eager_running {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            runtime
+                .translator
+                .handle_workspace_symbol("race".to_string(), None, 10),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .map(|result| {
+            result
+                .symbols
+                .into_iter()
+                .map(|symbol| symbol.name)
+                .collect::<Vec<_>>()
+        })
+    } else {
+        None
+    };
+    let untouched_lazy_error = if eager_running {
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            runtime
+                .translator
+                .handle_hover(typescript_file.to_string_lossy().into_owned(), 1, 1),
+        )
+        .await
+        .ok()
+        .and_then(Result::err)
+    } else {
+        None
+    };
+    let lazy_processes = std::fs::read_to_string(control.join("lazy.pids"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    runtime.shutdown().await;
+
+    assert!(eager_started.is_ok(), "initial eager spawn did not pause");
+    assert!(eager_running, "initial eager batch did not finish");
+    assert_eq!(
+        lazy_processes.len(),
+        1,
+        "lazy spawn count: {lazy_processes:?}"
+    );
+    assert_eq!(
+        first_symbols, second_symbols,
+        "lazy client changed during batch registration"
+    );
+    assert!(matches!(
+        untouched_lazy_error,
+        Some(Error::ServerInitializing { server_id })
+            if server_id == ServerId::from("typescript")
+    ));
+}
+
+#[tokio::test]
+async fn all_lazy_runtime_seeds_baseline_and_pumps_without_initial_batch() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dunce::canonicalize(dir.path()).unwrap();
+    let source = root.join("main.py");
+    std::fs::write(&source, "pass\n").unwrap();
+    let control = root.join("python");
+    let generation = root.join("python.generation");
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/notification_generations.py"
+    );
+    let mut lazy = crate::config::LspServerConfig::pyright();
+    lazy.command = "python3".to_string();
+    lazy.args = vec![
+        fixture.to_string(),
+        control.to_string_lossy().into_owned(),
+        bridge::path_to_uri(&source).unwrap().to_string(),
+        "python".to_string(),
+        "default".to_string(),
+    ];
+    lazy.heuristics = None;
+
+    let mut config = ServerConfig::default();
+    config.workspace.roots = vec![root.clone()];
+    config.backend.spawn = SpawnPolicy::Lazy;
+    config.diagnostics.hooks.enabled = false;
+    config.lsp_servers = vec![lazy];
+
+    let runtime = Runtime::start(&config, Ok(root)).await.unwrap();
+    let no_initial_batch = runtime.lsp_init_handle.is_none();
+    let pumps_initialized = runtime.translator.notification_pumps.get().is_some();
+    let empty_baseline = runtime.context.delivery.lock().await.has_baseline();
+    let no_spawn_before_trigger = !generation.exists();
+    let symbols = tokio::time::timeout(
+        Duration::from_secs(5),
+        runtime
+            .translator
+            .handle_workspace_symbol("lazy".to_string(), None, 10),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .map(|result| {
+        result
+            .symbols
+            .into_iter()
+            .map(|symbol| symbol.name)
+            .collect::<Vec<_>>()
+    });
+    runtime.shutdown().await;
+
+    assert!(no_initial_batch);
+    assert!(pumps_initialized);
+    assert!(empty_baseline);
+    assert!(no_spawn_before_trigger);
+    assert_eq!(symbols, Some(vec!["python-generation-1".to_string()]));
+    assert_eq!(std::fs::read_to_string(generation).unwrap(), "1");
+}
+
 #[allow(clippy::too_many_lines)]
 async fn recovery_scenario(startup: StartupMode) {
     tokio::time::timeout(Duration::from_secs(30), async {
@@ -880,7 +1153,16 @@ async fn recovery_scenario(startup: StartupMode) {
             document_tracker: Arc::clone(translator.document_tracker()), settle: Arc::clone(&settle),
             delivery: Arc::clone(&delivery), floors: Arc::clone(&floors) };
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        let init = spawn_lsp_servers_background(configs, Arc::clone(&translator), cancel_rx, shared);
+        translator.notification_pumps.get_or_init(|| {
+            notification_lifecycle::NotificationPumps::new(shared.clone(), cancel_rx.clone())
+        });
+        let init = spawn_lsp_servers_background(
+            configs,
+            HashSet::new(),
+            Arc::clone(&translator),
+            cancel_rx,
+            shared,
+        );
         let abort_init = AbortOnDrop(&init);
         let server = mcp::McplsServer::new(Arc::clone(&translator), cache, Arc::from(vec![root.clone()]),
             subs, false, Arc::clone(&delivery), floors, config.diagnostics, settle);
