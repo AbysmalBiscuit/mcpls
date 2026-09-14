@@ -703,6 +703,7 @@ impl LspServer {
                         server_id,
                         language_id,
                         command,
+                        missing_binary: e.is_missing_binary(),
                         message: e.to_string(),
                     });
                 }
@@ -1408,6 +1409,7 @@ mod tests {
             server_id: ServerId::from("rust"),
             language_id: "rust".to_string(),
             command: "rust-analyzer".to_string(),
+            missing_binary: false,
             message: "not found".to_string(),
         });
 
@@ -1415,6 +1417,7 @@ mod tests {
             server_id: ServerId::from("python"),
             language_id: "python".to_string(),
             command: "pyright".to_string(),
+            missing_binary: false,
             message: "permission denied".to_string(),
         });
 
@@ -1486,6 +1489,7 @@ mod tests {
             server_id: ServerId::from("python"),
             language_id: "python".to_string(),
             command: "pyright".to_string(),
+            missing_binary: false,
             message: "not found".to_string(),
         });
 
@@ -1594,6 +1598,7 @@ mod tests {
             server_id: ServerId::from("rust"),
             language_id: "rust".to_string(),
             command: "rust-analyzer".to_string(),
+            missing_binary: false,
             message: "not found".to_string(),
         });
 
@@ -1609,6 +1614,7 @@ mod tests {
             server_id: ServerId::from("python"),
             language_id: "python".to_string(),
             command: "pyright".to_string(),
+            missing_binary: false,
             message: "not found".to_string(),
         });
 
@@ -1616,6 +1622,7 @@ mod tests {
             server_id: ServerId::from("typescript"),
             language_id: "typescript".to_string(),
             command: "tsserver".to_string(),
+            missing_binary: false,
             message: "command not found".to_string(),
         });
 
@@ -1674,6 +1681,7 @@ mod tests {
         let failure = &result.failures[0];
         assert_eq!(failure.language_id, "rust");
         assert_eq!(failure.command, "nonexistent-command-12345");
+        assert!(failure.missing_binary);
         assert!(failure.message.contains("spawn"));
     }
 

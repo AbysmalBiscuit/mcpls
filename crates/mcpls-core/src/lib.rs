@@ -2073,12 +2073,14 @@ mod tests {
                 server_id: ServerId::from("rust"),
                 language_id: "rust".to_string(),
                 command: "rust-analyzer".to_string(),
+                missing_binary: false,
                 message: "not found".to_string(),
             });
             result.add_failure(ServerSpawnFailure {
                 server_id: ServerId::from("python"),
                 language_id: "python".to_string(),
                 command: "pyright".to_string(),
+                missing_binary: false,
                 message: "not found".to_string(),
             });
 
@@ -2098,6 +2100,7 @@ mod tests {
                 server_id: ServerId::from("python"),
                 language_id: "python".to_string(),
                 command: "pyright".to_string(),
+                missing_binary: false,
                 message: "not found".to_string(),
             });
 
@@ -2125,12 +2128,14 @@ mod tests {
                     server_id: ServerId::from("rust"),
                     language_id: "rust".to_string(),
                     command: "rust-analyzer".to_string(),
+                    missing_binary: false,
                     message: "command not found".to_string(),
                 },
                 ServerSpawnFailure {
                     server_id: ServerId::from("python"),
                     language_id: "python".to_string(),
                     command: "pyright".to_string(),
+                    missing_binary: false,
                     message: "permission denied".to_string(),
                 },
             ];
@@ -2169,6 +2174,7 @@ mod tests {
                 server_id: ServerId::from("typescript"),
                 language_id: "typescript".to_string(),
                 command: "tsserver".to_string(),
+                missing_binary: false,
                 message: "executable not found in PATH".to_string(),
             };
 
@@ -2192,6 +2198,7 @@ mod tests {
                 server_id: ServerId::from("go"),
                 language_id: "go".to_string(),
                 command: "gopls".to_string(),
+                missing_binary: false,
                 message: "error".to_string(),
             });
 
