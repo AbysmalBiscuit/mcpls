@@ -24,7 +24,7 @@ Restart the session once after installing, from a new terminal if `~/.cargo/bin`
 
 When the `mcpls` on `PATH` does not match the plugin's version, the plugin tells the agent at session start, including which version to install and where to get it. That covers an `mcpls` you installed yourself, an install that failed, and an install still running in another session. A failed install is not retried every session: run the installer from the release page, or delete `~/.local/state/mcpls/bootstrap-failed` and restart.
 
-On Codex, edits made outside Codex's own `apply_patch` tool (a terminal, another agent, a `git checkout`) reach mcpls only once the shared backend's file watcher lands (#23).
+Edits made outside the agent's own edit tools (a terminal, another agent, a `git checkout`) reach mcpls only once the shared backend's file watcher lands (#23, #25). Claude Code's `FileChanged` covers some of them, but only for paths the host already watches: the plugin no longer hands it the checkout to watch, because registering a recursive watch per directory costs more at session start than the reports are worth on a large tree.
 
 To run a local build instead of the release, put it first on `PATH` and stop the plugin from installing over it on upgrade:
 
@@ -43,7 +43,7 @@ On Windows the backend is started by the plugin's hooks rather than by the front
 
 ## Check that it's working
 
-Payload and socket failures exit cleanly without output, so a broken connection can look like a quiet workspace. `SessionStart` reports watch-path scan failures through a non-blocking user warning. To inspect the connection and scan, run:
+Payload and socket failures exit cleanly without output, so a broken connection can look like a quiet workspace. To inspect the connection and scan, run:
 
 ```fish
 mcpls hook doctor
@@ -83,7 +83,7 @@ Line by line:
 - **`backend pid:`** the process id holding the socket, `none` if nothing does, or `unknown` if an owner exists but the exchange did not get far enough to learn its pid (see the fault messages above). When it does print a pid, confirm it names a live `mcpls` process; a pid that no longer exists or belongs to something else means the socket is orphaned: delete the socket file at the path in `socket:` above (a Windows named pipe clears on its own once nothing holds it) so a new mcpls can bind it.
 - **`hooks seen:`** how many `Changed`, `Flush`, or `EndSession` requests this owner has served since it started; a `Status` probe, including the doctor's own, is never counted. Zero is not by itself a fault: `SessionStart` never touches the socket, so an owner that just started, or just took over from a previous one, looks identical to one that has never received a hook. The line's own wording says what to do about a zero.
 - **`mcpls on PATH:`** the absolute path of a candidate found on `PATH`, or `not found`. The doctor does not execute it: a text file named `mcpls.exe` on Windows is still a candidate, not a verified installation. The plugin's MCP server and hooks run this same `PATH` lookup, so this is the binary they run.
-- **`watch scan:`** what a fresh local scan can select for `SessionStart`. An empty successful scan says `no eligible top-level paths`; traversal or ignore-rule failures say `incomplete` and include their causes. A selected path does not prove the host registered it or can read its descendants. Hidden top-level files and directories, including `.github`, are excluded by default. Explicit allow rules in ignore files can include them; for example, `!.github/` in a Git repository's `.gitignore` includes `.github` in the watch scan. After fixing scan errors, restart the session to register a fresh watch list.
+- **`watch scan:`** what a fresh local scan selects as the top of the tree worth watching. Nothing consumes it today: the plugin does not hand the host a watch list, and the backend's own watcher has not landed. An empty successful scan says `no eligible top-level paths`; traversal or ignore-rule failures say `incomplete` and include their causes. Hidden top-level files and directories, including `.github`, are excluded by default. Explicit allow rules in ignore files can include them; for example, `!.github/` in a Git repository's `.gitignore` includes `.github` in the watch scan.
 
 An operation that exceeds the owner's response deadline keeps running in the background. Hook clients remain silent on that response; the deadline does not establish whether the work will succeed or whether a later report will contain diagnostics. The doctor reports a deadline response if it receives one during its probe window.
 
@@ -110,7 +110,7 @@ The `[diagnostics.hooks]` table controls the hook listener:
 | `sweep_quiet_ms` | `500` | How long pending file changes must sit quiet before diagnostics are gathered and delivered. |
 | `op_deadline_ms` | `1500` | How long a hook operation may run before it answers anyway, so a slow op can't block the agent. |
 
-Setting `enabled = false` disables the hook listener, so mcpls binds no socket and socket-dependent hooks receive no diagnostics. `SessionStart` still performs its local watch scan. Use this setting to run mcpls without push diagnostics, for example while diagnosing whether a problem is in the hook path or elsewhere.
+Setting `enabled = false` disables the hook listener, so mcpls binds no socket and socket-dependent hooks receive no diagnostics. Use this setting to run mcpls without push diagnostics, for example while diagnosing whether a problem is in the hook path or elsewhere.
 
 ## What's included
 
