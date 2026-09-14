@@ -784,7 +784,10 @@ impl Translator {
         path: &Path,
         has_headroom: bool,
     ) -> OpenOutcome {
-        let (server, client) = match self.get_client_for_file(path, ToolKind::Diagnostics) {
+        let (server, client) = match self
+            .resolve_client_for_file(path, ToolKind::Diagnostics)
+            .await
+        {
             Ok(resolved) => resolved,
             Err(Error::ServerInitializing { .. }) => return OpenOutcome::Failed,
             Err(_) => return OpenOutcome::NoRoute,

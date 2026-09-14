@@ -13,7 +13,7 @@
 //! would create a `config -> mcp -> bridge -> config` cycle. When a new
 //! routable MCP tool is added, extend [`ToolKind::ALL`] here.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -350,12 +350,25 @@ impl ToolRouter {
             .and_then(|routes| routes.default.as_ref())
     }
 
-    /// Resolve a workspace-wide tool without a language.
+    /// Resolve the first configured server for a workspace-wide tool.
+    /// Explicit claims precede catch-alls, in declaration order.
     ///
     /// # Errors
-    /// Returns [`NoServerReason::NothingRegistered`] when no applicable
-    /// server exists, or [`NoServerReason::NoClaimant`] when none claims `tool`.
+    /// Returns [`NoServerReason::NothingRegistered`] or [`NoServerReason::NoClaimant`].
     pub fn resolve_any(&self, tool: ToolKind) -> std::result::Result<&ServerId, NoServerReason> {
+        self.resolve_any_excluding(tool, &HashSet::new())
+    }
+
+    /// Resolve a workspace-wide tool while skipping unavailable servers.
+    /// Explicit claims precede catch-alls, in declaration order.
+    ///
+    /// # Errors
+    /// Returns [`NoServerReason::NothingRegistered`] or [`NoServerReason::NoClaimant`].
+    pub fn resolve_any_excluding(
+        &self,
+        tool: ToolKind,
+        excluded: &HashSet<ServerId>,
+    ) -> std::result::Result<&ServerId, NoServerReason> {
         let claims_explicitly = |id: &ServerId| {
             self.by_language
                 .values()
@@ -369,8 +382,12 @@ impl ToolRouter {
 
         self.order
             .iter()
-            .find(|id| claims_explicitly(id))
-            .or_else(|| self.order.iter().find(|id| is_catch_all(id)))
+            .find(|id| !excluded.contains(*id) && claims_explicitly(id))
+            .or_else(|| {
+                self.order
+                    .iter()
+                    .find(|id| !excluded.contains(*id) && is_catch_all(id))
+            })
             .ok_or(if self.order.is_empty() {
                 NoServerReason::NothingRegistered
             } else {

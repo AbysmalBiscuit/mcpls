@@ -21,6 +21,7 @@ use crate::lsp::{LspServer, ServerInitConfig};
 ///
 /// A respawn of a server that was running has a warm cache behind it, so
 /// this is generous where the first-spawn budget in `routing.rs` is not.
+#[cfg(test)]
 pub(super) const RESPAWN_WAIT: Duration = Duration::from_secs(5);
 
 /// Tracks respawn attempts for one server, so [`Translator::ensure_server`]

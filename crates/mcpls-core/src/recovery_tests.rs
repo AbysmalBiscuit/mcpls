@@ -1012,19 +1012,8 @@ while True:
     } else {
         None
     };
-    let untouched_lazy_error = if eager_running {
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            runtime
-                .translator
-                .handle_hover(typescript_file.to_string_lossy().into_owned(), 1, 1),
-        )
-        .await
-        .ok()
-        .and_then(Result::err)
-    } else {
-        None
-    };
+    let untouched_lazy_id = ServerId::from("typescript");
+    let untouched_lazy_state = runtime.translator.lifecycle_of(&untouched_lazy_id);
     let lazy_processes = std::fs::read_to_string(control.join("lazy.pids"))
         .unwrap_or_default()
         .lines()
@@ -1043,11 +1032,7 @@ while True:
         first_symbols, second_symbols,
         "lazy client changed during batch registration"
     );
-    assert!(matches!(
-        untouched_lazy_error,
-        Some(Error::ServerInitializing { server_id })
-            if server_id == ServerId::from("typescript")
-    ));
+    assert_eq!(untouched_lazy_state, Some(ServerLifecycle::Idle));
 }
 
 #[tokio::test]
