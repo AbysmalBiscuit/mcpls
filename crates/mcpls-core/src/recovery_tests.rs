@@ -1013,6 +1013,15 @@ while True:
         None
     };
     let untouched_lazy_id = ServerId::from("typescript");
+    assert!(
+        matches!(
+            runtime
+                .translator
+                .get_client_for_file(&typescript_file, crate::config::ToolKind::Hover),
+            Ok((id, None)) if id == untouched_lazy_id
+        ),
+        "the untouched lazy route resolves to its identity without a client"
+    );
     let untouched_lazy_state = runtime.translator.lifecycle_of(&untouched_lazy_id);
     let lazy_processes = std::fs::read_to_string(control.join("lazy.pids"))
         .unwrap_or_default()

@@ -762,9 +762,9 @@ impl Translator {
     /// the next tool call that much closer to the document limit.
     ///
     /// `has_headroom` says whether the caller can afford one more tracked
-    /// document. It is read after routing rather than before the call, so a
-    /// path nothing routes is never reported against the document limit it
-    /// was not competing for.
+    /// document. Route selection happens first, so a path nothing routes is
+    /// never reported against the document limit it was not competing for;
+    /// startup and opening wait until the caller has capacity.
     ///
     /// A route to a server that is still starting is [`OpenOutcome::Failed`],
     /// not [`OpenOutcome::NoRoute`]: servers spawn in the background, so a
@@ -784,17 +784,25 @@ impl Translator {
         path: &Path,
         has_headroom: bool,
     ) -> OpenOutcome {
+        if let Err(Error::NoServerForLanguage(_) | Error::NoServerForTool { .. }) =
+            self.get_client_for_file(path, ToolKind::Diagnostics)
+        {
+            return OpenOutcome::NoRoute;
+        }
+        if !has_headroom {
+            return OpenOutcome::NoHeadroom;
+        }
+
         let (server, client) = match self
             .resolve_client_for_file(path, ToolKind::Diagnostics)
             .await
         {
             Ok(resolved) => resolved,
-            Err(Error::ServerInitializing { .. }) => return OpenOutcome::Failed,
-            Err(_) => return OpenOutcome::NoRoute,
+            Err(Error::NoServerForLanguage(_) | Error::NoServerForTool { .. }) => {
+                return OpenOutcome::NoRoute;
+            }
+            Err(_) => return OpenOutcome::Failed,
         };
-        if !has_headroom {
-            return OpenOutcome::NoHeadroom;
-        }
         match self
             .document_tracker
             .ensure_open(path, &server, &client)
@@ -1060,12 +1068,13 @@ impl Default for Translator {
 mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     use tokio::time::Duration;
 
     use self::testing::TranslatorHarness;
     use super::*;
-    use crate::config::{ServerId, ToolKind};
+    use crate::config::{ServerId, ToolKind, ToolRouter};
     use crate::error::Error;
 
     #[test]
@@ -1334,6 +1343,44 @@ mod tests {
             vec!["textDocument/didOpen", "textDocument/didSave"]
         );
         assert!(harness.translator.document_tracker().is_open(&path));
+    }
+
+    fn translator_with_idle_rust_route() -> (Arc<Translator>, ServerId) {
+        let id = ServerId::from("rust");
+        let translator = Arc::new(
+            Translator::new()
+                .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]))
+                .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())])),
+        );
+        translator.set_lifecycle(&id, ServerLifecycle::Idle);
+        translator.set_self_handle(Arc::downgrade(&translator));
+        (translator, id)
+    }
+
+    #[tokio::test]
+    async fn open_untracked_document_with_no_headroom_does_not_start_idle_server() {
+        let (translator, id) = translator_with_idle_rust_route();
+        let path = PathBuf::from("/workspace/main.rs");
+
+        let outcome = translator.open_untracked_document(&path, false).await;
+
+        assert_eq!(outcome, OpenOutcome::NoHeadroom);
+        assert_eq!(
+            translator.lifecycle_of(&id),
+            Some(ServerLifecycle::Idle),
+            "a capacity check must not trigger a lazy server"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_untracked_document_reports_routed_spawn_failure_as_failed() {
+        let (translator, id) = translator_with_idle_rust_route();
+        let path = PathBuf::from("/workspace/main.rs");
+
+        let outcome = translator.open_untracked_document(&path, true).await;
+
+        assert_eq!(outcome, OpenOutcome::Failed);
+        assert_eq!(translator.lifecycle_of(&id), Some(ServerLifecycle::Failed));
     }
 
     #[tokio::test]

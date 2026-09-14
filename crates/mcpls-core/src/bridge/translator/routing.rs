@@ -87,7 +87,7 @@ impl Translator {
     /// Resolve the configured server and client for `path` and `tool`.
     ///
     /// Tries the detected language first, then its React base language.
-    pub(super) fn get_client_for_file(
+    pub(crate) fn get_client_for_file(
         &self,
         path: &Path,
         tool: ToolKind,
