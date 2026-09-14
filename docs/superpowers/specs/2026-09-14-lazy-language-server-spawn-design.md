@@ -76,6 +76,8 @@ An eager server is spawned in the startup batch and registered by `register_serv
 async fn ensure_server(&self, id: &ServerId, budget: Option<Duration>) -> Result<()>
 ```
 
+A `budget` of `None` starts the spawn and returns, which is what the sweep passes. `Some(d)` waits up to `d` for a terminal state and is what a tool call passes.
+
 The settled states return without touching the process table. `Running` and alive is success. `NotInstalled` is `ServerUnavailable` naming the command that was not found. `Failed` inside its backoff window is today's `ServerUnavailable` naming the remaining delay. Otherwise `ensure_server` moves the entry from `Idle` to `Starting` under the map lock and starts a spawn task, and the caller waits.
 
 That write is the single-flight test as well as a state change. A caller that finds the entry already `Starting` subscribes and waits rather than starting a second task, so whether a spawn is under way has one answer and the map holds it.
