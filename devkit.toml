@@ -128,11 +128,6 @@ description = "Build workspace API documentation"
 run = ["cargo", "doc", "--workspace", "--no-deps", "--all-features", "--locked"]
 guard = true
 
-[tasks.hooks]
-description = "Point git at the repository's hook directory"
-run = ["git", "config", "core.hooksPath", ".githooks"]
-guard = true
-
 [tasks.clean]
 description = "Remove Cargo build artifacts"
 run = ["cargo", "clean"]
