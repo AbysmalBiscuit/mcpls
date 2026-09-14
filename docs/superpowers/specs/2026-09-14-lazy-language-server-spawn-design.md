@@ -40,7 +40,7 @@ The applicable set keeps its current meaning: which servers this checkout could 
 - `Idle`: applicable, config registered, never triggered.
 - `Starting`: a spawn is in flight.
 - `Running`: registered in `lsp_servers` and alive.
-- `Unavailable`: the spawn failed because the binary is not there. Remembered for the backend's life.
+- `NotInstalled`: the spawn failed because the binary is not there. Remembered for the backend's life. Named for what is wrong rather than for the consequence, so it does not read as a synonym of the `ServerUnavailable` error, which covers this state and the backed-off one alike.
 - `Failed`: spawned and died, inside the existing respawn backoff.
 
 Routing keeps reading `lsp_servers`, which stays the registry a tool call resolves against. The map answers what state a server is in, which nothing could answer before. `ensure_server` is the only writer after setup, which is what keeps the two from drifting apart.
@@ -74,9 +74,11 @@ An eager server is spawned in the startup batch and registered by `register_serv
 async fn ensure_server(&self, id: &ServerId, budget: Option<Duration>) -> Result<()>
 ```
 
-The settled states return without touching the process table. `Running` and alive is success. `Unavailable` is `ServerUnavailable` naming the command that was not found. `Failed` inside its backoff window is today's `ServerUnavailable` naming the remaining delay. Otherwise a spawn task is started for that id, if one is not already running, and the caller waits.
+The settled states return without touching the process table. `Running` and alive is success. `NotInstalled` is `ServerUnavailable` naming the command that was not found. `Failed` inside its backoff window is today's `ServerUnavailable` naming the remaining delay. Otherwise a spawn task is started for that id, if one is not already running, and the caller waits.
 
 The spawn runs in a detached task, and the bounded wait is what forces that. A spawn awaited inline under a timeout would be cancelled when the timed-out future is dropped, so the tool call that triggered the work would also destroy it and a retry would start again from nothing. Detaching is what separates giving up waiting from giving up spawning. The single-flight lock (`crates/mcpls-core/src/bridge/translator/respawn.rs:71`) moves inside that task, so two triggers for one language still produce one process.
+
+Detaching needs an owned handle, and nothing on the path to `ensure_server` has one. `resolve_client_for_file` takes `&self`, and so does every tool method above it. `Translator` therefore keeps a `Weak` reference to itself, set once during setup where the `Arc` already exists, and `ensure_server` upgrades it for the task. The alternative, threading `self: &Arc<Self>` down from every tool entry point, spreads a receiver change across the whole translator surface to reach one function. A translator built without that handle, which is every unit test that does not spawn, simply cannot start a server lazily.
 
 Waiters use a per-id `tokio::sync::watch<ServerLifecycle>` created with the map entry. The spawn task publishes each transition. A watch rather than a notify, because it carries the state and leaves no lost-wakeup window between reading the map and subscribing.
 
@@ -102,7 +104,7 @@ The budget is a constant, not a configuration key. It covers a fast handshake su
 
 `workspace_symbol_search` has no file to resolve a language from, which is why `WorkspaceServersInitializing` exists as its own error. Under lazy spawning it can find nothing running at all, and answering a whole-workspace query from zero servers would return an empty result rather than an error, which is worse than failing.
 
-A workspace-wide tool ensures every applicable server on the same bounded budget, then answers from whatever reached `Running`. If any applicable server is still `Starting` when the budget expires, it returns `WorkspaceServersInitializing` rather than a partial answer, which keeps that error meaning what it means today: the result would be incomplete, wait and ask again. A server that is `Unavailable` or `Failed` does not hold the answer back, since waiting for it would never end.
+A workspace-wide tool ensures every applicable server on the same bounded budget, then answers from whatever reached `Running`. If any applicable server is still `Starting` when the budget expires, it returns `WorkspaceServersInitializing` rather than a partial answer, which keeps that error meaning what it means today: the result would be incomplete, wait and ask again. A server that is `NotInstalled` or `Failed` does not hold the answer back, since waiting for it would never end.
 
 An agent asking for a workspace-wide symbol search has declared interest in the whole checkout, so this stays demand-driven rather than a startup cost. It is the one path on which a single tool call can start every server in a large monorepo.
 
@@ -110,7 +112,9 @@ An agent asking for a workspace-wide symbol search has declared interest in the 
 
 `Error::ServerSpawnFailed` carries the underlying `io::Error` as its source (`crates/mcpls-core/src/lsp/lifecycle.rs:377`), so `ErrorKind::NotFound` identifies a missing binary exactly and no string matching is needed.
 
-A not-found spawn records `Unavailable` once and is never attempted again for the life of that backend. The environment a backend runs with, `PATH` included, is fixed when it starts, so an attempt that failed to find a binary fails identically every time after. Installing the binary mid-session does not bring the server back; the next backend picks it up, and the doctor says why the language is dark.
+The eager path never sees that error. `spawn_batch` turns each failure into a `ServerSpawnFailure` holding a formatted message rather than the error itself (`crates/mcpls-core/src/lsp/lifecycle.rs:671`), so by the time `register_servers` could record a state, the kind is gone. The judgement therefore belongs on `Error`, where the source is still typed, and its answer travels on `ServerSpawnFailure` as a field. Both the eager batch and a lazy trigger then record the same state from the same test, rather than one of them guessing from a string.
+
+A not-found spawn records `NotInstalled` once and is never attempted again for the life of that backend. The environment a backend runs with, `PATH` included, is fixed when it starts, so an attempt that failed to find a binary fails identically every time after. Installing the binary mid-session does not bring the server back; the next backend picks it up, and the doctor says why the language is dark.
 
 The command is not resolved against `PATH` ahead of the spawn to avoid the attempt. That duplicates what exec already does and races anything writing to `PATH`. Costing nothing at backend start means one lazy attempt, not zero attempts.
 
@@ -152,7 +156,9 @@ The inline budget for the tool-call fallback is set by guess rather than measure
 
 **A `spawn_if_absent` beside `respawn_if_dead`.** Sharing the single-flight lock and the backoff table but not the body leaves the respawn path untouched, so it carries no regression risk there. It also puts the install sequence in two places. That sequence is neither small nor obvious, every step of it carries a comment explaining why it must happen where it does, and two copies diverge the first time one of them is fixed.
 
-**A spawn supervisor task fed by a channel.** One task owning every spawn serializes them and keeps callers off the locks. The bounded wait means a tool call still has to learn when its own spawn finished, so the per-identity waiter map comes back with an extra task in front of it. It also moves the missing-binary state away from the backoff table that already models the distinction it needs.
+**A spawn supervisor task fed by a channel.** One task owning every spawn serializes them, keeps callers off the locks, and holds the owned handle the detached spawn needs without a `Weak` reference back to the translator. That last point is the real argument for it, and it is close. What decides against it is that the supervisor is a second place where a server can be starting: the lifecycle map says `Starting`, the channel holds a request the supervisor has not picked up yet, and the two disagree for as long as the queue is non-empty. A task spawned at the point of decision leaves one answer to the question of whether a spawn is under way.
+
+Its other advantage costs less than it looks. The waiter map a supervisor would need already exists as the lifecycle watch, so it is not an argument either way.
 
 **The first read as the trigger.** Named in the issue, and wrong twice over. Reads are not reported by the hook protocol, so it is not the free signal it was described as; and an agent reads across a whole tree while working in one language, so it would start rust-analyzer in exactly the session this design exists to keep it out of. Adding a read hook would also be Claude-only, since Codex wires `PostToolUse` on `apply_patch` alone (`plugin/hooks/hooks-codex.json`), which would give two hosts different startup behaviour for one checkout and one backend.
 
