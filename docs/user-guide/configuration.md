@@ -31,7 +31,8 @@ MCPLS_TRUST_PROJECT_CONFIG=true mcpls
 Without this flag, a `mcpls.toml` at the checkout root is ignored (a warning
 is logged naming the ignored path) and mcpls falls through to the user config
 directory or built-in defaults — including built-in project-marker heuristics, so
-e.g. a `Cargo.toml` in the workspace still spawns rust-analyzer. An explicit
+e.g. a `Cargo.toml` in the workspace still makes rust-analyzer applicable, and
+a session that touches Rust starts it. An explicit
 `--config <path>` or `$MCPLS_CONFIG` is always trusted, since naming a path is
 itself the user's consent.
 
@@ -373,6 +374,32 @@ separate, fixed 5 s timeout that is not configurable.
 timeout_seconds = 60  # Increase for servers slow to complete `initialize`
 ```
 
+### `spawn`
+
+**Type**: String
+**Default**: whatever `[backend] spawn` says, which is `"lazy"`
+**Options**: `"eager"`, `"lazy"`
+
+When this server starts, overriding the backend default for this entry alone.
+`"lazy"` holds the server back until a session shows it needs the language,
+either through a file the agent's hooks report or through a tool call that
+routes here. `"eager"` starts it with the backend whether or not the session
+uses it.
+
+Raise it to `"eager"` for a server whose index is slow enough that the first
+request should not wait on it, and accept that the process starts in every
+session for that checkout. A server whose binary is not installed costs
+nothing while it stays lazy.
+
+```toml
+[[lsp_servers]]
+language_id = "rust"
+spawn = "eager"  # Prime rust-analyzer's index at backend start
+```
+
+An entry that sets only `spawn` overlays a server an earlier entry already
+resolved, so a built-in can be made eager without restating its `command`.
+
 ### `request_timeout_seconds`
 
 **Type**: Integer
@@ -529,10 +556,12 @@ mutually exclusive `heuristics.project_markers` — where only one of the two
 servers is ever applicable in a given workspace — is not ambiguous and
 starts normally.
 
-**If the server a tool is routed to fails to spawn**, that tool's requests
-move to the language's catch-all server, if one is running; otherwise they
-report no server available for that tool rather than silently falling back
-to a server that explicitly declined it via `handles`.
+**If the server a tool is routed to has no binary to run**, that tool's
+requests move to the language's catch-all server, starting it if it has not
+started yet; otherwise they report no server available for that tool rather
+than silently falling back to a server that explicitly declined it via
+`handles`. A server that started and then failed is retried on the next
+request rather than routed around, so its requests stay with it.
 
 **Exception: `workspace_symbol_search`.** This tool has no document, so it
 has no language to route on. It resolves, across all configured servers, to

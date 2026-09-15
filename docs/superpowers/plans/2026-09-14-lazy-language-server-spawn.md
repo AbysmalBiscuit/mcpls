@@ -60,7 +60,7 @@ No behaviour changes. This task adds the key, its default, and the per-server ov
 - Consumes: nothing.
 - Produces: `config::SpawnPolicy` (`Lazy` or `Eager`; `Copy`, `PartialEq`, `Eq`, `Debug`), `BackendConfig::spawn: SpawnPolicy`, `LspServerConfig::spawn: Option<SpawnPolicy>`, and `LspServerConfig::effective_spawn(&self, backend: SpawnPolicy) -> SpawnPolicy`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Add to the `mod tests` block at the bottom of `crates/mcpls-core/src/config/server.rs`:
 
@@ -123,12 +123,12 @@ fn test_the_backend_spawn_policy_is_read_from_config() {
 
 `spawn` also has to be added to the `PartialLspServerConfig` at `crates/mcpls-core/src/config/server.rs:413` and to its `merge` at `:531`, or the third test's second entry has nowhere to carry the key and the merge cannot apply it.
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo nextest run -p mcpls-core spawn`
 Expected: FAIL to compile, `cannot find type SpawnPolicy in this scope`.
 
-- [ ] **Step 3: Add the enum**
+- [x] **Step 3: Add the enum**
 
 In `crates/mcpls-core/src/config/server.rs`, above `ServerHeuristics`:
 
@@ -147,7 +147,7 @@ pub enum SpawnPolicy {
 
 `Eager` is the derived default so this task changes no behaviour. Task 10 moves `#[default]` to `Lazy`.
 
-- [ ] **Step 4: Add the per-server key**
+- [x] **Step 4: Add the per-server key**
 
 In the same file, add a field to `LspServerConfig` beside `timeout_seconds`:
 
@@ -178,7 +178,7 @@ Add the same field to `PartialLspServerConfig`, beside its `enabled` field:
 
 Do the same for `from_partial`: carry `partial.spawn` onto the built config. Fix every other site the compiler names, including any struct literal of `LspServerConfig` in tests or in the built-in server table.
 
-- [ ] **Step 5: Add the accessor**
+- [x] **Step 5: Add the accessor**
 
 In the `impl LspServerConfig` block:
 
@@ -191,7 +191,7 @@ In the `impl LspServerConfig` block:
     }
 ```
 
-- [ ] **Step 6: Add the backend key**
+- [x] **Step 6: Add the backend key**
 
 In `crates/mcpls-core/src/config/mod.rs`, add to `BackendConfig`:
 
@@ -207,7 +207,7 @@ In `crates/mcpls-core/src/config/mod.rs`, add to `BackendConfig`:
 
 `BackendConfig` carries `#[serde(deny_unknown_fields)]`, so this is what makes `spawn = "lazy"` accepted there rather than rejected. Add `spawn: SpawnPolicy::default()` to its `Default` impl, and re-export `SpawnPolicy` wherever `config` re-exports `LspServerConfig`.
 
-- [ ] **Step 7: Document the key**
+- [x] **Step 7: Document the key**
 
 `crates/mcpls-core/src/config/mod.rs` holds a commented example configuration, the block containing `# idle_shutdown_ms = 10000`. Add beside it:
 
@@ -217,7 +217,7 @@ In `crates/mcpls-core/src/config/mod.rs`, add to `BackendConfig`:
 
 Then add the key to `docs/user-guide/configuration.md`, following the shape that file already uses for `idle_shutdown_ms`: what it does, what the default is, and that a `[[lsp_servers]]` entry can override it.
 
-- [ ] **Step 8: Run the tests to verify they pass**
+- [x] **Step 8: Run the tests to verify they pass**
 
 Run: `cargo nextest run -p mcpls-core spawn`
 Expected: PASS.
@@ -225,7 +225,7 @@ Expected: PASS.
 Run: `devrun task verify`
 Expected: PASS.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 devrun task commit --arg commit_subject='feat(config): add a spawn policy key' --arg commit_body=$'A server can now be marked lazy or eager, on the backend as a default\nand on an individual server entry as an override. Nothing reads the\nkey yet and the default stays eager, so behaviour is unchanged.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>'
@@ -246,7 +246,7 @@ devrun task commit --arg commit_subject='feat(config): add a spawn policy key' -
 - Consumes: `config::ServerId`, `config::SpawnPolicy`, `LspServerConfig::effective_spawn`, `Translator::register_server_config`.
 - Produces: `bridge::ServerLifecycle` with variants `Idle`, `Starting`, `Running`, `NotInstalled`, `Failed`, deriving `Copy`, `PartialEq`, `Eq`, `Debug`, `Display`, `Serialize`, `Deserialize`, `EnumIter`. On `Translator`: `set_lifecycle(&self, id: &ServerId, state: ServerLifecycle)`, `begin_starting(&self, id: &ServerId) -> bool`, `lifecycle_of(&self, id: &ServerId) -> Option<ServerLifecycle>`, `lifecycles(&self) -> Vec<(ServerId, ServerLifecycle)>` sorted by id, and `subscribe_lifecycle(&self, id: &ServerId) -> watch::Receiver<ServerLifecycle>`.
 
-- [ ] **Step 1: Add the dependency**
+- [x] **Step 1: Add the dependency**
 
 In the workspace `Cargo.toml`, under `[workspace.dependencies]`, which is sorted alphabetically, add between `serde_json` and `tempfile`:
 
@@ -260,12 +260,12 @@ In `crates/mcpls-core/Cargo.toml`, under `[dependencies]`, add:
 strum = { workspace = true }
 ```
 
-- [ ] **Step 2: Verify the dependency is allowed**
+- [x] **Step 2: Verify the dependency is allowed**
 
 Run: `cargo deny check licenses`
 Expected: PASS. If strum's license is not in `deny.toml`'s `[licenses] allow` list, add it there in this same commit rather than working around it.
 
-- [ ] **Step 3: Write the failing tests**
+- [x] **Step 3: Write the failing tests**
 
 Create `crates/mcpls-core/src/bridge/translator/lifecycle.rs` containing only its test module for now:
 
@@ -365,12 +365,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 4: Run the tests to verify they fail**
+- [x] **Step 4: Run the tests to verify they fail**
 
 Run: `cargo nextest run -p mcpls-core lifecycle`
 Expected: FAIL to compile, `file not found for module lifecycle` until Step 6 declares it, then `cannot find type ServerLifecycle`.
 
-- [ ] **Step 5: Write the enum and the accessors**
+- [x] **Step 5: Write the enum and the accessors**
 
 At the top of `crates/mcpls-core/src/bridge/translator/lifecycle.rs`, above the test module:
 
@@ -492,7 +492,7 @@ pub(super) type LifecycleSenders = HashMap<ServerId, watch::Sender<ServerLifecyc
 
 Both writers take the two locks in the order `lifecycles` then `lifecycle_senders`, and broadcast before releasing either. Every other method in this file that takes both must do the same: the order prevents a deadlock, and holding `lifecycles` across the `send_replace` is what keeps the map and the watch telling one story. `send_replace` does not block or await, so nothing waits on a lock while holding these. If `ServerId` does not already derive `Ord`, add `PartialOrd` and `Ord` to its derives where it is defined, since `lifecycles` sorts by it.
 
-- [ ] **Step 6: Wire the module and the fields**
+- [x] **Step 6: Wire the module and the fields**
 
 In `crates/mcpls-core/src/bridge/translator/mod.rs`, declare the module beside the existing `mod respawn;`:
 
@@ -520,7 +520,7 @@ Initialize both in `Translator::new`:
             lifecycle_senders: Arc::new(StdMutex::new(HashMap::new())),
 ```
 
-- [ ] **Step 7: Populate the map and the configs at setup**
+- [x] **Step 7: Populate the map and the configs at setup**
 
 Membership is what makes a server applicable, so the map has to be filled in the same commit that introduces it. `ensure_server` in Task 4 refuses an id the map does not hold, and `register_server_config` is what a spawn reads its command from; leaving either to a later task would mean two commits in which a crashed server can no longer be replaced.
 
@@ -552,7 +552,7 @@ An eager entry starts at `Starting`, not `Idle`: `spawn_batch` does not take the
 
 Nothing reads the map yet, so this commit changes no behaviour. It is here so that everything after it can assume the map is populated.
 
-- [ ] **Step 8: Run the tests to verify they pass**
+- [x] **Step 8: Run the tests to verify they pass**
 
 Run: `cargo nextest run -p mcpls-core lifecycle`
 Expected: PASS.
@@ -560,7 +560,7 @@ Expected: PASS.
 Run: `devrun task verify`
 Expected: PASS.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 devrun task commit --arg commit_subject='feat(bridge): track a state per language server' --arg commit_body=$'A server is idle, starting, running, missing its binary, or failed.\nSetup fills the map from the applicable set and registers each spawn\nconfig beside it, so membership is what makes a server applicable.\nNothing reads the map yet, and lsp_servers stays the registry routing\nresolves against.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>'
@@ -581,7 +581,7 @@ devrun task commit --arg commit_subject='feat(bridge): track a state per languag
 - Consumes: nothing.
 - Produces: `Error::is_missing_binary(&self) -> bool`, and `ServerSpawnFailure::missing_binary: bool`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Add to the `mod tests` block in `crates/mcpls-core/src/error.rs`:
 
@@ -614,12 +614,12 @@ fn test_a_handshake_failure_is_not_a_missing_binary() {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo nextest run -p mcpls-core missing_binary`
 Expected: FAIL to compile, `no method named is_missing_binary`.
 
-- [ ] **Step 3: Add the classifier**
+- [x] **Step 3: Add the classifier**
 
 `crates/mcpls-core/src/error.rs` has no `impl Error` block: it holds the enum, its `Display`, and the `ServerSpawnFailure` struct beside them. Add one below the enum, before the test module:
 
@@ -639,7 +639,7 @@ Expected: FAIL to compile, `no method named is_missing_binary`.
     }
 ```
 
-- [ ] **Step 4: Carry the answer on the batch failure**
+- [x] **Step 4: Carry the answer on the batch failure**
 
 Add a field to `ServerSpawnFailure` in the same file, beside `message`:
 
@@ -664,7 +664,7 @@ In `crates/mcpls-core/src/lsp/lifecycle.rs`, the `Err(e)` arm of `spawn_batch` c
 
 Fix every other `ServerSpawnFailure` literal the compiler names, including the ones in that file's tests, with `missing_binary: false` unless the test is about a missing binary.
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo nextest run -p mcpls-core missing_binary`
 Expected: PASS.
@@ -672,7 +672,7 @@ Expected: PASS.
 Run: `devrun task verify`
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 devrun task commit --arg commit_subject='feat(error): classify a missing server binary' --arg commit_body=$'A spawn that failed because the command is not on PATH is a different\nfact from one that failed for any other reason, and only the first is\npermanent for a backend. The answer is read from the io::Error kind and\ncarried on the batch failure, which formats the error away.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>'
@@ -697,7 +697,7 @@ devrun task commit --arg commit_subject='feat(error): classify a missing server 
 - Consumes: `ServerLifecycle`, `Translator::begin_starting`, `Translator::set_lifecycle`, `Translator::subscribe_lifecycle`, `Translator::lifecycle_of`, `Error::is_missing_binary`.
 - Produces: `Translator::ensure_server(&self, id: &ServerId, budget: Option<Duration>) -> Result<()>`, `Translator::set_self_handle(&self, handle: Weak<Translator>)`, and `respawn::RESPAWN_WAIT`. `build_translator` returns `Arc<Translator>` instead of `Translator`. `respawn_if_dead` no longer exists.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Add to the `mod tests` block in `crates/mcpls-core/src/bridge/translator/respawn.rs`:
 
@@ -789,12 +789,12 @@ async fn test_a_budget_that_expires_leaves_the_spawn_running() {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo nextest run -p mcpls-core ensure_server`
 Expected: FAIL to compile, `no method named ensure_server`.
 
-- [ ] **Step 3: Add the self handle**
+- [x] **Step 3: Add the self handle**
 
 In `crates/mcpls-core/src/bridge/translator/mod.rs`, add to the `Translator` struct:
 
@@ -818,7 +818,7 @@ Initialize it as `OnceLock::new()` in `Translator::new`, and add the setter besi
     }
 ```
 
-- [ ] **Step 4: Write the guard**
+- [x] **Step 4: Write the guard**
 
 At the top of `crates/mcpls-core/src/bridge/translator/respawn.rs`:
 
@@ -857,7 +857,7 @@ impl Drop for SpawnGuard {
 
 `record_respawn_failure` is currently private to the `impl Translator` block in this file. It stays in the same module, so no visibility change is needed; if the compiler disagrees, widen it to `pub(super)` rather than duplicating it.
 
-- [ ] **Step 5: Turn `respawn_if_dead` into `ensure_server`**
+- [x] **Step 5: Turn `respawn_if_dead` into `ensure_server`**
 
 Rename the method and change its head. Everything from `self.forget_watch_registrations(id)` to `self.record_respawn_success(id)` moves into the detached task unchanged.
 
@@ -941,7 +941,7 @@ Rename the method and change its head. Everything from `self.forget_watch_regist
     }
 ```
 
-- [ ] **Step 6: Write the spawn body and the wait**
+- [x] **Step 6: Write the spawn body and the wait**
 
 In the same `impl Translator` block:
 
@@ -1025,7 +1025,7 @@ In the same `impl Translator` block:
 
 One consequence of detaching is worth stating rather than fixing. `shutdown` at `crates/mcpls-core/src/lib.rs:1066` awaits the LSP init task and drains the server map, but it does not await a detached `run_spawn`. A spawn still in flight holds a strong `Arc<Translator>`, so it can finish and insert a fresh `LspServer` into a map that was already drained. The child is not orphaned: `kill_on_drop` at `crates/mcpls-core/src/lsp/lifecycle.rs:446` kills it when the translator drops, which is when the backend exits. So the window costs one extra process between the drain and process exit, and closing it would mean either a shutdown flag every install checks or a handle set `shutdown` awaits. Neither is worth it for a process that is about to die anyway.
 
-- [ ] **Step 7: Update the call sites**
+- [x] **Step 7: Update the call sites**
 
 `crates/mcpls-core/src/bridge/translator/routing.rs:77` and `crates/mcpls-core/src/bridge/translator/symbols.rs:212` call `respawn_if_dead(&id).await?`. Both become:
 
@@ -1047,7 +1047,7 @@ pub(super) const RESPAWN_WAIT: Duration = Duration::from_secs(5);
 
 This keeps today's behaviour for a crashed server: the call waits and then either gets the replacement or is told to retry, where before it waited without a bound.
 
-- [ ] **Step 8: Adapt the existing respawn tests**
+- [x] **Step 8: Adapt the existing respawn tests**
 
 Eleven tests in this module call `respawn_if_dead` on a `Translator::new()` that has neither a self handle nor a map entry. Renaming the method is not enough: without a handle the spawn cannot start, and without a map entry `ensure_server` refuses the id. Production gets both from setup; a test that builds a translator by hand does them here.
 
@@ -1211,7 +1211,7 @@ Update its doc comment to say the returned translator can spawn, then drop `let 
 
 This is also the answer to the cost the spec accepted when it chose a stored handle over threading `&Arc<Self>` through the call chain. That cost is real, and it lands as a setup step every hand-built translator must remember. Putting the step inside the shared constructor is what keeps it from becoming a fixture each new test rediscovers by watching a spawn silently fail.
 
-- [ ] **Step 9: Run the tests to verify they pass**
+- [x] **Step 9: Run the tests to verify they pass**
 
 Run: `cargo nextest run -p mcpls-core ensure_server`
 Expected: PASS.
@@ -1225,7 +1225,7 @@ Expected: PASS.
 Run: `devrun task verify`
 Expected: PASS.
 
-- [ ] **Step 10: Commit**
+- [x] **Step 10: Commit**
 
 ```bash
 devrun task commit --arg commit_subject='refactor(bridge): generalize respawn to ensure' --arg commit_body=$'A never-spawned server and a crashed one are one operation from two\nstarting states. The spawn moves into a detached task so a caller that\nstops waiting does not destroy it, and a drop guard publishes a terminal\nstate for a task that ends without one, which would otherwise leave the\nserver starting for the life of the backend.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>'
@@ -1250,7 +1250,7 @@ The diagnostics baseline is adopted once, after the startup batch, and seeds eve
 - Consumes: `Translator::run_spawn`, `ServerSettle::register_diagnostics_owner`.
 - Produces: `DiagnosticsDelivery::merge_baseline(&mut self, entries: HashMap<String, u64>)`, `NotificationPumps::shared(&self) -> &PumpShared`, `NotificationPumps::settle(&self) -> &ServerSettle`, `ServerSettle::diagnostics_owner_count(&self) -> usize`, and `crate::baseline_merge_task(shared: PumpShared, owner: ServerId, cancel_rx: watch::Receiver<bool>)`. `ServerSettle::register_diagnostics_owner` now also sets `owners_installed`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Add to the `mod tests` block in `crates/mcpls-core/src/bridge/delivery.rs`. It already has `entry(key, &diags, floor)`, `diagnostic(line, severity, message)` and `SessionId::from("s".to_string())`; these use them.
 
@@ -1319,12 +1319,12 @@ fn test_a_merge_does_not_rewrite_what_a_session_already_believes() {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo nextest run -p mcpls-core merge_baseline`
 Expected: FAIL to compile, `no method named merge_baseline`.
 
-- [ ] **Step 3: Write the merge**
+- [x] **Step 3: Write the merge**
 
 In `crates/mcpls-core/src/bridge/delivery.rs`, beside `set_baseline`:
 
@@ -1350,7 +1350,7 @@ In `crates/mcpls-core/src/bridge/delivery.rs`, beside `set_baseline`:
     }
 ```
 
-- [ ] **Step 4: Write the per-owner merge task**
+- [x] **Step 4: Write the per-owner merge task**
 
 In `crates/mcpls-core/src/lib.rs`, beside `baseline_task`:
 
@@ -1403,7 +1403,7 @@ async fn baseline_merge_task(
 
 If `diagnostics_entries` yields the owner by reference or by a different type than the comparison above expects, adjust the filter to match its real signature rather than changing the method.
 
-- [ ] **Step 5: Start the merge from a successful spawn**
+- [x] **Step 5: Start the merge from a successful spawn**
 
 Add the accessor in `crates/mcpls-core/src/notification_lifecycle.rs`, in the `impl NotificationPumps` block:
 
@@ -1509,7 +1509,7 @@ Add a test to `crates/mcpls-core/src/bridge/settle.rs`'s `mod tests` for the sta
 
 The owner has never reported progress, so the per-owner branch holds it for `NO_PROGRESS_GRACE` rather than `quiet_for`. Without the `owners_installed` line the workspace-wide branch answers instead, and 50ms is well past its 10ms debounce, so the assertion fails.
 
-- [ ] **Step 6: Move the two setup pieces**
+- [x] **Step 6: Move the two setup pieces**
 
 In `crates/mcpls-core/src/lib.rs`, `spawn_lsp_servers_background` initializes the notification pumps at `:1119`. Move that `get_or_init` call to the setup path, before the `if applicable_configs.is_empty()` branch at `:719`, so a lazily started server always has a pump to deliver through.
 
@@ -1544,7 +1544,7 @@ Then widen the empty-baseline condition at `:719`. It reads `applicable_configs.
 
 Keep the existing `warn!` about protocol-only mode on the branch where `applicable_configs` itself is empty, since that is still the case it describes.
 
-- [ ] **Step 7: Run the tests to verify they pass**
+- [x] **Step 7: Run the tests to verify they pass**
 
 Run: `cargo nextest run -p mcpls-core merge_baseline`
 Expected: PASS.
@@ -1555,7 +1555,7 @@ Expected: PASS. The recovery tests at `crates/mcpls-core/src/recovery_tests.rs:8
 Run: `devrun task verify`
 Expected: PASS.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 devrun task commit --arg commit_subject='fix(bridge): extend the baseline per owner' --arg commit_body=$'The baseline was adopted once, after the startup batch, and seeded every\nsession record. A server starting after that point published the\nwarnings the workspace already had into records that had never seen\nthem, and the next flush reported all of them as new work.\n\nEach owner now merges its own settled entries into the baseline and into\nevery live session record, taking only the keys nobody holds yet. The\nnotification pumps move to setup, where a server that starts without a\nstartup batch can still reach one.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>'
@@ -1580,7 +1580,7 @@ devrun task commit --arg commit_subject='fix(bridge): extend the baseline per ow
 - Consumes: `Translator::lifecycle_of`, `Translator::set_lifecycle`, `SpawnPolicy`, `ServerSpawnFailure::missing_binary`.
 - Produces: `ToolRouter::catch_all_for_language(&self, language_id: &str) -> Option<&ServerId>`. The existing public associated constructor `ToolRouter::catch_all(entries)` keeps its name. `register_servers` loses its `configs` parameter. `set_expected_servers`, `clear_expected_servers` and the `expected_servers` field are gone. `rebind_router` and `rebind_to_registered` are gone.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Add to the `mod tests` block in `crates/mcpls-core/src/bridge/translator/routing.rs`. Build the router and the lifecycle map the way the neighbouring tests build a router today.
 
@@ -1630,16 +1630,16 @@ fn test_a_crashed_narrow_server_does_not_fall_through() {
 
 `register_client` and `fake_client` stand for whatever the existing tests in this module already use to put a client in `lsp_clients`. Use those.
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo nextest run -p mcpls-core catch_all`
 Expected: FAIL. The fall-through test resolves to `rust-narrow` and errors.
 
-- [ ] **Step 3: Delete the `expected_servers` population**
+- [x] **Step 3: Delete the `expected_servers` population**
 
 Task 2 already populates the lifecycle map and `server_configs` at `crates/mcpls-core/src/lib.rs:658`, and Task 4 already gave `build_translator` the self handle. What is left here is removing what the map replaces: delete the `expected_servers` set built at `:660` and the `set_expected_servers` call at `:664`, leaving the loop Task 2 added in their place.
 
-- [ ] **Step 4: Publish the batch's outcomes**
+- [x] **Step 4: Publish the batch's outcomes**
 
 `register_servers` consumes the `ServerInitResult`, and `RegisteredServers` carries only `diagnostics_flags`. Publish the failures from the result first, then the successes from that map's keys, which hold exactly one entry per registered server:
 
@@ -1671,13 +1671,13 @@ Do this rather than adding an `ids` field to `RegisteredServers`: `diagnostics_f
 
 On the `all_failed` path at `:1143`, publish the same failure states and delete the `rebind_router(&HashSet::new())` call. Delete both `clear_expected_servers` calls.
 
-- [ ] **Step 5: Retire the router rebind**
+- [x] **Step 5: Retire the router rebind**
 
 `ToolRouter::from_configs` at `crates/mcpls-core/src/lib.rs:633` already builds the router from the applicable configs, which is the binding this design wants. Delete `Translator::rebind_router` and the `ToolRouter::rebind_to_registered` it calls, along with their tests. Nothing rebinds after setup.
 
 The call to delete first is inside `register_servers` itself, at `crates/mcpls-core/src/lib.rs:292`. Its `register_server_config` call at `:313` also becomes redundant, since Step 3 registers every applicable config during setup. Dropping it leaves the `configs` parameter unused, which is denied, so remove the parameter too and update both call sites: `crates/mcpls-core/src/lib.rs:1161` stops passing `&configs_by_id`, and `crates/mcpls-core/src/lsp/lifecycle.rs:2268` stops passing `&HashMap::new()`. The `warn!` about a missing respawn config goes with it, and so does the local `registered` set.
 
-- [ ] **Step 6: Apply the same redirect to the diagnostics flag**
+- [x] **Step 6: Apply the same redirect to the diagnostics flag**
 
 `register_servers` computes `diagnostics_flags` from `is_diagnostics_route` at `crates/mcpls-core/src/bridge/translator/mod.rs:841`, which reads the router as it stands. Rebinding is what used to make that reflect who actually came up; without it, a narrow server that claimed `Diagnostics` and never started still wins the lookup, the language's catch-all is flagged `false`, its pump is installed with caching off, and the language's diagnostics go dark. Move the redirect into the accessor:
 
@@ -1728,7 +1728,7 @@ The call to delete first is inside `register_servers` itself, at `crates/mcpls-c
 
 Rename it to `test_register_servers_redirects_the_flag_from_a_dead_claimant` and rewrite its doc comment: the flag is no longer computed from a rebound router, it is computed from a router that never moves plus the claimant's state.
 
-- [ ] **Step 7: Resolve against the map**
+- [x] **Step 7: Resolve against the map**
 
 In `crates/mcpls-core/src/bridge/translator/routing.rs`, replace the `expected_servers` arm of `get_client_for_file` with a match on the state, and add the catch-all fall-through:
 
@@ -1794,7 +1794,7 @@ Four test sites call those setters and must move to `set_lifecycle` in this same
 
 Also update the stale references in the comments at `crates/mcpls-core/src/bridge/translator/routing.rs:95`, `crates/mcpls-core/src/bridge/translator/symbols.rs:198` and `:299`, and `crates/mcpls-core/src/config/routing.rs:207`, each of which names `expected_servers` as the thing that answers "still expected to register".
 
-- [ ] **Step 8: Point the doctor at the map**
+- [x] **Step 8: Point the doctor at the map**
 
 `crates/mcpls-core/src/lib.rs:775` passes `translator.registered_server_ids()` as the status response's `servers`. Change it to report from the lifecycle map, keeping the field's `Vec<String>` shape for now, so an untriggered server is listed rather than absent:
 
@@ -1808,7 +1808,7 @@ Also update the stale references in the comments at `crates/mcpls-core/src/bridg
 
 Task 10 changes the field's type. Splitting it here keeps this task's diff to one concern.
 
-- [ ] **Step 9: Run the tests to verify they pass**
+- [x] **Step 9: Run the tests to verify they pass**
 
 Run: `cargo nextest run -p mcpls-core catch_all`
 Expected: PASS.
@@ -1816,7 +1816,7 @@ Expected: PASS.
 Run: `devrun task verify`
 Expected: PASS. Every test that asserted `ServerInitializing` now reaches it through the lifecycle map.
 
-- [ ] **Step 10: Commit**
+- [x] **Step 10: Commit**
 
 ```bash
 devrun task commit --arg commit_subject='refactor(bridge): resolve against the state map' --arg commit_body=$'expected_servers answered "not registered yet, wait and retry" and was\ncleared when startup finished. Lazy spawning has no such moment, and a\nset left populated would report a missing binary as still initializing\nfor the life of the backend.\n\nThe router now binds to the applicable set at setup and is never rebound,\nso the catch-all redirect that rebinding performed moves to lookup time:\na route naming a server whose binary is missing falls through to the\nlanguage catch-all.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>'
@@ -1836,7 +1836,7 @@ devrun task commit --arg commit_subject='refactor(bridge): resolve against the s
 - Consumes: `Translator::ensure_server`.
 - Produces: `get_client_for_file` returns `Result<(ServerId, Option<LspClient>)>`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `Translator::new` starts with an empty `extension_map`, and `detect_language` at `crates/mcpls-core/src/bridge/translator/state.rs:1228` answers `"plaintext"` for an extension it does not know. Every test here resolves a path, so every one of them needs the mapping or it fails on `NoServerForLanguage` before reaching the state match. The same applies to the Task 6 tests in this module.
 
@@ -1934,12 +1934,12 @@ async fn test_a_missing_binary_starts_the_idle_catch_all() {
 
 These translators have a self handle but no registered config, so each spawn ends on `Failed` by way of the drop guard. That is why every assertion is `assert_ne!` against the starting state: the witness is that the call claimed the spawn, which is the thing this task adds. A test for a spawn that reaches a live process belongs with the harness that has one, in `respawn.rs`.
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo nextest run -p mcpls-core tool_call`
 Expected: FAIL. Each state holds where it started, because nothing triggers a spawn.
 
-- [ ] **Step 3: Change the resolver's return type**
+- [x] **Step 3: Change the resolver's return type**
 
 `get_client_for_file` cannot hand back an identity for a server with no client while it returns `(ServerId, LspClient)`. Change its signature to `Result<(ServerId, Option<LspClient>)>`, and rewrite the state match Task 6 added so every state that a spawn could still change returns an identity instead of an error. Only a state nothing can act on stays an error:
 
@@ -1986,7 +1986,7 @@ Task 6's `test_a_crashed_narrow_server_does_not_fall_through` asserted `ServerUn
 
 `recovery_tests.rs` also has a lookup-only assertion for an idle Lazy route in `lazy_server_triggered_during_initial_batch_spawns_once`. Update it to expect the selected server identity with `None` as its client, then assert the lifecycle stays `Idle`: the synchronous resolver does not itself trigger a spawn.
 
-- [ ] **Step 4: Trigger from the wrapper**
+- [x] **Step 4: Trigger from the wrapper**
 
 ```rust
 /// How long a tool call waits for a server it just started.
@@ -2018,7 +2018,7 @@ const FIRST_SPAWN_BUDGET: Duration = Duration::from_millis(1_500);
     }
 ```
 
-- [ ] **Step 5: Trigger from the workspace path**
+- [x] **Step 5: Trigger from the workspace path**
 
 In `crates/mcpls-core/src/bridge/translator/symbols.rs`, `handle_workspace_symbol` resolves one server through `resolve_any` and then calls `ensure_server`. Change that call to pass the same budget:
 
@@ -2040,7 +2040,7 @@ It ensures that one server and no others. `resolve_any` picks a single claimant 
 
 If that server's state is `NotInstalled`, fall through to the next claimant in `order` before failing, matching the per-language rule. Add a `resolve_any_excluding(&self, tool: ToolKind, skip: &HashSet<ServerId>)` to `ToolRouter` if the existing `resolve_any` cannot express it, and loop until a claimant is not `NotInstalled` or the set is exhausted.
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [x] **Step 6: Run the tests to verify they pass**
 
 Run: `cargo nextest run -p mcpls-core tool_call`
 Expected: PASS.
@@ -2048,7 +2048,7 @@ Expected: PASS.
 Run: `devrun task verify`
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 devrun task commit --arg commit_subject='feat(bridge): start a server on a tool call' --arg commit_body=$'A tool call naming a language with no server running starts one and\nwaits a bounded time for the handshake. A fast server lands inside the\noriginating call; anything slower hands the caller back to the retry\ncontract it already has, with the spawn still running.\n\nWorkspace symbol search ensures the one server resolve_any picks, since\nthat is the only one it queries.\n\nCo-Authored-By: Codex GPT-5.5 <codex@openai.com>'
@@ -2071,7 +2071,7 @@ The notification pump currently freezes its cache-ownership flag when it is inst
 - Consumes: lifecycle-aware diagnostic route selection and the installed notification pumps.
 - Produces: `ServerSettle::owns_diagnostics(&ServerId) -> bool` and one `Translator::diagnostics_owner(language_id) -> Option<ServerId>` decision for cache ownership.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Cover these transitions:
 
@@ -2084,19 +2084,19 @@ Cover these transitions:
 
 Use the real notification-pump path for the transfer case: publish while the catch-all is unowned, change lifecycle and reconcile, then publish the tracked documents' baseline again. Assert that `didClose` precedes exactly one `didOpen` per tracked URI on the still-running catch-all, unchanged diagnostics are not new work, and a later change is. This captures the failure mode that an install-time boolean misses without sending a duplicate `didOpen` to a live process.
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run focused settle, state, respawn, recovery, translator, and diagnostics-pump tests. Expected: the pump installed before a transfer still drops the new owner's publish, the promoted owner has no fresh baseline task, the stale quiet clock permits an empty merge, a live server receives duplicate `didOpen` without `didClose`, a respawned owner merges before reopening documents, and route selection can choose a terminal catch-all.
 
-- [ ] **Step 3: Resolve one diagnostics owner per language**
+- [x] **Step 3: Resolve one diagnostics owner per language**
 
 Add `Translator::diagnostics_owner(language_id) -> Option<ServerId>` and make `is_diagnostics_route` compare its result with the supplied server ID. A terminal narrow claimant may move diagnostics to a usable catch-all; a terminal catch-all must not elect itself. If the only configured claimant is terminal, return no owner. Keep file/tool routing's `Failed` retry behavior unchanged: this resolver controls diagnostics delivery only, because a failed file/tool claimant still needs a chance to retry while a failed diagnostics publisher cannot produce anything.
 
-- [ ] **Step 4: Read ownership when each publish is handled**
+- [x] **Step 4: Read ownership when each publish is handled**
 
 Remove the install-time `caches_diagnostics` boolean from `NotificationPumps::install`, `diagnostics_pump`, and `handle_publish_diagnostics`. Check `ServerSettle::owns_diagnostics(server_id)` when handling each publish so an already-running pump follows later transfers.
 
-- [ ] **Step 5: Reconcile after spawn outcomes**
+- [x] **Step 5: Reconcile after spawn outcomes**
 
 After `run_spawn` publishes either `Running`, `Failed`, or `NotInstalled`, recompute the active diagnostics owners from the configured language routes and installed pumps. For every new baseline generation, including a replacement server whose process changed without an ownership change, drive document replay before starting the merge task. Reconcile in this order:
 
@@ -2110,12 +2110,12 @@ Publishes dropped while a server was not an owner cannot be replayed directly. C
 
 The baseline task still uses the settle timer as evidence that a snapshot is ready. A promoted server that takes longer than the applicable quiet/no-progress grace to publish can still have its first batch treated as new work. This is the same timer-based limitation as Task 5; gating on a publish received after the generation opens would require separate publish-generation tracking.
 
-- [ ] **Step 6: Run focused and full verification**
+- [x] **Step 6: Run focused and full verification**
 
 Run the focused settle, respawn, translator, and diagnostics-pump tests, then `devrun task verify`.
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 devrun task commit --arg commit_subject='refactor(bridge): reconcile diagnostics ownership' --arg commit_body=$'Notification pumps read diagnostics ownership at publish time, and\nspawn outcomes reconcile the active owner set. A running catch-all can\ntake over when its narrow claimant becomes unavailable, reseed from open\ndocuments, then hand ownership back after recovery.\n\nCo-Authored-By: Codex GPT-5.5 <codex@openai.com>'
@@ -2137,7 +2137,7 @@ devrun task commit --arg commit_subject='refactor(bridge): reconcile diagnostics
 - Consumes: `Translator::ensure_server`, `Translator::lifecycle_of`.
 - Produces: `Translator::server_for_path(&self, path: &Path) -> Option<ServerId>`, and `Sweeper::pending_paths` under `#[cfg(test)]`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `TestSweeper` at `crates/mcpls-core/src/hooks/sweep.rs:374` holds `sweeper`, `dir` and `_cancel`, and its tests reach the translator only through the sweeper. These tests assert on lifecycle state, so add the field and hand it out:
 
@@ -2299,12 +2299,12 @@ Rewrite `test_a_file_whose_server_is_still_starting_is_not_checked` at `crates/m
 
 Update `test_serve_with_runs_the_sweep_loop_it_built` in `crates/mcpls-core/src/hooks/service.rs`. Remove the `NEVER_ANSWERS` platform constants and configure the server command as a path under the test's temporary workspace that the test never creates. The first sweep triggers the `Idle` server and re-queues the path while it is `Starting`; after the spawn attempt settles at `NotInstalled`, the next sweep lets the path reach the open loop and report it as not checked. Update the test comment to describe this flow and assert the exact `1 file(s) not checked: they could not be opened` shortfall.
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `devrun task test`
 Expected: FAIL in the tracked-edit startup and `Starting` requeue tests; the configured task runs the workspace suite because it does not accept a test filter.
 
-- [ ] **Step 3: Trigger after the kinds are built**
+- [x] **Step 3: Trigger after the kinds are built**
 
 In `Sweeper::sweep`, after the `for path in paths` loop that fills `kinds`, `settle` and `untracked`, and before the headroom computation:
 
@@ -2369,12 +2369,12 @@ The ordering that works: build `kinds`, trigger and collect `waiting`, re-queue 
 
 Make `ensure_server` crate-visible so `hooks::sweep` can call the existing spawn entry point without exposing it outside `mcpls-core`.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `devrun task verify`
 Expected: PASS, including workspace tests, formatting, clippy, and doctests.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 devrun task commit-stage --arg files='crates/mcpls-core/src/hooks/sweep.rs,crates/mcpls-core/src/bridge/translator/routing.rs,crates/mcpls-core/src/bridge/translator/respawn.rs,crates/mcpls-core/src/hooks/service.rs'
@@ -2566,7 +2566,11 @@ Build in an isolated temporary checkout and runtime, then invoke that checkout's
 
 Walk the spec's Verification list. Each bullet is a claim about a running backend, and the automated tests cover the mechanism rather than the whole path. Record any bullet that does not hold rather than adjusting the spec to match.
 
-The isolated run and the status of each verification bullet are recorded in `.superpowers/sdd/2026-09-14-lazy-language-server-spawn/task-10-report.md`. The real Rust server returned hover data on retry, and doctor showed `rust (running), typescript (idle)`. The TypeScript-only case could not be verified because the configured TypeScript server failed to start in this environment.
+Result of the isolated run, in a temporary checkout and runtime directory under `/tmp`, against the binary built there. The first Rust hover arrived while rust-analyzer was still indexing and the retry returned the `add` signature. `hook doctor` reported `rust (running), typescript (idle)`, which is the state pair this task exists to make visible. The backend was terminated afterwards, and no daily-driver socket or hook registration was touched.
+
+Two bullets on the spec's Verification list are therefore established against a real backend: the doctor's state rendering, and a lazily started Rust server answering a tool call after a retry. One bullet could not be run at all. The installed `typescript-language-server` reported version 5.3.0 but the tool call returned `LSP server 'typescript' is unavailable: failed to start`, and the cause was not established, so this environment does not verify the TypeScript-only claim that gives the issue its name. That failure also blocks the TypeScript-only workspace-symbols bullet.
+
+The remaining bullets rest on automated tests of the mechanism rather than on a live multi-language session: baseline adoption across a startup boundary, a spawn task that never reaches a terminal state, a missing command staying `not installed`, the catch-all fallback, a concurrent edit and tool trigger producing one process, a slow `initialize` returning a retry, crash backoff reporting `failed`, and per-server `spawn = "eager"` in an otherwise lazy checkout. None of them contradicted the spec. Closing the gap belongs in the e2e suite, which unresolved question 4 records as separate work.
 
 - [x] **Step 9: Commit**
 
