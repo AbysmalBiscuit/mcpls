@@ -2177,8 +2177,6 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn test_a_language_server_started_by_a_detached_backend_opens_no_window() {
-        use std::os::windows::process::CommandExt as _;
-
         const BACKEND: &str = "MCPLS_TEST_DETACHED_BACKEND";
         const TEST_NAME: &str = "lsp::lifecycle::tests::test_a_language_server_started_by_a_detached_backend_opens_no_window";
         const DETACHED_PROCESS: u32 = 0x0000_0008;
@@ -2215,12 +2213,13 @@ mod tests {
             return;
         }
 
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
+        let output = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", TEST_NAME, "--nocapture"])
             .env(BACKEND, "1")
             .stdin(Stdio::null())
             .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
             .output()
+            .await
             .unwrap();
         assert!(
             output.status.success(),
