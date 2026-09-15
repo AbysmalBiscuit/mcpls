@@ -1,12 +1,19 @@
 {
   "name": "mcpls",
-  "version": "0.3.9",
+  "version": "0.3.10",
   "description": "Language server intelligence and push diagnostics through mcpls",
-  "author": { "name": "Lev Velykoivanenko" },
+  "author": {
+    "name": "Lev Velykoivanenko"
+  },
   "homepage": "https://github.com/AbysmalBiscuit/mcpls",
   "repository": "https://github.com/AbysmalBiscuit/mcpls",
   "license": "MIT OR Apache-2.0",
-  "keywords": ["mcp", "lsp", "language-server", "diagnostics"],
+  "keywords": [
+    "mcp",
+    "lsp",
+    "language-server",
+    "diagnostics"
+  ],
   "skills": "./skills/",
   "hooks": "./hooks/hooks-codex.json",
   "mcpServers": "./.mcp.json",
@@ -14,6 +21,8 @@
     "displayName": "mcpls",
     "shortDescription": "Language server diagnostics and code intelligence through MCP",
     "category": "Coding",
-    "capabilities": ["Read"]
+    "capabilities": [
+      "Read"
+    ]
   }
 }

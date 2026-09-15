@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.10](https://github.com/AbysmalBiscuit/mcpls/compare/v0.3.9...v0.3.10) (2026-09-15)
+
+
+### Features
+
+* **backend:** share one backend per checkout ([#29](https://github.com/AbysmalBiscuit/mcpls/issues/29)) ([2c5091b](https://github.com/AbysmalBiscuit/mcpls/commit/2c5091b0b50e38428fab0eb44424f9cd5c287563))
+* **plugin:** install mcpls on Claude Code and Codex ([#30](https://github.com/AbysmalBiscuit/mcpls/issues/30)) ([6bb515a](https://github.com/AbysmalBiscuit/mcpls/commit/6bb515ae4a9161db6997593244d79afcc867a2aa))
+* start language servers on first use ([#44](https://github.com/AbysmalBiscuit/mcpls/issues/44)) ([acbb5d2](https://github.com/AbysmalBiscuit/mcpls/commit/acbb5d2e176b42fffc2232f1914ac6f1912f45eb))
+
+
+### Bug Fixes
+
+* **lsp:** start language servers without a window ([#40](https://github.com/AbysmalBiscuit/mcpls/issues/40)) ([e5dd7e6](https://github.com/AbysmalBiscuit/mcpls/commit/e5dd7e609c1f5e0669701ca284ff1f827833c22e))
+
+
+### Performance Improvements
+
+* **plugin:** stop registering every directory ([#37](https://github.com/AbysmalBiscuit/mcpls/issues/37)) ([88a4eec](https://github.com/AbysmalBiscuit/mcpls/commit/88a4eec449d84643e32de3791d597143e3d6ae5b))
+
 ## [Unreleased]
 
 ### Added
