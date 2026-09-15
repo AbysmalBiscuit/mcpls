@@ -6,14 +6,15 @@
 //! registration, shutdown); actual tool-call handling lives in the sibling
 //! modules below, grouped by domain.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
 use tokio::sync::Mutex;
 
 use self::clock::{Clock, SystemClock};
 use self::encoding_ctx::EncodingCtx;
+pub use self::lifecycle::ServerLifecycle;
 use self::respawn::RespawnBackoff;
 use crate::bridge::apply::{Applier, ApplySummary, EditPlan, InvalidationQueue};
 use crate::bridge::encoding::PositionEncoding;
@@ -30,6 +31,7 @@ mod diagnostics;
 mod dto;
 mod edits;
 mod encoding_ctx;
+mod lifecycle;
 mod navigation;
 mod respawn;
 mod routing;
@@ -82,35 +84,31 @@ pub struct Translator {
     /// Custom file extension to language ID mappings. Read-only after
     /// `serve()` setup, so no lock is needed.
     extension_map: Arc<HashMap<String, String>>,
-    /// Servers that are configured + applicable but may not have finished
-    /// initializing yet (background init). Used to return a clear "still
-    /// initializing" error instead of "no server configured".
-    expected_servers: Arc<StdMutex<HashSet<ServerId>>>,
     /// Per-tool routing table: resolves `(language, tool)` to a `ServerId`.
-    /// Locked independently so `rebind_router` (called from a background
-    /// task once registration completes) never contends with an in-flight
+    /// Locked independently so route lookup never contends with an in-flight
     /// LSP round trip.
     router: Arc<StdMutex<ToolRouter>>,
-    /// Configs needed to respawn a server if its process dies later, keyed
-    /// by routing identity. Populated once per server right after a
-    /// successful spawn (see [`Self::register_server_config`]); the respawn
-    /// path ([`Self::respawn_if_dead`]) is the only reader.
+    /// Configs needed to spawn each applicable server, keyed by routing
+    /// identity. Registered during setup before any server starts; read by
+    /// `ensure_server`'s detached spawn task.
     server_configs: Arc<StdMutex<HashMap<ServerId, ServerInitConfig>>>,
-    /// Per-server single-flight lock so concurrent callers that both observe
-    /// a dead process don't race to respawn it independently -- the loser
-    /// waits for the winner's attempt to finish (success or failure) and
-    /// then re-reads whatever ended up registered. See
-    /// [`Self::respawn_if_dead`].
-    respawn_locks: Arc<StdMutex<HashMap<ServerId, Arc<Mutex<()>>>>>,
     /// Consecutive respawn failures and last-attempt time per server, so a
     /// crash-looping server backs off instead of eating a fresh
     /// `timeout_seconds` on every tool call that arrives while it is down.
-    /// See [`Self::respawn_if_dead`].
+    /// See `ensure_server`.
     respawn_backoffs: Arc<StdMutex<HashMap<ServerId, RespawnBackoff>>>,
+    /// What each applicable server is doing. Membership is the applicable
+    /// set: a server absent from here is not configured for this checkout.
+    lifecycles: Arc<StdMutex<HashMap<ServerId, ServerLifecycle>>>,
+    /// Per-server broadcast of the field above, so a caller waiting on a
+    /// spawn learns the outcome without polling.
+    lifecycle_senders: Arc<StdMutex<lifecycle::LifecycleSenders>>,
+    /// A weak handle used by detached server-spawn tasks.
+    self_handle: OnceLock<Weak<Self>>,
     /// Diagnostics cache, shared with `serve_with`'s notification pump.
     ///
     /// `None` for a `Translator` built without [`Self::with_notification_cache`]
-    /// (e.g. most unit tests). When present, [`Self::respawn_if_dead`] uses
+    /// (e.g. most unit tests). When present, [`Self::ensure_server`] uses
     /// it to invalidate a respawned server's stale cached diagnostics --
     /// see that method's docs for why that matters.
     notification_cache: Option<Arc<Mutex<NotificationCache>>>,
@@ -241,11 +239,12 @@ impl Translator {
             resource_limits: ResourceLimits::default(),
             workspace_roots: Arc::new(Vec::new()),
             extension_map: Arc::new(HashMap::new()),
-            expected_servers: Arc::new(StdMutex::new(HashSet::new())),
             router: Arc::new(StdMutex::new(ToolRouter::default())),
             server_configs: Arc::new(StdMutex::new(HashMap::new())),
-            respawn_locks: Arc::new(StdMutex::new(HashMap::new())),
             respawn_backoffs: Arc::new(StdMutex::new(HashMap::new())),
+            lifecycles: Arc::new(StdMutex::new(HashMap::new())),
+            lifecycle_senders: Arc::new(StdMutex::new(HashMap::new())),
+            self_handle: OnceLock::new(),
             notification_cache: None,
             apply_sink_lock: Arc::new(Mutex::new(())),
             applier: Arc::new(Applier::new(Vec::new(), ApplyConfig::default())),
@@ -291,6 +290,13 @@ impl Translator {
     /// shared, so this replaces the `Arc` wholesale rather than locking.
     pub fn set_workspace_roots(&mut self, roots: Vec<PathBuf>) {
         self.workspace_roots = Arc::new(roots);
+    }
+
+    /// Give the translator a handle to itself, so a spawn can outlive the
+    /// call that asked for it. Called once during setup, where the `Arc`
+    /// already exists.
+    pub fn set_self_handle(&self, handle: Weak<Self>) {
+        let _ = self.self_handle.set(handle);
     }
 
     /// Give the translator a handle to the shared diagnostics cache, so the
@@ -756,9 +762,9 @@ impl Translator {
     /// the next tool call that much closer to the document limit.
     ///
     /// `has_headroom` says whether the caller can afford one more tracked
-    /// document. It is read after routing rather than before the call, so a
-    /// path nothing routes is never reported against the document limit it
-    /// was not competing for.
+    /// document. Route selection happens first, so a path nothing routes is
+    /// never reported against the document limit it was not competing for;
+    /// startup and opening wait until the caller has capacity.
     ///
     /// A route to a server that is still starting is [`OpenOutcome::Failed`],
     /// not [`OpenOutcome::NoRoute`]: servers spawn in the background, so a
@@ -778,14 +784,25 @@ impl Translator {
         path: &Path,
         has_headroom: bool,
     ) -> OpenOutcome {
-        let (server, client) = match self.get_client_for_file(path, ToolKind::Diagnostics) {
-            Ok(resolved) => resolved,
-            Err(Error::ServerInitializing { .. }) => return OpenOutcome::Failed,
-            Err(_) => return OpenOutcome::NoRoute,
-        };
+        if let Err(Error::NoServerForLanguage(_) | Error::NoServerForTool { .. }) =
+            self.get_client_for_file(path, ToolKind::Diagnostics)
+        {
+            return OpenOutcome::NoRoute;
+        }
         if !has_headroom {
             return OpenOutcome::NoHeadroom;
         }
+
+        let (server, client) = match self
+            .resolve_client_for_file(path, ToolKind::Diagnostics)
+            .await
+        {
+            Ok(resolved) => resolved,
+            Err(Error::NoServerForLanguage(_) | Error::NoServerForTool { .. }) => {
+                return OpenOutcome::NoRoute;
+            }
+            Err(_) => return OpenOutcome::Failed,
+        };
         match self
             .document_tracker
             .ensure_open(path, &server, &client)
@@ -803,17 +820,6 @@ impl Translator {
         }
     }
 
-    /// Mark the set of servers that are expected (configured + applicable)
-    /// but may still be initializing in the background.
-    pub fn set_expected_servers(&self, servers: HashSet<ServerId>) {
-        *lock_std(&self.expected_servers) = servers;
-    }
-
-    /// Clear the expected-servers set (e.g. after background init failed).
-    pub fn clear_expected_servers(&self) {
-        lock_std(&self.expected_servers).clear();
-    }
-
     /// Install the per-tool routing table built from the applicable configs.
     ///
     /// Only called during single-owner setup, before the translator is
@@ -824,22 +830,29 @@ impl Translator {
         self
     }
 
-    /// Rebind the routing table to the set of servers that actually
-    /// registered, dropping or redirecting routes to servers that failed to
-    /// spawn. See `ToolRouter::rebind_to_registered` for the full semantics.
-    pub fn rebind_router(&self, registered: &HashSet<ServerId>) {
-        lock_std(&self.router).rebind_to_registered(registered);
+    /// Resolve the nonterminal diagnostics claimant or its usable catch-all.
+    #[must_use]
+    pub fn diagnostics_owner(&self, language_id: &str) -> Option<ServerId> {
+        let (claimant, catch_all) = {
+            let router = lock_std(&self.router);
+            (
+                router.resolve(language_id, ToolKind::Diagnostics).cloned(),
+                router.catch_all_for_language(language_id).cloned(),
+            )
+        };
+        let usable = |id: &ServerId| {
+            !matches!(
+                self.lifecycle_of(id),
+                Some(ServerLifecycle::NotInstalled | ServerLifecycle::Failed)
+            )
+        };
+        claimant.filter(usable).or_else(|| catch_all.filter(usable))
     }
 
-    /// Whether `id` is the server the router currently resolves
-    /// `ToolKind::Diagnostics` to for `language_id`.
-    ///
-    /// Purpose-built for `register_servers`, which needs this to compute the
-    /// diagnostics-cache filter passed into each pump task, without exposing
-    /// the router's lock guard outside this module.
+    /// Whether `id` currently owns diagnostics for this language.
     #[must_use]
     pub fn is_diagnostics_route(&self, language_id: &str, id: &ServerId) -> bool {
-        lock_std(&self.router).resolve(language_id, ToolKind::Diagnostics) == Some(id)
+        self.diagnostics_owner(language_id).as_ref() == Some(id)
     }
 
     /// Negotiated [`PositionEncoding`] of the registered server `id`, or the
@@ -932,11 +945,9 @@ impl Translator {
         lock_std(&self.lsp_servers).insert(id.into(), server);
     }
 
-    /// Store the config needed to respawn `id` if its process dies later.
+    /// Store the config needed to spawn `id` during setup.
     ///
-    /// Called once per server, right after a successful spawn (see the
-    /// crate-root `register_servers`); [`Self::respawn_if_dead`] is the only
-    /// reader.
+    /// The initial batch also refreshes this after successful registration.
     pub(crate) fn register_server_config(&self, id: impl Into<ServerId>, config: ServerInitConfig) {
         lock_std(&self.server_configs).insert(id.into(), config);
     }
@@ -1051,14 +1062,14 @@ impl Default for Translator {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     use tokio::time::Duration;
 
     use self::testing::TranslatorHarness;
     use super::*;
-    use crate::bridge::state::detect_language;
     use crate::config::{ServerId, ToolKind, ToolRouter};
     use crate::error::Error;
 
@@ -1068,6 +1079,74 @@ mod tests {
         assert_eq!(translator.workspace_roots.len(), 0);
         assert_eq!(lock_std(&translator.lsp_clients).len(), 0);
         assert_eq!(lock_std(&translator.lsp_servers).len(), 0);
+    }
+
+    #[test]
+    fn diagnostics_ownership_excludes_terminal_claimants() {
+        let configs: Vec<crate::config::LspServerConfig> =
+            toml::from_str::<crate::config::ServerConfig>(
+                r#"
+[[lsp_servers]]
+language_id = "rust"
+name = "wide"
+command = "wide"
+[[lsp_servers]]
+language_id = "rust"
+name = "narrow"
+command = "narrow"
+handles = ["diagnostics"]
+"#,
+            )
+            .unwrap()
+            .lsp_servers
+            .into_iter()
+            .filter(|config| config.name.is_some())
+            .collect();
+        let translator = Translator::new().with_router(ToolRouter::from_configs(&configs).unwrap());
+        let narrow = configs[1].id();
+        let wide = configs[0].id();
+        for narrow_state in [
+            ServerLifecycle::Idle,
+            ServerLifecycle::Starting,
+            ServerLifecycle::Running,
+            ServerLifecycle::Failed,
+            ServerLifecycle::NotInstalled,
+        ] {
+            for wide_state in [
+                ServerLifecycle::Idle,
+                ServerLifecycle::Starting,
+                ServerLifecycle::Running,
+                ServerLifecycle::Failed,
+                ServerLifecycle::NotInstalled,
+            ] {
+                translator.set_lifecycle(&narrow, narrow_state);
+                translator.set_lifecycle(&wide, wide_state);
+                let narrow_usable = !matches!(
+                    narrow_state,
+                    ServerLifecycle::Failed | ServerLifecycle::NotInstalled
+                );
+                let wide_usable = !matches!(
+                    wide_state,
+                    ServerLifecycle::Failed | ServerLifecycle::NotInstalled
+                );
+                assert_eq!(
+                    translator.is_diagnostics_route("rust", &narrow),
+                    narrow_usable,
+                    "{narrow_state:?}/{wide_state:?}"
+                );
+                assert_eq!(
+                    translator.is_diagnostics_route("rust", &wide),
+                    !narrow_usable && wide_usable,
+                    "{narrow_state:?}/{wide_state:?}"
+                );
+            }
+        }
+        let translator =
+            Translator::new().with_router(ToolRouter::catch_all([(wide.clone(), "rust".into())]));
+        for state in [ServerLifecycle::Failed, ServerLifecycle::NotInstalled] {
+            translator.set_lifecycle(&wide, state);
+            assert!(!translator.is_diagnostics_route("rust", &wide));
+        }
     }
 
     #[test]
@@ -1193,32 +1272,6 @@ mod tests {
             0,
             "all registered servers must be drained"
         );
-    }
-
-    #[test]
-    fn test_clear_expected_servers_reverts_to_no_server_after_all_routes_dropped() {
-        // Mirrors the real `serve_with` flow: `rebind_router` (called from
-        // `register_servers`/the all-failed path) drops routes to servers
-        // that never registered, then `clear_expected_servers` runs under
-        // the same lock. Subsequent lookups must fall back to
-        // NoServerForLanguage rather than keep implying the server is still
-        // on its way.
-        let path = PathBuf::from("/ws/Assets/Scripts/Player.cs");
-        let lang = detect_language(&path, &HashMap::new());
-        let id = ServerId::from(lang.clone());
-
-        let translator = Translator::new().with_router(ToolRouter::catch_all([(id.clone(), lang)]));
-        let mut expected = HashSet::new();
-        expected.insert(id);
-        translator.set_expected_servers(expected);
-
-        translator.rebind_router(&HashSet::new());
-        translator.clear_expected_servers();
-
-        let err = translator
-            .get_client_for_file(&path, ToolKind::Hover)
-            .unwrap_err();
-        assert!(matches!(err, Error::NoServerForLanguage(_)));
     }
 
     #[test]
@@ -1354,6 +1407,44 @@ mod tests {
             vec!["textDocument/didOpen", "textDocument/didSave"]
         );
         assert!(harness.translator.document_tracker().is_open(&path));
+    }
+
+    fn translator_with_idle_rust_route() -> (Arc<Translator>, ServerId) {
+        let id = ServerId::from("rust");
+        let translator = Arc::new(
+            Translator::new()
+                .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]))
+                .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())])),
+        );
+        translator.set_lifecycle(&id, ServerLifecycle::Idle);
+        translator.set_self_handle(Arc::downgrade(&translator));
+        (translator, id)
+    }
+
+    #[tokio::test]
+    async fn open_untracked_document_with_no_headroom_does_not_start_idle_server() {
+        let (translator, id) = translator_with_idle_rust_route();
+        let path = PathBuf::from("/workspace/main.rs");
+
+        let outcome = translator.open_untracked_document(&path, false).await;
+
+        assert_eq!(outcome, OpenOutcome::NoHeadroom);
+        assert_eq!(
+            translator.lifecycle_of(&id),
+            Some(ServerLifecycle::Idle),
+            "a capacity check must not trigger a lazy server"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_untracked_document_reports_routed_spawn_failure_as_failed() {
+        let (translator, id) = translator_with_idle_rust_route();
+        let path = PathBuf::from("/workspace/main.rs");
+
+        let outcome = translator.open_untracked_document(&path, true).await;
+
+        assert_eq!(outcome, OpenOutcome::Failed);
+        assert_eq!(translator.lifecycle_of(&id), Some(ServerLifecycle::Failed));
     }
 
     #[tokio::test]

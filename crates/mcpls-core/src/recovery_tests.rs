@@ -6,6 +6,24 @@ use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufStream, DuplexStrea
 
 use super::*;
 
+fn register_starting_configs(translator: &Translator, configs: &[lsp::ServerInitConfig]) {
+    for config in configs {
+        let id = config.server_config.id();
+        translator.register_server_config(id.clone(), config.clone());
+        translator.set_lifecycle(&id, bridge::ServerLifecycle::Starting);
+    }
+}
+
+async fn wait_for_owner_baseline(settle: &bridge::ServerSettle, owner: &ServerId) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while settle.pending_diagnostics_baselines().contains(owner) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the diagnostics owner baseline merge must finish");
+}
+
 #[derive(Debug)]
 pub struct RegistrationPause {
     server_id: ServerId,
@@ -274,7 +292,7 @@ async fn i1_t5_failed_replacement_does_not_hold_baseline() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn i1_t5_cancelled_replacement_does_not_hold_baseline() {
+async fn i1_t5_cancelled_request_keeps_replacement_owned_until_install_finishes() {
     replacement_owner_scenario(
         ReplacementOwnerOrder::AfterInitialOwnerInstallation,
         ReplacementAttempt::CancelledBeforeRetirement,
@@ -305,19 +323,24 @@ async fn replacement_owner_scenario(order: ReplacementOwnerOrder, attempt: Repla
         config.diagnostics.hooks.enabled = false;
         config.diagnostics.settle_quiet_ms = 50;
         config.diagnostics.settle_deadline_ms = 10000;
-        let rust_mode = match attempt {
-            ReplacementAttempt::Succeeds | ReplacementAttempt::CancelledAfterRetirement => {
-                "reporting-then-silent"
-            }
-            ReplacementAttempt::FailsInitialization => "fail-initialize",
-            ReplacementAttempt::CancelledBeforeRetirement => "hold-initialize",
+        let (rust_mode, rust_startup_delay, rust_initialize_delay) = match attempt {
+            ReplacementAttempt::Succeeds => ("reporting-then-silent", "1.5", "0"),
+            ReplacementAttempt::CancelledAfterRetirement => ("reporting-then-silent", "0", "0"),
+            ReplacementAttempt::FailsInitialization => ("fail-initialize", "0", "0"),
+            ReplacementAttempt::CancelledBeforeRetirement => ("reporting-then-silent", "0", "3"),
         };
         config.lsp_servers = [
-            ("rust", &rust, rust_mode, "1.5"),
-            ("python", &python, "reporting", "0"),
+            (
+                "rust",
+                &rust,
+                rust_mode,
+                rust_startup_delay,
+                rust_initialize_delay,
+            ),
+            ("python", &python, "reporting", "0", "0"),
         ]
         .into_iter()
-        .map(|(language, path, mode, startup_delay)| {
+        .map(|(language, path, mode, startup_delay, initialize_delay)| {
             let control = root.join(language);
             let initialized_marker = root.join(format!("{language}.initialized"));
             let published_marker = root.join(format!("{language}.published"));
@@ -326,7 +349,7 @@ async fn replacement_owner_scenario(order: ReplacementOwnerOrder, attempt: Repla
                 "language_id": language,
                 "command": "python3",
                 "args": [fixture, control, bridge::path_to_uri(path).unwrap().as_str(), language,
-                    mode, startup_delay, "0", initialized_marker, published_marker,
+                    mode, startup_delay, initialize_delay, initialized_marker, published_marker,
                     initialize_attempt_marker],
                 "timeout_seconds": 5,
                 "request_timeout_seconds": 2
@@ -337,14 +360,15 @@ async fn replacement_owner_scenario(order: ReplacementOwnerOrder, attempt: Repla
         let watch = Arc::new(lsp::WatchRegistry::new());
         let configs = applicable_server_configs(&config, std::slice::from_ref(&root), None, &watch);
         let cache = Arc::new(Mutex::new(NotificationCache::new()));
-        let translator = Arc::new(build_translator(
+        let translator = build_translator(
             &config,
             vec![root.clone()],
             HashMap::from([("rs".into(), "rust".into()), ("py".into(), "python".into())]),
             ToolRouter::from_configs(&config.lsp_servers).unwrap(),
             Arc::clone(&cache),
             watch,
-        ));
+        );
+        register_starting_configs(&translator, &configs);
         let owner_pause = if matches!(order, ReplacementOwnerOrder::AfterInitialOwnerInstallation) {
             let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
             let (resume_tx, resume_rx) = std::sync::mpsc::channel();
@@ -370,14 +394,15 @@ async fn replacement_owner_scenario(order: ReplacementOwnerOrder, attempt: Repla
         } else {
             None
         };
-        let async_retirement_pause = if matches!(attempt, ReplacementAttempt::CancelledAfterRetirement) {
-            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-            let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
-            arm_async_retirement_pause(entered_tx, resume_rx);
-            Some((entered_rx, resume_tx))
-        } else {
-            None
-        };
+        let async_retirement_pause =
+            if matches!(attempt, ReplacementAttempt::CancelledAfterRetirement) {
+                let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+                let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+                arm_async_retirement_pause(entered_tx, resume_rx);
+                Some((entered_rx, resume_tx))
+            } else {
+                None
+            };
         let mut cancellation_ack = if matches!(
             attempt,
             ReplacementAttempt::CancelledBeforeRetirement
@@ -433,6 +458,9 @@ async fn replacement_owner_scenario(order: ReplacementOwnerOrder, attempt: Repla
             floors: Arc::clone(&floors),
         };
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        translator.notification_pumps.get_or_init(|| {
+            notification_lifecycle::NotificationPumps::new(shared.clone(), cancel_rx.clone())
+        });
         let init =
             spawn_lsp_servers_background(configs, Arc::clone(&translator), cancel_rx, shared);
         let abort_init = AbortOnDrop(&init);
@@ -572,11 +600,8 @@ async fn replacement_owner_scenario(order: ReplacementOwnerOrder, attempt: Repla
             ) {
                 let cancellation_trigger = cancellation_trigger.unwrap();
                 if matches!(attempt, ReplacementAttempt::CancelledBeforeRetirement) {
-                    wait_for_marker(
-                        &root.join("rust.initialize-attempt"),
-                        "rust-generation-2",
-                    )
-                    .await;
+                    wait_for_marker(&root.join("rust.initialize-attempt"), "rust-generation-2")
+                        .await;
                     cancellation_trigger.send(()).unwrap();
                 } else {
                     let (entered, resume_retirement) = async_retirement_pause.unwrap();
@@ -592,37 +617,62 @@ async fn replacement_owner_scenario(order: ReplacementOwnerOrder, attempt: Repla
                     .unwrap()
                     .unwrap();
                 wire = new_wire;
-                assert!(response.is_none(), "cancelled workspace call returned: {response:?}");
+                assert!(
+                    response.is_none(),
+                    "cancelled workspace call returned: {response:?}"
+                );
                 let replacement_aborted = tokio::time::timeout(
                     Duration::from_millis(250),
                     replacement_aborted.take().unwrap(),
                 )
                 .await
                 .is_ok();
-                drop(cancellation_retirement_resume);
-                resume.send(()).unwrap();
-                let baseline_ready = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    baseline_check_entered,
-                )
-                .await
-                .unwrap()
-                .unwrap();
                 assert!(
-                    baseline_ready,
-                    "cancelled replacement must not hold baseline (abort ack: {replacement_aborted})"
+                    !replacement_aborted,
+                    "cancelling the workspace request must not abort the detached replacement"
                 );
-                assert!(replacement_aborted, "cancelled replacement did not clear its pending owner");
+                let rust_id = ServerId::from("rust");
+                assert_eq!(
+                    translator.lifecycle_of(&rust_id),
+                    Some(bridge::ServerLifecycle::Starting),
+                    "the replacement remains active after its waiter is cancelled"
+                );
+                resume.send(()).unwrap();
+                let baseline_ready =
+                    tokio::time::timeout(Duration::from_secs(5), baseline_check_entered)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                assert!(
+                    !baseline_ready,
+                    "an active replacement keeps the diagnostics baseline pending"
+                );
                 baseline_check_resume.send(()).unwrap();
+
+                if let Some(resume_retirement) = cancellation_retirement_resume {
+                    resume_retirement.send(()).unwrap();
+                }
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while translator.lifecycle_of(&rust_id)
+                        != Some(bridge::ServerLifecycle::Running)
+                    {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                tokio::time::timeout(Duration::from_secs(5), baseline_adopted)
+                    .await
+                    .unwrap()
+                    .unwrap();
                 let baseline = call(&mut wire, "get_new_diagnostics", json!({})).await;
-                assert!(!baseline.to_string().contains("rust-generation-2"), "{baseline}");
+                assert!(
+                    !baseline.to_string().contains("rust-generation-2"),
+                    "{baseline}"
+                );
             } else if matches!(attempt, ReplacementAttempt::FailsInitialization) {
                 resume.send(()).unwrap();
-                wait_for_marker(
-                    &root.join("rust.initialize-attempt"),
-                    "rust-generation-2",
-                )
-                .await;
+                wait_for_marker(&root.join("rust.initialize-attempt"), "rust-generation-2").await;
                 let (new_wire, response) = tokio::time::timeout(Duration::from_secs(5), pending)
                     .await
                     .unwrap()
@@ -630,17 +680,18 @@ async fn replacement_owner_scenario(order: ReplacementOwnerOrder, attempt: Repla
                 wire = new_wire;
                 let response = response.unwrap();
                 assert!(response["error"].is_object(), "{response}");
-                let baseline_ready = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    baseline_check_entered,
-                )
-                .await
-                .unwrap()
-                .unwrap();
+                let baseline_ready =
+                    tokio::time::timeout(Duration::from_secs(5), baseline_check_entered)
+                        .await
+                        .unwrap()
+                        .unwrap();
                 assert!(baseline_ready, "failed replacement must not hold baseline");
                 baseline_check_resume.send(()).unwrap();
                 let baseline = call(&mut wire, "get_new_diagnostics", json!({})).await;
-                assert!(!baseline.to_string().contains("rust-generation-2"), "{baseline}");
+                assert!(
+                    !baseline.to_string().contains("rust-generation-2"),
+                    "{baseline}"
+                );
             } else {
                 let (retirement_entered, retirement_resume) = retirement_pause.unwrap();
                 tokio::time::timeout(Duration::from_secs(5), retirement_entered)
@@ -648,13 +699,11 @@ async fn replacement_owner_scenario(order: ReplacementOwnerOrder, attempt: Repla
                     .unwrap()
                     .unwrap();
                 resume.send(()).unwrap();
-                let baseline_ready = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    baseline_check_entered,
-                )
-                .await
-                .unwrap()
-                .unwrap();
+                let baseline_ready =
+                    tokio::time::timeout(Duration::from_secs(5), baseline_check_entered)
+                        .await
+                        .unwrap()
+                        .unwrap();
                 baseline_check_resume.send(()).unwrap();
                 if baseline_ready {
                     tokio::time::timeout(Duration::from_secs(5), baseline_adopted)
@@ -796,6 +845,265 @@ async fn recovery_workspace_symbols_during_startup_preserve_live_client() {
     recovery_scenario(StartupMode::BetweenPublications).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
+async fn lazy_server_triggered_during_initial_batch_spawns_once() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dunce::canonicalize(dir.path()).unwrap();
+    let control = root.join("control");
+    std::fs::create_dir(&control).unwrap();
+    let script = root.join("fake_lsp.py");
+    let python_file = root.join("main.py");
+    let typescript_file = root.join("main.ts");
+    std::fs::write(&python_file, "pass\n").unwrap();
+    std::fs::write(&typescript_file, "const value = 1;\n").unwrap();
+    let symbol_uri = bridge::path_to_uri(&python_file).unwrap().to_string();
+    std::fs::write(
+        &script,
+        r#"import json, os, pathlib, sys, time
+
+control = pathlib.Path(sys.argv[1])
+role = sys.argv[2]
+symbol_uri = sys.argv[3]
+with (control / f"{role}.pids").open("a") as count:
+    count.write(f"{os.getpid()}\n")
+    count.flush()
+
+def receive():
+    length = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        if line in (b"\r\n", b"\n"):
+            break
+        key, value = line.decode().split(":", 1)
+        if key.lower() == "content-length":
+            length = int(value.strip())
+    return json.loads(sys.stdin.buffer.read(length))
+
+def send(message):
+    body = json.dumps(message).encode()
+    sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+    sys.stdout.buffer.flush()
+
+while True:
+    message = receive()
+    if message is None:
+        break
+    method = message.get("method")
+    if method == "initialize":
+        if role == "eager":
+            (control / "eager.initializing").write_text(str(os.getpid()))
+            while not (control / "eager.release").exists():
+                time.sleep(0.01)
+        send({"jsonrpc": "2.0", "id": message["id"], "result": {
+            "capabilities": {"positionEncoding": "utf-16", "workspaceSymbolProvider": True}
+        }})
+    elif method == "workspace/symbol":
+        send({"jsonrpc": "2.0", "id": message["id"], "result": [{
+            "name": f"{role}-{os.getpid()}",
+            "kind": 12,
+            "location": {"uri": symbol_uri, "range": {
+                "start": {"line": 0, "character": 0},
+                "end": {"line": 0, "character": 1}
+            }},
+            "containerName": role
+        }]})
+    elif method == "shutdown":
+        send({"jsonrpc": "2.0", "id": message["id"], "result": None})
+    elif method == "exit":
+        break
+"#,
+    )
+    .unwrap();
+
+    let make_server =
+        |mut config: crate::config::LspServerConfig, role: &str, spawn: SpawnPolicy| {
+            config.command = "python3".to_string();
+            config.args = vec![
+                script.to_string_lossy().into_owned(),
+                control.to_string_lossy().into_owned(),
+                role.to_string(),
+                symbol_uri.clone(),
+            ];
+            config.heuristics = None;
+            config.spawn = Some(spawn);
+            config
+        };
+    let mut eager = make_server(
+        crate::config::LspServerConfig::rust_analyzer(),
+        "eager",
+        SpawnPolicy::Eager,
+    );
+    eager.handles = Some(vec![crate::config::ToolKind::Hover]);
+    let lazy = make_server(
+        crate::config::LspServerConfig::pyright(),
+        "lazy",
+        SpawnPolicy::Lazy,
+    );
+    let mut untouched_lazy = make_server(
+        crate::config::LspServerConfig::typescript(),
+        "untouched-lazy",
+        SpawnPolicy::Lazy,
+    );
+    untouched_lazy.handles = Some(vec![crate::config::ToolKind::Hover]);
+
+    let mut config = ServerConfig::default();
+    config.workspace.roots = vec![root.clone()];
+    config.diagnostics.hooks.enabled = false;
+    config.lsp_servers = vec![eager, lazy, untouched_lazy];
+    let runtime = Runtime::start(&config, Ok(root.clone())).await.unwrap();
+
+    let eager_started = tokio::time::timeout(Duration::from_secs(5), async {
+        while !control.join("eager.initializing").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    let first_symbols = if eager_started.is_ok() {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            runtime
+                .translator
+                .handle_workspace_symbol("race".to_string(), None, 10),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .map(|result| {
+            result
+                .symbols
+                .into_iter()
+                .map(|symbol| symbol.name)
+                .collect::<Vec<_>>()
+        })
+    } else {
+        None
+    };
+
+    std::fs::write(control.join("eager.release"), "release").unwrap();
+    let eager_running = tokio::time::timeout(Duration::from_secs(10), async {
+        while runtime.translator.lifecycle_of(&ServerId::from("rust"))
+            != Some(ServerLifecycle::Running)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok();
+    let second_symbols = if eager_running {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            runtime
+                .translator
+                .handle_workspace_symbol("race".to_string(), None, 10),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .map(|result| {
+            result
+                .symbols
+                .into_iter()
+                .map(|symbol| symbol.name)
+                .collect::<Vec<_>>()
+        })
+    } else {
+        None
+    };
+    let untouched_lazy_id = ServerId::from("typescript");
+    assert!(
+        matches!(
+            runtime
+                .translator
+                .get_client_for_file(&typescript_file, crate::config::ToolKind::Hover),
+            Ok((id, None)) if id == untouched_lazy_id
+        ),
+        "the untouched lazy route resolves to its identity without a client"
+    );
+    let untouched_lazy_state = runtime.translator.lifecycle_of(&untouched_lazy_id);
+    let lazy_processes = std::fs::read_to_string(control.join("lazy.pids"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    runtime.shutdown().await;
+
+    assert!(eager_started.is_ok(), "initial eager spawn did not pause");
+    assert!(eager_running, "initial eager batch did not finish");
+    assert_eq!(
+        lazy_processes.len(),
+        1,
+        "lazy spawn count: {lazy_processes:?}"
+    );
+    assert_eq!(
+        first_symbols, second_symbols,
+        "lazy client changed during batch registration"
+    );
+    assert_eq!(untouched_lazy_state, Some(ServerLifecycle::Idle));
+}
+
+#[tokio::test]
+async fn all_lazy_runtime_seeds_baseline_and_pumps_without_initial_batch() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dunce::canonicalize(dir.path()).unwrap();
+    let source = root.join("main.py");
+    std::fs::write(&source, "pass\n").unwrap();
+    let control = root.join("python");
+    let generation = root.join("python.generation");
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/notification_generations.py"
+    );
+    let mut lazy = crate::config::LspServerConfig::pyright();
+    lazy.command = "python3".to_string();
+    lazy.args = vec![
+        fixture.to_string(),
+        control.to_string_lossy().into_owned(),
+        bridge::path_to_uri(&source).unwrap().to_string(),
+        "python".to_string(),
+        "default".to_string(),
+    ];
+    lazy.heuristics = None;
+
+    let mut config = ServerConfig::default();
+    config.workspace.roots = vec![root.clone()];
+    config.backend.spawn = SpawnPolicy::Lazy;
+    config.diagnostics.hooks.enabled = false;
+    config.lsp_servers = vec![lazy];
+
+    let runtime = Runtime::start(&config, Ok(root)).await.unwrap();
+    let no_initial_batch = runtime.lsp_init_handle.is_none();
+    let pumps_initialized = runtime.translator.notification_pumps.get().is_some();
+    let empty_baseline = runtime.context.delivery.lock().await.has_baseline();
+    let no_spawn_before_trigger = !generation.exists();
+    let symbols = tokio::time::timeout(
+        Duration::from_secs(5),
+        runtime
+            .translator
+            .handle_workspace_symbol("lazy".to_string(), None, 10),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .map(|result| {
+        result
+            .symbols
+            .into_iter()
+            .map(|symbol| symbol.name)
+            .collect::<Vec<_>>()
+    });
+    runtime.shutdown().await;
+
+    assert!(no_initial_batch);
+    assert!(pumps_initialized);
+    assert!(empty_baseline);
+    assert!(no_spawn_before_trigger);
+    assert_eq!(symbols, Some(vec!["python-generation-1".to_string()]));
+    assert_eq!(std::fs::read_to_string(generation).unwrap(), "1");
+}
+
 #[allow(clippy::too_many_lines)]
 async fn recovery_scenario(startup: StartupMode) {
     tokio::time::timeout(Duration::from_secs(30), async {
@@ -822,9 +1130,10 @@ async fn recovery_scenario(startup: StartupMode) {
         let mut held_cache = if matches!(startup, StartupMode::CacheLocked) { Some(startup_cache.lock().await) } else { None };
         let watch = Arc::new(lsp::WatchRegistry::new());
         let configs = applicable_server_configs(&config, std::slice::from_ref(&root), None, &watch);
-        let translator = Arc::new(build_translator(&config, vec![root.clone()],
+        let translator = build_translator(&config, vec![root.clone()],
             HashMap::from([("rs".into(), "rust".into()), ("py".into(), "python".into())]),
-            ToolRouter::from_configs(&config.lsp_servers).unwrap(), Arc::clone(&cache), watch));
+            ToolRouter::from_configs(&config.lsp_servers).unwrap(), Arc::clone(&cache), watch);
+        register_starting_configs(&translator, &configs);
         let publication_pause = if matches!(startup, StartupMode::BetweenPublications) {
             let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
             let (resume_tx, resume_rx) = std::sync::mpsc::channel();
@@ -843,10 +1152,18 @@ async fn recovery_scenario(startup: StartupMode) {
             document_tracker: Arc::clone(translator.document_tracker()), settle: Arc::clone(&settle),
             delivery: Arc::clone(&delivery), floors: Arc::clone(&floors) };
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        let init = spawn_lsp_servers_background(configs, Arc::clone(&translator), cancel_rx, shared);
+        translator.notification_pumps.get_or_init(|| {
+            notification_lifecycle::NotificationPumps::new(shared.clone(), cancel_rx.clone())
+        });
+        let init = spawn_lsp_servers_background(
+            configs,
+            Arc::clone(&translator),
+            cancel_rx,
+            shared,
+        );
         let abort_init = AbortOnDrop(&init);
         let server = mcp::McplsServer::new(Arc::clone(&translator), cache, Arc::from(vec![root.clone()]),
-            subs, false, Arc::clone(&delivery), floors, config.diagnostics, settle);
+            subs, false, Arc::clone(&delivery), floors, config.diagnostics, Arc::clone(&settle));
         let (server_io, client_io) = tokio::io::duplex(65_536);
         let started = tokio::spawn(async move { server.serve(server_io).await.unwrap() });
         let mut wire = BufStream::new(client_io);
@@ -928,6 +1245,7 @@ async fn recovery_scenario(startup: StartupMode) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }).await.unwrap();
+        wait_for_owner_baseline(&settle, &ServerId::from("rust")).await;
         for generation in first_generation..first_generation + 2 {
             tokio::time::sleep(Duration::from_millis(1100)).await;
             std::fs::write(root.join(format!("rust.crash-{generation}")), "").unwrap();
@@ -952,6 +1270,7 @@ async fn recovery_scenario(startup: StartupMode) {
                 }
             }).await.expect("replacement log sentinel must reach the public MCP tool");
             wait_cached(&mut wire, &python, "python-generation-1").await;
+            wait_for_owner_baseline(&settle, &ServerId::from("rust")).await;
             let first = call(&mut wire, "get_new_diagnostics", json!({})).await;
             assert!(first.to_string().contains(&sentinel), "{first}");
             let second = call(&mut wire, "get_new_diagnostics", json!({})).await;

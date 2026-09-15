@@ -37,6 +37,7 @@ jobs:
               - 'crates/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
+              - 'schema/**'
               - 'plugin/**'
               - '.claude-plugin/**'
               - '.agents/**'

@@ -16,6 +16,8 @@ pub struct ServerSpawnFailure {
     pub language_id: String,
     /// Command that was attempted.
     pub command: String,
+    /// Whether the command was not found.
+    pub missing_binary: bool,
     /// Error message describing the failure.
     pub message: String,
 }
@@ -333,6 +335,18 @@ pub enum Error {
     },
 }
 
+impl Error {
+    /// Whether this error means the server's command is not on `PATH`.
+    #[must_use]
+    pub fn is_missing_binary(&self) -> bool {
+        matches!(
+            self,
+            Self::ServerSpawnFailed { source, .. }
+                if source.kind() == std::io::ErrorKind::NotFound
+        )
+    }
+}
+
 /// A specialized Result type for mcpls-core operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -476,11 +490,39 @@ mod tests {
     }
 
     #[test]
+    fn test_a_not_found_spawn_is_a_missing_binary() {
+        let err = Error::ServerSpawnFailed {
+            command: "rust-analyzer".to_string(),
+            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        };
+        assert!(err.is_missing_binary());
+    }
+
+    #[test]
+    fn test_a_permission_denied_spawn_is_not_a_missing_binary() {
+        let err = Error::ServerSpawnFailed {
+            command: "rust-analyzer".to_string(),
+            source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        };
+        assert!(!err.is_missing_binary());
+    }
+
+    #[test]
+    fn test_a_handshake_failure_is_not_a_missing_binary() {
+        let err = Error::ServerUnavailable {
+            server_id: ServerId::from("rust"),
+            reason: "initialize timed out".to_string(),
+        };
+        assert!(!err.is_missing_binary());
+    }
+
+    #[test]
     fn test_server_spawn_failure_display() {
         let failure = ServerSpawnFailure {
             server_id: ServerId::from("rust"),
             language_id: "rust".to_string(),
             command: "rust-analyzer".to_string(),
+            missing_binary: false,
             message: "No such file or directory".to_string(),
         };
         assert_eq!(
@@ -495,6 +537,7 @@ mod tests {
             server_id: ServerId::from("python"),
             language_id: "python".to_string(),
             command: "pyright".to_string(),
+            missing_binary: false,
             message: "command not found".to_string(),
         };
         let debug_str = format!("{failure:?}");
@@ -509,6 +552,7 @@ mod tests {
             server_id: ServerId::from("typescript"),
             language_id: "typescript".to_string(),
             command: "tsserver".to_string(),
+            missing_binary: false,
             message: "failed to start".to_string(),
         };
         let cloned = failure.clone();
@@ -549,12 +593,14 @@ mod tests {
                 server_id: ServerId::from("rust"),
                 language_id: "rust".to_string(),
                 command: "rust-analyzer".to_string(),
+                missing_binary: false,
                 message: "not found".to_string(),
             },
             ServerSpawnFailure {
                 server_id: ServerId::from("python"),
                 language_id: "python".to_string(),
                 command: "pyright".to_string(),
+                missing_binary: false,
                 message: "permission denied".to_string(),
             },
         ];
@@ -571,6 +617,7 @@ mod tests {
             server_id: ServerId::from("python"),
             language_id: "python".to_string(),
             command: "pyright".to_string(),
+            missing_binary: false,
             message: "not found".to_string(),
         }];
 

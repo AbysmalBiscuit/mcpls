@@ -1,13 +1,16 @@
 //! Document symbols and workspace symbol search handlers.
 
+use std::collections::HashSet;
+
 use lsp_types::{
     DocumentSymbol, DocumentSymbolParams, PartialResultParams, TextDocumentIdentifier,
     WorkDoneProgressParams, WorkspaceSymbolParams as LspWorkspaceSymbolParams,
 };
 
-use super::Translator;
 use super::dto::{DocumentSymbolsResult, Location, Symbol, WorkspaceSymbol, WorkspaceSymbolResult};
 use super::encoding_ctx::EncodingCtx;
+use super::routing::FIRST_SPAWN_BUDGET;
+use super::{ServerLifecycle, Translator};
 use crate::bridge::lock_std;
 use crate::config::{NoServerReason, ToolKind};
 use crate::error::{Error, Result};
@@ -185,40 +188,52 @@ impl Translator {
     ) -> Result<WorkspaceSymbolResult> {
         validate_workspace_symbol_params(&query, kind_filter.as_deref())?;
 
-        // Workspace search has no document, so it resolves via `resolve_any`
-        // rather than a per-language route. If the resolved server is not
-        // registered yet but is expected, tell the caller to wait and retry
-        // rather than implying nothing is configured.
-        let server_id = lock_std(&self.router)
-            .resolve_any(ToolKind::WorkspaceSymbols)
-            .cloned()
-            .map_err(|reason| match reason {
-                // `resolve_any` reports "nothing registered", which also
-                // covers a server that is configured but has not finished
-                // spawning yet -- check `expected_servers` (unavailable to
-                // `ToolRouter` itself) to tell the two apart, mirroring
-                // `get_client_for_file`'s `ServerInitializing` check below.
-                NoServerReason::NothingRegistered => {
-                    if lock_std(&self.expected_servers).is_empty() {
-                        Error::NoServerConfigured
-                    } else {
-                        Error::WorkspaceServersInitializing
+        let mut excluded = HashSet::new();
+        let server_id = loop {
+            let candidate = lock_std(&self.router)
+                .resolve_any_excluding(ToolKind::WorkspaceSymbols, &excluded)
+                .cloned()
+                .map_err(|reason| match reason {
+                    NoServerReason::NothingRegistered => {
+                        if self.lifecycles().is_empty() {
+                            Error::NoServerConfigured
+                        } else {
+                            Error::WorkspaceServersInitializing
+                        }
                     }
-                }
-                NoServerReason::NoClaimant => Error::NoServerForWorkspaceTool {
-                    tool: ToolKind::WorkspaceSymbols,
-                },
-            })?;
-        self.respawn_if_dead(&server_id).await?;
-        let client = lock_std(&self.lsp_clients).get(&server_id).cloned();
-        let client = client.ok_or_else(|| {
-            if lock_std(&self.expected_servers).contains(&server_id) {
-                Error::ServerInitializing {
-                    server_id: server_id.clone(),
-                }
+                    NoServerReason::NoClaimant => Error::NoServerForWorkspaceTool {
+                        tool: ToolKind::WorkspaceSymbols,
+                    },
+                })?;
+            if self.lifecycle_of(&candidate) == Some(ServerLifecycle::NotInstalled) {
+                excluded.insert(candidate);
             } else {
-                Error::NoServerConfigured
+                break candidate;
             }
+        };
+        if let Err(err) = self
+            .ensure_server(&server_id, Some(FIRST_SPAWN_BUDGET))
+            .await
+        {
+            return Err(match err {
+                Error::ServerInitializing { .. } => Error::WorkspaceServersInitializing,
+                other => other,
+            });
+        }
+        let client = lock_std(&self.lsp_clients).get(&server_id).cloned();
+        let client = client.ok_or_else(|| match self.lifecycle_of(&server_id) {
+            Some(ServerLifecycle::Idle | ServerLifecycle::Starting) => Error::ServerInitializing {
+                server_id: server_id.clone(),
+            },
+            Some(ServerLifecycle::NotInstalled) => Error::ServerUnavailable {
+                server_id: server_id.clone(),
+                reason: "command not found".to_string(),
+            },
+            Some(ServerLifecycle::Failed) => Error::ServerUnavailable {
+                server_id: server_id.clone(),
+                reason: "failed to start".to_string(),
+            },
+            Some(ServerLifecycle::Running) | None => Error::NoServerConfigured,
         })?;
         self.require_capability(&server_id, "workspaceSymbolProvider", |caps| {
             matches!(
@@ -269,7 +284,7 @@ impl Translator {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::fs;
     use std::sync::Arc;
     use std::time::Duration;
@@ -284,6 +299,24 @@ mod tests {
     };
     use crate::config::{ServerId, ToolRouter};
 
+    fn workspace_symbol_server(language_id: &str, name: &str) -> crate::config::LspServerConfig {
+        crate::config::LspServerConfig {
+            language_id: language_id.to_string(),
+            command: "fake-lsp".to_string(),
+            args: vec![],
+            env: HashMap::new(),
+            file_patterns: vec![],
+            initialization_options: None,
+            timeout_seconds: 30,
+            spawn: None,
+            request_timeout_seconds: 30,
+            heuristics: None,
+            name: Some(name.to_string()),
+            handles: Some(vec![ToolKind::WorkspaceSymbols]),
+            diagnostics_severity: None,
+        }
+    }
+
     #[tokio::test]
     async fn test_handle_workspace_symbol_no_server() {
         let translator = Translator::new();
@@ -293,15 +326,12 @@ mod tests {
         assert!(matches!(result, Err(Error::NoServerConfigured)));
     }
 
-    /// #242/S4 regression: a server is configured and still spawning (large
-    /// project load) rather than never having existed -- the router alone
-    /// cannot tell these apart (both look like "nothing registered"), so
-    /// `handle_workspace_symbol` must consult `expected_servers` to report
-    /// "still initializing" instead of the misleading "no server configured".
+    /// Lifecycle membership distinguishes a configured server from an empty
+    /// setup when no workspace-symbol route is available yet.
     #[tokio::test]
-    async fn test_handle_workspace_symbol_reports_initializing_when_expected_but_not_registered() {
+    async fn test_handle_workspace_symbol_reports_initializing_while_server_is_starting() {
         let translator = Translator::new();
-        translator.set_expected_servers(HashSet::from([ServerId::from("pyright")]));
+        translator.set_lifecycle(&ServerId::from("pyright"), ServerLifecycle::Starting);
 
         let result = translator
             .handle_workspace_symbol("test".to_string(), None, 100)
@@ -324,6 +354,7 @@ mod tests {
             file_patterns: vec![],
             initialization_options: None,
             timeout_seconds: 30,
+            spawn: None,
             request_timeout_seconds: 30,
             heuristics: None,
             name: Some("pyright".to_string()),
@@ -342,6 +373,46 @@ mod tests {
                 tool: ToolKind::WorkspaceSymbols
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn workspace_symbol_skips_missing_binary_and_starts_only_the_next_claimant() {
+        let configs = [
+            workspace_symbol_server("python", "python-missing"),
+            workspace_symbol_server("typescript", "typescript-idle"),
+            workspace_symbol_server("lua", "lua-unused"),
+        ];
+        let router = ToolRouter::from_configs(&configs).unwrap();
+        let translator = Arc::new(Translator::new().with_router(router));
+        translator.set_self_handle(Arc::downgrade(&translator));
+
+        let missing_id = ServerId::from("python-missing");
+        let selected_id = ServerId::from("typescript-idle");
+        let unused_id = ServerId::from("lua-unused");
+        translator.set_lifecycle(&missing_id, ServerLifecycle::NotInstalled);
+        translator.set_lifecycle(&selected_id, ServerLifecycle::Idle);
+        translator.set_lifecycle(&unused_id, ServerLifecycle::Idle);
+
+        let result = translator
+            .handle_workspace_symbol("query".to_string(), None, 100)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(Error::ServerUnavailable { server_id, .. }) if server_id == selected_id
+        ));
+        assert_eq!(
+            translator.lifecycle_of(&missing_id),
+            Some(ServerLifecycle::NotInstalled)
+        );
+        assert_eq!(
+            translator.lifecycle_of(&selected_id),
+            Some(ServerLifecycle::Failed)
+        );
+        assert_eq!(
+            translator.lifecycle_of(&unused_id),
+            Some(ServerLifecycle::Idle)
+        );
     }
 
     #[tokio::test]

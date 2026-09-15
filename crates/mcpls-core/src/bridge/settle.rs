@@ -55,6 +55,8 @@ struct SettleState {
     pending_owners: HashSet<ServerId>,
     replacement_pending: HashSet<ServerId>,
     retired_servers: HashSet<ServerId>,
+    pending_baselines: HashMap<ServerId, PendingBaseline>,
+    next_baseline_generation: u64,
     /// When the outstanding set last became empty. `None` until the first
     /// operation ends, so a process that has not yet heard from a server is
     /// not mistaken for one whose servers have finished.
@@ -70,6 +72,13 @@ struct ServerProgress {
     outstanding: HashSet<String>,
     quiet_since: Option<Instant>,
     progress_seen: bool,
+}
+
+#[derive(Debug)]
+struct PendingBaseline {
+    generation: u64,
+    replay_claimed: bool,
+    replay_complete: bool,
 }
 
 impl ServerSettle {
@@ -89,6 +98,8 @@ impl ServerSettle {
                 pending_owners: HashSet::new(),
                 replacement_pending: HashSet::new(),
                 retired_servers: HashSet::new(),
+                pending_baselines: HashMap::new(),
+                next_baseline_generation: 0,
                 quiet_since: None,
                 deadline: Instant::now() + deadline_after,
                 epoch: 0,
@@ -111,11 +122,204 @@ impl ServerSettle {
             .cloned()
             .collect::<Vec<_>>();
         state.pending_owners.extend(replacement_owners);
-        state.diagnostics_owners = owners
+        let diagnostics_owners = owners
             .into_iter()
             .filter(|owner| !state.retired_servers.contains(owner))
             .collect();
+        for owner in &diagnostics_owners {
+            Self::ensure_baseline_pending(&mut state, owner);
+        }
+        state.diagnostics_owners = diagnostics_owners;
         state.owners_installed = true;
+    }
+
+    /// Adds startup owners without dropping registrations made during initialization.
+    pub(crate) fn add_diagnostics_owners(&self, owners: impl IntoIterator<Item = ServerId>) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let owners: HashSet<_> = owners.into_iter().collect();
+        let mut all_owners = state.diagnostics_owners.clone();
+        all_owners.extend(owners);
+        state
+            .pending_owners
+            .retain(|owner| all_owners.contains(owner));
+        let replacement_owners = all_owners
+            .iter()
+            .filter(|owner| state.replacement_pending.contains(*owner))
+            .cloned()
+            .collect::<Vec<_>>();
+        state.pending_owners.extend(replacement_owners);
+        let diagnostics_owners = all_owners
+            .into_iter()
+            .filter(|owner| !state.retired_servers.contains(owner))
+            .collect();
+        for owner in &diagnostics_owners {
+            Self::ensure_baseline_pending(&mut state, owner);
+        }
+        state.diagnostics_owners = diagnostics_owners;
+        state.owners_installed = true;
+    }
+
+    const fn next_baseline_generation(state: &mut SettleState) -> u64 {
+        state.next_baseline_generation += 1;
+        state.next_baseline_generation
+    }
+
+    fn ensure_baseline_pending(state: &mut SettleState, owner: &ServerId) -> u64 {
+        if let Some(pending) = state.pending_baselines.get(owner) {
+            return pending.generation;
+        }
+        let generation = Self::next_baseline_generation(state);
+        state.pending_baselines.insert(
+            owner.clone(),
+            PendingBaseline {
+                generation,
+                replay_claimed: false,
+                replay_complete: true,
+            },
+        );
+        generation
+    }
+
+    /// Mark a diagnostics owner's next settled snapshot as baseline state awaiting document replay.
+    pub(crate) fn begin_diagnostics_baseline_merge(&self, owner: &ServerId) -> Option<u64> {
+        let Ok(mut state) = self.state.lock() else {
+            return None;
+        };
+        let generation = Self::next_baseline_generation(&mut state);
+        state.pending_baselines.insert(
+            owner.clone(),
+            PendingBaseline {
+                generation,
+                replay_claimed: false,
+                replay_complete: false,
+            },
+        );
+        Some(generation)
+    }
+
+    /// Claim exclusive responsibility for replaying one pending generation.
+    pub(crate) fn claim_diagnostics_replay(&self, owner: &ServerId, generation: u64) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        let Some(pending) = state.pending_baselines.get_mut(owner) else {
+            return false;
+        };
+        if pending.generation != generation || pending.replay_claimed || pending.replay_complete {
+            return false;
+        }
+        pending.replay_claimed = true;
+        true
+    }
+
+    /// Make the pending generation eligible for adoption after its document replay finishes.
+    pub(crate) fn complete_diagnostics_replay(&self, owner: &ServerId, generation: u64) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if let Some(pending) = state.pending_baselines.get_mut(owner)
+            && pending.generation == generation
+        {
+            pending.replay_complete = true;
+        }
+    }
+
+    /// Complete a baseline merge only if the same owner generation is pending.
+    pub(crate) fn finish_diagnostics_baseline_merge(
+        &self,
+        owner: &ServerId,
+        generation: u64,
+    ) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        if state
+            .pending_baselines
+            .get(owner)
+            .is_none_or(|pending| pending.generation != generation)
+        {
+            return false;
+        }
+        state.pending_baselines.remove(owner);
+        true
+    }
+
+    /// Current diagnostics owners whose cache entries must stay out of flushes.
+    pub(crate) fn pending_diagnostics_baselines(&self) -> HashSet<ServerId> {
+        self.state
+            .lock()
+            .map(|state| state.pending_baselines.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn diagnostics_baseline_generation(&self, owner: &ServerId) -> Option<u64> {
+        self.state
+            .lock()
+            .ok()?
+            .pending_baselines
+            .get(owner)
+            .map(|pending| pending.generation)
+    }
+
+    pub(crate) fn baseline_merge_is_current(&self, owner: &ServerId, generation: u64) -> bool {
+        self.state.lock().is_ok_and(|state| {
+            state
+                .pending_baselines
+                .get(owner)
+                .is_some_and(|pending| pending.generation == generation)
+        })
+    }
+
+    /// Apply one owner's baseline while its generation is still pending and the workspace is settled.
+    pub(crate) fn merge_settled_diagnostics_baseline<T>(
+        &self,
+        owner: &ServerId,
+        generation: u64,
+        merge: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let Ok(mut state) = self.state.lock() else {
+            return None;
+        };
+        if state
+            .pending_baselines
+            .get(owner)
+            .is_none_or(|pending| pending.generation != generation || !pending.replay_complete)
+            || !self.should_settle_locked(&state, Instant::now())
+        {
+            return None;
+        }
+        let result = merge();
+        state.pending_baselines.remove(owner);
+        Some(result)
+    }
+
+    /// Adopt an initial baseline excluding replaying owners, retaining their pending generations.
+    pub(crate) fn adopt_settled_diagnostics_baseline<T>(
+        &self,
+        adopt: impl FnOnce(&HashSet<ServerId>) -> T,
+    ) -> Option<T> {
+        let Ok(mut state) = self.state.lock() else {
+            return None;
+        };
+        if !self.should_settle_locked(&state, Instant::now()) {
+            return None;
+        }
+        let replaying = state
+            .pending_baselines
+            .iter()
+            .filter(|(_, pending)| !pending.replay_complete)
+            .map(|(owner, _)| owner.clone())
+            .collect();
+        let result = adopt(&replaying);
+        let owners = state.diagnostics_owners.iter().cloned().collect::<Vec<_>>();
+        for owner in owners {
+            if !replaying.contains(&owner) {
+                state.pending_baselines.remove(&owner);
+            }
+        }
+        Some(result)
     }
 
     /// Re-install a diagnostics owner after a server replacement completed.
@@ -126,11 +330,46 @@ impl ServerSettle {
         state.retired_servers.remove(server);
         state.pending_owners.remove(server);
         state.replacement_pending.remove(server);
-        state.diagnostics_owners.insert(server.clone());
+        let newly_active = state.diagnostics_owners.insert(server.clone());
+        state.owners_installed = true;
+        Self::ensure_baseline_pending(&mut state, server);
         let progress = state.server_progress.entry(server.clone()).or_default();
-        if progress.outstanding.is_empty() && progress.quiet_since.is_none() {
+        if progress.outstanding.is_empty() && (newly_active || progress.quiet_since.is_none()) {
             progress.quiet_since = Some(Instant::now());
         }
+    }
+
+    /// Whether this server currently owns cached diagnostics.
+    #[must_use]
+    pub fn owns_diagnostics(&self, server: &ServerId) -> bool {
+        self.state
+            .lock()
+            .is_ok_and(|state| state.diagnostics_owners.contains(server))
+    }
+
+    pub(crate) fn diagnostics_owners(&self) -> HashSet<ServerId> {
+        self.state
+            .lock()
+            .map(|state| state.diagnostics_owners.clone())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn unregister_diagnostics_owner(&self, server: &ServerId) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        state.diagnostics_owners.remove(server);
+        state.pending_owners.remove(server);
+        state.pending_baselines.remove(server);
+    }
+
+    /// Number of diagnostics owners currently participating in settle.
+    #[must_use]
+    pub fn diagnostics_owner_count(&self) -> usize {
+        let Ok(state) = self.state.lock() else {
+            return 0;
+        };
+        state.diagnostics_owners.len()
     }
 
     /// Keep a retiring diagnostics owner in the startup wait until its replacement is installed.
@@ -246,6 +485,22 @@ impl ServerSettle {
         self.end_at(server, token, Instant::now());
     }
 
+    /// Release progress owned by an exited process while retaining its diagnostics route.
+    pub(crate) fn server_exited(&self, server: &ServerId) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let before = state.outstanding.len();
+        state.outstanding.retain(|(id, _)| id != server);
+        let now = Instant::now();
+        if state.outstanding.len() != before && state.outstanding.is_empty() {
+            state.quiet_since = Some(now);
+        }
+        let progress = state.server_progress.entry(server.clone()).or_default();
+        progress.outstanding.clear();
+        progress.quiet_since = Some(now);
+    }
+
     /// Retire outstanding work owned by an exited server without resetting the session.
     pub(crate) fn forget_server(&self, server: &ServerId) {
         let Ok(mut state) = self.state.lock() else {
@@ -260,6 +515,9 @@ impl ServerSettle {
         let was_owner = state.diagnostics_owners.remove(server);
         if was_owner && state.replacement_pending.contains(server) {
             state.pending_owners.insert(server.clone());
+        }
+        if !state.replacement_pending.contains(server) {
+            state.pending_baselines.remove(server);
         }
         state.retired_servers.insert(server.clone());
     }
@@ -299,17 +557,7 @@ impl ServerSettle {
                 .is_none_or(|since| now.duration_since(since) >= quiet_for)
     }
 
-    /// Whether the workspace counts as analyzed as of `now`.
-    ///
-    /// A quiet stamp from a real `end` needs only `quiet_for` to elapse. One
-    /// from [`Self::restart_deadline`], on a server that has never begun any
-    /// work, needs `NO_PROGRESS_GRACE` instead -- see that constant's doc
-    /// for why.
-    #[must_use]
-    pub fn should_settle_at(&self, now: Instant) -> bool {
-        let Ok(state) = self.state.lock() else {
-            return false;
-        };
+    fn should_settle_locked(&self, state: &SettleState, now: Instant) -> bool {
         if now >= state.deadline {
             return true;
         }
@@ -350,6 +598,17 @@ impl ServerSettle {
             }
         }
         true
+    }
+
+    /// Whether the workspace has settled as of `now`.
+    ///
+    /// Progress completion uses `quiet_for`; a silent server uses
+    /// `NO_PROGRESS_GRACE`, unless the deadline has expired.
+    #[must_use]
+    pub fn should_settle_at(&self, now: Instant) -> bool {
+        self.state
+            .lock()
+            .is_ok_and(|state| self.should_settle_locked(&state, now))
     }
 
     /// [`Self::should_settle_at`] as of now.
@@ -415,6 +674,22 @@ mod tests {
              and indexing has not started yet"
         );
         assert!(settle.should_settle_at(quiet_began + Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn promoted_owner_rearms_existing_quiet_clock() {
+        let settle = settle();
+        let owner = ServerId::from("wide");
+        settle.set_diagnostics_owners([]);
+        settle.begin(&owner, &json!("index"));
+        settle.end_at(
+            &owner,
+            &json!("index"),
+            Instant::now().checked_sub(Duration::from_secs(10)).unwrap(),
+        );
+        settle.register_diagnostics_owner(&owner);
+        settle.restart_deadline();
+        assert!(!settle.should_settle());
     }
 
     #[test]
@@ -739,6 +1014,67 @@ mod tests {
     }
 
     #[test]
+    fn test_the_first_lazy_owner_installs_the_per_owner_decision() {
+        let settle = ServerSettle::new(Duration::from_millis(10), Duration::from_secs(300));
+        let noisy = ServerId::from("typescript");
+        let token = serde_json::json!("t1");
+        let start = Instant::now();
+
+        settle.begin(&noisy, &token);
+        settle.end_at(&noisy, &token, start);
+
+        let owner = ServerId::from("rust");
+        settle.register_diagnostics_owner(&owner);
+
+        assert!(
+            !settle.should_settle_at(start + Duration::from_millis(50)),
+            "a lazily registered owner that has not gone quiet keeps the baseline waiting"
+        );
+    }
+
+    #[test]
+    fn test_startup_owner_publication_preserves_a_lazy_owner_started_during_batch() {
+        let settle = ServerSettle::new(Duration::from_millis(10), Duration::from_secs(300));
+        let eager = ServerId::from("typescript");
+        let lazy = ServerId::from("rust");
+        let token = serde_json::json!("indexing");
+        let start = Instant::now();
+
+        settle.begin(&eager, &token);
+        settle.register_diagnostics_owner(&lazy);
+        settle.end_at(&eager, &token, start);
+
+        settle.add_diagnostics_owners([eager]);
+
+        assert!(
+            !settle.should_settle_at(start + Duration::from_millis(50)),
+            "the eager owner is quiet, but the lazy owner has not reported progress"
+        );
+    }
+
+    #[test]
+    fn test_startup_owner_publication_keeps_a_retiring_replacement_pending() {
+        let settle = ServerSettle::new(Duration::from_millis(10), Duration::from_secs(60));
+        let rust = ServerId::from("rust");
+        let python = ServerId::from("python");
+
+        settle.begin_diagnostics_replacement(&rust);
+        settle.forget_server(&rust);
+        settle.add_diagnostics_owners([rust, python]);
+        settle.restart_deadline();
+
+        assert_eq!(
+            settle.diagnostics_owner_count(),
+            1,
+            "a retired process is excluded from the active diagnostics owner count"
+        );
+        assert!(
+            !settle.should_settle_at(Instant::now() + NO_PROGRESS_GRACE * 2),
+            "the retired owner's active replacement stays pending until it registers or aborts"
+        );
+    }
+
+    #[test]
     fn i1_t5_excluded_progress_does_not_delay_nonempty_owner_set() {
         let quiet_for = Duration::from_millis(10);
         let settle = ServerSettle::new(quiet_for, Duration::from_secs(60));
@@ -808,5 +1144,91 @@ mod tests {
         settle.set_diagnostics_owners([replacement, surviving]);
 
         assert!(settle.should_settle_at(surviving_quiet_started + quiet_for));
+    }
+
+    #[test]
+    fn i1_t5_initial_baseline_adoption_keeps_an_unregistered_owner_pending() {
+        let settle = ServerSettle::new(Duration::ZERO, Duration::from_secs(60));
+        let eager = ServerId::from("eager");
+        let late = ServerId::from("late");
+        settle.begin(&eager, &json!("indexing"));
+        settle.end(&eager, &json!("indexing"));
+        settle.set_diagnostics_owners([eager.clone()]);
+        let late_generation = settle.begin_diagnostics_baseline_merge(&late).unwrap();
+
+        assert!(settle.adopt_settled_diagnostics_baseline(|_| ()).is_some());
+
+        assert_eq!(settle.diagnostics_baseline_generation(&eager), None);
+        assert_eq!(
+            settle.diagnostics_baseline_generation(&late),
+            Some(late_generation),
+            "an owner that was not installed in the settled snapshot still needs its merge"
+        );
+    }
+
+    #[test]
+    fn i1_t5_stale_baseline_completion_cannot_release_a_new_generation() {
+        let settle = ServerSettle::new(Duration::ZERO, Duration::from_secs(60));
+        let owner = ServerId::from("rust");
+        let first = settle.begin_diagnostics_baseline_merge(&owner).unwrap();
+        let second = settle.begin_diagnostics_baseline_merge(&owner).unwrap();
+
+        assert_ne!(first, second);
+        assert!(!settle.finish_diagnostics_baseline_merge(&owner, first));
+        assert_eq!(settle.diagnostics_baseline_generation(&owner), Some(second));
+        assert!(settle.finish_diagnostics_baseline_merge(&owner, second));
+        assert_eq!(settle.diagnostics_baseline_generation(&owner), None);
+    }
+
+    #[test]
+    fn stale_replay_completion_cannot_ready_a_new_generation() {
+        let settle = ServerSettle::new(Duration::ZERO, Duration::from_secs(60));
+        let owner = ServerId::from("rust");
+        settle.register_diagnostics_owner(&owner);
+        settle.begin(&owner, &json!("indexing"));
+        settle.end(&owner, &json!("indexing"));
+        let first = settle.begin_diagnostics_baseline_merge(&owner).unwrap();
+        let second = settle.begin_diagnostics_baseline_merge(&owner).unwrap();
+        settle.complete_diagnostics_replay(&owner, first);
+        assert_eq!(
+            settle.adopt_settled_diagnostics_baseline(|replaying| replaying.contains(&owner)),
+            Some(true)
+        );
+        assert_eq!(
+            settle.merge_settled_diagnostics_baseline(&owner, second, || ()),
+            None
+        );
+        settle.complete_diagnostics_replay(&owner, second);
+        assert_eq!(
+            settle.merge_settled_diagnostics_baseline(&owner, second, || ()),
+            Some(())
+        );
+    }
+
+    #[test]
+    fn i1_t5_retiring_without_replacement_releases_the_baseline_gate() {
+        let settle = ServerSettle::new(Duration::ZERO, Duration::from_secs(60));
+        let owner = ServerId::from("rust");
+        settle.register_diagnostics_owner(&owner);
+
+        settle.forget_server(&owner);
+
+        assert!(settle.pending_diagnostics_baselines().is_empty());
+    }
+
+    #[test]
+    fn i1_t5_exited_silent_owner_settles_after_no_progress_grace() {
+        let settle = ServerSettle::new(Duration::from_secs(1), Duration::from_secs(60));
+        let owner = ServerId::from("rust");
+        settle.register_diagnostics_owner(&owner);
+        settle.restart_deadline();
+        let exited_at = Instant::now();
+
+        settle.server_exited(&owner);
+
+        assert_eq!(settle.diagnostics_owner_count(), 1);
+        assert!(settle.pending_diagnostics_baselines().contains(&owner));
+        assert!(!settle.should_settle_at(exited_at + NO_PROGRESS_GRACE / 2));
+        assert!(settle.should_settle_at(exited_at + NO_PROGRESS_GRACE + Duration::from_secs(1)));
     }
 }

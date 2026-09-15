@@ -12,7 +12,7 @@ use tokio::sync::watch;
 
 use crate::bridge::SessionId;
 use crate::hooks::identity::SocketIdentity;
-use crate::hooks::protocol::{Request, Response};
+use crate::hooks::protocol::{Request, Response, ServerStatus};
 use crate::hooks::sweep::Sweeper;
 use crate::mcp::McplsServer;
 
@@ -66,7 +66,7 @@ pub struct StatusExtras {
     /// The MCP sessions attached.
     pub sessions: Vec<String>,
     /// The language servers registered.
-    pub servers: Vec<String>,
+    pub servers: Vec<ServerStatus>,
     /// The configuration fingerprint this process started with.
     pub config_fingerprint: String,
 }
@@ -1174,14 +1174,6 @@ mod tests {
         }
     }
 
-    /// A command that starts, reads nothing, and never answers
-    /// `initialize`, so routing keeps reporting the server as still
-    /// starting for as long as a test needs it to.
-    #[cfg(all(unix, feature = "transport-http"))]
-    const NEVER_ANSWERS: (&str, &[&str]) = ("/bin/sleep", &["30"]);
-    #[cfg(all(windows, feature = "transport-http"))]
-    const NEVER_ANSWERS: (&str, &[&str]) = ("powershell", &["-Command", "Start-Sleep 30"]);
-
     /// A loopback HTTP transport on an ephemeral port.
     ///
     /// The stdio transport reads real process stdin, which a test runner
@@ -1248,16 +1240,9 @@ mod tests {
         drop(dir);
     }
 
-    /// The sweep half: the paths a `changed` op queues are acted on by a
-    /// loop `serve_with` also has to start.
-    ///
-    /// A sweep's one effect visible over the socket is its shortfall line,
-    /// and a sweep only reports one for a path that routes somewhere. So the
-    /// config names a server that starts and never answers `initialize`:
-    /// routing then reports it as still starting, which is a file that
-    /// should have been checked and was not. A command that cannot spawn
-    /// would not do -- the background spawn fails, every route is dropped,
-    /// and the sweep goes silent.
+    /// The sweep half: `serve_with` must act on paths a `changed` op queues.
+    /// The missing binary settles as `NotInstalled`, so the path reaches the
+    /// open loop and its failure is reported.
     #[cfg(feature = "transport-http")]
     #[tokio::test]
     async fn test_serve_with_runs_the_sweep_loop_it_built() {
@@ -1271,16 +1256,17 @@ mod tests {
         let mut config = bare_config_over(workspace.path());
         config.lsp_servers = vec![LspServerConfig {
             language_id: "rust".to_string(),
-            command: NEVER_ANSWERS.0.to_string(),
-            args: NEVER_ANSWERS
-                .1
-                .iter()
-                .map(|arg| (*arg).to_string())
-                .collect(),
+            command: workspace
+                .path()
+                .join("missing-lsp-server")
+                .to_string_lossy()
+                .into_owned(),
+            args: Vec::new(),
             env: HashMap::new(),
             file_patterns: vec!["**/*.rs".to_string()],
             initialization_options: None,
             timeout_seconds: 30,
+            spawn: None,
             request_timeout_seconds: 30,
             heuristics: None,
             name: None,
@@ -1338,7 +1324,7 @@ mod tests {
             "nothing ever swept the queued path, so every path a hook reports \
              reaches a set that is never drained and no flush ever mentions it",
         );
-        assert!(reported.contains("not checked"), "{reported}");
+        assert_eq!(reported, "1 file(s) not checked: they could not be opened");
 
         served.abort();
         drop(dir);

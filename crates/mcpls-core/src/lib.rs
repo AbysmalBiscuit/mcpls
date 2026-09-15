@@ -48,16 +48,16 @@ mod recovery_tests;
 pub mod transport;
 mod util;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bridge::apply::Applier;
 use bridge::resources::make_uri;
-use bridge::{NotificationCache, ResourceSubscriptions, Translator};
+use bridge::{NotificationCache, ResourceSubscriptions, ServerLifecycle, Translator};
 pub use config::{BackendConfig, ConfigSource, ProjectConfigTrust, ServerConfig};
-use config::{ServerId, ToolRouter};
+use config::{ServerId, SpawnPolicy, ToolRouter};
 pub use error::Error;
 use lsp::{LspNotification, LspServer, ServerInitConfig};
 use lsp_types::Uri;
@@ -164,7 +164,6 @@ pub(crate) async fn diagnostics_pump(
     server_id: ServerId,
     mut rx: tokio::sync::mpsc::Receiver<LspNotification>,
     mut cancel_rx: tokio::sync::watch::Receiver<bool>,
-    caches_diagnostics: bool,
     shared: PumpShared,
 ) {
     loop {
@@ -177,10 +176,13 @@ pub(crate) async fn diagnostics_pump(
                 }
             }
             msg = rx.recv() => {
-                let Some(notif) = msg else { break };
+                let Some(notif) = msg else {
+                    shared.settle.server_exited(&server_id);
+                    break;
+                };
                 match notif {
                     LspNotification::PublishDiagnostics(p) => {
-                        handle_publish_diagnostics(&server_id, caches_diagnostics, p, &shared).await;
+                        handle_publish_diagnostics(&server_id, p, &shared).await;
                     }
                     LspNotification::LogMessage(m) => {
                         let mut cache = shared.notification_cache.lock().await;
@@ -211,19 +213,9 @@ pub(crate) async fn diagnostics_pump(
 /// line-count lint.
 async fn handle_publish_diagnostics(
     server_id: &ServerId,
-    caches_diagnostics: bool,
     p: lsp_types::PublishDiagnosticsParams,
     shared: &PumpShared,
 ) {
-    // Only the server the router resolves `Diagnostics` to for this
-    // notification's language caches (and notifies subscribers of) it --
-    // see #174 §8. A server that was never the diagnostics route, or lost
-    // it without a live catch-all to rebind to, is not the authoritative
-    // source for this language's diagnostics; skip publishing so it doesn't
-    // overwrite (or spuriously notify about) another server's cache entry.
-    if !caches_diagnostics {
-        return;
-    }
     if !diagnostic_path_in_workspace(&p.uri, &shared.workspace_roots) {
         debug!(
             "dropping diagnostics for out-of-workspace URI: {}",
@@ -244,6 +236,9 @@ async fn handle_publish_diagnostics(
     }
     {
         let mut cache = shared.notification_cache.lock().await;
+        if !shared.settle.owns_diagnostics(server_id) {
+            return;
+        }
         cache.store_diagnostics(server_id, &p.uri, p.version, p.diagnostics);
     }
 
@@ -267,29 +262,17 @@ async fn handle_publish_diagnostics(
     }
 }
 
-/// Diagnostics ownership after registration, used to divide the cache budget.
+/// Diagnostics ownership of the successfully registered servers.
 pub(crate) struct RegisteredServers {
-    /// Whether each server is the one the (rebound) router resolves
-    /// `ToolKind::Diagnostics` to for its language -- see #174 §8. Computed
-    /// here, right after the rebind, so it always reflects the post-rebind
-    /// router rather than a stale pre-rebind view.
+    /// Whether each server owns the diagnostics route for its language.
     pub(crate) diagnostics_flags: HashMap<ServerId, bool>,
 }
 
-/// Register initialized LSP servers with the translator, rebind the router to
-/// the set that actually initialized, and install notification pumps before
-/// publishing clients that can trigger a replacement.
-///
-/// `configs` supplies the `ServerInitConfig` each surviving server was
-/// spawned from, keyed by routing identity, so the translator can respawn it
-/// later if its process dies (see `Translator::respawn_if_dead`).
+/// Install notification pumps before publishing the successful clients.
 pub(crate) fn register_servers(
     mut result: lsp::ServerInitResult,
     translator: &bridge::Translator,
-    configs: &HashMap<ServerId, ServerInitConfig>,
 ) -> RegisteredServers {
-    let registered: HashSet<ServerId> = result.servers.keys().cloned().collect();
-    translator.rebind_router(&registered);
     let diagnostics_flags: HashMap<_, _> = result
         .servers
         .iter()
@@ -303,19 +286,15 @@ pub(crate) fn register_servers(
     for (id, server) in &mut result.servers {
         let rx = server.take_notification_rx();
         if let Some(pumps) = translator.notification_pumps.get() {
-            pumps.install(id.clone(), rx, diagnostics_flags[id]);
+            if diagnostics_flags[id] {
+                pumps.register_diagnostics_owner(id);
+            }
+            pumps.install(id.clone(), rx);
         }
     }
 
     for (id, server) in result.servers {
         let client = server.client().clone();
-        if let Some(config) = configs.get(&id) {
-            translator.register_server_config(id.clone(), config.clone());
-        } else {
-            warn!(
-                "No respawn config registered for LSP server '{id}'; auto-respawn on crash will be unavailable for it"
-            );
-        }
         #[cfg(all(test, unix))]
         let registration_client = client.clone();
         // Workspace searches can respawn before looking up the client.
@@ -513,6 +492,19 @@ fn applicable_server_configs(
         .collect()
 }
 
+fn partition_spawn_configs(
+    config: &ServerConfig,
+    applicable: &[ServerInitConfig],
+) -> Vec<ServerInitConfig> {
+    let mut eager = Vec::new();
+    for init in applicable {
+        if init.server_config.effective_spawn(config.backend.spawn) == SpawnPolicy::Eager {
+            eager.push(init.clone());
+        }
+    }
+    eager
+}
+
 /// Start the MCPLS server with an explicit transport.
 ///
 /// Performs all shared setup (workspace discovery, LSP spawning, translator
@@ -654,14 +646,24 @@ impl Runtime {
             Arc::clone(&watch_registry),
         );
 
-        // Mark applicable servers as "expected" so a tool call that arrives while
-        // its server is still initializing gets a clear "still initializing" error
-        // (instead of "no server configured"), telling the caller to wait and retry.
-        let expected_servers: HashSet<ServerId> = applicable_configs
-            .iter()
-            .map(|c| c.server_config.id())
-            .collect();
-        translator.set_expected_servers(expected_servers);
+        // The lifecycle map records applicable servers before requests can
+        // observe the router or notification pumps.
+        for init_config in &applicable_configs {
+            let id = init_config.server_config.id();
+            let eager = init_config
+                .server_config
+                .effective_spawn(config.backend.spawn)
+                == SpawnPolicy::Eager;
+            translator.register_server_config(id.clone(), init_config.clone());
+            translator.set_lifecycle(
+                &id,
+                if eager {
+                    ServerLifecycle::Starting
+                } else {
+                    ServerLifecycle::Idle
+                },
+            );
+        }
 
         // Shared state, built BEFORE LSP initialization so the MCP server can answer
         // `initialize` immediately. LSP servers (which can take minutes to initialize
@@ -679,7 +681,6 @@ impl Runtime {
         // filesystem I/O on the hot per-notification path.
         let workspace_roots_snapshot: Arc<[PathBuf]> = Arc::from(workspace_roots.clone());
 
-        let translator = Arc::new(translator);
         let subscriptions = Arc::new(ResourceSubscriptions::new());
 
         // Cancellation for pump tasks: send `true` to request shutdown.
@@ -715,6 +716,11 @@ impl Runtime {
             delivery: Arc::clone(&delivery),
             floors: Arc::clone(&floors),
         };
+        translator.notification_pumps.get_or_init(|| {
+            notification_lifecycle::NotificationPumps::new(pump_shared.clone(), cancel_rx.clone())
+        });
+
+        let eager_configs = partition_spawn_configs(config, &applicable_configs);
 
         let lsp_init_handle = if applicable_configs.is_empty() {
             warn!("No applicable LSP servers configured — starting in protocol-only mode");
@@ -725,13 +731,16 @@ impl Runtime {
             // that instead of advising a retry that could never succeed.
             delivery.lock().await.set_baseline(HashMap::new());
             None
+        } else if eager_configs.is_empty() {
+            delivery.lock().await.set_baseline(HashMap::new());
+            None
         } else {
             info!(
                 "Spawning {} LSP server(s) in the background...",
-                applicable_configs.len()
+                eager_configs.len()
             );
             Some(spawn_lsp_servers_background(
-                applicable_configs,
+                eager_configs,
                 Arc::clone(&translator),
                 cancel_rx.clone(),
                 pump_shared,
@@ -772,7 +781,22 @@ impl Runtime {
             version: env!("CARGO_PKG_VERSION").to_string(),
             uptime_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             sessions: sessions(),
-            servers: translator.registered_server_ids(),
+            servers: translator
+                .lifecycles()
+                .into_iter()
+                .map(|(id, state)| {
+                    let state =
+                        if state == ServerLifecycle::Running && translator.is_server_dead(&id) {
+                            ServerLifecycle::Failed
+                        } else {
+                            state
+                        };
+                    hooks::protocol::ServerStatus {
+                        id: id.to_string(),
+                        state,
+                    }
+                })
+                .collect(),
             config_fingerprint: config_fingerprint.clone(),
         })
     }
@@ -929,7 +953,7 @@ fn build_translator(
     router: ToolRouter,
     notification_cache: Arc<Mutex<NotificationCache>>,
     watch_registry: Arc<lsp::WatchRegistry>,
-) -> Translator {
+) -> Arc<Translator> {
     let applier = Arc::new(Applier::new(workspace_roots.clone(), config.apply.clone()));
     let mut translator = Translator::new()
         .with_resource_limits(config.workspace.resource_limits())
@@ -939,6 +963,8 @@ fn build_translator(
         .with_watch_registry(watch_registry)
         .with_applier(applier);
     translator.set_workspace_roots(workspace_roots);
+    let translator = Arc::new(translator);
+    translator.set_self_handle(Arc::downgrade(&translator));
     translator
 }
 
@@ -1097,16 +1123,15 @@ async fn shutdown(
     }
 }
 
-/// Spawn the applicable LSP servers in a background task and register them into
-/// the shared `translator` once ready.
+/// Spawn eager LSP servers in a background task and register them into the
+/// shared `translator` once ready.
 ///
 /// This intentionally does NOT block the caller: `serve_with` starts the MCP
 /// server immediately so its `initialize` handshake returns before slow language
 /// servers (e.g. `OmniSharp` on a large Unity solution, which can take minutes to
 /// load) finish initializing. Tool calls that arrive before a server has
 /// registered return a `ServerInitializing` error telling the caller to wait and
-/// retry. If every server fails, the "expected servers" set is cleared so those
-/// calls fall back to a plain "no server configured" error instead.
+/// retry. The lifecycle map retains each configured route's startup outcome.
 ///
 /// Returns the task's `JoinHandle` so [`shutdown`] can await startup and
 /// baseline processing. Notification pumps are owned by the translator.
@@ -1116,15 +1141,18 @@ fn spawn_lsp_servers_background(
     cancel_rx: tokio::sync::watch::Receiver<bool>,
     shared: PumpShared,
 ) -> JoinHandle<()> {
-    translator.notification_pumps.get_or_init(|| {
-        notification_lifecycle::NotificationPumps::new(shared.clone(), cancel_rx.clone())
-    });
     tokio::spawn(async move {
-        let configs_by_id: HashMap<ServerId, ServerInitConfig> = applicable_configs
-            .iter()
-            .map(|c| (c.server_config.id(), c.clone()))
-            .collect();
         let result = LspServer::spawn_batch(&applicable_configs).await;
+
+        for failure in &result.failures {
+            let state = if failure.missing_binary {
+                ServerLifecycle::NotInstalled
+            } else {
+                translator.record_respawn_failure(&failure.server_id);
+                ServerLifecycle::Failed
+            };
+            translator.set_lifecycle(&failure.server_id, state);
+        }
 
         if result.all_failed() {
             error!(
@@ -1134,14 +1162,6 @@ fn spawn_lsp_servers_background(
             for failure in &result.failures {
                 error!("Server initialization failed: {}", failure);
             }
-            // No server will register: rebind against an empty registered
-            // set so every route drops (one rule, no special case -- see
-            // `ToolRouter::rebind_to_registered`), then stop reporting
-            // "still initializing". This path returns before
-            // `register_servers` ever runs, so it needs its own rebind call;
-            // skipping it would leave every route pointed at a dead server.
-            translator.rebind_router(&HashSet::new());
-            translator.clear_expected_servers();
             shared.delivery.lock().await.set_baseline(HashMap::new());
             return;
         }
@@ -1158,27 +1178,11 @@ fn spawn_lsp_servers_background(
         }
 
         let server_count = result.server_count();
-        let registered = register_servers(result, &translator, &configs_by_id);
-        // Background initialization has completed; stop reporting "still
-        // initializing" (especially for servers that failed to spawn on
-        // partial success, which would otherwise return ServerInitializing
-        // forever instead of NoServerForLanguage/Tool).
-        translator.clear_expected_servers();
+        let registered = register_servers(result, &translator);
+        for id in registered.diagnostics_flags.keys() {
+            translator.set_lifecycle(id, ServerLifecycle::Running);
+        }
         info!("Proceeding with {} LSP server(s)", server_count);
-
-        // Give each diagnostics-route server a fair share of the shared
-        // diagnostics cache budget now that the full set is known -- see
-        // `NotificationCache::set_diagnostics_route_count` (#266).
-        let diagnostics_route_count = registered
-            .diagnostics_flags
-            .values()
-            .filter(|&&is_route| is_route)
-            .count();
-        shared
-            .notification_cache
-            .lock()
-            .await
-            .set_diagnostics_route_count(diagnostics_route_count);
 
         let diagnostics_owners = registered
             .diagnostics_flags
@@ -1188,7 +1192,11 @@ fn spawn_lsp_servers_background(
             .collect::<Vec<_>>();
         #[cfg(all(test, unix))]
         recovery_tests::pause_before_owner_installation();
-        shared.settle.set_diagnostics_owners(diagnostics_owners);
+        shared.settle.add_diagnostics_owners(diagnostics_owners);
+        {
+            let mut cache = shared.notification_cache.lock().await;
+            cache.set_diagnostics_route_count(shared.settle.diagnostics_owner_count());
+        }
 
         // The settle deadline backstops indexing, which only starts here:
         // everything before this point -- config load, and every server's
@@ -1217,13 +1225,11 @@ fn spawn_lsp_servers_background(
 /// rather than by the process lifetime.
 const BASELINE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Adopt the current cache as the baseline once the servers have stayed
-/// quiet, so a session's first flush reports what happened since startup
-/// rather than everything the workspace already knew.
-///
-/// Spawned once per `serve_with` run, alongside (not inside) the per-server
-/// diagnostics pumps: the pumps run once per server, but the baseline is a
-/// single snapshot for the whole session.
+/// Adopts the current diagnostics cache after servers settle, so sessions do
+/// not report pre-existing workspace diagnostics as new work.
+// Keep the delivery and cache guards through baseline adoption so a flush
+// cannot record diagnostics between the snapshot and the baseline update.
+#[allow(clippy::significant_drop_tightening)]
 async fn baseline_task(
     settle: Arc<bridge::ServerSettle>,
     cache: Arc<Mutex<NotificationCache>>,
@@ -1245,30 +1251,102 @@ async fn baseline_task(
                 if !ready {
                     continue;
                 }
-                let baseline: HashMap<String, u64> = {
+                let baseline_len = {
+                    let mut delivery = delivery.lock().await;
                     let cache = cache.lock().await;
-                    cache
-                        .diagnostics_entries()
-                        .into_iter()
-                        .filter_map(|(key, info, owner)| {
-                            bridge::DiagnosticsDelivery::visible_hash(
-                                &info.diagnostics,
-                                floors.for_server(owner),
-                            )
-                            .map(|hash| (key.to_string(), hash))
-                        })
-                        .collect()
+                    settle.adopt_settled_diagnostics_baseline(|replaying| {
+                        let baseline: HashMap<String, u64> = cache
+                            .diagnostics_entries()
+                            .into_iter()
+                            .filter(|(_, _, owner)| !replaying.contains(*owner))
+                            .filter_map(|(key, info, owner)| {
+                                bridge::DiagnosticsDelivery::visible_hash(
+                                    &info.diagnostics,
+                                    floors.for_server(owner),
+                                )
+                                .map(|hash| (key.to_string(), hash))
+                            })
+                            .collect();
+                        let baseline_len = baseline.len();
+                        delivery.set_baseline(baseline);
+                        baseline_len
+                    })
                 };
-                let baseline_len = baseline.len();
-                // Cache guard is dropped above before delivery's is taken --
-                // the opposite of the flush's delivery-before-cache order,
-                // but safe here because this task never holds both locks at
-                // once.
-                delivery.lock().await.set_baseline(baseline);
+                let Some(baseline_len) = baseline_len else {
+                    continue;
+                };
                 #[cfg(all(test, unix))]
                 recovery_tests::mark_baseline_adopted();
                 debug!("diagnostics baseline taken over {baseline_len} file(s)");
                 return;
+            }
+        }
+    }
+}
+
+// Hold delivery -> cache through the generation-checked merge so a flush
+// cannot observe unbaselined diagnostics for this owner.
+#[allow(clippy::significant_drop_tightening)]
+async fn try_merge_settled_owner_baseline(
+    shared: &PumpShared,
+    owner: &ServerId,
+    generation: u64,
+) -> Option<usize> {
+    let mut delivery = shared.delivery.lock().await;
+    if !delivery.has_baseline() {
+        return None;
+    }
+    if !shared.settle.baseline_merge_is_current(owner, generation) {
+        return None;
+    }
+
+    let cache = shared.notification_cache.lock().await;
+    let entries: HashMap<String, u64> = cache
+        .diagnostics_entries()
+        .into_iter()
+        .filter(|(_, _, entry_owner)| *entry_owner == owner)
+        .filter_map(|(key, info, entry_owner)| {
+            bridge::DiagnosticsDelivery::visible_hash(
+                &info.diagnostics,
+                shared.floors.for_server(entry_owner),
+            )
+            .map(|hash| (key.to_string(), hash))
+        })
+        .collect();
+    let merged = entries.len();
+    shared
+        .settle
+        .merge_settled_diagnostics_baseline(owner, generation, || {
+            delivery.merge_baseline(entries);
+            merged
+        })
+}
+
+/// Merge one later-started owner's settled diagnostics into the baseline and
+/// the records of sessions that attached before that owner existed.
+pub(crate) async fn baseline_merge_task(
+    shared: PumpShared,
+    owner: ServerId,
+    generation: u64,
+    mut cancel_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            result = cancel_rx.changed() => {
+                if result.is_err() || *cancel_rx.borrow() {
+                    return;
+                }
+            }
+            () = tokio::time::sleep(BASELINE_POLL_INTERVAL) => {
+                if !shared.settle.baseline_merge_is_current(&owner, generation) {
+                    return;
+                }
+                if let Some(merged) =
+                    try_merge_settled_owner_baseline(&shared, &owner, generation).await
+                {
+                    debug!("diagnostics baseline extended over {merged} file(s) for '{owner}'");
+                    return;
+                }
             }
         }
     }
@@ -1593,6 +1671,105 @@ mod tests {
     use bridge::{DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE};
 
     use super::*;
+
+    #[tokio::test]
+    async fn test_owner_baseline_waits_for_initial_adoption() {
+        use lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range, Uri};
+
+        use crate::config::{DiagnosticsConfig, SeverityFloor};
+
+        let owner = ServerId::from("typescript");
+        let config = DiagnosticsConfig::default();
+        let mut cache = NotificationCache::new();
+        let lazy_uri: Uri = "file:///lazy.ts".parse().unwrap();
+        let lazy_diagnostics = vec![Diagnostic {
+            range: Range {
+                start: Position::new(1, 0),
+                end: Position::new(1, 1),
+            },
+            severity: Some(DiagnosticSeverity::ERROR),
+            message: "lazy diagnostic".to_string(),
+            ..Default::default()
+        }];
+        cache.store_diagnostics(&owner, &lazy_uri, Some(1), lazy_diagnostics.clone());
+
+        let settle = Arc::new(bridge::ServerSettle::new(
+            Duration::ZERO,
+            Duration::from_secs(60),
+        ));
+        let token = serde_json::json!("indexing");
+        settle.begin(&owner, &token);
+        settle.end(&owner, &token);
+        settle.set_diagnostics_owners([owner.clone()]);
+        let generation = settle.diagnostics_baseline_generation(&owner).unwrap();
+
+        let shared = PumpShared {
+            notification_cache: Arc::new(Mutex::new(cache)),
+            subs: Arc::new(ResourceSubscriptions::new()),
+            workspace_roots: Arc::from(Vec::<PathBuf>::new()),
+            document_tracker: Arc::new(bridge::DocumentTracker::new(
+                bridge::ResourceLimits::default(),
+                HashMap::new(),
+            )),
+            settle,
+            delivery: Arc::new(Mutex::new(bridge::DiagnosticsDelivery::new(config))),
+            floors: Arc::new(bridge::FloorTable::new(&config, &[])),
+        };
+
+        assert_eq!(
+            super::try_merge_settled_owner_baseline(&shared, &owner, generation).await,
+            None,
+            "a later owner's task must not create a baseline before initial adoption"
+        );
+        assert!(
+            !shared.delivery.lock().await.has_baseline(),
+            "the initial baseline task must remain the first publisher"
+        );
+
+        let eager_diagnostics = vec![Diagnostic {
+            range: Range {
+                start: Position::new(2, 0),
+                end: Position::new(2, 1),
+            },
+            severity: Some(DiagnosticSeverity::ERROR),
+            message: "eager diagnostic".to_string(),
+            ..Default::default()
+        }];
+        let eager_hash =
+            bridge::DiagnosticsDelivery::visible_hash(&eager_diagnostics, SeverityFloor::Warning)
+                .unwrap();
+        shared
+            .delivery
+            .lock()
+            .await
+            .set_baseline(HashMap::from([("eager.rs".to_string(), eager_hash)]));
+
+        assert_eq!(
+            super::try_merge_settled_owner_baseline(&shared, &owner, generation).await,
+            Some(1)
+        );
+        let entries = [
+            bridge::FileEntry {
+                key: "eager.rs",
+                diagnostics: &eager_diagnostics,
+                floor: SeverityFloor::Warning,
+            },
+            bridge::FileEntry {
+                key: lazy_uri.as_str(),
+                diagnostics: &lazy_diagnostics,
+                floor: SeverityFloor::Warning,
+            },
+        ];
+        let report = shared
+            .delivery
+            .lock()
+            .await
+            .flush(&bridge::SessionId::from("session".to_string()), &entries);
+        assert!(
+            report.changed.is_empty(),
+            "initial adoption and the later owner merge both remain baseline state"
+        );
+    }
 
     #[test]
     fn test_diagnostic_path_in_workspace_empty_roots_allows_any_uri() {
@@ -2054,12 +2231,14 @@ mod tests {
                 server_id: ServerId::from("rust"),
                 language_id: "rust".to_string(),
                 command: "rust-analyzer".to_string(),
+                missing_binary: false,
                 message: "not found".to_string(),
             });
             result.add_failure(ServerSpawnFailure {
                 server_id: ServerId::from("python"),
                 language_id: "python".to_string(),
                 command: "pyright".to_string(),
+                missing_binary: false,
                 message: "not found".to_string(),
             });
 
@@ -2079,6 +2258,7 @@ mod tests {
                 server_id: ServerId::from("python"),
                 language_id: "python".to_string(),
                 command: "pyright".to_string(),
+                missing_binary: false,
                 message: "not found".to_string(),
             });
 
@@ -2106,12 +2286,14 @@ mod tests {
                     server_id: ServerId::from("rust"),
                     language_id: "rust".to_string(),
                     command: "rust-analyzer".to_string(),
+                    missing_binary: false,
                     message: "command not found".to_string(),
                 },
                 ServerSpawnFailure {
                     server_id: ServerId::from("python"),
                     language_id: "python".to_string(),
                     command: "pyright".to_string(),
+                    missing_binary: false,
                     message: "permission denied".to_string(),
                 },
             ];
@@ -2150,6 +2332,7 @@ mod tests {
                 server_id: ServerId::from("typescript"),
                 language_id: "typescript".to_string(),
                 command: "tsserver".to_string(),
+                missing_binary: false,
                 message: "executable not found in PATH".to_string(),
             };
 
@@ -2173,6 +2356,7 @@ mod tests {
                 server_id: ServerId::from("go"),
                 language_id: "go".to_string(),
                 command: "gopls".to_string(),
+                missing_binary: false,
                 message: "error".to_string(),
             });
 
@@ -2211,6 +2395,7 @@ mod tests {
                     file_patterns: vec!["**/*.rs".to_string()],
                     initialization_options: None,
                     timeout_seconds: 10,
+                    spawn: None,
                     request_timeout_seconds: 10,
                     heuristics: None,
                     name: None,
@@ -2405,6 +2590,7 @@ mod tests {
                     file_patterns: vec!["**/*.rs".to_string()],
                     initialization_options: None,
                     timeout_seconds: 10,
+                    spawn: None,
                     request_timeout_seconds: 10,
                     heuristics: None,
                     name: None,
@@ -2642,10 +2828,12 @@ mod tests {
         }
 
         fn make_settle() -> Arc<bridge::ServerSettle> {
-            Arc::new(bridge::ServerSettle::new(
+            let settle = Arc::new(bridge::ServerSettle::new(
                 Duration::from_secs(1),
                 Duration::from_secs(600),
-            ))
+            ));
+            settle.register_diagnostics_owner(&ServerId::from("rust"));
+            settle
         }
 
         fn make_delivery() -> Arc<Mutex<bridge::DiagnosticsDelivery>> {
@@ -2738,7 +2926,6 @@ mod tests {
                 ServerId::from("rust"),
                 rx,
                 cancel_rx,
-                true,
                 PumpShared {
                     notification_cache: make_cache(),
                     subs: Arc::clone(&subs),
@@ -2793,7 +2980,6 @@ mod tests {
                 ServerId::from("rust"),
                 rx,
                 cancel_rx,
-                true,
                 PumpShared {
                     notification_cache: make_cache(),
                     subs: Arc::clone(&subs),
@@ -2854,7 +3040,6 @@ mod tests {
                 ServerId::from("rust"),
                 rx,
                 cancel_rx,
-                true,
                 PumpShared {
                     notification_cache: c,
                     subs: Arc::clone(&subs),
@@ -2912,7 +3097,6 @@ mod tests {
                 ServerId::from("rust"),
                 rx,
                 cancel_rx,
-                true,
                 PumpShared {
                     notification_cache: c,
                     subs: Arc::clone(&subs),
@@ -2986,7 +3170,6 @@ mod tests {
                 ServerId::from("rust"),
                 rx,
                 cancel_rx,
-                true,
                 PumpShared {
                     notification_cache: Arc::clone(&cache),
                     subs: Arc::clone(&subs),
@@ -3061,7 +3244,6 @@ mod tests {
                 ServerId::from("rust"),
                 rx,
                 cancel_rx,
-                true,
                 PumpShared {
                     notification_cache: cache,
                     subs,
@@ -3093,7 +3275,6 @@ mod tests {
                 ServerId::from("rust"),
                 rx,
                 cancel_rx,
-                true,
                 PumpShared {
                     notification_cache: cache,
                     subs,
@@ -3110,6 +3291,44 @@ mod tests {
                 .await
                 .expect("pump did not exit within timeout")
                 .unwrap();
+        }
+
+        #[tokio::test]
+        async fn test_pump_releases_progress_when_notification_channel_closes() {
+            let owner = ServerId::from("rust");
+            let settle = make_settle();
+            settle.register_diagnostics_owner(&owner);
+            settle.begin(&owner, &serde_json::json!("indexing"));
+            assert!(!settle.should_settle());
+
+            let cache = make_cache();
+            let subs = make_subs();
+            let (tx, rx) = mpsc::channel::<LspNotification>(8);
+            let (_cancel_tx, cancel_rx) = watch::channel(false);
+            drop(tx);
+
+            diagnostics_pump(
+                owner.clone(),
+                rx,
+                cancel_rx,
+                PumpShared {
+                    notification_cache: cache,
+                    subs,
+                    workspace_roots: no_workspace_roots(),
+                    document_tracker: make_tracker(),
+                    settle: Arc::clone(&settle),
+                    delivery: make_delivery(),
+                    floors: make_floors(),
+                },
+            )
+            .await;
+
+            assert!(settle.pending_diagnostics_baselines().contains(&owner));
+            assert_eq!(settle.diagnostics_owner_count(), 1);
+            assert!(
+                settle.should_settle_at(std::time::Instant::now() + Duration::from_secs(2)),
+                "closing the channel retires its progress token without retiring its route"
+            );
         }
 
         /// Regression test for #104: the pump must cache a notification promptly
@@ -3145,7 +3364,6 @@ mod tests {
                 ServerId::from("rust"),
                 rx,
                 cancel_rx,
-                true,
                 PumpShared {
                     notification_cache: Arc::clone(&cache),
                     subs,
@@ -3216,7 +3434,6 @@ mod tests {
                 ServerId::from("rust"),
                 rx,
                 cancel_rx,
-                true,
                 PumpShared {
                     notification_cache: Arc::clone(&cache),
                     subs,
@@ -3293,7 +3510,6 @@ mod tests {
                 ServerId::from("rust"),
                 rx,
                 cancel_rx,
-                true,
                 PumpShared {
                     notification_cache: Arc::clone(&cache),
                     subs,
@@ -3350,7 +3566,6 @@ mod tests {
                 ServerId::from("rust"),
                 rx,
                 cancel_rx,
-                true,
                 PumpShared {
                     notification_cache: Arc::clone(&cache),
                     subs,
@@ -3401,7 +3616,6 @@ mod tests {
                 ServerId::from("rust"),
                 rx,
                 cancel_rx,
-                true,
                 PumpShared {
                     notification_cache: cache,
                     subs,

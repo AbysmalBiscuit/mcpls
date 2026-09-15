@@ -14,6 +14,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::bridge::ServerLifecycle;
+
 /// A message sent from a Claude Code hook to a running mcpls.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -65,6 +67,18 @@ pub enum ChangeEvent {
     Add,
     /// The file was removed, or removed and not yet recreated.
     Unlink,
+}
+
+/// One language server on a status response.
+///
+/// A struct rather than a pair, so future server details can live here
+/// instead of growing parallel lists on the response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerStatus {
+    /// The server's routing identity.
+    pub id: String,
+    /// What the server is doing.
+    pub state: ServerLifecycle,
 }
 
 /// A message sent from a running mcpls back to a Claude Code hook.
@@ -119,9 +133,9 @@ pub enum Response {
         /// The sessions attached.
         #[serde(default)]
         sessions: Vec<String>,
-        /// The language servers registered.
+        /// The language servers registered and their current lifecycle.
         #[serde(default)]
-        servers: Vec<String>,
+        servers: Vec<ServerStatus>,
         /// The configuration fingerprint the backend started with.
         #[serde(default)]
         config_fingerprint: String,
@@ -142,6 +156,7 @@ pub enum Response {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::bridge::ServerLifecycle;
 
     /// An absolute path with a drive letter on Windows, where
     /// `Url::from_file_path` fails without one.
@@ -268,7 +283,7 @@ mod tests {
 
     #[test]
     fn test_the_status_response_pins_the_wire_shape() {
-        let literal = r#"{"op":"status","hash":"abc123","socket":"mcpls.sock","pid":42,"owner":true,"root":"/work","hooks_seen":7,"version":"0.3.9","uptime_ms":61000,"sessions":["s1","connection-4"],"servers":["rust"],"config_fingerprint":"00000000000000ff"}"#;
+        let literal = r#"{"op":"status","hash":"abc123","socket":"mcpls.sock","pid":42,"owner":true,"root":"/work","hooks_seen":7,"version":"0.3.9","uptime_ms":61000,"sessions":["s1","connection-4"],"servers":[{"id":"rust","state":"running"},{"id":"lua","state":"not_installed"}],"config_fingerprint":"00000000000000ff"}"#;
         let value = Response::Status {
             hash: "abc123".to_string(),
             socket: PathBuf::from("mcpls.sock"),
@@ -279,7 +294,16 @@ mod tests {
             version: "0.3.9".to_string(),
             uptime_ms: 61_000,
             sessions: vec!["s1".to_string(), "connection-4".to_string()],
-            servers: vec!["rust".to_string()],
+            servers: vec![
+                ServerStatus {
+                    id: "rust".to_string(),
+                    state: ServerLifecycle::Running,
+                },
+                ServerStatus {
+                    id: "lua".to_string(),
+                    state: ServerLifecycle::NotInstalled,
+                },
+            ],
             config_fingerprint: "00000000000000ff".to_string(),
         };
         assert_eq!(
@@ -290,6 +314,36 @@ mod tests {
             serde_json::from_str::<Response>(literal).expect("deserialize"),
             value
         );
+    }
+
+    #[test]
+    fn test_every_server_lifecycle_round_trips_on_status() {
+        use strum::IntoEnumIterator;
+
+        for state in ServerLifecycle::iter() {
+            let value = Response::Status {
+                hash: "abc123".to_string(),
+                socket: PathBuf::from("mcpls.sock"),
+                pid: 42,
+                owner: true,
+                root: PathBuf::from("/work"),
+                hooks_seen: 7,
+                version: "0.3.9".to_string(),
+                uptime_ms: 61_000,
+                sessions: vec!["s1".to_string()],
+                servers: vec![ServerStatus {
+                    id: "language".to_string(),
+                    state,
+                }],
+                config_fingerprint: "00000000000000ff".to_string(),
+            };
+
+            let wire = serde_json::to_value(&value).expect("serialize");
+            assert_eq!(
+                serde_json::from_value::<Response>(wire).expect("deserialize"),
+                value
+            );
+        }
     }
 
     /// A status from a build that predates the backend fields still parses.

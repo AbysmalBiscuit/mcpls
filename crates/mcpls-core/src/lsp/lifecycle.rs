@@ -703,6 +703,7 @@ impl LspServer {
                         server_id,
                         language_id,
                         command,
+                        missing_binary: e.is_missing_binary(),
                         message: e.to_string(),
                     });
                 }
@@ -880,7 +881,7 @@ fn workspace_folder(root: &Path) -> Result<WorkspaceFolder> {
 /// [`LspServer::new_for_test_with_encoding`]'s live `cat`: the shutdown-path
 /// tests this feeds drive `shutdown_servers`, which waits `CHILD_EXIT_GRACE`
 /// on a child that is still running. They do not route calls through
-/// `respawn_if_dead`, so the dead-server reading that breaks a routed call
+/// `ensure_server`, so the dead-server reading that breaks a routed call
 /// costs them nothing.
 ///
 /// `pub` rather than private to this module's own `tests` (`lifecycle` is a
@@ -943,7 +944,7 @@ impl LspServer {
     ///
     /// `child` is a `cat` blocked on a piped stdin rather than anything that
     /// returns on its own: `has_exited` reads it, and a server that looks
-    /// dead sends every routed call through `respawn_if_dead`, which fails
+    /// dead sends every routed call through `ensure_server`, which fails
     /// with `ServerUnavailable` since a fixture registers no respawn config.
     #[allow(clippy::unwrap_used)]
     pub(crate) fn new_for_test_with_encoding(
@@ -1251,6 +1252,7 @@ mod tests {
                 file_patterns: vec!["**/*.py".to_string()],
                 initialization_options: Some(init_opts.clone()),
                 timeout_seconds: 10,
+                spawn: None,
                 request_timeout_seconds: 10,
                 heuristics: None,
                 name: None,
@@ -1407,6 +1409,7 @@ mod tests {
             server_id: ServerId::from("rust"),
             language_id: "rust".to_string(),
             command: "rust-analyzer".to_string(),
+            missing_binary: false,
             message: "not found".to_string(),
         });
 
@@ -1414,6 +1417,7 @@ mod tests {
             server_id: ServerId::from("python"),
             language_id: "python".to_string(),
             command: "pyright".to_string(),
+            missing_binary: false,
             message: "permission denied".to_string(),
         });
 
@@ -1485,6 +1489,7 @@ mod tests {
             server_id: ServerId::from("python"),
             language_id: "python".to_string(),
             command: "pyright".to_string(),
+            missing_binary: false,
             message: "not found".to_string(),
         });
 
@@ -1593,6 +1598,7 @@ mod tests {
             server_id: ServerId::from("rust"),
             language_id: "rust".to_string(),
             command: "rust-analyzer".to_string(),
+            missing_binary: false,
             message: "not found".to_string(),
         });
 
@@ -1608,6 +1614,7 @@ mod tests {
             server_id: ServerId::from("python"),
             language_id: "python".to_string(),
             command: "pyright".to_string(),
+            missing_binary: false,
             message: "not found".to_string(),
         });
 
@@ -1615,6 +1622,7 @@ mod tests {
             server_id: ServerId::from("typescript"),
             language_id: "typescript".to_string(),
             command: "tsserver".to_string(),
+            missing_binary: false,
             message: "command not found".to_string(),
         });
 
@@ -1648,6 +1656,7 @@ mod tests {
                 file_patterns: vec!["**/*.rs".to_string()],
                 initialization_options: None,
                 timeout_seconds: 10,
+                spawn: None,
                 request_timeout_seconds: 10,
                 heuristics: None,
                 name: None,
@@ -1672,6 +1681,7 @@ mod tests {
         let failure = &result.failures[0];
         assert_eq!(failure.language_id, "rust");
         assert_eq!(failure.command, "nonexistent-command-12345");
+        assert!(failure.missing_binary);
         assert!(failure.message.contains("spawn"));
     }
 
@@ -1688,6 +1698,7 @@ mod tests {
                     file_patterns: vec!["**/*.rs".to_string()],
                     initialization_options: None,
                     timeout_seconds: 10,
+                    spawn: None,
                     request_timeout_seconds: 10,
                     heuristics: None,
                     name: None,
@@ -1710,6 +1721,7 @@ mod tests {
                     file_patterns: vec!["**/*.py".to_string()],
                     initialization_options: None,
                     timeout_seconds: 10,
+                    spawn: None,
                     request_timeout_seconds: 10,
                     heuristics: None,
                     name: None,
@@ -1732,6 +1744,7 @@ mod tests {
                     file_patterns: vec!["**/*.ts".to_string()],
                     initialization_options: None,
                     timeout_seconds: 10,
+                    spawn: None,
                     request_timeout_seconds: 10,
                     heuristics: None,
                     name: None,
@@ -1777,6 +1790,7 @@ mod tests {
                     file_patterns: vec![],
                     initialization_options: None,
                     timeout_seconds: 10,
+                    spawn: None,
                     request_timeout_seconds: 10,
                     heuristics: None,
                     name: None,
@@ -1799,6 +1813,7 @@ mod tests {
                     file_patterns: vec![],
                     initialization_options: None,
                     timeout_seconds: 10,
+                    spawn: None,
                     request_timeout_seconds: 10,
                     heuristics: None,
                     name: None,
@@ -2053,6 +2068,7 @@ mod tests {
                     file_patterns: vec![],
                     initialization_options: None,
                     timeout_seconds: 10,
+                    spawn: None,
                     request_timeout_seconds: 10,
                     heuristics: None,
                     name: None,
@@ -2075,6 +2091,7 @@ mod tests {
                     file_patterns: vec![],
                     initialization_options: None,
                     timeout_seconds: 10,
+                    spawn: None,
                     request_timeout_seconds: 10,
                     heuristics: None,
                     name: None,
@@ -2107,6 +2124,7 @@ mod tests {
             file_patterns: vec![],
             initialization_options: None,
             timeout_seconds: 5,
+            spawn: None,
             request_timeout_seconds: 5,
             heuristics: None,
             name: None,
@@ -2281,17 +2299,10 @@ mod tests {
         );
     }
 
-    /// #174 §8/S2 regression: `register_servers`'s diagnostics-cache flags
-    /// must be computed from the *rebound* router, not the pre-rebind view.
-    /// Sets up a `python` config where a narrow "diagnostics-only" server
-    /// (`pyright-diag`) is configured but never actually registers (as if
-    /// it failed to spawn), leaving only a catch-all (`pylsp`) live. Before
-    /// the fix, computing the flags from the pre-rebind router would resolve
-    /// `Diagnostics` to the dead `pyright-diag` for every survivor, so
-    /// `pylsp` would be flagged `false` and the diagnostics cache would go
-    /// silently dark for `python` despite a live server being available.
+    /// A missing narrow diagnostics claimant passes cache ownership to the
+    /// language catch-all when the registered server pumps are installed.
     #[tokio::test]
-    async fn test_register_servers_computes_diagnostics_flags_from_rebound_router() {
+    async fn test_register_servers_redirects_flags_from_a_missing_claimant() {
         use crate::bridge::Translator;
         use crate::config::{ServerId, ToolKind, ToolRouter};
 
@@ -2305,6 +2316,7 @@ mod tests {
                 file_patterns: vec![],
                 initialization_options: None,
                 timeout_seconds: 30,
+                spawn: None,
                 request_timeout_seconds: 30,
                 heuristics: None,
                 name: Some("pyright-diag".to_string()),
@@ -2319,6 +2331,7 @@ mod tests {
                 file_patterns: vec![],
                 initialization_options: None,
                 timeout_seconds: 30,
+                spawn: None,
                 request_timeout_seconds: 30,
                 heuristics: None,
                 name: Some("pylsp".to_string()),
@@ -2328,18 +2341,22 @@ mod tests {
         ];
         let router = ToolRouter::from_configs(&configs).unwrap();
         let translator = Translator::new().with_router(router);
+        translator.set_lifecycle(
+            &ServerId::from("pyright-diag"),
+            crate::bridge::ServerLifecycle::NotInstalled,
+        );
 
         // Only pylsp actually registers; pyright-diag never spawned.
         let mut result = ServerInitResult::new();
         result.add_server(pylsp_id.clone(), fake_lsp_server());
 
-        let registered = crate::register_servers(result, &translator, &HashMap::new());
+        let registered = crate::register_servers(result, &translator);
 
         assert_eq!(
             registered.diagnostics_flags.get(&pylsp_id),
             Some(&true),
-            "pylsp must inherit the diagnostics route once pyright-diag is \
-             known dead, and the flag must reflect that post-rebind state"
+            "pylsp must inherit the diagnostics route when the narrow claimant \
+             is missing"
         );
     }
 }

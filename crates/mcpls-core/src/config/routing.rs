@@ -15,6 +15,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::server::LspServerConfig;
@@ -78,7 +79,7 @@ impl From<&str> for ServerId {
 /// assert_eq!(ToolKind::Hover.as_str(), "hover");
 /// assert_eq!(ToolKind::ALL.len(), 15);
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolKind {
     /// `textDocument/hover`.
@@ -199,31 +200,24 @@ struct LanguageRoutes {
 /// workspace-wide tool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoServerReason {
-    /// No server is registered in this workspace at all. Reflects what has
-    /// *registered* (i.e. finished spawning), not what is configured in
-    /// `mcpls.toml` — a server that is still initializing, or one that was
-    /// configured but failed to spawn, is indistinguishable from "nothing
-    /// configured" at this layer. Callers with access to the set of servers
-    /// still expected to register (e.g. `Translator::expected_servers`) can
-    /// tell these apart.
+    /// No applicable server is configured in this workspace. The router is
+    /// built from the applicable configs, so this also means no server has
+    /// registered yet.
     NothingRegistered,
-    /// At least one server is registered, but none explicitly claims the
+    /// At least one server is configured, but none explicitly claims the
     /// requested tool and none is a catch-all.
     NoClaimant,
 }
 
 /// Resolves `(language, tool)` to the [`ServerId`] that should handle it.
 ///
-/// Built once at startup by [`Self::from_configs`] over the *applicable*
-/// (post-heuristics) server configs, then rebound once at registration time
-/// by [`Self::rebind_to_registered`] so that no route ever points at a
-/// server that failed to spawn.
+/// Built once at startup from the applicable server configs. Server
+/// lifecycles determine whether a configured route is available.
 #[derive(Debug, Default)]
 pub struct ToolRouter {
     by_language: HashMap<String, LanguageRoutes>,
     /// Config declaration order, used by `resolve_any` for a deterministic
-    /// choice among candidates. Pruned to registered servers by
-    /// `rebind_to_registered`.
+    /// choice among candidates.
     order: Vec<ServerId>,
 }
 
@@ -339,81 +333,6 @@ impl ToolRouter {
         Self { by_language, order }
     }
 
-    /// Rebind every route pointing at a server that did not register — i.e.
-    /// failed to spawn — to that language's live catch-all, or drop the
-    /// route entirely if no catch-all is live.
-    ///
-    /// A dead route is never rebound to a *narrowly-scoped* live server: a
-    /// server that declared `handles = [...]` has explicitly declined every
-    /// other tool, and conscripting it would override that declaration (and,
-    /// via the diagnostics cache filter, start caching diagnostics the user
-    /// deliberately routed away).
-    ///
-    /// # Preconditions
-    ///
-    /// Call this exactly once, after all spawn attempts for a `serve_with`
-    /// invocation have completed and before any request can observe the
-    /// router. This is sound only because `LspServer::spawn_batch` is a
-    /// sequential loop that produces one `ServerInitResult` registered under
-    /// a single lock — registration is one atomic all-or-nothing event, so
-    /// no request can observe a half-rebound router. If server registration
-    /// is ever made incremental (servers registering as they finish spawning,
-    /// rather than all together), an early rebind here would permanently
-    /// steal a slow server's routes with no way back; this function would
-    /// need to be replaced with a design that derives the active table on
-    /// each lookup instead of mutating it once.
-    pub fn rebind_to_registered(&mut self, registered: &HashSet<ServerId>) {
-        for (language, routes) in &mut self.by_language {
-            let live_catch_all = routes.default.clone().filter(|id| registered.contains(id));
-
-            let mut dead: HashMap<ServerId, Vec<ToolKind>> = HashMap::new();
-            for (tool, id) in &routes.explicit {
-                if !registered.contains(id) {
-                    dead.entry(id.clone()).or_default().push(*tool);
-                }
-            }
-
-            for (dead_id, tools) in dead {
-                let tool_names: Vec<&str> = tools.iter().map(ToolKind::as_str).collect();
-                if let Some(catch_all_id) = &live_catch_all {
-                    for tool in &tools {
-                        routes.explicit.insert(*tool, catch_all_id.clone());
-                    }
-                    tracing::warn!(
-                        "language '{language}': server '{dead_id}' failed to spawn; \
-                         rebinding [{}] to catch-all '{catch_all_id}'",
-                        tool_names.join(", ")
-                    );
-                } else {
-                    for tool in &tools {
-                        routes.explicit.remove(tool);
-                    }
-                    tracing::warn!(
-                        "language '{language}': server '{dead_id}' failed to spawn and no \
-                         live catch-all is available; [{}] will report no server available",
-                        tool_names.join(", ")
-                    );
-                }
-            }
-
-            if let Some(dead_catch_all) = routes
-                .default
-                .as_ref()
-                .filter(|id| !registered.contains(*id))
-                .cloned()
-            {
-                routes.default = None;
-                tracing::warn!(
-                    "language '{language}': catch-all server '{dead_catch_all}' failed to \
-                     spawn; every tool it wasn't already explicitly rebound above will report \
-                     no server available"
-                );
-            }
-        }
-
-        self.order.retain(|id| registered.contains(id));
-    }
-
     /// Resolve the server that should handle `tool` for `language_id`.
     ///
     /// Explicit claims win over the language's catch-all; if neither exists,
@@ -424,28 +343,33 @@ impl ToolRouter {
         routes.explicit.get(&tool).or(routes.default.as_ref())
     }
 
-    /// Resolve a server for `tool` without a specific language — used for
-    /// workspace-wide tools like `workspace_symbol_search` that have no
-    /// document to detect a language from.
-    ///
-    /// Resolves in two tiers, in config declaration order:
-    /// 1. the first server that explicitly claims `tool`;
-    /// 2. else the first catch-all server.
-    ///
-    /// Deliberately does *not* fall back to "the first server at all" when
-    /// neither tier matches: a server with a `handles` list has explicitly
-    /// declined every tool not on it, so forwarding an unclaimed workspace-wide
-    /// tool to it anyway would silently violate that declaration. Callers get
-    /// [`NoServerReason`] instead, distinguishing "nothing configured" from
-    /// "something is configured but nothing claims this tool" so they can
-    /// report a precise error rather than defaulting to an arbitrary server.
+    /// Return the configured catch-all server for `language_id`, if present.
+    #[must_use]
+    pub fn catch_all_for_language(&self, language_id: &str) -> Option<&ServerId> {
+        self.by_language
+            .get(language_id)
+            .and_then(|routes| routes.default.as_ref())
+    }
+
+    /// Resolve the first configured server for a workspace-wide tool.
+    /// Explicit claims precede catch-alls, in declaration order.
     ///
     /// # Errors
-    ///
-    /// Returns [`NoServerReason::NothingRegistered`] if no server is
-    /// registered at all, or [`NoServerReason::NoClaimant`] if servers are
-    /// registered but none explicitly claims `tool` and none is a catch-all.
+    /// Returns [`NoServerReason::NothingRegistered`] or [`NoServerReason::NoClaimant`].
     pub fn resolve_any(&self, tool: ToolKind) -> std::result::Result<&ServerId, NoServerReason> {
+        self.resolve_any_excluding(tool, &HashSet::new())
+    }
+
+    /// Resolve a workspace-wide tool while skipping unavailable servers.
+    /// Explicit claims precede catch-alls, in declaration order.
+    ///
+    /// # Errors
+    /// Returns [`NoServerReason::NothingRegistered`] or [`NoServerReason::NoClaimant`].
+    pub fn resolve_any_excluding(
+        &self,
+        tool: ToolKind,
+        excluded: &HashSet<ServerId>,
+    ) -> std::result::Result<&ServerId, NoServerReason> {
         let claims_explicitly = |id: &ServerId| {
             self.by_language
                 .values()
@@ -459,8 +383,12 @@ impl ToolRouter {
 
         self.order
             .iter()
-            .find(|id| claims_explicitly(id))
-            .or_else(|| self.order.iter().find(|id| is_catch_all(id)))
+            .find(|id| !excluded.contains(*id) && claims_explicitly(id))
+            .or_else(|| {
+                self.order
+                    .iter()
+                    .find(|id| !excluded.contains(*id) && is_catch_all(id))
+            })
             .ok_or(if self.order.is_empty() {
                 NoServerReason::NothingRegistered
             } else {
@@ -468,16 +396,7 @@ impl ToolRouter {
             })
     }
 
-    /// Whether `language_id` currently has at least one live-or-configured
-    /// route (a catch-all or an explicit claim), used to distinguish
-    /// `NoServerForTool` (some server handles this language, just not this
-    /// tool) from `NoServerForLanguage` (nothing does).
-    ///
-    /// Deliberately checks route *contents*, not just map-key presence: after
-    /// `rebind_to_registered` drops every route for a language whose sole
-    /// server failed to spawn, this must go back to `false` so that language
-    /// reports `NoServerForLanguage` exactly as it did before per-tool
-    /// routing existed, not `NoServerForTool`.
+    /// Whether `language_id` has a configured catch-all or explicit claim.
     #[must_use]
     pub fn has_language(&self, language_id: &str) -> bool {
         self.by_language
@@ -504,6 +423,7 @@ mod tests {
             file_patterns: vec![],
             initialization_options: None,
             timeout_seconds: 30,
+            spawn: None,
             request_timeout_seconds: 30,
             heuristics: None,
             name: name.map(str::to_string),
@@ -595,6 +515,7 @@ mod tests {
                 file_patterns: vec![],
                 initialization_options: None,
                 timeout_seconds: 30,
+                spawn: None,
                 request_timeout_seconds: 30,
                 heuristics: None,
                 name: None,
@@ -609,6 +530,7 @@ mod tests {
                 file_patterns: vec![],
                 initialization_options: None,
                 timeout_seconds: 30,
+                spawn: None,
                 request_timeout_seconds: 30,
                 heuristics: None,
                 name: None,
@@ -670,66 +592,15 @@ mod tests {
     }
 
     #[test]
-    fn test_rebind_to_registered_dead_server_with_live_catch_all() {
-        let configs = vec![
-            cfg("python", Some("pyright"), Some(vec![ToolKind::Hover])),
-            cfg("python", Some("pylsp"), None),
-        ];
-        let mut router = ToolRouter::from_configs(&configs).unwrap();
-        let registered: HashSet<ServerId> = HashSet::from([ServerId::from("pylsp")]);
-        router.rebind_to_registered(&registered);
+    fn test_catch_all_for_language_returns_default_route() {
+        let configs = vec![cfg("python", Some("pylsp"), None)];
+        let router = ToolRouter::from_configs(&configs).unwrap();
 
         assert_eq!(
-            router.resolve("python", ToolKind::Hover),
+            router.catch_all_for_language("python"),
             Some(&ServerId::from("pylsp"))
         );
-    }
-
-    #[test]
-    fn test_rebind_to_registered_dead_server_no_catch_all_drops_route() {
-        let configs = vec![
-            cfg("python", Some("pyright"), Some(vec![ToolKind::Hover])),
-            cfg("python", Some("pylsp"), Some(vec![ToolKind::Diagnostics])),
-        ];
-        let mut router = ToolRouter::from_configs(&configs).unwrap();
-        let registered: HashSet<ServerId> = HashSet::from([ServerId::from("pylsp")]);
-        router.rebind_to_registered(&registered);
-
-        // pyright died, no catch-all exists, and pylsp never claimed Hover:
-        // the route must drop rather than conscript pylsp.
-        assert_eq!(router.resolve("python", ToolKind::Hover), None);
-        assert_eq!(
-            router.resolve("python", ToolKind::Diagnostics),
-            Some(&ServerId::from("pylsp"))
-        );
-    }
-
-    #[test]
-    fn test_rebind_to_registered_all_failed_drops_everything() {
-        let configs = vec![cfg("rust", None, None)];
-        let mut router = ToolRouter::from_configs(&configs).unwrap();
-        router.rebind_to_registered(&HashSet::new());
-        assert_eq!(router.resolve("rust", ToolKind::Hover), None);
-        assert_eq!(
-            router.resolve_any(ToolKind::Hover),
-            Err(NoServerReason::NothingRegistered)
-        );
-        // A single-server-per-language config whose server fails to spawn
-        // must report NoServerForLanguage upstream, not NoServerForTool --
-        // has_language must go back to false once every route is dropped.
-        assert!(!router.has_language("rust"));
-    }
-
-    #[test]
-    fn test_rebind_prunes_order_for_resolve_any() {
-        let configs = vec![cfg("rust", Some("a"), None), cfg("python", Some("b"), None)];
-        let mut router = ToolRouter::from_configs(&configs).unwrap();
-        let registered: HashSet<ServerId> = HashSet::from([ServerId::from("b")]);
-        router.rebind_to_registered(&registered);
-        assert_eq!(
-            router.resolve_any(ToolKind::Hover),
-            Ok(&ServerId::from("b"))
-        );
+        assert_eq!(router.catch_all_for_language("rust"), None);
     }
 
     #[test]

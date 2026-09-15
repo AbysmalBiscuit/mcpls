@@ -799,6 +799,38 @@ impl DocumentTracker {
             .await
     }
 
+    /// Replay a tracked document, closing it first if this process already holds it.
+    pub(crate) async fn reopen(
+        &self,
+        path: &Path,
+        server: &ServerId,
+        lsp_client: &LspClient,
+    ) -> Result<Uri> {
+        let _path_guard = self.lock_path(path).await;
+        let generation = self.generation(server);
+        let decision = self.disk_phase(path).await?;
+        let is_open = lock_std(&self.documents)
+            .get(path)
+            .is_some_and(|state| state.synced_version(server).is_some());
+        if is_open {
+            lsp_client
+                .notify(
+                    "textDocument/didClose",
+                    lsp_types::DidCloseTextDocumentParams {
+                        text_document: lsp_types::TextDocumentIdentifier {
+                            uri: decision.uri.clone(),
+                        },
+                    },
+                )
+                .await?;
+            if let Some(state) = lock_std(&self.documents).get_mut(path) {
+                state.forget_server(server);
+            }
+        }
+        self.sync_phase(path, server, lsp_client, decision, generation)
+            .await
+    }
+
     /// Disk-verification phase of `ensure_open`: decides the version `path`
     /// should be at, reading from disk only when necessary. Never sends any
     /// LSP notification and never returns early in a way that would skip the

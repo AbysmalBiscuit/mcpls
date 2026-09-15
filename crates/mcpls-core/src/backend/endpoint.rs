@@ -673,6 +673,7 @@ while True:
         let control = root.join("release.sock");
         let runtime_shutdown = root.join("runtime-shutdown");
         let mut backend_config = config(60_000);
+        backend_config.backend.spawn = crate::config::SpawnPolicy::Eager;
         backend_config.workspace.roots = vec![root.clone()];
         backend_config.lsp_servers = vec![crate::config::LspServerConfig {
             language_id: "rust".to_string(),
@@ -688,6 +689,7 @@ while True:
             file_patterns: vec!["**/*.rs".to_string()],
             initialization_options: None,
             timeout_seconds: 30,
+            spawn: None,
             request_timeout_seconds: 30,
             heuristics: None,
             name: None,

@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use ignore::WalkBuilder;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::SeverityFloor;
@@ -35,20 +36,27 @@ const EXCLUDED_DIRECTORIES: &[&str] = &[
     ".nuxt",
 ];
 
+/// When a language server is started.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum SpawnPolicy {
+    /// Started the first time the session touches the server's language.
+    #[default]
+    Lazy,
+    /// Started with the backend, whether or not the session uses it.
+    Eager,
+}
+
 /// Heuristics for determining if an LSP server should be spawned.
 ///
 /// Used to prevent spawning servers in projects where they are not applicable
 /// (e.g., rust-analyzer in a Python-only project).
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ServerHeuristics {
-    /// Files or directories that indicate this server is applicable.
-    ///
-    /// The server will spawn if ANY of these markers exist anywhere in the workspace tree
-    /// (searched recursively up to `heuristics_max_depth`). Well-known directories like
-    /// `node_modules`, `target`, `.git` are excluded from the search.
-    ///
-    /// If empty, the server will always attempt to spawn.
+    /// Files or directories that make the server applicable. Any match starts
+    /// it, searched through `workspace.heuristics_max_depth` (default: `10`).
+    /// An omitted list inherits for built-ins; no markers means always applicable.
     #[serde(default)]
     pub project_markers: Vec<String>,
 }
@@ -180,6 +188,13 @@ pub struct LspServerConfig {
     #[serde(default = "default_timeout")]
     pub timeout_seconds: u64,
 
+    /// When this server starts, overriding `[backend] spawn`.
+    ///
+    /// Absent means follow the backend default, so a server entry never
+    /// has to restate it.
+    #[serde(default)]
+    pub spawn: Option<SpawnPolicy>,
+
     /// Per-request timeout in seconds, applied to each LSP request issued
     /// while translating an MCP tool call (hover, definition, references, etc.).
     ///
@@ -300,6 +315,7 @@ impl LspServerConfig {
             file_patterns: file_patterns.iter().map(ToString::to_string).collect(),
             initialization_options: None,
             timeout_seconds: default_timeout(),
+            spawn: None,
             request_timeout_seconds: default_request_timeout(),
             heuristics: Some(ServerHeuristics::with_markers(markers)),
             name: None,
@@ -402,54 +418,82 @@ impl LspServerConfig {
             Self::zls(),
         ]
     }
+
+    /// The policy that decides when this server starts: its own `spawn`
+    /// key when it has one, otherwise the backend's.
+    #[must_use]
+    pub fn effective_spawn(&self, backend: SpawnPolicy) -> SpawnPolicy {
+        self.spawn.unwrap_or(backend)
+    }
 }
 
 /// One `[[lsp_servers]]` entry as written in a configuration file.
 ///
-/// Every field is optional because an entry modifies a built-in rather than
-/// replacing it: what it omits, it inherits. See [`resolve_lsp_servers`].
-#[derive(Debug, Clone, Default, Deserialize)]
+/// Optional overrides for one `[[lsp_servers]]` entry. Missing fields inherit
+/// from a matching built-in; new servers use each field's documented fallback.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PartialLspServerConfig {
-    /// Language identifier. Required unless `name` identifies the entry.
+    /// Language identifier used to match a built-in. Required for a new entry
+    /// unless `name` identifies it; for a new named server, an omitted value
+    /// uses `name` as its language identifier.
     #[serde(default)]
     pub language_id: Option<String>,
-    /// Command to start the LSP server.
+    /// Command to start the LSP server. An overlay inherits the built-in
+    /// command when omitted; a new server must set it.
     #[serde(default)]
     pub command: Option<String>,
-    /// Arguments to pass to the command. An empty list is empty arguments,
-    /// not an absent key.
+    /// Arguments to pass to the command. An overlay inherits these from its
+    /// built-in unless `command` is replaced, in which case an omitted value
+    /// becomes `[]`. A new server also defaults to `[]`.
     #[serde(default)]
     pub args: Option<Vec<String>>,
-    /// Environment variables for the server process.
+    /// Environment variables for the server process. An overlay inherits
+    /// these from its built-in unless `command` is replaced, in which case an
+    /// omitted value becomes `{}`. A new server also defaults to `{}`.
     #[serde(default)]
     pub env: Option<HashMap<String, String>>,
-    /// File patterns this server handles.
+    /// File patterns this server handles. An overlay inherits the built-in
+    /// patterns; a new server defaults to `[]`.
     #[serde(default)]
     pub file_patterns: Option<Vec<String>>,
     /// Server-specific initialization options. Replaces the built-in's
-    /// value rather than merging into it.
+    /// value rather than merging into it. An overlay inherits the built-in
+    /// value unless `command` is replaced; a new server defaults to no
+    /// initialization options.
     #[serde(default)]
     pub initialization_options: Option<serde_json::Value>,
-    /// Handshake timeout in seconds.
+    /// Handshake timeout in seconds. An overlay inherits the built-in value;
+    /// a new server defaults to `30` seconds.
     #[serde(default)]
     pub timeout_seconds: Option<u64>,
-    /// Per-request timeout in seconds.
+    /// When this server starts, overriding `[backend] spawn`. When omitted,
+    /// it follows `[backend] spawn`, which defaults to `"lazy"`.
+    #[serde(default)]
+    pub spawn: Option<SpawnPolicy>,
+    /// Per-request timeout in seconds. An overlay inherits the built-in
+    /// value; a new server defaults to `30` seconds.
     #[serde(default)]
     pub request_timeout_seconds: Option<u64>,
-    /// Spawn heuristics.
+    /// Spawn heuristics. An overlay inherits the built-in markers; a new
+    /// server without markers always attempts to spawn.
     #[serde(default)]
     pub heuristics: Option<ServerHeuristics>,
-    /// Routing identity, defaulting to `language_id`.
+    /// Routing identity. An overlay inherits the built-in value; when absent
+    /// on a new server, `language_id` is used.
     #[serde(default)]
     pub name: Option<String>,
-    /// Tools this server handles.
+    /// Tools this server handles. An overlay inherits the built-in value; a
+    /// new server without a list handles every unclaimed tool.
     #[serde(default)]
     pub handles: Option<Vec<ToolKind>>,
-    /// Set to `false` to drop the server this entry names.
+    /// Set to `false` to drop the server this entry names. Omission leaves an
+    /// existing server enabled and enables a new server by default.
     #[serde(default)]
     pub enabled: Option<bool>,
-    /// The least severe diagnostic worth delivering from this server.
+    /// The least severe diagnostic worth delivering from this server. An
+    /// overlay inherits the built-in value; a new server without one uses
+    /// `[diagnostics].severity`, which defaults to `"warning"`.
     #[serde(default)]
     pub diagnostics_severity: Option<SeverityFloor>,
 }
@@ -464,6 +508,21 @@ impl PartialLspServerConfig {
             .or_else(|| self.language_id.clone())
             .map(ServerId::from)
     }
+
+    const fn is_spawn_only_overlay(&self) -> bool {
+        self.command.is_none()
+            && self.args.is_none()
+            && self.env.is_none()
+            && self.file_patterns.is_none()
+            && self.initialization_options.is_none()
+            && self.timeout_seconds.is_none()
+            && self.spawn.is_some()
+            && self.request_timeout_seconds.is_none()
+            && self.heuristics.is_none()
+            && self.handles.is_none()
+            && self.enabled.is_none()
+            && self.diagnostics_severity.is_none()
+    }
 }
 
 /// Fold configuration entries onto the built-in servers.
@@ -473,11 +532,13 @@ impl PartialLspServerConfig {
 /// server, where nothing can be inherited and `command` is required. An
 /// entry with `enabled = false` removes every server it names.
 ///
-/// Only the first entry claiming an id merges. A second entry with the same
-/// id appends another server, because two servers for one language,
-/// separated by their spawn heuristics, is a configuration mcpls supports
-/// (see `ToolRouter::from_configs`, which adjudicates the pair against the
-/// workspace). Folding the second onto the first would delete one of them.
+/// The first entry claiming an id merges onto the built-in. A later entry
+/// with the same id and a `command` appends another server, because two
+/// servers for one language, separated by their spawn heuristics, is a
+/// configuration mcpls supports (see `ToolRouter::from_configs`, which
+/// adjudicates the pair against the workspace). A later entry that only
+/// sets `spawn` overlays the already-resolved server; every other later
+/// entry still defines another server and therefore needs its own command.
 ///
 /// Overriding `command` drops the built-in's `args`, `env`, and
 /// `initialization_options`, because those belong to the binary being
@@ -507,7 +568,10 @@ pub fn resolve_lsp_servers(partials: Vec<PartialLspServerConfig>) -> Result<Vec<
         }
 
         let existing = if claimed.contains(&id) {
-            None
+            partial
+                .is_spawn_only_overlay()
+                .then(|| resolved.iter().position(|server| server.id() == id))
+                .flatten()
         } else {
             resolved.iter().position(|server| server.id() == id)
         };
@@ -537,6 +601,7 @@ impl LspServerConfig {
             file_patterns,
             initialization_options,
             timeout_seconds,
+            spawn,
             request_timeout_seconds,
             heuristics,
             name,
@@ -569,6 +634,9 @@ impl LspServerConfig {
         }
         if let Some(timeout) = timeout_seconds {
             self.timeout_seconds = timeout;
+        }
+        if let Some(spawn) = spawn {
+            self.spawn = Some(spawn);
         }
         if let Some(timeout) = request_timeout_seconds {
             self.request_timeout_seconds = timeout;
@@ -604,6 +672,7 @@ impl LspServerConfig {
             file_patterns: partial.file_patterns.unwrap_or_default(),
             initialization_options: partial.initialization_options,
             timeout_seconds: partial.timeout_seconds.unwrap_or_else(default_timeout),
+            spawn: partial.spawn,
             request_timeout_seconds: partial
                 .request_timeout_seconds
                 .unwrap_or_else(default_request_timeout),
@@ -616,11 +685,12 @@ impl LspServerConfig {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::config::ServerConfig;
 
     #[test]
     fn test_rust_analyzer_defaults() {
@@ -633,6 +703,61 @@ mod tests {
         assert_eq!(config.file_patterns, vec!["**/*.rs"]);
         assert!(config.initialization_options.is_none());
         assert_eq!(config.timeout_seconds, 30);
+    }
+
+    #[test]
+    fn test_a_server_without_a_spawn_key_follows_the_backend_default() {
+        let server = LspServerConfig::rust_analyzer();
+        assert_eq!(server.effective_spawn(SpawnPolicy::Lazy), SpawnPolicy::Lazy);
+        assert_eq!(
+            server.effective_spawn(SpawnPolicy::Eager),
+            SpawnPolicy::Eager
+        );
+    }
+
+    #[test]
+    fn test_a_server_spawn_key_overrides_the_backend_default() {
+        let mut server = LspServerConfig::rust_analyzer();
+        server.spawn = Some(SpawnPolicy::Eager);
+        assert_eq!(
+            server.effective_spawn(SpawnPolicy::Lazy),
+            SpawnPolicy::Eager
+        );
+    }
+
+    #[test]
+    fn test_a_later_entry_merges_its_spawn_key_over_an_earlier_one() {
+        let toml = r#"
+            [[lsp_servers]]
+            language_id = "rust"
+            command = "rust-analyzer"
+            spawn = "lazy"
+
+            [[lsp_servers]]
+            language_id = "rust"
+            spawn = "eager"
+        "#;
+        let parsed: ServerConfig = toml::from_str(toml).expect("parse");
+        let rust = parsed
+            .lsp_servers
+            .iter()
+            .find(|server| server.language_id == "rust")
+            .expect("a rust server");
+        assert_eq!(rust.spawn, Some(SpawnPolicy::Eager));
+    }
+
+    #[test]
+    fn test_a_later_entry_without_spawn_still_needs_a_command() {
+        let toml = r#"
+            [[lsp_servers]]
+            language_id = "rust"
+            command = "rust-analyzer"
+
+            [[lsp_servers]]
+            language_id = "rust"
+            args = ["--stdio"]
+        "#;
+        assert!(toml::from_str::<ServerConfig>(toml).is_err());
     }
 
     #[test]
@@ -679,6 +804,7 @@ mod tests {
             file_patterns: vec!["**/*.custom".to_string()],
             initialization_options: Some(serde_json::json!({"key": "value"})),
             timeout_seconds: 60,
+            spawn: None,
             request_timeout_seconds: 45,
             heuristics: None,
             name: None,
@@ -798,6 +924,7 @@ mod tests {
             file_patterns: vec![],
             initialization_options: None,
             timeout_seconds: 30,
+            spawn: None,
             request_timeout_seconds: 30,
             heuristics: None,
             name: None,

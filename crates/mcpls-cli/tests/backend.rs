@@ -49,7 +49,7 @@ impl Project {
     fn write_config(&self, idle_ms: u64, servers: &str) {
         std::fs::write(
             self.config(),
-            format!("[backend]\nidle_shutdown_ms = {idle_ms}\n{servers}"),
+            format!("[backend]\nidle_shutdown_ms = {idle_ms}\nspawn = \"eager\"\n{servers}"),
         )
         .unwrap();
     }

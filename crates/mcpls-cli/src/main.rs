@@ -12,7 +12,7 @@ mod completions;
 mod hook;
 mod logging;
 
-use args::{Args, Command, HookAction};
+use args::{Args, Command, HookAction, SchemaAction};
 
 #[tokio::main]
 async fn main() {
@@ -25,6 +25,39 @@ async fn main() {
         if let Err(err) = completions::emit(*shell, &mut out) {
             eprintln!("failed to write completion script: {err}");
             std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
+
+    if let Some(Command::Schema { action }) = &args.command {
+        match action {
+            Some(SchemaAction::Init) => {
+                let directory = match std::env::current_dir() {
+                    Ok(directory) => directory,
+                    Err(err) => {
+                        eprintln!("failed to read the current directory: {err}");
+                        std::process::exit(1);
+                    }
+                };
+                let path = directory.join("mcpls.toml");
+                match mcpls_core::config::init_config_file(&path) {
+                    Ok(()) => {
+                        println!("Created {}", path.display());
+                        println!(
+                            "For project-local use, run init at the checkout root and opt in with `--trust-project-config` or `MCPLS_TRUST_PROJECT_CONFIG=true`."
+                        );
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                        eprintln!("{} already exists", path.display());
+                        std::process::exit(1);
+                    }
+                    Err(err) => {
+                        eprintln!("failed to create {}: {err}", path.display());
+                        std::process::exit(1);
+                    }
+                }
+            }
+            None => emit_schema(),
         }
         std::process::exit(0);
     }
@@ -123,6 +156,25 @@ async fn main() {
     // -- safe here because everything that matters has already completed
     // above. See #308.
     std::process::exit(exit_code);
+}
+
+fn emit_schema() {
+    use std::io::Write as _;
+    let document = match mcpls_core::config::schema::document() {
+        Ok(document) => document,
+        Err(err) => {
+            eprintln!("failed to generate config schema: {err}");
+            std::process::exit(1);
+        }
+    };
+    let mut out = std::io::stdout().lock();
+    if let Err(err) = out
+        .write_all(document.as_bytes())
+        .and_then(|()| out.flush())
+    {
+        eprintln!("failed to write config schema: {err}");
+        std::process::exit(1);
+    }
 }
 
 async fn run(args: Args) -> Result<()> {

@@ -4,7 +4,7 @@ Complete reference for configuring mcpls.
 
 ## Configuration File
 
-mcpls uses TOML format for configuration. The file can be placed in several locations (searched in order):
+mcpls uses TOML 1.1 for configuration. The file can be placed in several locations (searched in order):
 
 1. Path specified by `--config` flag
 2. `$MCPLS_CONFIG` environment variable
@@ -13,6 +13,20 @@ mcpls uses TOML format for configuration. The file can be placed in several loca
    - Linux: `$XDG_CONFIG_HOME/mcpls/mcpls.toml`, else `~/.config/mcpls/mcpls.toml`
    - macOS: `~/Library/Application Support/mcpls/mcpls.toml`
    - Windows: `%APPDATA%\mcpls\mcpls.toml`
+
+### JSON Schema
+
+Run `mcpls schema` to print the JSON Schema for `mcpls.toml`. Run
+`mcpls schema init` to create a commented default `mcpls.toml` in the current
+directory with a Taplo schema link; it leaves an existing file untouched. The
+file is discovered automatically only at the checkout root, and project-local
+config must be trusted with `--trust-project-config` or
+`MCPLS_TRUST_PROJECT_CONFIG=true`; see [Trusting a Project-Local Config](#trusting-a-project-local-config).
+For automatic discovery, run `mcpls schema init` at the checkout root. The
+latest release also publishes the schema at
+`https://github.com/AbysmalBiscuit/mcpls/releases/latest/download/mcpls-config.json`.
+After changing configuration types, run `devrun task schema` to regenerate the
+checked-in schema.
 
 ### Trusting a Project-Local Config
 
@@ -31,7 +45,8 @@ MCPLS_TRUST_PROJECT_CONFIG=true mcpls
 Without this flag, a `mcpls.toml` at the checkout root is ignored (a warning
 is logged naming the ignored path) and mcpls falls through to the user config
 directory or built-in defaults — including built-in project-marker heuristics, so
-e.g. a `Cargo.toml` in the workspace still spawns rust-analyzer. An explicit
+e.g. a `Cargo.toml` in the workspace still makes rust-analyzer applicable, and
+a session that touches Rust starts it. An explicit
 `--config <path>` or `$MCPLS_CONFIG` is always trusted, since naming a path is
 itself the user's consent.
 
@@ -282,7 +297,7 @@ mcpls ships six built-in servers — rust-analyzer, pyright, the TypeScript lang
 
 Overriding `command` drops the built-in's `args`, `env`, and `initialization_options`, since those belong to the binary being replaced (pyright's `--stdio` means nothing to a different program) — `file_patterns` survive, since they describe the language rather than the binary.
 
-Two entries may name the same identity: the first merges onto the built-in (or founds a new server, if there is no matching built-in), and every subsequent one appends another server. `ToolRouter::from_configs` rejects two servers sharing one identity if both are applicable in the same workspace, so this only works when their `heuristics.project_markers` are mutually exclusive. To run two servers for one language that are applicable at the same time, give each a distinct `name` and split the tools between them with `handles` instead — see `name` and `handles` below.
+Two entries may name the same identity. The first merges onto the built-in, or founds a new server when there is no matching built-in. A later entry with `command` appends another server. A later entry that only sets `spawn` overlays the already-resolved server. Every other later entry defines another server and therefore needs its own `command`. `ToolRouter::from_configs` rejects two servers sharing one identity if both are applicable in the same workspace, so appended entries only work when their `heuristics.project_markers` are mutually exclusive. To run two servers for one language that are applicable at the same time, give each a distinct `name` and split the tools between them with `handles` instead. See `name` and `handles` below.
 
 ### `language_id`
 
@@ -372,6 +387,32 @@ separate, fixed 5 s timeout that is not configurable.
 [[lsp_servers]]
 timeout_seconds = 60  # Increase for servers slow to complete `initialize`
 ```
+
+### `spawn`
+
+**Type**: String
+**Default**: whatever `[backend] spawn` says, which is `"lazy"`
+**Options**: `"eager"`, `"lazy"`
+
+When this server starts, overriding the backend default for this entry alone.
+`"lazy"` holds the server back until a session shows it needs the language,
+either through a file the agent's hooks report or through a tool call that
+routes here. `"eager"` starts it with the backend whether or not the session
+uses it.
+
+Raise it to `"eager"` for a server whose index is slow enough that the first
+request should not wait on it, and accept that the process starts in every
+session for that checkout. A server whose binary is not installed costs
+nothing while it stays lazy.
+
+```toml
+[[lsp_servers]]
+language_id = "rust"
+spawn = "eager"  # Prime rust-analyzer's index at backend start
+```
+
+An entry that sets only `spawn` overlays a server an earlier entry already
+resolved, so a built-in can be made eager without restating its `command`.
 
 ### `request_timeout_seconds`
 
@@ -529,10 +570,12 @@ mutually exclusive `heuristics.project_markers` — where only one of the two
 servers is ever applicable in a given workspace — is not ambiguous and
 starts normally.
 
-**If the server a tool is routed to fails to spawn**, that tool's requests
-move to the language's catch-all server, if one is running; otherwise they
-report no server available for that tool rather than silently falling back
-to a server that explicitly declined it via `handles`.
+**If the server a tool is routed to has no binary to run**, that tool's
+requests move to the language's catch-all server, starting it if it has not
+started yet; otherwise they report no server available for that tool rather
+than silently falling back to a server that explicitly declined it via
+`handles`. A server that started and then failed is retried on the next
+request rather than routed around, so its requests stay with it.
 
 **Exception: `workspace_symbol_search`.** This tool has no document, so it
 has no language to route on. It resolves, across all configured servers, to
@@ -716,6 +759,7 @@ Pass `--no-backend` (or set `MCPLS_NO_BACKEND=true`) to serve one session entire
 ```toml
 [backend]
 idle_shutdown_ms = 10000
+spawn = "lazy"
 ```
 
 ### `backend.idle_shutdown_ms`
@@ -724,6 +768,14 @@ idle_shutdown_ms = 10000
 **Default**: `10000`
 
 How long the backend waits after its last MCP session closes before it exits and stops its language servers. Hook connections do not keep it alive. The cost of a short value is a cold reindex for a session that opens just after the timer; raise it when sessions come and go in quick succession.
+
+### `backend.spawn`
+
+**Type**: String
+**Default**: `"lazy"`
+**Options**: `"eager"`, `"lazy"`
+
+When language servers start. `"eager"` starts every applicable server with the backend. `"lazy"` holds a server back until a session touches its language. A `[[lsp_servers]]` entry can set `spawn` to override this backend default for that server.
 
 ## Environment Variables
 

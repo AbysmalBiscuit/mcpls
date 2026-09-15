@@ -140,6 +140,13 @@ pub enum Command {
         shell: Shell,
     },
 
+    /// Print the JSON Schema for `mcpls.toml` or initialize a config file
+    Schema {
+        /// An action to perform instead of printing the schema
+        #[command(subcommand)]
+        action: Option<SchemaAction>,
+    },
+
     /// Serve one agent hook invocation
     ///
     /// With no argument, reads the hook payload from stdin and writes hook
@@ -156,6 +163,13 @@ pub enum Command {
         #[command(subcommand)]
         action: Option<HookAction>,
     },
+}
+
+/// Actions for `mcpls schema`.
+#[derive(Debug, Subcommand)]
+pub enum SchemaAction {
+    /// Create a default `mcpls.toml` in the current directory
+    Init,
 }
 
 /// What `mcpls hook` can do besides serving a hook invocation.
