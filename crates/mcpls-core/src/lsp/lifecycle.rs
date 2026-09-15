@@ -445,6 +445,14 @@ impl LspServer {
             .stderr(Stdio::null())
             .kill_on_drop(true);
 
+        // The detached backend has no console to share, so without this
+        // Windows opens a new console window for every console-program server.
+        #[cfg(windows)]
+        {
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+
         command
     }
 
@@ -2158,6 +2166,66 @@ mod tests {
         assert!(
             format!("{:?}", command.as_std()).starts_with("env -i "),
             "build_command must call .env_clear() so the child doesn't inherit the full parent environment"
+        );
+    }
+
+    /// A backend runs detached, with no console, so each console program it
+    /// starts gets a new console, which opens as a window unless the program
+    /// is started hidden. The test re-runs its own binary detached, standing
+    /// in for the backend, which starts PowerShell as the language server
+    /// through `build_command`. A hidden console has no window handle.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_a_language_server_started_by_a_detached_backend_opens_no_window() {
+        const BACKEND: &str = "MCPLS_TEST_DETACHED_BACKEND";
+        const TEST_NAME: &str = "lsp::lifecycle::tests::test_a_language_server_started_by_a_detached_backend_opens_no_window";
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CONSOLE_WINDOW_PROBE: &str = r#"(Add-Type -Name ConsoleWindow -Namespace Mcpls -PassThru -MemberDefinition '[DllImport("kernel32.dll")] public static extern System.IntPtr GetConsoleWindow();')::GetConsoleWindow()"#;
+
+        if std::env::var_os(BACKEND).is_some() {
+            let system_root = std::env::var("SystemRoot").unwrap();
+            let mut config = bare_server_config(HashMap::new());
+            config.command =
+                format!(r"{system_root}\System32\WindowsPowerShell\v1.0\powershell.exe");
+            config.args = [
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                CONSOLE_WINDOW_PROBE,
+            ]
+            .map(String::from)
+            .to_vec();
+            let output = LspServer::build_command(&config, |key| std::env::var_os(key))
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "the probe failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout).trim(),
+                "0",
+                "the language server's console has a window"
+            );
+            return;
+        }
+
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(BACKEND, "1")
+            .stdin(Stdio::null())
+            .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "detached backend test failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 
