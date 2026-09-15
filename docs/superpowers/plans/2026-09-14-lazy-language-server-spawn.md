@@ -2388,14 +2388,15 @@ devrun task commit-write --arg files='crates/mcpls-core/src/hooks/sweep.rs,crate
 The doctor cannot ship after the default flips: an idle server would read as absent, which is a fault report for working software. Both land together.
 
 **Files:**
-- Modify: `crates/mcpls-core/src/hooks/protocol.rs:123`, `:271`
-- Modify: `crates/mcpls-core/src/hooks/service.rs:69`, `:159`
-- Modify: `crates/mcpls-core/src/lib.rs:775`
-- Modify: `crates/mcpls-cli/src/hook.rs:462`, and the `Response::Status` literals at `:1122` and `:2440`
-- Modify: `crates/mcpls-core/src/config/server.rs`
-- Modify: `crates/mcpls-core/src/config/mod.rs` and `docs/user-guide/configuration.md`
-- Test: the `mod tests` blocks in `protocol.rs` and `hook.rs`, including the doctor assertion at `crates/mcpls-cli/src/hook.rs:2365`
+- Modify: `Cargo.lock` and `crates/mcpls-cli/Cargo.toml` for the CLI lifecycle test dependency
+- Modify: `crates/mcpls-cli/src/hook.rs`
+- Modify: `crates/mcpls-core/src/backend/endpoint.rs` and `crates/mcpls-cli/tests/backend.rs` so startup-specific tests keep their eager fixture policy
+- Modify: `crates/mcpls-core/src/bridge/translator/respawn.rs` to make the process-death check available to production status reporting at crate visibility
+- Modify: `crates/mcpls-core/src/config/mod.rs`, `crates/mcpls-core/src/config/server.rs`, and `docs/user-guide/configuration.md`
+- Modify: `crates/mcpls-core/src/hooks/protocol.rs`, `crates/mcpls-core/src/hooks/service.rs`, and `crates/mcpls-core/src/lib.rs`
+- Test: the `mod tests` blocks in `protocol.rs` and `hook.rs`, including the doctor assertion in `crates/mcpls-cli/src/hook.rs`
 - Test: the backend spawn-default test in `crates/mcpls-core/src/config/mod.rs`
+- Test: `crates/mcpls-core/tests/e2e/protocol_tests.rs` and `crates/mcpls-core/tests/pyrefly_e2e.rs` for startup-specific fixture policy
 
 `servers` travels from the translator to the wire through `StatusExtras` at `crates/mcpls-core/src/hooks/service.rs:69`, which is copied into `Response::Status` at `:159`. Its `Vec<String>` becomes `Vec<ServerStatus>` in the same change, or the two ends disagree and nothing compiles.
 
@@ -2403,7 +2404,7 @@ The doctor cannot ship after the default flips: an idle server would read as abs
 - Consumes: `ServerLifecycle`, `Translator::lifecycles`, `Translator::is_server_dead`.
 - Produces: `hooks::protocol::ServerStatus { id: String, state: ServerLifecycle }`. `Response::Status::servers` is `Vec<ServerStatus>`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Replace the status literal test in `crates/mcpls-core/src/hooks/protocol.rs:271`. The literals in that module are the wire contract, so this assertion is the change:
 
@@ -2471,12 +2472,12 @@ fn test_the_backend_spawn_policy_defaults_to_lazy() {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `devrun task test`
 Expected: FAIL to compile, `cannot find struct ServerStatus`.
 
-- [ ] **Step 3: Add the wire struct**
+- [x] **Step 3: Add the wire struct**
 
 In `crates/mcpls-core/src/hooks/protocol.rs`, above `Response`:
 
@@ -2497,7 +2498,7 @@ pub struct ServerStatus {
 
 Change the `servers` field on `Response::Status` to `Vec<ServerStatus>`. The state field is `ServerLifecycle` itself rather than a second enum mirroring it: both live in `mcpls-core` and both name the same five states, so a mirror would only be something to keep in step by hand.
 
-- [ ] **Step 4: Report the real state**
+- [x] **Step 4: Report the real state**
 
 In `crates/mcpls-core/src/lib.rs:775`:
 
@@ -2525,9 +2526,9 @@ In `crates/mcpls-core/src/lib.rs:775`:
                 .collect(),
 ```
 
-`is_server_dead` is `pub(crate)`; widen it to `pub` if this call site is outside the crate boundary it allows.
+`is_server_dead` is currently test-only `pub(crate)`. Remove its test-only gate and retain crate visibility so the status reporter can check process liveness without exposing the helper outside `mcpls-core`.
 
-- [ ] **Step 5: Render the line**
+- [x] **Step 5: Render the line**
 
 In `crates/mcpls-cli/src/hook.rs`:
 
@@ -2547,11 +2548,11 @@ fn servers_line(servers: &[ServerStatus]) -> String {
 
 One line rather than two lists: the doctor line is read in hook output at session start, and splitting running from configured would make the reader cross-reference two lists to answer whether a language is covered.
 
-- [ ] **Step 6: Flip the default**
+- [x] **Step 6: Flip the default**
 
 In `crates/mcpls-core/src/config/server.rs`, move `#[default]` from `Eager` to `Lazy` on `SpawnPolicy`. Update the commented example in `crates/mcpls-core/src/config/mod.rs` to `# spawn = "lazy"`, and the configuration guide to say lazy is the default.
 
-- [ ] **Step 7: Run the tests to verify they pass**
+- [x] **Step 7: Run the tests to verify they pass**
 
 Run: `devrun task verify`
 Expected: PASS, including workspace tests, formatting, clippy, and doctests.
@@ -2559,25 +2560,27 @@ Expected: PASS, including workspace tests, formatting, clippy, and doctests.
 Run: `devrun task test-e2e`
 Expected: PASS. This suite spawns real backends, so it is where the default flip shows up.
 
-- [ ] **Step 8: Verify against a real checkout**
+- [x] **Step 8: Verify against a real checkout**
 
 Build in an isolated temporary checkout and runtime, then invoke that checkout's built `mcpls` binary directly with `hook doctor`. Confirm the `language servers:` line names a state beside each server and that only the languages this session touched read `running`; do not install into or contact the daily-driver hook channel.
 
 Walk the spec's Verification list. Each bullet is a claim about a running backend, and the automated tests cover the mechanism rather than the whole path. Record any bullet that does not hold rather than adjusting the spec to match.
 
-- [ ] **Step 9: Commit**
+The isolated run and the status of each verification bullet are recorded in `.superpowers/sdd/2026-09-14-lazy-language-server-spawn/task-10-report.md`. The real Rust server returned hover data on retry, and doctor showed `rust (running), typescript (idle)`. The TypeScript-only case could not be verified because the configured TypeScript server failed to start in this environment.
+
+- [x] **Step 9: Commit**
 
 ```bash
-devrun task commit-stage --arg files='crates/mcpls-core/src/hooks/protocol.rs,crates/mcpls-core/src/hooks/service.rs,crates/mcpls-core/src/lib.rs,crates/mcpls-cli/src/hook.rs,crates/mcpls-core/src/config/server.rs,crates/mcpls-core/src/config/mod.rs,docs/user-guide/configuration.md'
-devrun task commit-write --arg files='crates/mcpls-core/src/hooks/protocol.rs,crates/mcpls-core/src/hooks/service.rs,crates/mcpls-core/src/lib.rs,crates/mcpls-cli/src/hook.rs,crates/mcpls-core/src/config/server.rs,crates/mcpls-core/src/config/mod.rs,docs/user-guide/configuration.md' --arg commit_subject='feat: start language servers on first use' --arg commit_body=$'A checkout no longer starts every server whose markers matched. A server\nstarts when an edit or a tool call shows the session needs its language,\nand spawn = "eager" holds the old behaviour for one server or all of\nthem.\n\nThe doctor reports a state beside each server, so an idle one reads as\nidle rather than as absent. The status response carries a struct per\nserver in place of a bare identity, which a backend from an older build\ncannot answer; idle shutdown clears that without intervention.\n\nCo-Authored-By: Codex GPT-5.5 <codex@openai.com>'
+devrun task commit-stage --arg files='Cargo.lock,crates/mcpls-cli/Cargo.toml,crates/mcpls-cli/src/hook.rs,crates/mcpls-cli/tests/backend.rs,crates/mcpls-core/src/backend/endpoint.rs,crates/mcpls-core/src/bridge/translator/respawn.rs,crates/mcpls-core/src/config/mod.rs,crates/mcpls-core/src/config/server.rs,crates/mcpls-core/src/hooks/protocol.rs,crates/mcpls-core/src/hooks/service.rs,crates/mcpls-core/src/lib.rs,crates/mcpls-core/tests/e2e/protocol_tests.rs,crates/mcpls-core/tests/pyrefly_e2e.rs,docs/user-guide/configuration.md'
+devrun task commit-write --arg files='Cargo.lock,crates/mcpls-cli/Cargo.toml,crates/mcpls-cli/src/hook.rs,crates/mcpls-cli/tests/backend.rs,crates/mcpls-core/src/backend/endpoint.rs,crates/mcpls-core/src/bridge/translator/respawn.rs,crates/mcpls-core/src/config/mod.rs,crates/mcpls-core/src/config/server.rs,crates/mcpls-core/src/hooks/protocol.rs,crates/mcpls-core/src/hooks/service.rs,crates/mcpls-core/src/lib.rs,crates/mcpls-core/tests/e2e/protocol_tests.rs,crates/mcpls-core/tests/pyrefly_e2e.rs,docs/user-guide/configuration.md' --arg commit_subject='feat: start language servers on first use' --arg commit_body=$'A checkout no longer starts every server whose markers matched. A server\nstarts when an edit or a tool call shows the session needs its language,\nand spawn = "eager" holds the old behaviour for one server or all of\nthem.\n\nThe doctor reports a state beside each server, so an idle one reads as\nidle rather than as absent. The status response carries a struct per\nserver in place of a bare identity, which a backend from an older build\ncannot answer; idle shutdown clears that without intervention.\n\nCo-Authored-By: Codex GPT-5.5 <codex@openai.com>'
 ```
 
 ---
 
 ## Unresolved questions
 
-1. `FIRST_SPAWN_BUDGET` is 1.5 seconds by guess. The spec's Open decisions section asks for a taplo and a lua-ls handshake measured on a cold cache before the constant is fixed. Measure during Task 7 and change the number there if it is wrong.
+1. `FIRST_SPAWN_BUDGET` remains 1.5 seconds without a cold-cache measurement. Task 7 deferred measuring taplo and lua-ls handshakes; use those measurements before changing the budget.
 2. `RESPAWN_WAIT` in Task 4 is new. Today a respawn waits without a bound, so five seconds is a behaviour change for a crashed server on a slow machine. If the e2e suite goes flaky around respawn, that constant is the first suspect.
 3. Task 6 deletes `ToolRouter::rebind_to_registered`. If something outside this repository calls it, that is a breaking change to a public item. Nothing in the workspace does.
-4. Several bullets on the spec's Verification list are claims about a running backend that no test here establishes: the swept file landing open on the first sweep after its server is running, one language's paths not being held behind another's handshake, a workspace symbol search from a TypeScript-only session, an edit and a tool call for one language producing one process, and `spawn = "eager"` on one server in an otherwise lazy checkout. Task 10 Step 8 walks them by hand. If any is worth pinning down, it belongs in the e2e suite rather than in a unit test, and that is a separate piece of work.
+4. Several bullets on the spec's Verification list are claims about a running backend that no test here establishes: the swept file landing open on the first sweep after its server is running, one language's paths not being held behind another's handshake, a workspace symbol search from a TypeScript-only session, an edit and a tool call for one language producing one process, and `spawn = "eager"` on one server in an otherwise lazy checkout. Task 10's report records the real-backend run and the cases that remain unverified; the TypeScript-only session could not be checked because its configured server failed to start in this environment. If any remaining behavior is worth pinning down, it belongs in the e2e suite rather than a unit test, and that is separate work.
 5. Task 8 refreshes promoted owners by closing and reopening tracked documents, but the baseline merge still uses Task 5's settle timer rather than proof that a publish arrived after the generation began. Decide separately whether to add per-generation publish evidence; a promoted server slower than the quiet/no-progress grace can still report its existing diagnostics as new work.
