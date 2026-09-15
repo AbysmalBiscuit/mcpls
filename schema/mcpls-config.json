@@ -1,0 +1,725 @@
+{
+  "$defs": {
+    "ApplyConfig": {
+      "additionalProperties": false,
+      "description": "Which tools may write their edits to the working tree.\n\nEvery field defaults to `false`, so a configuration without an\n`[apply]` table leaves mcpls entirely read-only.",
+      "properties": {
+        "allow_file_deletion": {
+          "default": false,
+          "description": "Operations that destroy a file's content inside an otherwise\npermitted `WorkspaceEdit` are honored: an explicit delete, a create\nthat overwrites an existing file, and a rename onto an existing\ndestination, all of which leave nothing of what was there. Gates all\nthree for every tool above rather than any one of them, because\nlosing a file is not the kind of mistake a bad edit is.",
+          "type": "boolean"
+        },
+        "code_actions": {
+          "default": false,
+          "description": "`apply_code_action` may apply a resolved action.",
+          "type": "boolean"
+        },
+        "format_document": {
+          "default": false,
+          "description": "`format_document` may apply its edits.",
+          "type": "boolean"
+        },
+        "rename": {
+          "default": false,
+          "description": "`rename_symbol` may apply its `WorkspaceEdit`.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "BackendConfig": {
+      "additionalProperties": false,
+      "description": "How long a shared backend outlives its last session.",
+      "properties": {
+        "idle_shutdown_ms": {
+          "default": 10000,
+          "description": "How long a backend with no session attached waits before it exits.\n\nShort by default so memory returns to the machine soon after the\nlast session closes. The cost of short is a cold reindex for a\nsession that opens just after the timer; raise it when sessions\nalternate quickly.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "spawn": {
+          "$ref": "#/$defs/SpawnPolicy",
+          "default": "lazy",
+          "description": "When this backend's language servers start.\n\nLazy holds a server back until the session touches its language,\nwhich keeps a checkout's unused languages out of memory. Eager\nstarts every applicable server with the backend."
+        }
+      },
+      "type": "object"
+    },
+    "DiagnosticsConfig": {
+      "additionalProperties": false,
+      "description": "How much of what the language servers report reaches the agent.",
+      "properties": {
+        "footer": {
+          "default": false,
+          "description": "Whether the tools that write append their new diagnostics to their\nown result.",
+          "type": "boolean"
+        },
+        "footer_grace_ms": {
+          "default": 250,
+          "description": "How long a footer waits before it starts looking for quiet.\n\nrust-analyzer's flycheck begins about 90 ms after a `didSave`, and a\nfooter that checks before then sees a quiet workspace and reports\nthe state from before the edit.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "footer_quiet_ms": {
+          "default": 200,
+          "description": "How long nothing may be outstanding before a footer calls it done.\n\nShorter than `settle_quiet_ms`, which exists to bridge the 70 to 100\nmillisecond gaps between rust-analyzer's startup phases. A footer\nnever sees those; what it bridges is the cancel-and-restart between\ntwo saves landing back to back.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "footer_wait_ms": {
+          "default": 15000,
+          "description": "How long a footer waits in total before reporting what it has.\n\nSized against a real build rather than against patience: a no-op\ntouch in this repository's largest crate costs about 4.3 seconds of\n`cargo check`, measured, so a five second cap would expire on every\nrename there and report the pre-edit state. The wait is gated on\nprogress rather than on a timer, so a fast workspace still returns\nin about a second and the high cap costs it nothing.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "hooks": {
+          "$ref": "#/$defs/HooksConfig",
+          "description": "How the Claude Code hooks reach this process."
+        },
+        "max_per_file": {
+          "default": 10,
+          "description": "Most diagnostics delivered for one file in one flush. `0` means\nunlimited.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_total": {
+          "default": 50,
+          "description": "Most diagnostics delivered in one flush across every file. This is a\ncontext budget, which is why it is not per server. `0` means\nunlimited.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "settle_deadline_ms": {
+          "default": 300000,
+          "description": "How long to wait for that quiet before giving up and baselining\nanyway. Bounds the damage from a server that never finishes, or from\na progress notification dropped before its pump existed.\n\nCounted from the moment the language servers are spawned, so it\ncovers indexing rather than the handshake that precedes it. It must\noutlast a full index of the workspace: firing before that captures a\npartial baseline, and every file analyzed afterwards then reads as\nnewly changed.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "settle_quiet_ms": {
+          "default": 1000,
+          "description": "How long the language servers must report no work before their view\nof the workspace counts as complete.\n\nRaise it on a workspace whose servers pause mid-analysis for longer\nthan this; the cost of raising it is a later baseline, and the cost\nof setting it too low is a baseline taken mid-index.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "severity": {
+          "$ref": "#/$defs/SeverityFloor",
+          "default": "warning",
+          "description": "The least severe diagnostic worth delivering, for any server that\ndoes not set its own."
+        }
+      },
+      "type": "object"
+    },
+    "HooksConfig": {
+      "additionalProperties": false,
+      "description": "How the Claude Code hooks reach a running mcpls.",
+      "properties": {
+        "enabled": {
+          "default": true,
+          "description": "Whether the listener binds at all.\n\nDefaults on, because reaching this configuration means installing\nthe plugin and installing the plugin is the opt-in. With this off,\nno listener binds, but `SessionStart` still performs its local watch scan.",
+          "type": "boolean"
+        },
+        "op_deadline_ms": {
+          "default": 1500,
+          "description": "How long an op may take before it answers anyway.\n\nThe host's default hook timeout is 600 seconds, so a hook that hangs\nblocks the agent. This bound is the hook's protection, not the host's;\nwork already started can continue, but the deadline does not guarantee\neventual success or delivery.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sweep_quiet_ms": {
+          "default": 500,
+          "description": "How long the pending set must be quiet before the sweep runs.\n\nEvery `didSave` restarts rust-analyzer's flycheck and cancels the\ncheck in flight, so a `cargo fmt` forwarded one path at a time\nproduces a run of cancelled checks and no diagnostics at all.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "LanguageExtensionMapping": {
+      "additionalProperties": false,
+      "description": "Maps file extensions to LSP language identifiers.\n\nUsed to detect the language ID for files based on their extension.\nExtensions are mapped to language IDs like \"rust\", \"python\", \"cpp\", etc.",
+      "properties": {
+        "extensions": {
+          "description": "Array of extensions and their corresponding language ID.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "language_id": {
+          "description": "Language ID to report to the LSP server.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "extensions",
+        "language_id"
+      ],
+      "type": "object"
+    },
+    "PartialLspServerConfig": {
+      "additionalProperties": false,
+      "description": "One `[[lsp_servers]]` entry as written in a configuration file.\n\nOptional overrides for one `[[lsp_servers]]` entry. Missing fields inherit\nfrom a matching built-in; new servers use each field's documented fallback.",
+      "properties": {
+        "args": {
+          "description": "Arguments to pass to the command. An overlay inherits these from its\nbuilt-in unless `command` is replaced, in which case an omitted value\nbecomes `[]`. A new server also defaults to `[]`.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "command": {
+          "description": "Command to start the LSP server. An overlay inherits the built-in\ncommand when omitted; a new server must set it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "diagnostics_severity": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SeverityFloor"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The least severe diagnostic worth delivering from this server. An\noverlay inherits the built-in value; a new server without one uses\n`[diagnostics].severity`, which defaults to `\"warning\"`."
+        },
+        "enabled": {
+          "description": "Set to `false` to drop the server this entry names. Omission leaves an\nexisting server enabled and enables a new server by default.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Environment variables for the server process. An overlay inherits\nthese from its built-in unless `command` is replaced, in which case an\nomitted value becomes `{}`. A new server also defaults to `{}`.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "file_patterns": {
+          "description": "File patterns this server handles. An overlay inherits the built-in\npatterns; a new server defaults to `[]`.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "handles": {
+          "description": "Tools this server handles. An overlay inherits the built-in value; a\nnew server without a list handles every unclaimed tool.",
+          "items": {
+            "$ref": "#/$defs/ToolKind"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "heuristics": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ServerHeuristics"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Spawn heuristics. An overlay inherits the built-in markers; a new\nserver without markers always attempts to spawn."
+        },
+        "initialization_options": {
+          "description": "Server-specific initialization options. Replaces the built-in's\nvalue rather than merging into it. An overlay inherits the built-in\nvalue unless `command` is replaced; a new server defaults to no\ninitialization options."
+        },
+        "language_id": {
+          "description": "Language identifier used to match a built-in. Required for a new entry\nunless `name` identifies it; for a new named server, an omitted value\nuses `name` as its language identifier.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Routing identity. An overlay inherits the built-in value; when absent\non a new server, `language_id` is used.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "request_timeout_seconds": {
+          "description": "Per-request timeout in seconds. An overlay inherits the built-in\nvalue; a new server defaults to `30` seconds.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "spawn": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SpawnPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When this server starts, overriding `[backend] spawn`. When omitted,\nit follows `[backend] spawn`, which defaults to `\"lazy\"`."
+        },
+        "timeout_seconds": {
+          "description": "Handshake timeout in seconds. An overlay inherits the built-in value;\na new server defaults to `30` seconds.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ServerHeuristics": {
+      "additionalProperties": false,
+      "description": "Heuristics for determining if an LSP server should be spawned.\n\nUsed to prevent spawning servers in projects where they are not applicable\n(e.g., rust-analyzer in a Python-only project).",
+      "properties": {
+        "project_markers": {
+          "description": "Files or directories that make the server applicable. Any match starts\nit, searched through `workspace.heuristics_max_depth` (default: `10`).\nAn omitted list inherits for built-ins; no markers means always applicable.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "SeverityFloor": {
+      "description": "The least severe diagnostic worth delivering.",
+      "oneOf": [
+        {
+          "const": "off",
+          "description": "Deliver nothing from this server.",
+          "type": "string"
+        },
+        {
+          "const": "error",
+          "description": "Errors only.",
+          "type": "string"
+        },
+        {
+          "const": "warning",
+          "description": "Errors and warnings.",
+          "type": "string"
+        },
+        {
+          "const": "information",
+          "description": "Everything but hints.",
+          "type": "string"
+        },
+        {
+          "const": "hint",
+          "description": "Everything.",
+          "type": "string"
+        }
+      ]
+    },
+    "SpawnPolicy": {
+      "description": "When a language server is started.",
+      "oneOf": [
+        {
+          "const": "lazy",
+          "description": "Started the first time the session touches the server's language.",
+          "type": "string"
+        },
+        {
+          "const": "eager",
+          "description": "Started with the backend, whether or not the session uses it.",
+          "type": "string"
+        }
+      ]
+    },
+    "ToolKind": {
+      "description": "A routable MCP tool: every MCP tool that dispatches a request to a\nspecific LSP server via [`ToolRouter`].\n\nCache-only tools (`get_cached_diagnostics`, `get_new_diagnostics`,\n`get_server_logs`, `get_server_messages`) are deliberately excluded —\nthey never reach a client directly, so they have nothing to route.\n\n`CallHierarchy` covers `prepare`, `incoming_calls`, and `outgoing_calls`\nas a single route: the opaque item returned by `prepare` is only\nmeaningful to the server that produced it, and the incoming/outgoing\nhandlers never call `ensure_open` themselves — they rely on `prepare`\nhaving already synced the document to the *same* server.\n\n# Examples\n\n```\nuse mcpls_core::config::ToolKind;\n\nassert_eq!(ToolKind::Hover.as_str(), \"hover\");\nassert_eq!(ToolKind::ALL.len(), 15);\n```",
+      "oneOf": [
+        {
+          "const": "hover",
+          "description": "`textDocument/hover`.",
+          "type": "string"
+        },
+        {
+          "const": "definition",
+          "description": "`textDocument/definition`.",
+          "type": "string"
+        },
+        {
+          "const": "type_definition",
+          "description": "`textDocument/typeDefinition`.",
+          "type": "string"
+        },
+        {
+          "const": "implementation",
+          "description": "`textDocument/implementation`.",
+          "type": "string"
+        },
+        {
+          "const": "references",
+          "description": "`textDocument/references`.",
+          "type": "string"
+        },
+        {
+          "const": "diagnostics",
+          "description": "`textDocument/diagnostic` (pull) and the `publishDiagnostics` cache filter.",
+          "type": "string"
+        },
+        {
+          "const": "rename",
+          "description": "`textDocument/rename`.",
+          "type": "string"
+        },
+        {
+          "const": "completions",
+          "description": "`textDocument/completion`.",
+          "type": "string"
+        },
+        {
+          "const": "signature_help",
+          "description": "`textDocument/signatureHelp`.",
+          "type": "string"
+        },
+        {
+          "const": "document_symbols",
+          "description": "`textDocument/documentSymbol`.",
+          "type": "string"
+        },
+        {
+          "const": "workspace_symbols",
+          "description": "`workspace/symbol`.",
+          "type": "string"
+        },
+        {
+          "const": "format_document",
+          "description": "`textDocument/formatting`.",
+          "type": "string"
+        },
+        {
+          "const": "code_actions",
+          "description": "`textDocument/codeAction`.",
+          "type": "string"
+        },
+        {
+          "const": "call_hierarchy",
+          "description": "`textDocument/prepareCallHierarchy`, `callHierarchy/incomingCalls`, `callHierarchy/outgoingCalls`.",
+          "type": "string"
+        },
+        {
+          "const": "inlay_hints",
+          "description": "`textDocument/inlayHint`.",
+          "type": "string"
+        }
+      ]
+    },
+    "WorkspaceConfig": {
+      "additionalProperties": false,
+      "description": "Workspace-level configuration.",
+      "properties": {
+        "heuristics_max_depth": {
+          "default": 10,
+          "description": "Maximum depth for recursive project marker search.\nControls how deeply nested projects can be detected.\nDefault: 10",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "language_extensions": {
+          "default": [
+            {
+              "extensions": [
+                "rs"
+              ],
+              "language_id": "rust"
+            },
+            {
+              "extensions": [
+                "py",
+                "pyw",
+                "pyi"
+              ],
+              "language_id": "python"
+            },
+            {
+              "extensions": [
+                "js",
+                "mjs",
+                "cjs"
+              ],
+              "language_id": "javascript"
+            },
+            {
+              "extensions": [
+                "ts",
+                "mts",
+                "cts"
+              ],
+              "language_id": "typescript"
+            },
+            {
+              "extensions": [
+                "tsx"
+              ],
+              "language_id": "typescriptreact"
+            },
+            {
+              "extensions": [
+                "jsx"
+              ],
+              "language_id": "javascriptreact"
+            },
+            {
+              "extensions": [
+                "go"
+              ],
+              "language_id": "go"
+            },
+            {
+              "extensions": [
+                "c",
+                "h"
+              ],
+              "language_id": "c"
+            },
+            {
+              "extensions": [
+                "cpp",
+                "cc",
+                "cxx",
+                "hpp",
+                "hh",
+                "hxx"
+              ],
+              "language_id": "cpp"
+            },
+            {
+              "extensions": [
+                "java"
+              ],
+              "language_id": "java"
+            },
+            {
+              "extensions": [
+                "rb"
+              ],
+              "language_id": "ruby"
+            },
+            {
+              "extensions": [
+                "php"
+              ],
+              "language_id": "php"
+            },
+            {
+              "extensions": [
+                "swift"
+              ],
+              "language_id": "swift"
+            },
+            {
+              "extensions": [
+                "kt",
+                "kts"
+              ],
+              "language_id": "kotlin"
+            },
+            {
+              "extensions": [
+                "scala",
+                "sc"
+              ],
+              "language_id": "scala"
+            },
+            {
+              "extensions": [
+                "zig"
+              ],
+              "language_id": "zig"
+            },
+            {
+              "extensions": [
+                "lua"
+              ],
+              "language_id": "lua"
+            },
+            {
+              "extensions": [
+                "sh",
+                "bash",
+                "zsh"
+              ],
+              "language_id": "shellscript"
+            },
+            {
+              "extensions": [
+                "json"
+              ],
+              "language_id": "json"
+            },
+            {
+              "extensions": [
+                "toml"
+              ],
+              "language_id": "toml"
+            },
+            {
+              "extensions": [
+                "yaml",
+                "yml"
+              ],
+              "language_id": "yaml"
+            },
+            {
+              "extensions": [
+                "xml"
+              ],
+              "language_id": "xml"
+            },
+            {
+              "extensions": [
+                "html",
+                "htm"
+              ],
+              "language_id": "html"
+            },
+            {
+              "extensions": [
+                "css"
+              ],
+              "language_id": "css"
+            },
+            {
+              "extensions": [
+                "scss"
+              ],
+              "language_id": "scss"
+            },
+            {
+              "extensions": [
+                "less"
+              ],
+              "language_id": "less"
+            },
+            {
+              "extensions": [
+                "md",
+                "markdown"
+              ],
+              "language_id": "markdown"
+            },
+            {
+              "extensions": [
+                "cs"
+              ],
+              "language_id": "csharp"
+            },
+            {
+              "extensions": [
+                "fs",
+                "fsi",
+                "fsx"
+              ],
+              "language_id": "fsharp"
+            },
+            {
+              "extensions": [
+                "r",
+                "R"
+              ],
+              "language_id": "r"
+            }
+          ],
+          "description": "File extension to language ID mappings.\nAllows users to customize which file extensions map to which language servers.",
+          "items": {
+            "$ref": "#/$defs/LanguageExtensionMapping"
+          },
+          "type": "array"
+        },
+        "max_documents": {
+          "default": 100,
+          "description": "Maximum number of documents `DocumentTracker` will keep open\nsimultaneously. A `textDocument/didOpen`-triggering tool call (hover,\ndefinition, diagnostics, etc.) for a document beyond this count fails\nwith `DocumentLimitExceeded`. Documents stay tracked for the whole\nmcpls process lifetime (there is no eviction), so once the ceiling is\nreached, opening any further new path fails until either the process\nis restarted or this limit is raised; already-tracked paths are\nunaffected. `0` disables the limit.\nDefault: 100",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_file_size": {
+          "default": 10485760,
+          "description": "Maximum size, in bytes, of a single file `DocumentTracker` will open.\nA file larger than this fails with `FileSizeLimitExceeded`. `0`\ndisables the limit.\nDefault: 10485760 (10MB)",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "position_encodings": {
+          "default": [
+            "utf-8",
+            "utf-16"
+          ],
+          "description": "Position encoding preference order, offered to each spawned LSP\nserver as `capabilities.general.positionEncodings` during the\n`initialize` handshake (see [`crate::lsp::LspServer::spawn`]), in the\norder configured here.\n\nValid values: `\"utf-8\"`, `\"utf-16\"`, `\"utf-32\"`. Must be non-empty;\n[`ServerConfig::validate`] rejects an empty list or an unrecognized\nvalue.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "roots": {
+          "default": [],
+          "description": "Root directories for the workspace.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "$id": "https://github.com/AbysmalBiscuit/mcpls/releases/latest/download/mcpls-config.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Configuration for mcpls, written in TOML 1.1.",
+  "properties": {
+    "apply": {
+      "$ref": "#/$defs/ApplyConfig",
+      "description": "Which tools may write their edits to the working tree."
+    },
+    "backend": {
+      "$ref": "#/$defs/BackendConfig",
+      "description": "How a shared backend manages its own lifetime."
+    },
+    "diagnostics": {
+      "$ref": "#/$defs/DiagnosticsConfig",
+      "description": "How much of what the language servers report reaches the agent."
+    },
+    "lsp_servers": {
+      "description": "If omitted, the built-in servers are used. Entries identify a server\nby `name`, or `language_id` when `name` is absent. The first enabled\nentry for an existing server overlays it; a new identity needs\n`command`. Once claimed, a later entry with `command` adds another\nserver, while a later `spawn`-only entry overlays the resolved server.",
+      "items": {
+        "$ref": "#/$defs/PartialLspServerConfig"
+      },
+      "type": "array"
+    },
+    "workspace": {
+      "$ref": "#/$defs/WorkspaceConfig",
+      "description": "Workspace configuration."
+    }
+  },
+  "title": "mcpls.toml",
+  "type": "object"
+}

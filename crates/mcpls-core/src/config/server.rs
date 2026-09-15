@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use ignore::WalkBuilder;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::SeverityFloor;
@@ -36,7 +37,7 @@ const EXCLUDED_DIRECTORIES: &[&str] = &[
 ];
 
 /// When a language server is started.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum SpawnPolicy {
     /// Started the first time the session touches the server's language.
@@ -50,16 +51,12 @@ pub enum SpawnPolicy {
 ///
 /// Used to prevent spawning servers in projects where they are not applicable
 /// (e.g., rust-analyzer in a Python-only project).
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ServerHeuristics {
-    /// Files or directories that indicate this server is applicable.
-    ///
-    /// The server will spawn if ANY of these markers exist anywhere in the workspace tree
-    /// (searched recursively up to `heuristics_max_depth`). Well-known directories like
-    /// `node_modules`, `target`, `.git` are excluded from the search.
-    ///
-    /// If empty, the server will always attempt to spawn.
+    /// Files or directories that make the server applicable. Any match starts
+    /// it, searched through `workspace.heuristics_max_depth` (default: `10`).
+    /// An omitted list inherits for built-ins; no markers means always applicable.
     #[serde(default)]
     pub project_markers: Vec<String>,
 }
@@ -432,53 +429,71 @@ impl LspServerConfig {
 
 /// One `[[lsp_servers]]` entry as written in a configuration file.
 ///
-/// Every field is optional because an entry modifies a built-in rather than
-/// replacing it: what it omits, it inherits. See [`resolve_lsp_servers`].
-#[derive(Debug, Clone, Default, Deserialize)]
+/// Optional overrides for one `[[lsp_servers]]` entry. Missing fields inherit
+/// from a matching built-in; new servers use each field's documented fallback.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PartialLspServerConfig {
-    /// Language identifier. Required unless `name` identifies the entry.
+    /// Language identifier used to match a built-in. Required for a new entry
+    /// unless `name` identifies it; for a new named server, an omitted value
+    /// uses `name` as its language identifier.
     #[serde(default)]
     pub language_id: Option<String>,
-    /// Command to start the LSP server.
+    /// Command to start the LSP server. An overlay inherits the built-in
+    /// command when omitted; a new server must set it.
     #[serde(default)]
     pub command: Option<String>,
-    /// Arguments to pass to the command. An empty list is empty arguments,
-    /// not an absent key.
+    /// Arguments to pass to the command. An overlay inherits these from its
+    /// built-in unless `command` is replaced, in which case an omitted value
+    /// becomes `[]`. A new server also defaults to `[]`.
     #[serde(default)]
     pub args: Option<Vec<String>>,
-    /// Environment variables for the server process.
+    /// Environment variables for the server process. An overlay inherits
+    /// these from its built-in unless `command` is replaced, in which case an
+    /// omitted value becomes `{}`. A new server also defaults to `{}`.
     #[serde(default)]
     pub env: Option<HashMap<String, String>>,
-    /// File patterns this server handles.
+    /// File patterns this server handles. An overlay inherits the built-in
+    /// patterns; a new server defaults to `[]`.
     #[serde(default)]
     pub file_patterns: Option<Vec<String>>,
     /// Server-specific initialization options. Replaces the built-in's
-    /// value rather than merging into it.
+    /// value rather than merging into it. An overlay inherits the built-in
+    /// value unless `command` is replaced; a new server defaults to no
+    /// initialization options.
     #[serde(default)]
     pub initialization_options: Option<serde_json::Value>,
-    /// Handshake timeout in seconds.
+    /// Handshake timeout in seconds. An overlay inherits the built-in value;
+    /// a new server defaults to `30` seconds.
     #[serde(default)]
     pub timeout_seconds: Option<u64>,
-    /// When this server starts, overriding `[backend] spawn`.
+    /// When this server starts, overriding `[backend] spawn`. When omitted,
+    /// it follows `[backend] spawn`, which defaults to `"lazy"`.
     #[serde(default)]
     pub spawn: Option<SpawnPolicy>,
-    /// Per-request timeout in seconds.
+    /// Per-request timeout in seconds. An overlay inherits the built-in
+    /// value; a new server defaults to `30` seconds.
     #[serde(default)]
     pub request_timeout_seconds: Option<u64>,
-    /// Spawn heuristics.
+    /// Spawn heuristics. An overlay inherits the built-in markers; a new
+    /// server without markers always attempts to spawn.
     #[serde(default)]
     pub heuristics: Option<ServerHeuristics>,
-    /// Routing identity, defaulting to `language_id`.
+    /// Routing identity. An overlay inherits the built-in value; when absent
+    /// on a new server, `language_id` is used.
     #[serde(default)]
     pub name: Option<String>,
-    /// Tools this server handles.
+    /// Tools this server handles. An overlay inherits the built-in value; a
+    /// new server without a list handles every unclaimed tool.
     #[serde(default)]
     pub handles: Option<Vec<ToolKind>>,
-    /// Set to `false` to drop the server this entry names.
+    /// Set to `false` to drop the server this entry names. Omission leaves an
+    /// existing server enabled and enables a new server by default.
     #[serde(default)]
     pub enabled: Option<bool>,
-    /// The least severe diagnostic worth delivering from this server.
+    /// The least severe diagnostic worth delivering from this server. An
+    /// overlay inherits the built-in value; a new server without one uses
+    /// `[diagnostics].severity`, which defaults to `"warning"`.
     #[serde(default)]
     pub diagnostics_severity: Option<SeverityFloor>,
 }

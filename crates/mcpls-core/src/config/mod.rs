@@ -7,12 +7,15 @@ mod language;
 mod routing;
 mod server;
 
+pub mod schema;
+
 use std::collections::{HashMap, HashSet};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 pub use language::{base_language_id, react_variant_language_id};
 pub use routing::{NoServerReason, ServerId, ToolKind, ToolRouter};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 pub use server::{
     DEFAULT_HEURISTICS_MAX_DEPTH, LspServerConfig, MAX_TIMEOUT_SECONDS, PartialLspServerConfig,
@@ -22,11 +25,28 @@ pub use server::{
 use crate::bridge::{DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE, ResourceLimits};
 use crate::error::{Error, Result};
 
+/// Create a default config template with a Taplo schema link.
+///
+/// The file is created exclusively, so an existing config is never replaced.
+///
+/// # Errors
+///
+/// Returns an error if the path already exists or file creation or writing fails.
+pub fn init_config_file(path: &Path) -> std::io::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    writeln!(file, "#:schema {}", schema::SCHEMA_ID)?;
+    file.write_all(DEFAULT_CONFIG_TEMPLATE.as_bytes())
+}
+
 /// Maps file extensions to LSP language identifiers.
 ///
 /// Used to detect the language ID for files based on their extension.
 /// Extensions are mapped to language IDs like "rust", "python", "cpp", etc.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct LanguageExtensionMapping {
     /// Array of extensions and their corresponding language ID.
     pub extensions: Vec<String>,
@@ -38,7 +58,7 @@ pub struct LanguageExtensionMapping {
 ///
 /// Every field defaults to `false`, so a configuration without an
 /// `[apply]` table leaves mcpls entirely read-only.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct ApplyConfig {
@@ -90,7 +110,7 @@ impl ApplyConfig {
 }
 
 /// The least severe diagnostic worth delivering.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum SeverityFloor {
     /// Deliver nothing from this server.
@@ -129,7 +149,7 @@ impl SeverityFloor {
 }
 
 /// How much of what the language servers report reaches the agent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DiagnosticsConfig {
     /// The least severe diagnostic worth delivering, for any server that
@@ -257,7 +277,7 @@ impl Default for DiagnosticsConfig {
 }
 
 /// How the Claude Code hooks reach a running mcpls.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HooksConfig {
     /// Whether the listener binds at all.
@@ -307,7 +327,7 @@ impl Default for HooksConfig {
 }
 
 /// How long a shared backend outlives its last session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BackendConfig {
     /// How long a backend with no session attached waits before it exits.
@@ -357,18 +377,23 @@ pub enum ConfigSource {
 }
 
 /// Main configuration for the MCPLS server.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     /// Workspace configuration.
     #[serde(default)]
     pub workspace: WorkspaceConfig,
 
-    /// LSP server configurations, resolved against the built-ins.
+    /// If omitted, the built-in servers are used. Entries identify a server
+    /// by `name`, or `language_id` when `name` is absent. The first enabled
+    /// entry for an existing server overlays it; a new identity needs
+    /// `command`. Once claimed, a later entry with `command` adds another
+    /// server, while a later `spawn`-only entry overlays the resolved server.
     #[serde(
         default = "LspServerConfig::builtins",
         deserialize_with = "deserialize_lsp_servers"
     )]
+    #[schemars(with = "Vec<PartialLspServerConfig>")]
     pub lsp_servers: Vec<LspServerConfig>,
 
     /// Which tools may write their edits to the working tree.
@@ -506,7 +531,7 @@ const DEFAULT_CONFIG_TEMPLATE: &str = r#"# mcpls configuration
 "#;
 
 /// Workspace-level configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceConfig {
     /// Root directories for the workspace.
@@ -526,7 +551,7 @@ pub struct WorkspaceConfig {
 
     /// File extension to language ID mappings.
     /// Allows users to customize which file extensions map to which language servers.
-    #[serde(default)]
+    #[serde(default = "default_language_extensions")]
     pub language_extensions: Vec<LanguageExtensionMapping>,
 
     /// Maximum depth for recursive project marker search.

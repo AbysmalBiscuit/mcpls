@@ -15,6 +15,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::server::LspServerConfig;
@@ -78,7 +79,7 @@ impl From<&str> for ServerId {
 /// assert_eq!(ToolKind::Hover.as_str(), "hover");
 /// assert_eq!(ToolKind::ALL.len(), 15);
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolKind {
     /// `textDocument/hover`.

@@ -4,7 +4,7 @@ Complete reference for configuring mcpls.
 
 ## Configuration File
 
-mcpls uses TOML format for configuration. The file can be placed in several locations (searched in order):
+mcpls uses TOML 1.1 for configuration. The file can be placed in several locations (searched in order):
 
 1. Path specified by `--config` flag
 2. `$MCPLS_CONFIG` environment variable
@@ -13,6 +13,20 @@ mcpls uses TOML format for configuration. The file can be placed in several loca
    - Linux: `$XDG_CONFIG_HOME/mcpls/mcpls.toml`, else `~/.config/mcpls/mcpls.toml`
    - macOS: `~/Library/Application Support/mcpls/mcpls.toml`
    - Windows: `%APPDATA%\mcpls\mcpls.toml`
+
+### JSON Schema
+
+Run `mcpls schema` to print the JSON Schema for `mcpls.toml`. Run
+`mcpls schema init` to create a commented default `mcpls.toml` in the current
+directory with a Taplo schema link; it leaves an existing file untouched. The
+file is discovered automatically only at the checkout root, and project-local
+config must be trusted with `--trust-project-config` or
+`MCPLS_TRUST_PROJECT_CONFIG=true`; see [Trusting a Project-Local Config](#trusting-a-project-local-config).
+For automatic discovery, run `mcpls schema init` at the checkout root. The
+latest release also publishes the schema at
+`https://github.com/AbysmalBiscuit/mcpls/releases/latest/download/mcpls-config.json`.
+After changing configuration types, run `devrun task schema` to regenerate the
+checked-in schema.
 
 ### Trusting a Project-Local Config
 

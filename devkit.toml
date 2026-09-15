@@ -67,6 +67,12 @@ description = "Run workspace tests with nextest"
 run = ["cargo", "nextest", "run", "--workspace", "--all-features", "--locked"]
 guard = true
 
+[tasks.schema]
+description = "Generate the committed mcpls config schema"
+run = ["cargo", "test", "-p", "mcpls-core", "--test", "config_schema", "--locked"]
+guard = true
+env = { MCPLS_UPDATE_SCHEMA = "1" }
+
 [tasks.test-doc]
 description = "Run workspace documentation tests"
 run = ["cargo", "test", "--doc", "--workspace", "--all-features", "--locked"]
