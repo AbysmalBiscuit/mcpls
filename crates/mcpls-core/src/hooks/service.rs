@@ -12,7 +12,7 @@ use tokio::sync::watch;
 
 use crate::bridge::SessionId;
 use crate::hooks::identity::SocketIdentity;
-use crate::hooks::protocol::{Request, Response};
+use crate::hooks::protocol::{Request, Response, ServerStatus};
 use crate::hooks::sweep::Sweeper;
 use crate::mcp::McplsServer;
 
@@ -66,7 +66,7 @@ pub struct StatusExtras {
     /// The MCP sessions attached.
     pub sessions: Vec<String>,
     /// The language servers registered.
-    pub servers: Vec<String>,
+    pub servers: Vec<ServerStatus>,
     /// The configuration fingerprint this process started with.
     pub config_fingerprint: String,
 }

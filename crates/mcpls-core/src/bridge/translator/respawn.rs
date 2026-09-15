@@ -123,13 +123,8 @@ impl Drop for SpawnGuard {
 impl Translator {
     /// Whether the server tracked under `id` is registered and has exited.
     ///
-    /// Returns `false` ("not dead") for an `id` that isn't registered at
-    /// all -- that's the separate `ServerInitializing`/`NoServerForTool`
-    /// concern callers already handle, not something the respawn path
-    /// should react to -- and for any `try_wait` error, on the conservative
-    /// assumption that a health check that itself failed should not trigger
-    /// a respawn.
-    #[cfg(test)]
+    /// Returns `false` when `id` is not registered or the process check
+    /// returns an error; neither is evidence that the process exited.
     pub(crate) fn is_server_dead(&self, id: &ServerId) -> bool {
         lock_std(&self.lsp_servers)
             .get_mut(id)

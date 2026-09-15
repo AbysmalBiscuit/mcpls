@@ -453,7 +453,7 @@ const DEFAULT_CONFIG_TEMPLATE: &str = r#"# mcpls configuration
 #
 # [backend]
 # idle_shutdown_ms = 10000
-# spawn = "eager"
+# spawn = "lazy"
 #
 # Built-in servers are active when their project markers are present. Copy an
 # example to override one, or set enabled = false to disable it.
@@ -1457,8 +1457,8 @@ mod tests {
     }
 
     #[test]
-    fn test_the_backend_spawn_policy_defaults_to_eager() {
-        assert_eq!(ServerConfig::default().backend.spawn, SpawnPolicy::Eager);
+    fn test_the_backend_spawn_policy_defaults_to_lazy() {
+        assert_eq!(ServerConfig::default().backend.spawn, SpawnPolicy::Lazy);
     }
 
     #[test]

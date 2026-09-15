@@ -1011,6 +1011,7 @@ dependencies = [
  "predicates",
  "serde",
  "serde_json",
+ "strum",
  "tempfile",
  "tokio",
  "toml",

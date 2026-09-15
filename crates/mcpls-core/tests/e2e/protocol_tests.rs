@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use std::{fs, thread};
 
 use anyhow::{Context, Result};
+use mcpls_core::config::SpawnPolicy;
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -30,15 +31,26 @@ fn toml_patterns(values: &[&str]) -> String {
         .join(", ")
 }
 
+#[derive(Clone, Copy)]
+struct FixtureConfigOptions<'a> {
+    workspace_mapping: bool,
+    spawn: SpawnPolicy,
+    handles: &'a [&'a str],
+}
+
 fn write_fixture_config(
     config_path: &Path,
     language_id: &str,
     command: &str,
     args: &[String],
     file_patterns: &[&str],
-    workspace_mapping: bool,
-    handles: &[&str],
+    options: FixtureConfigOptions<'_>,
 ) -> Result<()> {
+    let FixtureConfigOptions {
+        workspace_mapping,
+        spawn,
+        handles,
+    } = options;
     let workspace = config_path
         .parent()
         .context("fixture config path must have a parent")?;
@@ -59,8 +71,12 @@ fn write_fixture_config(
     };
     let workspace = toml::Value::String(workspace.to_string_lossy().into_owned()).to_string();
     let args = toml_array(args);
+    let spawn = match spawn {
+        SpawnPolicy::Eager => "eager",
+        SpawnPolicy::Lazy => "lazy",
+    };
     let config = format!(
-        "[workspace]\nroots = [{workspace}]{workspace_mapping}\n[diagnostics.hooks]\nenabled = false\n\n[[lsp_servers]]\nlanguage_id = {language_id:?}\ncommand = {command:?}\nargs = [{args}]\n{file_patterns}{handles}"
+        "[workspace]\nroots = [{workspace}]{workspace_mapping}\n[backend]\nspawn = {spawn:?}\n[diagnostics.hooks]\nenabled = false\n\n[[lsp_servers]]\nlanguage_id = {language_id:?}\ncommand = {command:?}\nargs = [{args}]\n{file_patterns}{handles}"
     );
     fs::write(config_path, config)?;
     Ok(())
@@ -141,8 +157,11 @@ fn run_hover_case_in_workspace(
         "python3",
         &args,
         file_patterns,
-        workspace_mapping,
-        &[],
+        FixtureConfigOptions {
+            workspace_mapping,
+            spawn: SpawnPolicy::Lazy,
+            handles: &[],
+        },
     )?;
     let file_path = workspace.path().join(file_name);
     if let Some(parent) = file_path.parent() {
@@ -194,7 +213,7 @@ fn write_duplicate_floor_config(
     fs::write(
         config_path,
         format!(
-            "[workspace]\nroots = [{workspace}]\n[diagnostics]\nsettle_quiet_ms = 50\nsettle_deadline_ms = 10000\n[diagnostics.hooks]\nenabled = false\n\n{servers}"
+            "[workspace]\nroots = [{workspace}]\n[backend]\nspawn = \"eager\"\n[diagnostics]\nsettle_quiet_ms = 50\nsettle_deadline_ms = 10000\n[diagnostics.hooks]\nenabled = false\n\n{servers}"
         ),
     )?;
     Ok(())
@@ -267,7 +286,7 @@ fn write_mixed_startup_config(
     fs::write(
         config_path,
         format!(
-            "[workspace]\nroots = [{workspace}]\n[diagnostics]\nsettle_quiet_ms = 50\nsettle_deadline_ms = 10000\n[diagnostics.hooks]\nenabled = false\n\n[[lsp_servers]]\nlanguage_id = \"elixir\"\ncommand = \"python3\"\nargs = [{script}, \"reporting\", {reporting_initialized}, {reporting_initialized}, {reporting_initialized}, \"main.ex\", \"0\"]\nfile_patterns = [\"**/*.ex\"]\ndiagnostics_severity = \"warning\"\n\n[[lsp_servers]]\nlanguage_id = \"haskell\"\ncommand = \"python3\"\nargs = [{script}, \"silent\", {silent_initialized}, {silent_startup_published}, {silent_changed_published}, \"main.hs\", \"1.5\"]\nfile_patterns = [\"**/*.hs\"]\ndiagnostics_severity = \"warning\"\n"
+            "[workspace]\nroots = [{workspace}]\n[backend]\nspawn = \"eager\"\n[diagnostics]\nsettle_quiet_ms = 50\nsettle_deadline_ms = 10000\n[diagnostics.hooks]\nenabled = false\n\n[[lsp_servers]]\nlanguage_id = \"elixir\"\ncommand = \"python3\"\nargs = [{script}, \"reporting\", {reporting_initialized}, {reporting_initialized}, {reporting_initialized}, \"main.ex\", \"0\"]\nfile_patterns = [\"**/*.ex\"]\ndiagnostics_severity = \"warning\"\n\n[[lsp_servers]]\nlanguage_id = \"haskell\"\ncommand = \"python3\"\nargs = [{script}, \"silent\", {silent_initialized}, {silent_startup_published}, {silent_changed_published}, \"main.hs\", \"1.5\"]\nfile_patterns = [\"**/*.hs\"]\ndiagnostics_severity = \"warning\"\n"
         ),
     )?;
     Ok(())
@@ -291,7 +310,7 @@ fn write_non_diagnostics_config(
     fs::write(
         config_path,
         format!(
-            "[workspace]\nroots = [{workspace}]\n[diagnostics]\nsettle_quiet_ms = 50\nsettle_deadline_ms = 5000\n[diagnostics.hooks]\nenabled = false\n\n[[lsp_servers]]\nlanguage_id = \"elixir\"\nname = \"hover-only\"\ncommand = \"python3\"\nargs = [{script}, \"holding\", {initialized_marker}, {progress_marker}, {progress_marker}, \"main.ex\", \"0\"]\nfile_patterns = [\"**/*.ex\"]\nhandles = [\"hover\"]\ndiagnostics_severity = \"warning\"\n"
+            "[workspace]\nroots = [{workspace}]\n[backend]\nspawn = \"eager\"\n[diagnostics]\nsettle_quiet_ms = 50\nsettle_deadline_ms = 5000\n[diagnostics.hooks]\nenabled = false\n\n[[lsp_servers]]\nlanguage_id = \"elixir\"\nname = \"hover-only\"\ncommand = \"python3\"\nargs = [{script}, \"holding\", {initialized_marker}, {progress_marker}, {progress_marker}, \"main.ex\", \"0\"]\nfile_patterns = [\"**/*.ex\"]\nhandles = [\"hover\"]\ndiagnostics_severity = \"warning\"\n"
         ),
     )?;
     Ok(())
@@ -415,8 +434,11 @@ fn i1_t1_workspace_only_server_without_mapping_is_accepted() -> Result<()> {
         "python3",
         &args,
         &[],
-        false,
-        &["workspace_symbols"],
+        FixtureConfigOptions {
+            workspace_mapping: false,
+            spawn: SpawnPolicy::Lazy,
+            handles: &["workspace_symbols"],
+        },
     )?;
 
     let config_arg = config_path.to_string_lossy().into_owned();
@@ -606,7 +628,7 @@ async fn e2e_shared_backend_keeps_records_per_session(
     fs::write(
         &config_path,
         format!(
-            "[workspace]\nroots = [{workspace_value}]\n[backend]\nidle_shutdown_ms = 500\n[diagnostics]\nsettle_quiet_ms = 50\nsettle_deadline_ms = 5000\n\n[[lsp_servers]]\nlanguage_id = \"python\"\ncommand = \"python3\"\nargs = [{args}]\nfile_patterns = [\"**/*.py\"]\ndiagnostics_severity = \"warning\"\n\n[lsp_servers.heuristics]\nproject_markers = [\"main.py\"]\n"
+            "[workspace]\nroots = [{workspace_value}]\n[backend]\nidle_shutdown_ms = 500\nspawn = \"eager\"\n[diagnostics]\nsettle_quiet_ms = 50\nsettle_deadline_ms = 5000\n\n[[lsp_servers]]\nlanguage_id = \"python\"\ncommand = \"python3\"\nargs = [{args}]\nfile_patterns = [\"**/*.py\"]\ndiagnostics_severity = \"warning\"\n\n[lsp_servers.heuristics]\nproject_markers = [\"main.py\"]\n"
         ),
     )?;
     let file_path = root.join("main.py");
@@ -1044,7 +1066,18 @@ fn i1_t3_all_failed_startup_flushes_empty() -> Result<()> {
     let missing_command = missing_command
         .to_str()
         .context("missing fixture executable path must be valid UTF-8")?;
-    write_fixture_config(&config_path, "rust", missing_command, &[], &[], false, &[])?;
+    write_fixture_config(
+        &config_path,
+        "rust",
+        missing_command,
+        &[],
+        &[],
+        FixtureConfigOptions {
+            workspace_mapping: false,
+            spawn: SpawnPolicy::Eager,
+            handles: &[],
+        },
+    )?;
 
     let file_path = workspace.path().join("src/lib.rs");
     fs::create_dir_all(
@@ -1082,9 +1115,8 @@ fn i1_t3_all_failed_startup_flushes_empty() -> Result<()> {
             Err(error) => {
                 let message = error.to_string();
                 assert!(
-                    message.contains("no LSP server configured for language: rust"),
-                    "the failed Rust server should be removed from routing after spawn failure, \
-                     got {message}"
+                    message.contains("LSP server 'rust' is unavailable: command not found"),
+                    "the missing Rust executable should be reported as unavailable, got {message}"
                 );
                 break;
             }

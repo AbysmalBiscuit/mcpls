@@ -31,6 +31,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use mcp_client::McpClient;
+use mcpls_core::config::SpawnPolicy;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -161,6 +162,7 @@ struct LspServerConfig {
     command: String,
     args: Vec<String>,
     file_patterns: Vec<String>,
+    spawn: SpawnPolicy,
     heuristics: Heuristics,
 }
 
@@ -192,6 +194,7 @@ fn write_config(pyrefly_binary: &Path, workspace_root: &Path, config_path: &Path
                 "lazy-blocking".to_owned(),
             ],
             file_patterns: vec!["**/*.py".to_owned()],
+            spawn: SpawnPolicy::Eager,
             heuristics: Heuristics {
                 project_markers: vec!["pyrefly.toml".to_owned()],
             },

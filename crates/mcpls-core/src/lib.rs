@@ -784,7 +784,18 @@ impl Runtime {
             servers: translator
                 .lifecycles()
                 .into_iter()
-                .map(|(id, _)| id.to_string())
+                .map(|(id, state)| {
+                    let state =
+                        if state == ServerLifecycle::Running && translator.is_server_dead(&id) {
+                            ServerLifecycle::Failed
+                        } else {
+                            state
+                        };
+                    hooks::protocol::ServerStatus {
+                        id: id.to_string(),
+                        state,
+                    }
+                })
                 .collect(),
             config_fingerprint: config_fingerprint.clone(),
         })

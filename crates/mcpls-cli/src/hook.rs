@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use mcpls_core::hooks::filters::WatchPaths;
+use mcpls_core::hooks::protocol::ServerStatus;
 use mcpls_core::hooks::{
     ChangeEvent, ProbeOutcome, Request, Response, SocketIdentity, probe, send,
     send_and_acknowledge, watch_paths,
@@ -459,11 +460,15 @@ fn sessions_line(sessions: &[String]) -> String {
     }
 }
 
-fn servers_line(servers: &[String]) -> String {
+fn servers_line(servers: &[ServerStatus]) -> String {
     if servers.is_empty() {
         "language servers: none".to_string()
     } else {
-        format!("language servers: {}", servers.join(", "))
+        let rendered: Vec<String> = servers
+            .iter()
+            .map(|server| format!("{} ({})", server.id, server.state))
+            .collect();
+        format!("language servers: {}", rendered.join(", "))
     }
 }
 
@@ -905,8 +910,10 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
+    use mcpls_core::bridge::ServerLifecycle;
     use mcpls_core::config::HooksConfig;
     use serde_json::json;
+    use strum::IntoEnumIterator;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
     use super::*;
@@ -924,6 +931,13 @@ mod tests {
     /// to `additionalContext` fails the exact-value assertions below rather
     /// than passing on a fixture too flat to notice.
     const DEFAULT_FLUSH_TEXT: &str = "2 problems in a.rs\n  1 warning in b.rs\n";
+
+    fn status(id: &str, state: ServerLifecycle) -> ServerStatus {
+        ServerStatus {
+            id: id.to_string(),
+            state,
+        }
+    }
 
     /// Run the dispatcher over one payload, against the socket identity
     /// `project_dir` derives, and return what it printed.
@@ -1119,7 +1133,7 @@ mod tests {
                     version: "0.3.9".to_string(),
                     uptime_ms: 61_000,
                     sessions: vec!["s1".to_string(), "connection-4".to_string()],
-                    servers: vec!["rust".to_string()],
+                    servers: vec![status("rust", ServerLifecycle::Running)],
                     config_fingerprint: "00000000000000ff".to_string(),
                 },
                 |message| Response::Error {
@@ -2362,7 +2376,7 @@ mod tests {
         );
         assert_eq!(lines[6], "backend: mcpls 0.3.9, up 1m1s");
         assert_eq!(lines[7], "sessions: 2 attached (s1, connection-4)");
-        assert_eq!(lines[8], "language servers: rust");
+        assert_eq!(lines[8], "language servers: rust (running)");
         assert_eq!(lines[9], "config: 00000000000000ff");
         assert!(lines[10].starts_with("mcpls on PATH: "));
     }
@@ -2373,6 +2387,30 @@ mod tests {
         assert_eq!(servers_line(&[]), "language servers: none");
         assert_eq!(uptime(0), "0s");
         assert_eq!(uptime(3_725_000), "1h2m");
+    }
+
+    #[test]
+    fn test_the_servers_line_names_a_state_beside_each_server() {
+        let servers = vec![
+            status("rust", ServerLifecycle::Running),
+            status("typescript", ServerLifecycle::Idle),
+            status("lua", ServerLifecycle::NotInstalled),
+        ];
+        assert_eq!(
+            servers_line(&servers),
+            "language servers: rust (running), typescript (idle), lua (not installed)"
+        );
+    }
+
+    #[test]
+    fn test_the_servers_line_renders_every_lifecycle_state() {
+        let servers: Vec<ServerStatus> = ServerLifecycle::iter()
+            .map(|state| status("language", state))
+            .collect();
+        assert_eq!(
+            servers_line(&servers),
+            "language servers: language (idle), language (starting), language (running), language (not installed), language (failed)"
+        );
     }
 
     /// The doctor prints the backend's fingerprint beside the one this
@@ -2437,7 +2475,7 @@ mod tests {
                     version: "0.3.9".to_string(),
                     uptime_ms: 61_000,
                     sessions: vec!["s1".to_string(), "connection-4".to_string()],
-                    servers: vec!["rust".to_string()],
+                    servers: vec![status("rust", ServerLifecycle::Running)],
                     config_fingerprint: "00000000000000ff".to_string(),
                 }
             )

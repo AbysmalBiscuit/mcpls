@@ -40,9 +40,9 @@ const EXCLUDED_DIRECTORIES: &[&str] = &[
 #[serde(rename_all = "lowercase")]
 pub enum SpawnPolicy {
     /// Started the first time the session touches the server's language.
+    #[default]
     Lazy,
     /// Started with the backend, whether or not the session uses it.
-    #[default]
     Eager,
 }
 

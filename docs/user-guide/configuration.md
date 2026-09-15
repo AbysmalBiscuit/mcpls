@@ -716,7 +716,7 @@ Pass `--no-backend` (or set `MCPLS_NO_BACKEND=true`) to serve one session entire
 ```toml
 [backend]
 idle_shutdown_ms = 10000
-spawn = "eager"
+spawn = "lazy"
 ```
 
 ### `backend.idle_shutdown_ms`
@@ -729,7 +729,7 @@ How long the backend waits after its last MCP session closes before it exits and
 ### `backend.spawn`
 
 **Type**: String
-**Default**: `"eager"`
+**Default**: `"lazy"`
 **Options**: `"eager"`, `"lazy"`
 
 When language servers start. `"eager"` starts every applicable server with the backend. `"lazy"` holds a server back until a session touches its language. A `[[lsp_servers]]` entry can set `spawn` to override this backend default for that server.
