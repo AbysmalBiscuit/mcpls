@@ -14,12 +14,12 @@
 
 - Workspace is `mcpls-core` (library) and `mcpls-cli` (binary). All paths below are repository-relative.
 - Gate every task with `devrun task verify`: nightly rustfmt check, clippy with warnings denied, nextest, and doctests. A task is not done until it passes.
-- Run one test with `cargo nextest run -p mcpls-core <test_name>`. Run the ignored end-to-end suite with `devrun task test-e2e`.
-- Commit through `devrun task commit --arg commit_subject='...' --arg commit_body=$'...'`. Do **not** pass `--arg coauthors`: it renders `Co-authored-by` and the repository's `commit-msg` hook rejects any capitalization but `Co-Authored-By`. Put the trailer as the last line of `commit_body` instead, after a blank line: `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`.
+- Run project tests through `devrun task test`; the configured task runs the workspace and accepts no test filter. Use `devrun task verify` for formatting, clippy, workspace tests, and doctests, and `devrun task test-e2e` for the ignored end-to-end suite.
+- Stage and commit only task-owned paths with `devrun task commit-stage --arg files='path1,path2'` and `devrun task commit-write --arg files='path1,path2' --arg commit_subject='...' --arg commit_body=$'...'`. `devrun task commit` is invalid in this checkout. Do **not** pass `--arg coauthors`: it renders `Co-authored-by` and the repository's `commit-msg` hook requires `Co-Authored-By`. Put the actual implementing agent's model and address on the last line of `commit_body`, after a blank line.
 - Conventional Commits. Subject at most 50 characters including the type prefix, imperative mood, lowercase after the colon, no trailing period.
 - `clippy::unwrap_used` and `clippy::expect_used` are denied outside test modules. Test modules in this crate carry `#[allow(clippy::unwrap_used, clippy::expect_used)]` on the `mod tests` item; follow that pattern.
 - Comments describe what the code does and why, in the present tense. No references to this plan, the issue, tasks, or the change itself.
-- The default spawn policy stays `Eager` until Task 9. Do not flip it early: Tasks 3 through 8 rely on today's startup behaviour to keep the existing suite passing.
+- The default spawn policy stays `Eager` until Task 10. Do not flip it early: Tasks 3 through 9 rely on today's startup behaviour to keep the existing suite passing.
 - `budget: Option<Duration>` on `ensure_server` means: `None` starts the spawn and returns without waiting, `Some(d)` waits up to `d` for a terminal state. `None` is not "wait forever".
 
 ## File Structure
@@ -37,6 +37,7 @@
 - `crates/mcpls-core/src/bridge/translator/routing.rs`: the tool-call trigger and the catch-all fallback.
 - `crates/mcpls-core/src/bridge/translator/symbols.rs`: workspace-wide tools.
 - `crates/mcpls-core/src/bridge/delivery.rs`: `merge_baseline`.
+- `crates/mcpls-core/src/bridge/settle.rs`: lifecycle-driven diagnostics ownership.
 - `crates/mcpls-core/src/notification_lifecycle.rs`: a `PumpShared` accessor.
 - `crates/mcpls-core/src/hooks/sweep.rs`: the edit trigger.
 - `crates/mcpls-core/src/hooks/protocol.rs`: `ServerStatus` on the wire.
@@ -144,7 +145,7 @@ pub enum SpawnPolicy {
 }
 ```
 
-`Eager` is the derived default so this task changes no behaviour. Task 9 moves `#[default]` to `Lazy`.
+`Eager` is the derived default so this task changes no behaviour. Task 10 moves `#[default]` to `Lazy`.
 
 - [ ] **Step 4: Add the per-server key**
 
@@ -1512,7 +1513,7 @@ The owner has never reported progress, so the per-owner branch holds it for `NO_
 
 In `crates/mcpls-core/src/lib.rs`, `spawn_lsp_servers_background` initializes the notification pumps at `:1119`. Move that `get_or_init` call to the setup path, before the `if applicable_configs.is_empty()` branch at `:719`, so a lazily started server always has a pump to deliver through.
 
-Then widen the empty-baseline condition at `:719`. It reads `applicable_configs.is_empty()` today. It becomes "no server will start eagerly", which is the same thing when the default is eager and a different thing once Task 9 lands:
+Then widen the empty-baseline condition at `:719`. It reads `applicable_configs.is_empty()` today. It becomes "no server will start eagerly", which is the same thing when the default is eager and a different thing once Task 10 lands:
 
 ```rust
         let eager_configs: Vec<ServerInitConfig> = applicable_configs
@@ -1577,7 +1578,7 @@ devrun task commit --arg commit_subject='fix(bridge): extend the baseline per ow
 
 **Interfaces:**
 - Consumes: `Translator::lifecycle_of`, `Translator::set_lifecycle`, `SpawnPolicy`, `ServerSpawnFailure::missing_binary`.
-- Produces: `ToolRouter::catch_all(&self, language_id: &str) -> Option<&ServerId>`. `register_servers` loses its `configs` parameter. `set_expected_servers`, `clear_expected_servers` and the `expected_servers` field are gone. `rebind_router` and `rebind_to_registered` are gone.
+- Produces: `ToolRouter::catch_all_for_language(&self, language_id: &str) -> Option<&ServerId>`. The existing public associated constructor `ToolRouter::catch_all(entries)` keeps its name. `register_servers` loses its `configs` parameter. `set_expected_servers`, `clear_expected_servers` and the `expected_servers` field are gone. `rebind_router` and `rebind_to_registered` are gone.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1687,7 +1688,7 @@ The call to delete first is inside `register_servers` itself, at `crates/mcpls-c
             let router = lock_std(&self.router);
             (
                 router.resolve(language_id, ToolKind::Diagnostics).cloned(),
-                router.catch_all(language_id).cloned(),
+                router.catch_all_for_language(language_id).cloned(),
             )
         };
         match claimant {
@@ -1744,7 +1745,7 @@ In `crates/mcpls-core/src/bridge/translator/routing.rs`, replace the `expected_s
                 // conscripting the catch-all would hand its diagnostics
                 // the tools the user routed away.
                 Some(ServerLifecycle::NotInstalled) => {
-                    let catch_all = lock_std(&self.router).catch_all(lang).cloned();
+                    let catch_all = lock_std(&self.router).catch_all_for_language(lang).cloned();
                     if let Some(catch_all) = catch_all
                         && catch_all != id
                         && self.lifecycle_of(&catch_all) != Some(ServerLifecycle::NotInstalled)
@@ -1767,7 +1768,7 @@ In `crates/mcpls-core/src/bridge/translator/routing.rs`, replace the `expected_s
             }
 ```
 
-`ToolRouter` needs a `catch_all(&self, language_id: &str) -> Option<&ServerId>` accessor returning `by_language[language].default`. Add it beside `resolve`.
+`ToolRouter` needs a `catch_all_for_language(&self, language_id: &str) -> Option<&ServerId>` accessor returning `by_language[language].default`. The public associated constructor already uses the `catch_all` name, so keep it unchanged. Add the lookup beside `resolve`.
 
 The `tracing::error!` fall-through below this block stays: it is now reached only by a library consumer that called `with_router` without registering matching clients, which is what its comment already says.
 
@@ -1788,7 +1789,7 @@ The `expected_servers` check further down at `:215` becomes the same `lifecycle_
 Four test sites call those setters and must move to `set_lifecycle` in this same task, or the tree does not compile:
 
 - `crates/mcpls-core/src/bridge/translator/routing.rs:357` and `crates/mcpls-core/src/bridge/translator/symbols.rs:304` mark a server that has not registered. Both become `set_lifecycle(&id, ServerLifecycle::Starting)`, which is the state that set stood for.
-- `crates/mcpls-core/src/hooks/sweep.rs:425`, inside `initializing_sweeper`, becomes the same. Task 8 replaces that helper wholesale; this keeps it compiling until then.
+- `crates/mcpls-core/src/hooks/sweep.rs:425`, inside `initializing_sweeper`, becomes the same. Task 9 replaces that helper wholesale; this keeps it compiling until then.
 - `crates/mcpls-core/src/bridge/translator/mod.rs:1199`, `test_clear_expected_servers_reverts_to_no_server_after_all_routes_dropped`, tests the clearing moment itself. Lazy spawning has no such moment, which is the premise of this task, so delete it rather than translating it.
 
 Also update the stale references in the comments at `crates/mcpls-core/src/bridge/translator/routing.rs:95`, `crates/mcpls-core/src/bridge/translator/symbols.rs:198` and `:299`, and `crates/mcpls-core/src/config/routing.rs:207`, each of which names `expected_servers` as the thing that answers "still expected to register".
@@ -1805,7 +1806,7 @@ Also update the stale references in the comments at `crates/mcpls-core/src/bridg
                 .collect(),
 ```
 
-Task 9 changes the field's type. Splitting it here keeps this task's diff to one concern.
+Task 10 changes the field's type. Splitting it here keeps this task's diff to one concern.
 
 - [ ] **Step 9: Run the tests to verify they pass**
 
@@ -1827,8 +1828,9 @@ devrun task commit --arg commit_subject='refactor(bridge): resolve against the s
 
 **Files:**
 - Modify: `crates/mcpls-core/src/bridge/translator/routing.rs:71`, `:97`
+- Modify: `crates/mcpls-core/src/bridge/translator/mod.rs` (`open_untracked_document` call site)
 - Modify: `crates/mcpls-core/src/bridge/translator/symbols.rs:192`
-- Test: `crates/mcpls-core/src/bridge/translator/routing.rs`'s `mod tests`
+- Test: `crates/mcpls-core/src/bridge/translator/routing.rs`'s `mod tests`, `open_untracked_document` coverage in `translator/mod.rs`, and the lazy-route lookup assertion in `crates/mcpls-core/src/recovery_tests.rs`
 
 **Interfaces:**
 - Consumes: `Translator::ensure_server`.
@@ -1963,7 +1965,7 @@ Expected: FAIL. Each state holds where it started, because nothing triggers a sp
                 // common case on first contact, so hand back whatever
                 // client it has and let the wrapper start it.
                 Some(ServerLifecycle::NotInstalled) => {
-                    let catch_all = lock_std(&self.router).catch_all(lang).cloned();
+                    let catch_all = lock_std(&self.router).catch_all_for_language(lang).cloned();
                     if let Some(catch_all) = catch_all
                         && catch_all != id
                         && self.lifecycle_of(&catch_all) != Some(ServerLifecycle::NotInstalled)
@@ -1981,6 +1983,8 @@ Expected: FAIL. Each state holds where it started, because nothing triggers a sp
 ```
 
 Task 6's `test_a_crashed_narrow_server_does_not_fall_through` asserted `ServerUnavailable` from this method. Its subject, that a crashed narrow server keeps its own route rather than conscripting the catch-all, is still true and still worth testing, but the witness moves: assert the returned identity is `rust-narrow` and the client is `None`. Move it and the tests that assert `ServerInitializing` to `resolve_client_for_file`, as `#[tokio::test]`.
+
+`recovery_tests.rs` also has a lookup-only assertion for an idle Lazy route in `lazy_server_triggered_during_initial_batch_spawns_once`. Update it to expect the selected server identity with `None` as its client, then assert the lifecycle stays `Idle`: the synchronous resolver does not itself trigger a spawn.
 
 - [ ] **Step 4: Trigger from the wrapper**
 
@@ -2047,16 +2051,87 @@ Expected: PASS.
 - [ ] **Step 7: Commit**
 
 ```bash
-devrun task commit --arg commit_subject='feat(bridge): start a server on a tool call' --arg commit_body=$'A tool call naming a language with no server running starts one and\nwaits a bounded time for the handshake. A fast server lands inside the\noriginating call; anything slower hands the caller back to the retry\ncontract it already has, with the spawn still running.\n\nWorkspace symbol search ensures the one server resolve_any picks, since\nthat is the only one it queries.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>'
+devrun task commit --arg commit_subject='feat(bridge): start a server on a tool call' --arg commit_body=$'A tool call naming a language with no server running starts one and\nwaits a bounded time for the handshake. A fast server lands inside the\noriginating call; anything slower hands the caller back to the retry\ncontract it already has, with the spawn still running.\n\nWorkspace symbol search ensures the one server resolve_any picks, since\nthat is the only one it queries.\n\nCo-Authored-By: Codex GPT-5.5 <codex@openai.com>'
 ```
 
 ---
 
-### Task 8: The edit trigger
+### Task 8: Reconcile diagnostics ownership after lifecycle changes
+
+The notification pump currently freezes its cache-ownership flag when it is installed. A catch-all that starts while a narrow claimant is still idle can therefore keep dropping diagnostics after the narrow server later becomes unavailable.
+
+**Files:**
+- Modify: `crates/mcpls-core/src/bridge/settle.rs`
+- Modify: `crates/mcpls-core/src/bridge/state.rs`
+- Modify: `crates/mcpls-core/src/bridge/translator/mod.rs`, `crates/mcpls-core/src/bridge/translator/respawn.rs`
+- Modify: `crates/mcpls-core/src/notification_lifecycle.rs`, `crates/mcpls-core/src/lib.rs`
+- Test: `settle.rs`, `state.rs`, `translator/mod.rs`, `translator/respawn.rs`, `notification_lifecycle.rs`, the recovery tests, and the diagnostics-pump tests in `lib.rs`
+
+**Interfaces:**
+- Consumes: lifecycle-aware diagnostic route selection and the installed notification pumps.
+- Produces: `ServerSettle::owns_diagnostics(&ServerId) -> bool` and one `Translator::diagnostics_owner(language_id) -> Option<ServerId>` decision for cache ownership.
+
+- [ ] **Step 1: Write the failing tests**
+
+Cover these transitions:
+
+- An `Idle`, `Starting`, or `Running` narrow claimant owns diagnostics. A `Failed` or `NotInstalled` claimant falls through to its catch-all only when that catch-all is not itself terminal. A dead singleton or dead catch-all has no owner.
+- A pump installed before its server owns diagnostics starts caching after `ServerSettle` elects it, and stops caching after ownership is revoked. Install-time state must not freeze this decision.
+- With a catch-all pump already running, a narrow claimant becoming `NotInstalled` transfers ownership to the catch-all; recovery transfers it back. The old owner's cached diagnostics are cleared and the cache route count follows the active owner set.
+- When an already-running catch-all is promoted, it gets a new baseline generation, then the generation completes after its tracked documents are safely closed and reopened and settle. An existing diagnostic is baseline state; only a later change is reported as new work.
+- When a server is reinstalled and owns diagnostics, its tracked documents are reopened before its baseline task can merge. A recovery test verifies that existing diagnostics are not reported as new work after respawn.
+- Promoting a server with an old `quiet_since` value re-arms its quiet clock, so the baseline task cannot immediately merge an empty cache using the previous owner's quiet interval.
+
+Use the real notification-pump path for the transfer case: publish while the catch-all is unowned, change lifecycle and reconcile, then publish the tracked documents' baseline again. Assert that `didClose` precedes exactly one `didOpen` per tracked URI on the still-running catch-all, unchanged diagnostics are not new work, and a later change is. This captures the failure mode that an install-time boolean misses without sending a duplicate `didOpen` to a live process.
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run focused settle, state, respawn, recovery, translator, and diagnostics-pump tests. Expected: the pump installed before a transfer still drops the new owner's publish, the promoted owner has no fresh baseline task, the stale quiet clock permits an empty merge, a live server receives duplicate `didOpen` without `didClose`, a respawned owner merges before reopening documents, and route selection can choose a terminal catch-all.
+
+- [ ] **Step 3: Resolve one diagnostics owner per language**
+
+Add `Translator::diagnostics_owner(language_id) -> Option<ServerId>` and make `is_diagnostics_route` compare its result with the supplied server ID. A terminal narrow claimant may move diagnostics to a usable catch-all; a terminal catch-all must not elect itself. If the only configured claimant is terminal, return no owner. Keep file/tool routing's `Failed` retry behavior unchanged: this resolver controls diagnostics delivery only, because a failed file/tool claimant still needs a chance to retry while a failed diagnostics publisher cannot produce anything.
+
+- [ ] **Step 4: Read ownership when each publish is handled**
+
+Remove the install-time `caches_diagnostics` boolean from `NotificationPumps::install`, `diagnostics_pump`, and `handle_publish_diagnostics`. Check `ServerSettle::owns_diagnostics(server_id)` when handling each publish so an already-running pump follows later transfers.
+
+- [ ] **Step 5: Reconcile after spawn outcomes**
+
+After `run_spawn` publishes either `Running`, `Failed`, or `NotInstalled`, recompute the active diagnostics owners from the configured language routes and installed pumps. For every new baseline generation, including a replacement server whose process changed without an ownership change, drive document replay before starting the merge task. Reconcile in this order:
+
+1. Diff the desired owner set against the active set. Clear cached diagnostics for IDs that lost ownership.
+2. For a newly elected owner whose pump was already installed, begin a fresh baseline generation before making it active. If `install_server` already opened a generation for the same server replacement, keep that generation and let the existing spawn path start its task.
+3. Register newly active owners. `register_diagnostics_owner` must re-arm the owner's quiet clock when it enters the active set, even when it still has an old `quiet_since`; then restart the settle deadline and set `NotificationCache::set_diagnostics_route_count` from the new set.
+4. Mark the generation as replaying before the first open, then replay every path from `document_tracker.open_paths()` to its owner with `ensure_open`. A just-installed process has no open documents because `install_server` already forgot its sync state. A live promoted process may still hold the documents, so send `textDocument/didClose` for each path currently synced to it before forgetting that sync state; then `ensure_open` sends one `didOpen` with current content. Serialize each close and reopen with the document's per-path lock. Initial adoption excludes replaying owners, while other owners can still adopt; the per-owner merge also waits for the same generation's replay marker.
+5. Start exactly one `baseline_merge_task(shared, owner, generation, cancel_rx)` after marking replay as active and before awaiting the opens. The task polls while that generation is replaying, so neither initial adoption nor the per-owner merge can consume a partial cache. A generation-matched replay guard clears only the replay marker on success, per-path error, or cancellation; it does not remove the pending baseline. The task then merges whatever diagnostics settled for that generation, including a partial replay after cancellation. Superseding the generation or retiring the owner removes the old marker with the old pending generation. Use the same resolver for replacement baseline setup so setup and runtime ownership agree.
+
+Publishes dropped while a server was not an owner cannot be replayed directly. Closing and reopening supplies current diagnostics for tracked documents; unopened or no-longer-tracked documents still depend on a later open or change. Do not restart a healthy catch-all to force a republish.
+
+The baseline task still uses the settle timer as evidence that a snapshot is ready. A promoted server that takes longer than the applicable quiet/no-progress grace to publish can still have its first batch treated as new work. This is the same timer-based limitation as Task 5; gating on a publish received after the generation opens would require separate publish-generation tracking.
+
+- [ ] **Step 6: Run focused and full verification**
+
+Run the focused settle, respawn, translator, and diagnostics-pump tests, then `devrun task verify`.
+Expected: PASS.
+
+- [ ] **Step 7: Commit**
+
+```bash
+devrun task commit --arg commit_subject='refactor(bridge): reconcile diagnostics ownership' --arg commit_body=$'Notification pumps read diagnostics ownership at publish time, and\nspawn outcomes reconcile the active owner set. A running catch-all can\ntake over when its narrow claimant becomes unavailable, reseed from open\ndocuments, then hand ownership back after recovery.\n\nCo-Authored-By: Codex GPT-5.5 <codex@openai.com>'
+```
+
+---
+
+### Task 9: The edit trigger
 
 **Files:**
 - Modify: `crates/mcpls-core/src/hooks/sweep.rs:226`, `:183`
+- Modify: `crates/mcpls-core/src/bridge/translator/routing.rs` (`server_for_path`)
+- Modify: `crates/mcpls-core/src/bridge/translator/respawn.rs` (`ensure_server` visibility for the sweep caller)
 - Test: `crates/mcpls-core/src/hooks/sweep.rs`'s `mod tests`, including `TestSweeper` at `:374`, `sweeper_over` at `:427`, `initializing_sweeper` at `:415` (deleted), and `test_a_file_whose_server_is_still_starting_is_not_checked` at `:802` (rewritten)
+- Test: `crates/mcpls-core/src/bridge/translator/routing.rs`'s `mod tests`, including the NotInstalled diagnostics-route fallback to an idle catch-all
+- Test: `crates/mcpls-core/src/hooks/service.rs::test_serve_with_runs_the_sweep_loop_it_built`
 
 **Interfaces:**
 - Consumes: `Translator::ensure_server`, `Translator::lifecycle_of`.
@@ -2101,15 +2176,27 @@ devrun task commit --arg commit_subject='feat(bridge): start a server on a tool 
 Then the tests:
 
 ```rust
-    /// This translator was built by hand and so has no self handle, which
-    /// means `ensure_server` publishes `Failed` rather than reaching a
-    /// process. That is enough for what this test is about: the witness is
-    /// that the sweep moved the server off `Idle` at all, which only the
-    /// trigger does.
+    /// A hand-built translator has no spawn handle, so a trigger publishes
+    /// `Failed`. Keeping the document tracked isolates the trigger from the
+    /// separate open path for created files.
     #[tokio::test]
     async fn test_an_edit_starts_the_language_server() {
         let sweeper = idle_sweeper();
         let path = sweeper.write("main.rs");
+        let (transport, _fake_server) = crate::test_support::fake_lsp_transport();
+        let client = crate::lsp::LspClient::from_transport(
+            crate::config::LspServerConfig::rust_analyzer(),
+            transport,
+        );
+        sweeper
+            .translator
+            .document_tracker()
+            .ensure_open(&path, &ServerId::from(SERVER), &client)
+            .await
+            .expect("seed a tracked document");
+        sweeper
+            .translator
+            .set_lifecycle(&ServerId::from(SERVER), ServerLifecycle::Idle);
         sweeper.enqueue(std::slice::from_ref(&path));
 
         sweeper.sweep_now().await;
@@ -2210,10 +2297,12 @@ Rewrite `test_a_file_whose_server_is_still_starting_is_not_checked` at `crates/m
 
 `initializing_sweeper` then has no callers; delete it.
 
+Update `test_serve_with_runs_the_sweep_loop_it_built` in `crates/mcpls-core/src/hooks/service.rs`. Remove the `NEVER_ANSWERS` platform constants and configure the server command as a path under the test's temporary workspace that the test never creates. The first sweep triggers the `Idle` server and re-queues the path while it is `Starting`; after the spawn attempt settles at `NotInstalled`, the next sweep lets the path reach the open loop and report it as not checked. Update the test comment to describe this flow and assert the exact `1 file(s) not checked: they could not be opened` shortfall.
+
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo nextest run -p mcpls-core sweep`
-Expected: FAIL. The server stays `Idle` and the path is not re-queued.
+Run: `devrun task test`
+Expected: FAIL in the tracked-edit startup and `Starting` requeue tests; the configured task runs the workspace suite because it does not accept a test filter.
 
 - [ ] **Step 3: Trigger after the kinds are built**
 
@@ -2276,25 +2365,25 @@ Then put those paths back and drop them from this pass. This block goes before t
 
 The ordering that works: build `kinds`, trigger and collect `waiting`, re-queue and filter `settle` and `untracked`, then the headroom computation, the open loop, and `queue_invalidations`.
 
-`server_for_path` does not exist yet. Add it beside `get_client_for_file` in `crates/mcpls-core/src/bridge/translator/routing.rs`: a thin method resolving a path's language to a `ServerId` through the router without touching `lsp_clients`, reusing `detect_language` and the same React base-language fallback that method already applies.
+`server_for_path` does not exist yet. Add it beside `get_client_for_file` in `crates/mcpls-core/src/bridge/translator/routing.rs`: resolve a path's language to a `ServerId` through the router without touching `lsp_clients`, reusing `detect_language` and the same React base-language fallback that method already applies. Resolve with `ToolKind::Diagnostics`, which is the route used by `open_untracked_document` and `resync_one_document`, so the sweep starts the server that will receive the document. If that route is `NotInstalled`, apply the same usable catch-all fallback as `get_client_for_file`; otherwise the edit trigger can miss a catch-all that the later open path will select.
+
+Make `ensure_server` crate-visible so `hooks::sweep` can call the existing spawn entry point without exposing it outside `mcpls-core`.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo nextest run -p mcpls-core sweep`
-Expected: PASS.
-
 Run: `devrun task verify`
-Expected: PASS.
+Expected: PASS, including workspace tests, formatting, clippy, and doctests.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-devrun task commit --arg commit_subject='feat(hooks): start a server on the first edit' --arg commit_body=$'An edit to a file whose language has no server running starts one. The\nsweep fires the trigger and does not wait: there is one sweeper for the\nbackend, so a wait would hold every other language and session behind one\ncold handshake. Paths whose server is not up yet go back on the pending\nset and land on the first sweep after it is running.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>'
+devrun task commit-stage --arg files='crates/mcpls-core/src/hooks/sweep.rs,crates/mcpls-core/src/bridge/translator/routing.rs,crates/mcpls-core/src/bridge/translator/respawn.rs,crates/mcpls-core/src/hooks/service.rs'
+devrun task commit-write --arg files='crates/mcpls-core/src/hooks/sweep.rs,crates/mcpls-core/src/bridge/translator/routing.rs,crates/mcpls-core/src/bridge/translator/respawn.rs,crates/mcpls-core/src/hooks/service.rs' --arg commit_subject='feat(hooks): start a server on the first edit' --arg commit_body=$'An edit to a file whose language has no server running starts one. The\nsweep fires the trigger and does not wait: there is one sweeper for the\nbackend, so a wait would hold every other language and session behind one\ncold handshake. Paths whose server is not up yet go back on the pending\nset and land on the first sweep after it is running.\n\nCo-Authored-By: Codex GPT-5.5 <codex@openai.com>'
 ```
 
 ---
 
-### Task 9: The doctor, and lazy by default
+### Task 10: The doctor, and lazy by default
 
 The doctor cannot ship after the default flips: an idle server would read as absent, which is a fault report for working software. Both land together.
 
@@ -2304,7 +2393,9 @@ The doctor cannot ship after the default flips: an idle server would read as abs
 - Modify: `crates/mcpls-core/src/lib.rs:775`
 - Modify: `crates/mcpls-cli/src/hook.rs:462`, and the `Response::Status` literals at `:1122` and `:2440`
 - Modify: `crates/mcpls-core/src/config/server.rs`
+- Modify: `crates/mcpls-core/src/config/mod.rs` and `docs/user-guide/configuration.md`
 - Test: the `mod tests` blocks in `protocol.rs` and `hook.rs`, including the doctor assertion at `crates/mcpls-cli/src/hook.rs:2365`
+- Test: the backend spawn-default test in `crates/mcpls-core/src/config/mod.rs`
 
 `servers` travels from the translator to the wire through `StatusExtras` at `crates/mcpls-core/src/hooks/service.rs:69`, which is copied into `Response::Status` at `:159`. Its `Vec<String>` becomes `Vec<ServerStatus>` in the same change, or the two ends disagree and nothing compiles.
 
@@ -2382,7 +2473,7 @@ fn test_the_backend_spawn_policy_defaults_to_lazy() {
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo nextest run -p mcpls-core status_response && cargo nextest run -p mcpls-cli servers_line`
+Run: `devrun task test`
 Expected: FAIL to compile, `cannot find struct ServerStatus`.
 
 - [ ] **Step 3: Add the wire struct**
@@ -2462,25 +2553,23 @@ In `crates/mcpls-core/src/config/server.rs`, move `#[default]` from `Eager` to `
 
 - [ ] **Step 7: Run the tests to verify they pass**
 
-Run: `cargo nextest run -p mcpls-core && cargo nextest run -p mcpls-cli`
-Expected: PASS.
-
 Run: `devrun task verify`
-Expected: PASS.
+Expected: PASS, including workspace tests, formatting, clippy, and doctests.
 
 Run: `devrun task test-e2e`
 Expected: PASS. This suite spawns real backends, so it is where the default flip shows up.
 
 - [ ] **Step 8: Verify against a real checkout**
 
-Build and install, then from a mixed checkout run `mcpls hook doctor` and confirm the `language servers:` line names a state beside each server and that only the languages this session touched read `running`.
+Build in an isolated temporary checkout and runtime, then invoke that checkout's built `mcpls` binary directly with `hook doctor`. Confirm the `language servers:` line names a state beside each server and that only the languages this session touched read `running`; do not install into or contact the daily-driver hook channel.
 
 Walk the spec's Verification list. Each bullet is a claim about a running backend, and the automated tests cover the mechanism rather than the whole path. Record any bullet that does not hold rather than adjusting the spec to match.
 
 - [ ] **Step 9: Commit**
 
 ```bash
-devrun task commit --arg commit_subject='feat: start language servers on first use' --arg commit_body=$'A checkout no longer starts every server whose markers matched. A server\nstarts when an edit or a tool call shows the session needs its language,\nand spawn = "eager" holds the old behaviour for one server or all of\nthem.\n\nThe doctor reports a state beside each server, so an idle one reads as\nidle rather than as absent. The status response carries a struct per\nserver in place of a bare identity, which a backend from an older build\ncannot answer; idle shutdown clears that without intervention.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>'
+devrun task commit-stage --arg files='crates/mcpls-core/src/hooks/protocol.rs,crates/mcpls-core/src/hooks/service.rs,crates/mcpls-core/src/lib.rs,crates/mcpls-cli/src/hook.rs,crates/mcpls-core/src/config/server.rs,crates/mcpls-core/src/config/mod.rs,docs/user-guide/configuration.md'
+devrun task commit-write --arg files='crates/mcpls-core/src/hooks/protocol.rs,crates/mcpls-core/src/hooks/service.rs,crates/mcpls-core/src/lib.rs,crates/mcpls-cli/src/hook.rs,crates/mcpls-core/src/config/server.rs,crates/mcpls-core/src/config/mod.rs,docs/user-guide/configuration.md' --arg commit_subject='feat: start language servers on first use' --arg commit_body=$'A checkout no longer starts every server whose markers matched. A server\nstarts when an edit or a tool call shows the session needs its language,\nand spawn = "eager" holds the old behaviour for one server or all of\nthem.\n\nThe doctor reports a state beside each server, so an idle one reads as\nidle rather than as absent. The status response carries a struct per\nserver in place of a bare identity, which a backend from an older build\ncannot answer; idle shutdown clears that without intervention.\n\nCo-Authored-By: Codex GPT-5.5 <codex@openai.com>'
 ```
 
 ---
@@ -2490,5 +2579,5 @@ devrun task commit --arg commit_subject='feat: start language servers on first u
 1. `FIRST_SPAWN_BUDGET` is 1.5 seconds by guess. The spec's Open decisions section asks for a taplo and a lua-ls handshake measured on a cold cache before the constant is fixed. Measure during Task 7 and change the number there if it is wrong.
 2. `RESPAWN_WAIT` in Task 4 is new. Today a respawn waits without a bound, so five seconds is a behaviour change for a crashed server on a slow machine. If the e2e suite goes flaky around respawn, that constant is the first suspect.
 3. Task 6 deletes `ToolRouter::rebind_to_registered`. If something outside this repository calls it, that is a breaking change to a public item. Nothing in the workspace does.
-4. Several bullets on the spec's Verification list are claims about a running backend that no test here establishes: the swept file landing open on the first sweep after its server is running, one language's paths not being held behind another's handshake, a workspace symbol search from a TypeScript-only session, an edit and a tool call for one language producing one process, and `spawn = "eager"` on one server in an otherwise lazy checkout. Task 9 Step 8 walks them by hand. If any is worth pinning down, it belongs in the e2e suite rather than in a unit test, and that is a separate piece of work.
-5. `is_diagnostics_route` and `get_client_for_file` redirect on different rules: the flag falls through for a claimant that is `NotInstalled` or `Failed`, routing only for `NotInstalled`. The reason is in Task 6 Step 6, and it is real, but two rules for one redirect is the kind of thing that drifts. If a third caller ever needs the redirect, give it a name and one place to live.
+4. Several bullets on the spec's Verification list are claims about a running backend that no test here establishes: the swept file landing open on the first sweep after its server is running, one language's paths not being held behind another's handshake, a workspace symbol search from a TypeScript-only session, an edit and a tool call for one language producing one process, and `spawn = "eager"` on one server in an otherwise lazy checkout. Task 10 Step 8 walks them by hand. If any is worth pinning down, it belongs in the e2e suite rather than in a unit test, and that is a separate piece of work.
+5. Task 8 refreshes promoted owners by closing and reopening tracked documents, but the baseline merge still uses Task 5's settle timer rather than proof that a publish arrived after the generation began. Decide separately whether to add per-generation publish evidence; a promoted server slower than the quiet/no-progress grace can still report its existing diagnostics as new work.
