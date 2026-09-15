@@ -3,11 +3,13 @@
 
 use std::process::Command;
 
+use assert_cmd::cargo::CommandCargoExt;
 use mcpls_core::config::schema::document;
 
 #[test]
 fn schema_subcommand_prints_the_library_document_without_logs() {
-    let output = Command::new(env!("CARGO_BIN_EXE_mcpls"))
+    let output = Command::cargo_bin("mcpls")
+        .expect("locate mcpls binary")
         .arg("schema")
         .output()
         .expect("run `mcpls schema`");
@@ -27,7 +29,8 @@ fn schema_subcommand_prints_the_library_document_without_logs() {
 #[test]
 fn schema_init_creates_a_default_config_with_the_latest_schema_link() {
     let directory = tempfile::tempdir().expect("create temporary working directory");
-    let output = Command::new(env!("CARGO_BIN_EXE_mcpls"))
+    let output = Command::cargo_bin("mcpls")
+        .expect("locate mcpls binary")
         .args(["schema", "init"])
         .current_dir(directory.path())
         .output()
@@ -68,7 +71,8 @@ fn schema_init_leaves_an_existing_config_untouched() {
     let original = "[workspace]\nroots = [\"keep me\"]\n";
     std::fs::write(&config_path, original).expect("create existing config");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_mcpls"))
+    let output = Command::cargo_bin("mcpls")
+        .expect("locate mcpls binary")
         .args(["schema", "init"])
         .current_dir(directory.path())
         .output()
