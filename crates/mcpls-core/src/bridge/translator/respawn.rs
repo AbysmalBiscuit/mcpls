@@ -7,8 +7,6 @@
 use std::sync::{Arc, Weak};
 use std::time::Instant;
 
-#[cfg(test)]
-use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant as TokioInstant};
 
 use super::{ServerLifecycle, Translator};
@@ -16,13 +14,6 @@ use crate::bridge::lock_std;
 use crate::config::ServerId;
 use crate::error::{Error, Result};
 use crate::lsp::{LspServer, ServerInitConfig};
-
-/// How long a caller waits for a replacement before it is told to retry.
-///
-/// A respawn of a server that was running has a warm cache behind it, so
-/// this is generous where the first-spawn budget in `routing.rs` is not.
-#[cfg(test)]
-pub(super) const RESPAWN_WAIT: Duration = Duration::from_secs(5);
 
 /// Tracks respawn attempts for one server, so [`Translator::ensure_server`]
 /// can back off a crash-looping process instead of retrying it on every
@@ -570,13 +561,6 @@ mod tests {
     use crate::bridge::translator::clock::{Clock, FakeClock};
     use crate::config::ServerId;
 
-    fn spawnable(translator: Translator, id: &ServerId) -> Arc<Translator> {
-        let translator = Arc::new(translator);
-        translator.set_self_handle(Arc::downgrade(&translator));
-        translator.set_lifecycle(id, ServerLifecycle::Idle);
-        translator
-    }
-
     #[test]
     fn test_respawn_backoff_remaining_returns_none_once_delay_elapsed() {
         let clock = Arc::new(FakeClock::new());
@@ -700,11 +684,21 @@ mod tests {
         use std::path::{Path, PathBuf};
 
         use tempfile::TempDir;
+        use tokio::sync::Mutex;
         use tokio::time::Duration;
 
         use super::*;
         use crate::config::{LspServerConfig, ToolKind, ToolRouter};
         use crate::lsp::ServerInitConfig;
+
+        const RESPAWN_WAIT: Duration = Duration::from_secs(5);
+
+        fn spawnable(translator: Translator, id: &ServerId) -> Arc<Translator> {
+            let translator = Arc::new(translator);
+            translator.set_self_handle(Arc::downgrade(&translator));
+            translator.set_lifecycle(id, ServerLifecycle::Idle);
+            translator
+        }
 
         /// Writes a `sh` script that answers the LSP `initialize` handshake
         /// with a canned response -- request id `1`, since a freshly spawned

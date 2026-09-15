@@ -4217,6 +4217,7 @@ mod tests {
         settle.register_diagnostics_owner(&owner);
         let startup_diagnostics = vec![diagnostic_at("startup diagnostic")];
         cache.store_diagnostics(&owner, &uri, Some(1), startup_diagnostics.clone());
+        let key = cache.diagnostics_entries()[0].0.to_owned();
         drop(cache);
 
         let report: serde_json::Value = serde_json::from_str(&flush.await.unwrap()).unwrap();
@@ -4242,7 +4243,7 @@ mod tests {
         delivery
             .lock()
             .await
-            .merge_baseline(HashMap::from([(uri.to_string(), hash)]));
+            .merge_baseline(HashMap::from([(key, hash)]));
         assert!(settle.finish_diagnostics_baseline_merge(&owner, generation));
 
         let report: serde_json::Value =
