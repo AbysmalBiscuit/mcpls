@@ -1,6 +1,6 @@
 # mcpls plugin
 
-Registers `mcpls` as an MCP server, wires it into Claude Code's hook events so diagnostics reach the agent without being asked for, and installs the mcpls skill alongside them.
+Registers `mcpls` as an MCP server, wires it into Claude Code's hook events so diagnostics reach the agent without being asked for, and installs the mcpls skills alongside them.
 
 ## Install
 
@@ -117,4 +117,5 @@ Setting `enabled = false` disables the hook listener, so mcpls binds no socket a
 - `hooks/bootstrap-binaries` installs the mcpls release this plugin version pins when a session starts, and tells the agent when the `mcpls` on `PATH` does not match. `hooks/run-hook.cmd` runs it through bash, or through its PowerShell twin on Windows without Git Bash.
 - `.mcp.json` registers the server with both harnesses, and `hooks/hooks.json` wires Claude Code's hooks.
 - `.codex-plugin/plugin.json` and `hooks/hooks-codex.json` register the plugin with Codex. There is deliberately no `plugin.json` at this directory's root: Codex would load one as an Agent Plugins manifest, start mcpls inside the plugin cache instead of the project, and load no hooks.
-- [`skills/mcpls`](skills/mcpls/) is the agent skill that explains the tools.
+- [`skills/mcpls`](skills/mcpls/) teaches the agent when and how to use the tools for coding work.
+- [`skills/setup-mcpls`](skills/setup-mcpls/) covers installing, configuring, and troubleshooting mcpls.

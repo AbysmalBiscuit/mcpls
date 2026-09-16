@@ -403,8 +403,8 @@ Each MCP session runs a small stdio frontend that relays to the checkout's one b
 - [Configuration Reference](docs/user-guide/configuration.md)
 - [Tools Reference](docs/user-guide/tools-reference.md)
 - [Troubleshooting](docs/user-guide/troubleshooting.md)
-- [Agent Skill](plugin/skills/mcpls/) — packaged [Agent Skill](https://agentskills.io/specification) teaching an AI coding agent to install, configure, and run the mcpls CLI
-- [Claude Code Plugin](plugin/README.md) — installs the skill above alongside the MCP server registration and the push-diagnostics hooks
+- [Agent Skills](plugin/skills/): [`mcpls`](plugin/skills/mcpls/) teaches an AI coding agent to use the tools for coding work, and [`setup-mcpls`](plugin/skills/setup-mcpls/) to install, configure, and troubleshoot mcpls
+- [Claude Code Plugin](plugin/README.md): installs the skills above alongside the MCP server registration and the push-diagnostics hooks
 
 ## Development
 

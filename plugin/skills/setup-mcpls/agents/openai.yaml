@@ -1,0 +1,5 @@
+interface:
+  display_name: setup-mcpls
+  short_description: 'Set up mcpls: install or register it, choose its CLI flags or MCPLS_* variables, write or debug an mcpls.toml, or diagnose why mcpls or a language server fails to start.'
+policy:
+  allow_implicit_invocation: true

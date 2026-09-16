@@ -1,261 +1,38 @@
 ---
 name: mcpls
-description: >-
-  Install, configure, and run the mcpls CLI — a Rust binary bridging MCP to LSP that gives
-  an agent compiler-grade code intelligence (hover, definitions, references, diagnostics,
-  rename). Use when setting up or registering mcpls as an MCP server, writing or debugging
-  an mcpls.toml, choosing CLI flags or MCPLS_* environment variables, or diagnosing why
-  mcpls or one of its language servers fails to start.
+description: "Navigate and change code through language servers with the mcpls tools. Use when finding a symbol's definition, references, callers, implementations, or type; renaming a symbol; or checking errors after an edit. Also when the user asks about setting up mcpls."
+argument-hint: "[symbol, file, or code question, e.g. \"who calls parse_config\"]"
+allowed-tools: "mcp__plugin_mcpls_mcpls__workspace_symbol_search, mcp__plugin_mcpls_mcpls__get_definition, mcp__plugin_mcpls_mcpls__get_references, mcp__plugin_mcpls_mcpls__get_hover, mcp__plugin_mcpls_mcpls__go_to_implementation, mcp__plugin_mcpls_mcpls__go_to_type_definition, mcp__plugin_mcpls_mcpls__prepare_call_hierarchy, mcp__plugin_mcpls_mcpls__get_incoming_calls, mcp__plugin_mcpls_mcpls__get_outgoing_calls, mcp__plugin_mcpls_mcpls__get_document_symbols, mcp__plugin_mcpls_mcpls__get_signature_help, mcp__plugin_mcpls_mcpls__get_completions, mcp__plugin_mcpls_mcpls__get_inlay_hints, mcp__plugin_mcpls_mcpls__get_diagnostics, mcp__plugin_mcpls_mcpls__get_cached_diagnostics, mcp__plugin_mcpls_mcpls__get_new_diagnostics, mcp__plugin_mcpls_mcpls__get_code_actions, mcp__plugin_mcpls_mcpls__apply_code_action, mcp__plugin_mcpls_mcpls__rename_symbol, mcp__plugin_mcpls_mcpls__format_document, mcp__plugin_mcpls_mcpls__get_server_logs, mcp__plugin_mcpls_mcpls__get_server_messages"
 license: MIT OR Apache-2.0
-compatibility: >-
-  Wraps the `mcpls` Rust binary (Rust 1.88+ / edition 2024 to build from source). Requires at
-  least one LSP server on PATH (rust-analyzer, pyright, gopls, clangd, …). HTTP transport
-  requires building with the non-default `transport-http` feature.
 metadata:
-  repository: "https://github.com/bug-ops/mcpls"
-  docs: "https://github.com/bug-ops/mcpls/tree/main/docs/user-guide"
+  repository: "https://github.com/AbysmalBiscuit/mcpls"
+  docs: "https://github.com/AbysmalBiscuit/mcpls/tree/main/docs/user-guide"
 ---
 
-# mcpls
+# Using mcpls
 
-## Purpose
+If the user asks for help installing, configuring, or troubleshooting mcpls itself, load the `setup-mcpls` skill instead.
 
-mcpls is a single Rust binary that bridges the Model Context Protocol (MCP) to the
-Language Server Protocol (LSP). It spawns and speaks LSP to real language servers
-(rust-analyzer, pyright, gopls, clangd, …) and exposes their capabilities to an AI
-agent as MCP tools — hover, go-to-definition, references, diagnostics, rename,
-completions, symbols, formatting, call hierarchy, and more.
+The mcpls tools answer from the compiler's view of the code, so a lookup returns the symbol itself: no matches in comments, strings, or same-named symbols in other scopes. Reach for them first whenever the question is about a symbol rather than about text.
 
-This skill covers operating the **binary**: installing it, choosing CLI flags and
-environment variables, registering it with an MCP client, and writing `mcpls.toml`.
-It does not enumerate the MCP tools themselves or their parameters — for that, see
-[Tools Reference](https://github.com/bug-ops/mcpls/blob/main/docs/user-guide/tools-reference.md).
-
-## Prerequisites
-
-mcpls does not implement language analysis itself — it forwards to a real LSP server
-that must already be installed and on `PATH` (e.g. `rust-analyzer`, `pyright-langserver`,
-`gopls`, `clangd`, `typescript-language-server`). mcpls runs multiple LSP servers
-concurrently, and one failing to start does not affect the others (graceful
-degradation) — but a language with no server configured, or whose server isn't on
-`PATH`, simply has no code intelligence available for it.
-
-See [Language Server Setup](https://github.com/bug-ops/mcpls/blob/main/docs/user-guide/installation.md#language-server-setup)
-for per-language install commands.
-
-## Installation
-
-**Installer (recommended):** installs the release binary into `$CARGO_HOME/bin`.
-
-```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/AbysmalBiscuit/mcpls/releases/latest/download/mcpls-installer.sh | sh
-```
-
-On Windows:
-
-```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/AbysmalBiscuit/mcpls/releases/latest/download/mcpls-installer.ps1 | iex"
-```
-
-**Pre-built binaries:** download the archive for your platform from [GitHub Releases](https://github.com/AbysmalBiscuit/mcpls/releases), extract it, and move the `mcpls` binary onto your `PATH`. Unix archives are `mcpls-<target>.tar.xz`, Windows archives are `mcpls-<target>.zip`. Each archive ships with a `.sha256` sidecar; verify before extracting:
-
-```bash
-curl -LO https://github.com/AbysmalBiscuit/mcpls/releases/latest/download/mcpls-<target>.tar.xz
-curl -LO https://github.com/AbysmalBiscuit/mcpls/releases/latest/download/mcpls-<target>.tar.xz.sha256
-shasum -a 256 -c mcpls-<target>.tar.xz.sha256
-```
-
-**Cargo:**
-
-```bash
-cargo install --git https://github.com/AbysmalBiscuit/mcpls mcpls
-```
-
-**From source (this repository):**
-
-```bash
-cargo install --path crates/mcpls-cli
-```
-
-This builds only the default feature set — no HTTP transport (see below). To build
-with HTTP transport support, add `--features transport-http`.
-
-**Verify:**
-
-```bash
-mcpls --version
-```
-
-## CLI Reference
-
-Each mcpls-specific option below accepts an equivalent `MCPLS_*` environment
-variable; the flag takes precedence when both are set. `--version`/`--help` have
-no environment variable equivalent.
-
-| Flag | Short | Env var | Default | Notes |
-|---|---|---|---|---|
-| `--config <FILE>` | `-c` | `MCPLS_CONFIG` | auto-detect | Always trusted, even a *relative* path set via the env var — naming a path is treated as consent, so this bypasses the project-config trust gate entirely (see [Config trust model](#config-trust-model)). Hard-errors at startup if the file doesn't exist — unlike auto-detection, it never falls back to defaults. |
-| `--trust-project-config` | — | `MCPLS_TRUST_PROJECT_CONFIG` | `false` | See [Config trust model](#config-trust-model) below. The env var accepts `1`/`0`, `true`/`false`, `yes`/`no`, `y`/`n`, and `on`/`off` (case-insensitive); any other value is a startup parse error. |
-| `--log-level <LEVEL>` | `-l` | `MCPLS_LOG` | `info` | Any `tracing-subscriber` `EnvFilter` directive works, e.g. `mcpls=debug,info`. An invalid value does **not** error — it silently falls back to `info`. |
-| `--log-json` | — | `MCPLS_LOG_JSON` | `false` | Output logs in JSON format for structured logging. The env var accepts `1`/`0`, `true`/`false`, `yes`/`no`, `y`/`n`, and `on`/`off` (case-insensitive). |
-| `--listen <ADDR>` | — | `MCPLS_LISTEN` | unset | HTTP transport bind address (e.g. `127.0.0.1:3000`). Only exists when built with `--features transport-http` — see [HTTP transport caveats](#registering-with-an-mcp-client). |
-| `--http-path <PATH>` | — | `MCPLS_HTTP_PATH` | `/mcp` | URL path the MCP service mounts at. Only meaningful with `--listen`; same `transport-http` feature gate. |
-
-Plus standard `--version` / `--help`. No subcommands.
-
-## Registering with an MCP client
-
-**stdio (default, works with any build):**
-
-```json
-{
-  "mcpServers": {
-    "mcpls": {
-      "command": "mcpls",
-      "args": []
-    }
-  }
-}
-```
-
-**Per-project, trusting that project's `mcpls.toml`:**
-
-```json
-{
-  "mcpServers": {
-    "mcpls": {
-      "command": "mcpls",
-      "args": ["--trust-project-config"]
-    }
-  }
-}
-```
-
-Only pass `--trust-project-config` for repositories you trust — see
-[Config trust model](#config-trust-model). Prefer the `args` form above (scoped to
-this one client config entry) over `MCPLS_TRUST_PROJECT_CONFIG=true` in a shell
-profile or `.envrc` — the env var is a blanket grant for every `mcpls` process
-launched in that shell, including future untrusted checkouts.
-
-**HTTP transport:** requires a binary built with `--features transport-http`
-(`cargo install mcpls --features transport-http`, or the equivalent `cargo install
---path` form). This asymmetry matters when diagnosing startup failures:
-
-- On a build **without** the feature, passing `--listen` on the command line is a
-  startup **parse error** (`unexpected argument '--listen'`) — clap doesn't know the
-  flag exists.
-- On that same build, setting `MCPLS_LISTEN`/`MCPLS_HTTP_PATH` as environment
-  variables produces **no error at all** — the fields they'd bind to are compiled
-  out, so mcpls silently ignores them and serves stdio as usual.
-
-If mcpls appears to ignore `MCPLS_LISTEN`, or `--listen` errors as unrecognized, the
-binary was built without `transport-http` — reinstall with the feature enabled.
-
-## Configuration
-
-### Search order and paths
-
-mcpls resolves configuration in this order; the first match wins:
-
-1. `--config <FILE>` / `$MCPLS_CONFIG` — an explicit path is always trusted and
-   loaded via a strict path that hard-errors if the file is missing (it never falls
-   back or creates a default).
-2. `./mcpls.toml` in the current directory — only loaded when trusted (see below).
-3. The platform user-config path (table below).
-4. Built-in defaults (covers 30 languages out of the box).
-
-| Platform | Path |
+| Question | Tool |
 |---|---|
-| Linux | `$XDG_CONFIG_HOME/mcpls/mcpls.toml`, else `~/.config/mcpls/mcpls.toml` |
-| macOS | `~/Library/Application Support/mcpls/mcpls.toml` |
-| Windows | `%APPDATA%\mcpls\mcpls.toml` |
+| Where is `Foo` defined? | `workspace_symbol_search`, then `get_definition` from a use site |
+| Who uses this? | `get_references` |
+| Who calls this function, and what does it call? | `prepare_call_hierarchy`, then `get_incoming_calls` or `get_outgoing_calls` with the returned item |
+| Which types implement this trait or interface? | `go_to_implementation` |
+| What type is this, and what does its doc say? | `get_hover`; `go_to_type_definition` to jump to the type |
+| Rename a symbol everywhere | `rename_symbol` |
+| Did my edit break anything? | `get_new_diagnostics` |
 
-`~/.config/mcpls/mcpls.toml` is **not** read on macOS — only
-`~/Library/Application Support/mcpls/mcpls.toml` is.
+Use text search and file reads for text: comments, docs, config, string literals, languages with no language server, and files outside the session's checkout.
 
-**First run writes a default config.** If auto-detection (tiers 2–4 above) finds no
-existing file, mcpls writes one to the platform path in the table, populated with all
-30 default language mappings, and continues running. If the write fails (e.g.
-read-only filesystem), it degrades gracefully to in-memory defaults with a warning —
-it does not crash. This auto-create behavior only applies to auto-detection; passing
-`--config <path>` explicitly never creates a file, it only reads one.
+## Calling the tools
 
-### Config trust model
-
-A project-local `./mcpls.toml` can set the `command`/`args` mcpls spawns as an LSP
-server — so honoring one automatically from an unfamiliar checkout would be arbitrary
-code execution. mcpls therefore **ignores** a discovered `./mcpls.toml` by default.
-Pass `--trust-project-config` (or `MCPLS_TRUST_PROJECT_CONFIG=true`) only for
-repositories you trust. Note that the env var grants trust process-wide, not
-per-project — setting it in a shell profile trusts every `mcpls` invocation that
-shell ever launches, not just the one project you meant to trust.
-
-When a project config is found but ignored, mcpls does not just log a `tracing::warn!`
-to stderr (which a stdio-based agent typically can't see) — it also appends a NOTE to
-the `instructions` field of the MCP `initialize` response (`ServerInfo.instructions`,
-populated by `McplsServer::get_info`). **Check the server instructions surfaced at
-connection time**: if you see a note about an ignored project config, the file wasn't
-malicious-by-default — it just needs an explicit trust decision.
-
-### Starter config
-
-A minimal `mcpls.toml` — expand per-language via
-[Configuration Reference](https://github.com/bug-ops/mcpls/blob/main/docs/user-guide/configuration.md):
-
-A `[workspace]` table is deliberately omitted here: `roots` defaults to `[]`, which
-already auto-resolves to the current directory, and adding `[workspace]` for that
-alone would zero out the 30 built-in `language_extensions` mappings (see
-[`language_extensions`](references/configuration.md#workspace-fields)) unless you
-list them all back explicitly.
-
-```toml
-[[lsp_servers]]
-language_id = "rust"
-command = "rust-analyzer"
-args = []
-file_patterns = ["**/*.rs"]
-timeout_seconds = 30
-request_timeout_seconds = 30
-
-[[lsp_servers]]
-language_id = "python"
-command = "pyright-langserver"
-args = ["--stdio"]
-file_patterns = ["**/*.py"]
-timeout_seconds = 30
-request_timeout_seconds = 30
-```
-
-Each entry here merges onto the built-in sharing its `language_id`, so leave `name` unset unless you're running a second server for the same language — setting it gives the entry a distinct identity that no longer matches the built-in, and the built-in then spawns alongside it.
-
-For the full field reference (`handles` routing, `initialization_options`, `env`
-allowlist, heuristics), see
-[references/configuration.md](references/configuration.md).
-
-## Task recipes
-
-| Goal | How |
-|---|---|
-| Add support for a new language | Add a `[[lsp_servers]]` entry with `language_id`, `command`, `file_patterns`. See [Multi-Language Configuration](https://github.com/bug-ops/mcpls/blob/main/docs/user-guide/installation.md#multi-language-configuration). |
-| Route specific tools to a specialized server | Set `handles` on each `[[lsp_servers]]` entry to claim only the tools that server should serve; see `handles` in [references/configuration.md](references/configuration.md). |
-| Fix a slow/timing-out LSP request | Raise that server's `request_timeout_seconds` (per-request) and/or `timeout_seconds` (handshake) in `mcpls.toml`. |
-| Handle a "still initializing" error on a large project | This is `Error::ServerInitializing` — the server is up but hasn't finished its `initialize` handshake (common with rust-analyzer on a large repo). It returns immediately, it does not time out, so raising `request_timeout_seconds` does nothing here. Wait and retry the call instead. |
-| Debug why mcpls won't start | Run with `--log-level debug` (or `trace`) and inspect stderr; see [Troubleshooting](https://github.com/bug-ops/mcpls/blob/main/docs/user-guide/troubleshooting.md#advanced-debugging). |
-| Use a trusted project's own `mcpls.toml` | Pass `--trust-project-config` — see [Config trust model](#config-trust-model). |
-
-## Troubleshooting
-
-For symptom-driven debugging, see
-[Troubleshooting Guide](https://github.com/bug-ops/mcpls/blob/main/docs/user-guide/troubleshooting.md):
-
-- ["command not found: mcpls"](https://github.com/bug-ops/mcpls/blob/main/docs/user-guide/troubleshooting.md#command-not-found-mcpls) — `PATH` doesn't include Cargo's bin directory.
-- [mcpls not showing up in an MCP client](https://github.com/bug-ops/mcpls/blob/main/docs/user-guide/troubleshooting.md#claude-code-integration) — verify the client config points at an absolute binary path.
-- ["LSP server not available for file type"](https://github.com/bug-ops/mcpls/blob/main/docs/user-guide/troubleshooting.md#lsp-server-issues) — no `[[lsp_servers]]` entry matches the file's extension.
-- ["Configuration file not found" / unexpected config used](https://github.com/bug-ops/mcpls/blob/main/docs/user-guide/troubleshooting.md#configuration-issues) — check the [search order and paths](#search-order-and-paths) above first.
-- [High memory or CPU usage](https://github.com/bug-ops/mcpls/blob/main/docs/user-guide/troubleshooting.md#performance-issues) — usually an over-broad `workspace.roots` or too many configured servers.
-
-## Further reference
-
-[references/configuration.md](references/configuration.md) — full `mcpls.toml` schema
-tables (`[workspace]` fields, `[[lsp_servers]]` fields, the `handles` routing map, the
-`env` allowlist), for cases the starter config above doesn't cover.
+- Positions are an absolute `file_path` plus 1-based `line` and `character`, and the character must land on the identifier. Every location an mcpls tool returns is already in that form, so feed it straight back in. A text search that reports line and column numbers gives the same 1-based position.
+- Start from a name with `workspace_symbol_search`; its result is the position the other tools need.
+- A file in another checkout or worktree fails with `path outside workspace`. Read it directly instead.
+- The first call for a language starts its server. While it indexes, calls return empty results or a "still initializing" error. Retry shortly before concluding a symbol does not exist.
+- `get_document_symbols` returns the whole outline, tests included, which is thousands of lines for a large file. Prefer `workspace_symbol_search` there.
+- `rename_symbol` and `format_document` return the edits unless called with `apply: true` and the checkout allows writes; otherwise apply the returned edits yourself.
+- With the mcpls plugin installed, diagnostics from your edits arrive in context on their own. Call `get_new_diagnostics` to check before calling a change done; it returns nothing when nothing changed.
