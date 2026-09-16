@@ -42,15 +42,6 @@ powershell -ExecutionPolicy Bypass -c "irm https://github.com/AbysmalBiscuit/mcp
 
 Both installers detect your platform, download the matching release archive, verify its SHA256 checksum, and install `mcpls` to `$CARGO_HOME/bin` (`~/.cargo/bin` by default). No `sudo` or admin rights required.
 
-<details>
-<summary><strong>Cargo, pre-built binaries & other methods</strong></summary>
-
-**Cargo:**
-
-```bash
-cargo install --git https://github.com/AbysmalBiscuit/mcpls mcpls
-```
-
 **Manual download:**
 
 Download the archive matching your platform from [GitHub Releases](https://github.com/AbysmalBiscuit/mcpls/releases/latest). Each archive has a `.sha256` checksum file published alongside it. The installers above verify it for you; verify it yourself if downloading by hand.
@@ -65,6 +56,12 @@ Download the archive matching your platform from [GitHub Releases](https://githu
 | Windows | x86_64 | `mcpls-x86_64-pc-windows-msvc.zip` |
 | Windows | ARM64 | `mcpls-aarch64-pc-windows-msvc.zip` |
 
+**Cargo:**
+
+```bash
+cargo install --git https://github.com/AbysmalBiscuit/mcpls mcpls
+```
+
 **From source:**
 
 ```bash
@@ -72,8 +69,6 @@ git clone https://github.com/AbysmalBiscuit/mcpls
 cd mcpls
 cargo install --path crates/mcpls-cli
 ```
-
-</details>
 
 <details>
 <summary><strong>Prerequisites (language servers)</strong></summary>

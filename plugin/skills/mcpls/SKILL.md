@@ -65,6 +65,12 @@ curl -LO https://github.com/AbysmalBiscuit/mcpls/releases/latest/download/mcpls-
 shasum -a 256 -c mcpls-<target>.tar.xz.sha256
 ```
 
+**Cargo:**
+
+```bash
+cargo install --git https://github.com/AbysmalBiscuit/mcpls mcpls
+```
+
 **From source (this repository):**
 
 ```bash
