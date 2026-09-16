@@ -31,16 +31,16 @@ AI coding assistants are remarkably capable, but they're working blind. They see
 **Linux / macOS:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/bug-ops/mcpls/main/scripts/install.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/AbysmalBiscuit/mcpls/releases/latest/download/mcpls-installer.sh | sh
 ```
 
 **Windows (PowerShell):**
 
 ```powershell
-irm https://raw.githubusercontent.com/bug-ops/mcpls/main/scripts/install.ps1 | iex
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/AbysmalBiscuit/mcpls/releases/latest/download/mcpls-installer.ps1 | iex"
 ```
 
-Both scripts detect your OS/architecture, download the matching release archive, verify its SHA256 checksum, and install `mcpls` to a per-user directory (`~/.local/bin` on Linux/macOS, `$HOME\.local\bin` on Windows) — no `sudo`/admin rights required.
+Both installers detect your platform, download the matching release archive, verify its SHA256 checksum, and install `mcpls` to `$CARGO_HOME/bin` (`~/.cargo/bin` by default). No `sudo` or admin rights required.
 
 <details>
 <summary><strong>Cargo, pre-built binaries & other methods</strong></summary>
@@ -48,26 +48,27 @@ Both scripts detect your OS/architecture, download the matching release archive,
 **Cargo:**
 
 ```bash
-cargo install mcpls
+cargo install --git https://github.com/AbysmalBiscuit/mcpls mcpls
 ```
 
 **Manual download:**
 
-Download the archive matching your platform from [GitHub Releases](https://github.com/bug-ops/mcpls/releases/latest). Each archive has a corresponding `.sha256` checksum file published alongside it — the install scripts above verify this automatically; verify manually if downloading by hand.
+Download the archive matching your platform from [GitHub Releases](https://github.com/AbysmalBiscuit/mcpls/releases/latest). Each archive has a `.sha256` checksum file published alongside it. The installers above verify it for you; verify it yourself if downloading by hand.
 
 | Platform | Architecture | Archive |
 |----------|--------------|---------|
-| Linux | x86_64 | `mcpls-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux | aarch64 | `mcpls-aarch64-unknown-linux-gnu.tar.gz` |
-| macOS | Intel | `mcpls-x86_64-apple-darwin.tar.gz` |
-| macOS | Apple Silicon | `mcpls-aarch64-apple-darwin.tar.gz` |
+| Linux | x86_64 | `mcpls-x86_64-unknown-linux-gnu.tar.xz` |
+| Linux | x86_64 (static) | `mcpls-x86_64-unknown-linux-musl.tar.xz` |
+| Linux | aarch64 | `mcpls-aarch64-unknown-linux-gnu.tar.xz` |
+| macOS | Intel | `mcpls-x86_64-apple-darwin.tar.xz` |
+| macOS | Apple Silicon | `mcpls-aarch64-apple-darwin.tar.xz` |
 | Windows | x86_64 | `mcpls-x86_64-pc-windows-msvc.zip` |
 | Windows | ARM64 | `mcpls-aarch64-pc-windows-msvc.zip` |
 
 **From source:**
 
 ```bash
-git clone https://github.com/bug-ops/mcpls
+git clone https://github.com/AbysmalBiscuit/mcpls
 cd mcpls
 cargo install --path crates/mcpls-cli
 ```
