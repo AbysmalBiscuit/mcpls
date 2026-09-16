@@ -28,7 +28,11 @@ Read the reference for the task in front of you:
 | Installing or updating the binary, or building with `transport-http` | [references/install.md](references/install.md) |
 | Registering mcpls with an MCP client, picking flags or `MCPLS_*` variables, serving over HTTP | [references/cli.md](references/cli.md) |
 | Finding which `mcpls.toml` loads, or why a checkout's `mcpls.toml` is ignored | [references/config-loading.md](references/config-loading.md) |
-| Writing `mcpls.toml`: servers, tool routing, write access, diagnostics, `env` | [references/configuration.md](references/configuration.md) |
+| Writing `mcpls.toml`: the starter config, server, workspace, and backend fields | [references/configuration.md](references/configuration.md) |
+| Running several servers for one language, or sending a tool to a specific server | [references/routing.md](references/routing.md) |
+| Letting rename, formatting, or code actions write to disk | [references/apply.md](references/apply.md) |
+| Tuning diagnostic severity, volume, write-tool footers, or hook timing | [references/diagnostics.md](references/diagnostics.md) |
+| A language server missing an environment variable it needs | [references/env.md](references/env.md) |
 | mcpls or a language server failing to start, time out, or answer | [references/troubleshooting.md](references/troubleshooting.md) |
 
 The MCP tools themselves and their parameters are documented in the [Tools Reference](https://github.com/AbysmalBiscuit/mcpls/blob/main/docs/user-guide/tools-reference.md).
