@@ -1,11 +1,26 @@
 # mcpls.toml — configuration reference
 
-Compact field tables for `mcpls.toml`. This is a schema reference, not a tutorial —
-for worked examples per language, see
-[Configuration Reference](https://github.com/bug-ops/mcpls/blob/main/docs/user-guide/configuration.md)
-and [Complete Examples](https://github.com/bug-ops/mcpls/blob/main/docs/user-guide/configuration.md#complete-examples).
+Compact field tables for `mcpls.toml`. `mcpls schema` prints the full JSON Schema. For worked examples per language, see [Configuration Reference](https://github.com/AbysmalBiscuit/mcpls/blob/main/docs/user-guide/configuration.md) and [Complete Examples](https://github.com/AbysmalBiscuit/mcpls/blob/main/docs/user-guide/configuration.md#complete-examples). Which file mcpls loads, and when it ignores a checkout's own, is in [config-loading.md](config-loading.md).
 
-The project-local `mcpls.toml` is discovered at the checkout root, so sessions started in subdirectories use the same project configuration.
+## Starter config
+
+```toml
+[[lsp_servers]]
+language_id = "rust"
+command = "rust-analyzer"
+args = []
+file_patterns = ["**/*.rs"]
+
+[[lsp_servers]]
+language_id = "python"
+command = "pyright-langserver"
+args = ["--stdio"]
+file_patterns = ["**/*.py"]
+```
+
+Each entry merges onto the built-in server sharing its `language_id`. Leave `name` unset unless you run a second server for the same language: a `name` gives the entry its own identity, and the built-in then spawns alongside it.
+
+The starter has no `[workspace]` table on purpose. `roots` already defaults to the current checkout, and writing `[workspace]` for any field drops the built-in `language_extensions` mappings unless you list them all back.
 
 ## `[workspace]` fields
 
@@ -13,7 +28,7 @@ The project-local `mcpls.toml` is discovered at the checkout root, so sessions s
 |---|---|---|---|
 | `roots` | array of strings | `[]` | Workspace root directories. Empty array auto-detects from the current directory. |
 | `position_encodings` | array of strings | `["utf-8", "utf-16"]` | Preferred LSP position encodings (`utf-8`, `utf-16`, `utf-32`), offered to each spawned server during the `initialize` handshake in the listed order. A preference, not a restriction — per the LSP spec, UTF-16 is a mandatory fallback a server may still choose even if omitted here. |
-| `language_extensions` | array of `{extensions, language_id}` | `[]` within an explicit `[workspace]` table; 30 built-in mappings only when `[workspace]` is absent entirely | Custom or overriding file-extension → language-ID mappings. Adding a `[workspace]` table for any other field (e.g. just `roots`) silently drops the 30 built-ins unless you list `language_extensions` yourself — list every language you need, not just the new one. |
+| `language_extensions` | array of `{extensions, language_id}` | `[]` within an explicit `[workspace]` table; the built-in mappings only when `[workspace]` is absent entirely | Custom or overriding file-extension -> language-ID mappings. Adding a `[workspace]` table for any other field (e.g. just `roots`) silently drops the built-ins unless you list `language_extensions` yourself — list every language you need, not just the new one. |
 | `heuristics_max_depth` | integer | `10` | Recursion depth for `heuristics.project_markers` search (see below). |
 
 ## `[[lsp_servers]]` fields
@@ -38,8 +53,7 @@ mcpls ships six built-in servers — rust-analyzer, pyright, the TypeScript lang
 
 ## Tool routing (`handles`)
 
-`handles` values are routing identifiers, not MCP tool names — most match directly,
-a few map many-to-one:
+`handles` values are routing identifiers, not MCP tool names. Most match one tool; a few govern several:
 
 | `handles` value | MCP tool(s) it governs |
 |---|---|
@@ -61,28 +75,14 @@ a few map many-to-one:
 
 Rules:
 
-- Each language may have one, and only one, server without `handles` set; that
-  unrestricted server catches every tool the other servers for the language don't
-  explicitly claim.
+- Each language may have at most one server without `handles`. That catch-all server takes every tool the language's other servers leave unclaimed.
 - A tool may be claimed by only one server per language.
-- If the server routed to a tool fails to spawn, that tool falls back to the
-  language's catch-all (if running); otherwise the call fails naming "no server
-  available" rather than silently reaching a server that explicitly declined it via
-  `handles`.
-- `workspace_symbol_search` is the one tool with no document to route on. It
-  resolves, across *all* configured servers, to the first explicit
-  `workspace_symbols` claimant, else the first catch-all — there is no per-language
-  fallback since the tool has no language. With neither, the call fails by name.
+- If the server routed to a tool fails to spawn, the tool falls back to the language's catch-all when one is running. Otherwise the call fails with an error naming the tool; it never reaches a server whose `handles` left that tool out.
+- `workspace_symbol_search` has no document to route on. Across *all* configured servers it goes to the first explicit `workspace_symbols` claimant, else the first catch-all. With neither, the call fails naming the tool.
 
 ## Ambiguous configs fail at startup, not silently
 
-A startup check looks for any pair of servers configured for the same language that
-would both be active in the same workspace at once (per `heuristics.project_markers`).
-If that pair also collides on routing — same `name`, both lacking `handles`, or both
-claiming an identical tool — mcpls refuses to start rather than pick one arbitrarily,
-and the error names the conflicting `[[lsp_servers]]` entries. Two servers whose
-`heuristics.project_markers` are mutually exclusive never overlap in one workspace, so
-that combination is not flagged and starts fine.
+A startup check looks for any pair of servers for the same language that would both be active in one workspace, per `heuristics.project_markers`. If that pair also collides on routing (same `name`, both lacking `handles`, or both claiming one tool), mcpls refuses to start rather than pick one, and the error names the conflicting `[[lsp_servers]]` entries. Two servers whose `heuristics.project_markers` are mutually exclusive never overlap, so that pair starts fine.
 
 ## `[apply]` fields
 
@@ -123,24 +123,8 @@ The `[backend]` table controls how long the shared backend stays alive after its
 
 ## Environment passthrough (`env`)
 
-Spawned LSP server processes do **not** inherit mcpls's full environment — this is a
-deliberate security boundary, not an oversight. Each child's environment is cleared,
-then a minimal allowlist is passed through from mcpls's own process (`PATH`, `HOME`,
-`USERPROFILE`, `TMPDIR`/`TEMP`/`TMP` on every platform, plus Windows loader
-essentials), and only then is the server's `[lsp_servers.env]` table applied on top,
-so entries there can override the passthrough.
+Spawned LSP servers start from a cleared environment, as a security boundary. mcpls passes through a minimal allowlist from its own process (`PATH`, `HOME`, `USERPROFILE`, and `TMPDIR`/`TEMP`/`TMP` on every platform, plus Windows loader essentials), then applies the server's `[lsp_servers.env]` table on top, so entries there override the passthrough.
 
-Use `env` to restore anything a server needs beyond that allowlist: proxy settings,
-`VIRTUAL_ENV`/`PYTHONPATH`, or toolchain variables a `build.rs` reads (`DATABASE_URL`,
-`LIBCLANG_PATH`, `SSH_AUTH_SOCK`, …). Values here are written literally into
-`mcpls.toml`, a file that's often committed to VCS — don't put real secrets in it;
-and forwarding `SSH_AUTH_SOCK` hands the ssh-agent socket to the spawned LSP
-process, so only do so for servers you trust.
+Use `env` to restore anything a server needs beyond the allowlist: proxy settings, `VIRTUAL_ENV`/`PYTHONPATH`, or toolchain variables a `build.rs` reads, such as `DATABASE_URL`, `LIBCLANG_PATH`, or `SSH_AUTH_SOCK`. Values are written literally into `mcpls.toml`, which is often committed, so keep real secrets out of it. Forwarding `SSH_AUTH_SOCK` hands the ssh-agent socket to the language server, so forward it only to servers you trust.
 
-**`PATH` caution:** an `env.PATH` entry overwrites the passthrough value rather than
-extending it, and the two platforms then behave differently. On Unix, a bare
-`command` with no directory component is now resolved against your override, so it
-stops working unless you kept the original directory in it; on Windows the loader
-still consults the parent process's `PATH` as a fallback after your override, so the
-same mistake is less likely to break anything. If you just need to add one directory,
-give `command` an absolute path instead of touching `PATH` at all.
+**`PATH` caution:** an `env.PATH` entry replaces the passthrough value rather than extending it. On Unix, a bare `command` then resolves against your override and stops working unless the override keeps its directory. On Windows the loader still falls back to the parent process's `PATH`, so the same mistake rarely breaks anything. To add one directory, give `command` an absolute path and leave `PATH` alone.
