@@ -23,7 +23,6 @@ jobs:
     timeout-minutes: 2
     outputs:
       run-full-ci: ${{ steps.classify.outputs.run-full-ci }}
-      scripts: ${{ steps.filter.outputs.scripts }}
       plugin: ${{ steps.filter.outputs.plugin }}
       release: ${{ steps.filter.outputs.release }}
     steps:
@@ -44,9 +43,6 @@ jobs:
             workflows:
               - '.github/workflows/**'
               - '.cargo/**'
-            scripts:
-              - 'scripts/**'
-              - '.github/workflows/ci.yml'
             plugin:
               - 'plugin/**'
               - 'tests/plugin/**'
@@ -308,15 +304,13 @@ jobs:
   shellcheck:
     name: Shellcheck
     needs: detect-changes
-    if: needs.detect-changes.outputs.scripts == 'true' || needs.detect-changes.outputs.plugin == 'true'
+    if: needs.detect-changes.outputs.plugin == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
-      - name: Shellcheck install script
-        run: shellcheck --shell=sh scripts/install.sh
       - name: Shellcheck plugin scripts
         run: shellcheck plugin/hooks/bootstrap-binaries tests/plugin/bootstrap-binaries.test.sh
 

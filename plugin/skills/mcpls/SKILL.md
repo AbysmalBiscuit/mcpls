@@ -45,23 +45,30 @@ for per-language install commands.
 
 ## Installation
 
-**From crates.io (recommended):**
+**Installer (recommended):** installs the release binary into `$CARGO_HOME/bin`.
 
 ```bash
-cargo install mcpls
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/AbysmalBiscuit/mcpls/releases/latest/download/mcpls-installer.sh | sh
 ```
 
-**Pre-built binaries:** download the archive for your platform from
-[GitHub Releases](https://github.com/bug-ops/mcpls/releases), extract it, and move
-the `mcpls` binary onto your `PATH`. See
-[Pre-Built Binaries](https://github.com/bug-ops/mcpls/blob/main/docs/user-guide/installation.md#method-2-pre-built-binaries-from-github-releases)
-for per-platform archive names. Each archive ships with a `.sha256` sidecar; verify
-before extracting:
+On Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/AbysmalBiscuit/mcpls/releases/latest/download/mcpls-installer.ps1 | iex"
+```
+
+**Pre-built binaries:** download the archive for your platform from [GitHub Releases](https://github.com/AbysmalBiscuit/mcpls/releases), extract it, and move the `mcpls` binary onto your `PATH`. Unix archives are `mcpls-<target>.tar.xz`, Windows archives are `mcpls-<target>.zip`. Each archive ships with a `.sha256` sidecar; verify before extracting:
 
 ```bash
-curl -LO https://github.com/bug-ops/mcpls/releases/latest/download/mcpls-<target>.tar.gz
-curl -LO https://github.com/bug-ops/mcpls/releases/latest/download/mcpls-<target>.tar.gz.sha256
-shasum -a 256 -c mcpls-<target>.tar.gz.sha256
+curl -LO https://github.com/AbysmalBiscuit/mcpls/releases/latest/download/mcpls-<target>.tar.xz
+curl -LO https://github.com/AbysmalBiscuit/mcpls/releases/latest/download/mcpls-<target>.tar.xz.sha256
+shasum -a 256 -c mcpls-<target>.tar.xz.sha256
+```
+
+**Cargo:**
+
+```bash
+cargo install --git https://github.com/AbysmalBiscuit/mcpls mcpls
 ```
 
 **From source (this repository):**
