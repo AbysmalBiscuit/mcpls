@@ -1,38 +1,38 @@
 ---
 name: mcpls
-description: >-
-  Install, configure, and run mcpls, the MCP-to-LSP bridge that gives an agent compiler-grade
-  code intelligence. Use when installing or registering mcpls, choosing its CLI flags or
-  MCPLS_* environment variables, writing or debugging an mcpls.toml, or diagnosing why mcpls
-  or one of its language servers fails to start.
+description: "Navigate and change code through language servers with the mcpls tools. Use when finding a symbol's definition, references, callers, implementations, or type; renaming a symbol; or checking errors after an edit. Also when the user asks about setting up mcpls."
+argument-hint: "[symbol, file, or code question, e.g. \"who calls parse_config\"]"
+allowed-tools: "mcp__plugin_mcpls_mcpls__workspace_symbol_search, mcp__plugin_mcpls_mcpls__get_definition, mcp__plugin_mcpls_mcpls__get_references, mcp__plugin_mcpls_mcpls__get_hover, mcp__plugin_mcpls_mcpls__go_to_implementation, mcp__plugin_mcpls_mcpls__go_to_type_definition, mcp__plugin_mcpls_mcpls__prepare_call_hierarchy, mcp__plugin_mcpls_mcpls__get_incoming_calls, mcp__plugin_mcpls_mcpls__get_outgoing_calls, mcp__plugin_mcpls_mcpls__get_document_symbols, mcp__plugin_mcpls_mcpls__get_signature_help, mcp__plugin_mcpls_mcpls__get_completions, mcp__plugin_mcpls_mcpls__get_inlay_hints, mcp__plugin_mcpls_mcpls__get_diagnostics, mcp__plugin_mcpls_mcpls__get_cached_diagnostics, mcp__plugin_mcpls_mcpls__get_new_diagnostics, mcp__plugin_mcpls_mcpls__get_code_actions, mcp__plugin_mcpls_mcpls__apply_code_action, mcp__plugin_mcpls_mcpls__rename_symbol, mcp__plugin_mcpls_mcpls__format_document, mcp__plugin_mcpls_mcpls__get_server_logs, mcp__plugin_mcpls_mcpls__get_server_messages"
 license: MIT OR Apache-2.0
-compatibility: >-
-  Wraps the `mcpls` Rust binary. Requires at least one LSP server on PATH (rust-analyzer,
-  pyright, gopls, clangd, and so on). HTTP transport requires building with the non-default
-  `transport-http` feature.
 metadata:
   repository: "https://github.com/AbysmalBiscuit/mcpls"
   docs: "https://github.com/AbysmalBiscuit/mcpls/tree/main/docs/user-guide"
 ---
 
-# mcpls
+# Using mcpls
 
-mcpls is one Rust binary that speaks LSP to real language servers such as rust-analyzer, pyright, gopls, and clangd, and exposes them to an agent as MCP tools. It does no language analysis itself: a language whose server is missing from `PATH` or from the config has no code intelligence, while the other languages keep working.
+If the user asks for help installing, configuring, or troubleshooting mcpls itself, load the `setup-mcpls` skill instead.
 
-The binary is the source of truth for its own surface. `mcpls --help` lists every flag, environment variable, and subcommand. `mcpls schema` prints the JSON Schema for `mcpls.toml`. `mcpls hook doctor` reports the running backend, its sessions, language servers, and loaded configuration.
+The mcpls tools answer from the compiler's view of the code, so a lookup returns the symbol itself: no matches in comments, strings, or same-named symbols in other scopes. Reach for them first whenever the question is about a symbol rather than about text.
 
-Read the reference for the task in front of you:
-
-| Task | Read |
+| Question | Tool |
 |---|---|
-| Installing or updating the binary, or building with `transport-http` | [references/install.md](references/install.md) |
-| Registering mcpls with an MCP client, picking flags or `MCPLS_*` variables, serving over HTTP | [references/cli.md](references/cli.md) |
-| Finding which `mcpls.toml` loads, or why a checkout's `mcpls.toml` is ignored | [references/config-loading.md](references/config-loading.md) |
-| Writing `mcpls.toml`: the starter config, server, workspace, and backend fields | [references/configuration.md](references/configuration.md) |
-| Running several servers for one language, or sending a tool to a specific server | [references/routing.md](references/routing.md) |
-| Letting rename, formatting, or code actions write to disk | [references/apply.md](references/apply.md) |
-| Tuning diagnostic severity, volume, write-tool footers, or hook timing | [references/diagnostics.md](references/diagnostics.md) |
-| A language server missing an environment variable it needs | [references/env.md](references/env.md) |
-| mcpls or a language server failing to start, time out, or answer | [references/troubleshooting.md](references/troubleshooting.md) |
+| Where is `Foo` defined? | `workspace_symbol_search`, then `get_definition` from a use site |
+| Who uses this? | `get_references` |
+| Who calls this function, and what does it call? | `prepare_call_hierarchy`, then `get_incoming_calls` or `get_outgoing_calls` with the returned item |
+| Which types implement this trait or interface? | `go_to_implementation` |
+| What type is this, and what does its doc say? | `get_hover`; `go_to_type_definition` to jump to the type |
+| Rename a symbol everywhere | `rename_symbol` |
+| Did my edit break anything? | `get_new_diagnostics` |
 
-The MCP tools themselves and their parameters are documented in the [Tools Reference](https://github.com/AbysmalBiscuit/mcpls/blob/main/docs/user-guide/tools-reference.md).
+Use text search and file reads for text: comments, docs, config, string literals, languages with no language server, and files outside the session's checkout.
+
+## Calling the tools
+
+- Positions are an absolute `file_path` plus 1-based `line` and `character`, and the character must land on the identifier. Every location an mcpls tool returns is already in that form, so feed it straight back in. A text search that reports line and column numbers gives the same 1-based position.
+- Start from a name with `workspace_symbol_search`; its result is the position the other tools need.
+- A file in another checkout or worktree fails with `path outside workspace`. Read it directly instead.
+- The first call for a language starts its server. While it indexes, calls return empty results or a "still initializing" error. Retry shortly before concluding a symbol does not exist.
+- `get_document_symbols` returns the whole outline, tests included, which is thousands of lines for a large file. Prefer `workspace_symbol_search` there.
+- `rename_symbol` and `format_document` return the edits unless called with `apply: true` and the checkout allows writes; otherwise apply the returned edits yourself.
+- With the mcpls plugin installed, diagnostics from your edits arrive in context on their own. Call `get_new_diagnostics` to check before calling a change done; it returns nothing when nothing changed.

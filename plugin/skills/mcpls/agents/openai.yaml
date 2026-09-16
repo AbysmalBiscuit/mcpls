@@ -1,0 +1,5 @@
+interface:
+  display_name: mcpls
+  short_description: Navigate and change code through language servers with the mcpls tools. Use when finding a symbol's definition, references, callers, implementations, or type; renaming a symbol; or checking errors after an edit. Also when the user asks about setting up mcpls.
+policy:
+  allow_implicit_invocation: true
