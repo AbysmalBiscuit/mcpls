@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use lsp_types::FileChangeType;
 use tokio::sync::watch;
@@ -77,6 +77,13 @@ pub struct Sweeper {
     last_opened_count: AtomicUsize,
     /// Files the last sweep could not check, and why.
     last_shortfall: StdMutex<Option<String>>,
+    /// When the last sweep began taking the pending set, or `None` before
+    /// any sweep has.
+    ///
+    /// Read by the project watcher: an inotify overflow is answered by a
+    /// full walk, and this is what tells that walk which of the files it
+    /// finds may have had an event dropped.
+    last_sweep_at: StdMutex<Option<SystemTime>>,
     /// Publishes the sweep count each time a sweep finishes.
     ///
     /// A watcher subscribed before the sweep it cares about sees exactly one
@@ -110,6 +117,7 @@ impl Sweeper {
             last_kinds: StdMutex::new(Vec::new()),
             last_opened_count: AtomicUsize::new(0),
             last_shortfall: StdMutex::new(None),
+            last_sweep_at: StdMutex::new(None),
             completed: watch::channel(0).0,
         }
     }
@@ -190,6 +198,11 @@ impl Sweeper {
     #[must_use]
     pub fn last_shortfall(&self) -> Option<String> {
         lock_std(&self.last_shortfall).clone()
+    }
+
+    /// When the last sweep began taking the pending set.
+    pub(crate) fn last_sweep_at(&self) -> Option<SystemTime> {
+        *lock_std(&self.last_sweep_at)
     }
 
     /// Whether the pending set is non-empty and has gone quiet for
@@ -304,10 +317,14 @@ impl Sweeper {
     /// queue until it lands, so a sweep dropped partway through leaves the
     /// remaining saves for the next one instead of losing them.
     async fn sweep(&self) {
+        let started = SystemTime::now();
         let origins: HashMap<PathBuf, Origin> = lock_std(&self.pending).drain().collect();
         if origins.is_empty() {
             return;
         }
+        // Before the stats below, not after them: a file written while
+        // this sweep runs must count as changed since it.
+        *lock_std(&self.last_sweep_at) = Some(started);
         let paths: Vec<PathBuf> = origins.keys().cloned().collect();
         let tracker = self.translator.document_tracker();
         let mut kinds = Vec::with_capacity(paths.len());

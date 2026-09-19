@@ -160,7 +160,7 @@ pub fn build_handler(
                         sessions: extras.sessions,
                         servers: extras.servers,
                         config_fingerprint: extras.config_fingerprint,
-                        watcher: extras.watcher,
+                        watcher: Box::new(extras.watcher),
                     }
                 }
             }

@@ -13,16 +13,23 @@
 //! hands paths to [`Sweeper::enqueue_from`]; the filtering, the debounce,
 //! the resync and the notification belong to the sweeper and the
 //! translator, unchanged.
+//!
+//! Nothing here blocks a caller or a tokio worker. The mount probe, the
+//! `ignore` walks and every `is_dir` stat run on
+//! [`tokio::task::spawn_blocking`], because [`ProjectWatcher::start`] is
+//! called from `Runtime::start`, which the MCP `initialize` handshake waits
+//! on, and because the event loop must keep draining while a walk runs.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::SystemTime;
 
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::{mpsc, watch};
 
 use crate::bridge::lock_std;
-use crate::hooks::filters::watch_set;
+use crate::hooks::filters::{WatchSet, watch_set};
 use crate::hooks::sweep::{Origin, Sweeper};
 
 /// Filesystems inotify does not report changes on.
@@ -34,13 +41,29 @@ use crate::hooks::sweep::{Origin, Sweeper};
 const UNWATCHABLE_FILESYSTEMS: &[&str] =
     &["9p", "drvfs", "virtiofs", "cifs", "smb3", "nfs", "nfs4"];
 
+/// How many unwalkable paths a doctor line names before it just counts
+/// them. A permissions failure over a large subtree reports one error per
+/// entry, and this line is read at a terminal.
+const NAMED_WALK_ERRORS: usize = 3;
+
 /// What the backend is doing about filesystem changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WatchState {
+    /// The watcher is still placing its watches, so nothing is covered
+    /// yet. [`ProjectWatcher::start`] returns in this state and leaves it
+    /// once the startup walk and every watch are done.
+    Starting,
     /// A watcher is running over this many directories.
     Watching {
         /// How many directories carry a watch.
         directories: usize,
+        /// What the walk could not reach, when coverage is incomplete.
+        ///
+        /// A subtree that cannot be traversed -- a permissions failure, a
+        /// broken mount -- is silently unwatched, and a watcher reporting
+        /// only a directory count would call that coverage. Present means
+        /// the count is not the whole checkout, and says why.
+        incomplete: Option<String>,
     },
     /// No watcher runs, and why.
     Unwatched {
@@ -57,6 +80,12 @@ pub struct ProjectWatcher {
 impl ProjectWatcher {
     /// Start watching `roots`, or record why it could not be done.
     ///
+    /// Returns as soon as the placement task is spawned, reporting
+    /// [`WatchState::Starting`] until that task has walked the roots and
+    /// placed every watch. `Runtime::start` is on the path the MCP
+    /// `initialize` handshake waits on, and the walk of a large checkout
+    /// is not something to make that handshake wait for.
+    ///
     /// Never fails: a checkout that cannot be watched is a reported state
     /// rather than an error, because the hooks still deliver the agent's
     /// own edits and a session that degrades to the coverage it had before
@@ -68,74 +97,14 @@ impl ProjectWatcher {
         cancel: watch::Receiver<bool>,
     ) -> Arc<Self> {
         let watcher = Arc::new(Self {
-            state: StdMutex::new(WatchState::Unwatched {
-                reason: "starting".to_string(),
-            }),
+            state: StdMutex::new(WatchState::Starting),
         });
-        if let Some(reason) = unwatchable_reason(&roots) {
-            tracing::warn!(%reason, "not watching this checkout for changes");
-            *lock_std(&watcher.state) = WatchState::Unwatched { reason };
-            return watcher;
-        }
-        let filter = sweeper.filter();
-        let set = watch_set(&filter, &roots);
-        for error in &set.errors {
-            tracing::warn!(%error, "could not fully walk the project for watch paths");
-        }
-
-        // `notify` calls this handler on a thread of its own, and adding a
-        // watch for a newly created directory needs `&mut Watcher`, which
-        // the handler cannot take while it is running. So it forwards and
-        // nothing else, and the task below owns the watcher.
-        let (tx, rx) = mpsc::unbounded_channel();
-        let mut native = match notify::recommended_watcher(move |result| {
-            let _ = tx.send(result);
-        }) {
-            Ok(native) => native,
-            Err(error) => {
-                let reason = format!("could not create a filesystem watcher: {error}");
-                tracing::warn!(%reason, "not watching this checkout for changes");
-                *lock_std(&watcher.state) = WatchState::Unwatched { reason };
-                return watcher;
-            }
-        };
-
-        let mut placed = BTreeSet::new();
-        for directory in &set.directories {
-            match native.watch(directory, RecursiveMode::NonRecursive) {
-                Ok(()) => {
-                    placed.insert(directory.clone());
-                }
-                Err(error) if is_watch_limit(&error) => {
-                    let reason = format!(
-                        "the kernel's watch limit was reached after {} directories; \
-                         raise fs.inotify.max_user_watches to watch this checkout",
-                        placed.len()
-                    );
-                    tracing::warn!(%reason, "not watching this checkout for changes");
-                    // Dropping the watcher releases every descriptor it
-                    // took. A checkout watched in part is worse than one
-                    // watched not at all: which part depends on walk
-                    // order, so the behaviour is not reproducible and a
-                    // bug report against it is not readable.
-                    drop(native);
-                    *lock_std(&watcher.state) = WatchState::Unwatched { reason };
-                    return watcher;
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        %error,
-                        directory = %directory.display(),
-                        "could not watch a directory"
-                    );
-                }
-            }
-        }
-
-        *lock_std(&watcher.state) = WatchState::Watching {
-            directories: placed.len(),
-        };
-        tokio::spawn(run(native, placed, rx, cancel, roots, Arc::clone(sweeper)));
+        tokio::spawn(place(
+            Arc::clone(&watcher),
+            roots,
+            Arc::clone(sweeper),
+            cancel,
+        ));
         watcher
     }
 
@@ -144,13 +113,269 @@ impl ProjectWatcher {
     pub fn state(&self) -> WatchState {
         lock_std(&self.state).clone()
     }
+
+    /// Record that no watcher runs, and why.
+    fn unwatched(&self, reason: String) {
+        tracing::warn!(%reason, "not watching this checkout for changes");
+        *lock_std(&self.state) = WatchState::Unwatched { reason };
+    }
 }
 
-/// Drain events until cancelled, placing watches on directories that appear
-/// and handing every path to the sweeper.
-async fn run(
-    mut native: RecommendedWatcher,
-    mut placed: BTreeSet<PathBuf>,
+/// Where a watch is placed, so the rules around the kernel's watch limit
+/// can be exercised without exhausting a real kernel's descriptors.
+///
+/// Narrower than [`notify::Watcher`], which also demands a constructor and
+/// a configuration hook this module has no use for. Every watch here is
+/// non-recursive: recursive mode places a descriptor on every descendant,
+/// `target/` and `node_modules/` included, which is the exhaustion the walk
+/// exists to avoid.
+trait Place {
+    /// Watch `path` itself, without descending into it.
+    fn watch(&mut self, path: &Path) -> notify::Result<()>;
+    /// Stop watching `path`.
+    fn unwatch(&mut self, path: &Path) -> notify::Result<()>;
+}
+
+impl Place for RecommendedWatcher {
+    fn watch(&mut self, path: &Path) -> notify::Result<()> {
+        Watcher::watch(self, path, RecursiveMode::NonRecursive)
+    }
+
+    fn unwatch(&mut self, path: &Path) -> notify::Result<()> {
+        Watcher::unwatch(self, path)
+    }
+}
+
+/// Whether the watcher may carry on, or has run out of the kernel's watch
+/// descriptors and must tear itself down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Coverage {
+    /// Every directory asked for carries a watch.
+    Whole,
+    /// The kernel refused a watch for want of descriptors.
+    Exhausted,
+}
+
+/// The watches this project holds, and the state a doctor reads them from.
+///
+/// One owner of both, because every change to what is watched is also a
+/// change to what the doctor should say: a watch added moves the count, a
+/// directory that went moves it back, and a walk that could not finish
+/// makes the count no longer the whole checkout.
+struct Placement<P: Place> {
+    native: P,
+    placed: BTreeSet<PathBuf>,
+    incomplete: Option<String>,
+    watcher: Arc<ProjectWatcher>,
+}
+
+impl<P: Place> Placement<P> {
+    const fn new(native: P, watcher: Arc<ProjectWatcher>, incomplete: Option<String>) -> Self {
+        Self {
+            native,
+            placed: BTreeSet::new(),
+            incomplete,
+            watcher,
+        }
+    }
+
+    /// Whether `directory` already carries a watch.
+    fn holds(&self, directory: &Path) -> bool {
+        self.placed.contains(directory)
+    }
+
+    /// Place a watch on `directory`, unless it already carries one.
+    ///
+    /// A failure that is not the watch limit is logged and skipped: one
+    /// directory that went away between the walk and the watch is not a
+    /// reason to stop covering the rest.
+    fn watch(&mut self, directory: &Path) -> Coverage {
+        if self.placed.contains(directory) {
+            return Coverage::Whole;
+        }
+        match self.native.watch(directory) {
+            Ok(()) => {
+                self.placed.insert(directory.to_path_buf());
+                Coverage::Whole
+            }
+            Err(error) if is_watch_limit(&error) => Coverage::Exhausted,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    directory = %directory.display(),
+                    "could not watch a directory"
+                );
+                Coverage::Whole
+            }
+        }
+    }
+
+    /// Drop `directory` and everything under it from the watch set.
+    ///
+    /// Called when the watcher learns a directory is gone, so a later
+    /// re-creation of the same path is adopted rather than mistaken for a
+    /// directory already covered. Without this, `rm -rf src/foo && git
+    /// checkout src/foo` -- or any branch switch that drops and re-adds a
+    /// directory -- leaves every edit under it invisible for the rest of
+    /// the session while the doctor still reports the checkout watched.
+    ///
+    /// Descendants go too. A `BTreeSet` of paths orders a directory
+    /// immediately before everything under it, so they are one contiguous
+    /// range, and the kernel has already dropped their descriptors.
+    fn forget(&mut self, directory: &Path) {
+        let under: Vec<PathBuf> = self
+            .placed
+            .range(directory.to_path_buf()..)
+            .take_while(|held| held.starts_with(directory))
+            .cloned()
+            .collect();
+        if under.is_empty() {
+            return;
+        }
+        for path in under {
+            let _ = self.native.unwatch(&path);
+            self.placed.remove(&path);
+        }
+        self.publish();
+    }
+
+    /// Every watched directory the latest walk no longer finds.
+    fn vanished(&self, found: &BTreeSet<PathBuf>) -> Vec<PathBuf> {
+        self.placed.difference(found).cloned().collect()
+    }
+
+    /// Widen what the doctor reports as unreachable.
+    ///
+    /// A walk of one adopted subtree says nothing about the rest of the
+    /// checkout, so a clean one does not clear a reason an earlier walk
+    /// recorded. Only [`rescan`], which walks everything, replaces it.
+    fn note_incomplete(&mut self, errors: &[String]) {
+        if let Some(reason) = incomplete_reason(errors) {
+            self.incomplete = Some(reason);
+        }
+    }
+
+    /// Publish what is watched now.
+    fn publish(&self) {
+        *lock_std(&self.watcher.state) = WatchState::Watching {
+            directories: self.placed.len(),
+            incomplete: self.incomplete.clone(),
+        };
+    }
+
+    /// Release every descriptor and report the checkout unwatched.
+    ///
+    /// A checkout watched in part is worse than one watched not at all:
+    /// which part depends on walk order, so the behaviour is not
+    /// reproducible and a bug report against it is not readable. The rule
+    /// is the same after startup as at it, because a checkout that grows
+    /// past `fs.inotify.max_user_watches` while a session runs is the same
+    /// checkout as one that was already past it.
+    fn tear_down(self) {
+        let reason = format!(
+            "the kernel's watch limit was reached after {} directories; \
+             raise fs.inotify.max_user_watches to watch this checkout",
+            self.placed.len()
+        );
+        // Dropping the watcher releases every descriptor it took.
+        drop(self.native);
+        self.watcher.unwatched(reason);
+    }
+}
+
+/// Walk `roots`, place a watch on every directory they keep, and drain
+/// events until cancelled.
+///
+/// The whole of this runs off [`ProjectWatcher::start`]'s caller, which is
+/// `Runtime::start`.
+async fn place(
+    watcher: Arc<ProjectWatcher>,
+    roots: Arc<[PathBuf]>,
+    sweeper: Arc<Sweeper>,
+    cancel: watch::Receiver<bool>,
+) {
+    let probed = Arc::clone(&roots);
+    let Ok(unwatchable) = tokio::task::spawn_blocking(move || unwatchable_reason(&probed)).await
+    else {
+        return;
+    };
+    if let Some(reason) = unwatchable {
+        watcher.unwatched(reason);
+        return;
+    }
+
+    let Some(set) = walk(&sweeper, Arc::clone(&roots)).await else {
+        return;
+    };
+    let incomplete = incomplete_reason(&set.errors);
+
+    // `notify` calls this handler on a thread of its own, and adding a
+    // watch for a newly created directory needs `&mut Watcher`, which
+    // the handler cannot take while it is running. So it forwards and
+    // nothing else, and the loop below owns the watcher.
+    let (tx, rx) = mpsc::unbounded_channel();
+    let native = match notify::recommended_watcher(move |result| {
+        let _ = tx.send(result);
+    }) {
+        Ok(native) => native,
+        Err(error) => {
+            watcher.unwatched(format!("could not create a filesystem watcher: {error}"));
+            return;
+        }
+    };
+
+    let mut placement = Placement::new(native, watcher, incomplete);
+    for directory in &set.directories {
+        if placement.watch(directory) == Coverage::Exhausted {
+            placement.tear_down();
+            return;
+        }
+    }
+    placement.publish();
+    run(placement, rx, cancel, roots, sweeper).await;
+}
+
+/// Walk `roots` off the worker, logging what could not be reached.
+///
+/// `None` means the blocking pool is gone, which only happens as the
+/// runtime shuts down.
+async fn walk(sweeper: &Arc<Sweeper>, roots: Arc<[PathBuf]>) -> Option<WatchSet> {
+    let filter = sweeper.filter();
+    let set = tokio::task::spawn_blocking(move || watch_set(&filter, &roots))
+        .await
+        .ok()?;
+    for error in &set.errors {
+        tracing::warn!(%error, "could not fully walk the project for watch paths");
+    }
+    Some(set)
+}
+
+/// What the walk could not reach, for the doctor, or `None` when it reached
+/// everything.
+fn incomplete_reason(errors: &[String]) -> Option<String> {
+    if errors.is_empty() {
+        return None;
+    }
+    let named = errors
+        .iter()
+        .take(NAMED_WALK_ERRORS)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(if errors.len() > NAMED_WALK_ERRORS {
+        format!(
+            "{} path(s) could not be walked, including: {named}",
+            errors.len()
+        )
+    } else {
+        format!("{} path(s) could not be walked: {named}", errors.len())
+    })
+}
+
+/// Drain events until cancelled, placing watches on directories that appear,
+/// dropping the ones that go, and handing every path to the sweeper.
+async fn run<P: Place>(
+    mut placement: Placement<P>,
     mut rx: mpsc::UnboundedReceiver<notify::Result<Event>>,
     mut cancel: watch::Receiver<bool>,
     roots: Arc<[PathBuf]>,
@@ -166,12 +391,29 @@ async fn run(
                         // overflowed, so what was lost is unknown and the
                         // walk is the only honest answer to what may have
                         // changed.
-                        rescan(&mut native, &mut placed, &roots, &sweeper);
+                        if rescan(&mut placement, &roots, &sweeper).await == Coverage::Exhausted {
+                            placement.tear_down();
+                            return;
+                        }
                     }
                     Ok(event) => {
+                        let Some(directories) = directories_among(&event.paths).await else {
+                            break;
+                        };
                         for path in &event.paths {
-                            if path.is_dir() {
-                                adopt(&mut native, &mut placed, &sweeper, path);
+                            if directories.contains(path) {
+                                if adopt(&mut placement, &sweeper, path).await
+                                    == Coverage::Exhausted
+                                {
+                                    placement.tear_down();
+                                    return;
+                                }
+                            } else {
+                                // Not a directory any more, if it ever was.
+                                // A watched directory that has gone must
+                                // leave the set, or the path it stood at is
+                                // never adopted again when it comes back.
+                                placement.forget(path);
                             }
                         }
                         sweeper.enqueue_from(&event.paths, Origin::Watcher);
@@ -191,7 +433,25 @@ async fn run(
     }
     // Dropping the watcher here releases every descriptor with it, so no
     // watch outlives the backend.
-    drop(native);
+    drop(placement);
+}
+
+/// Which of `paths` are directories right now.
+///
+/// One `spawn_blocking` for the whole event rather than a stat apiece on
+/// the worker: an event carries a handful of paths and each stat is a
+/// filesystem call that must not run on the thread draining the channel.
+/// `None` means the blocking pool is gone.
+async fn directories_among(paths: &[PathBuf]) -> Option<BTreeSet<PathBuf>> {
+    let owned = paths.to_vec();
+    tokio::task::spawn_blocking(move || {
+        owned
+            .into_iter()
+            .filter(|path| path.is_dir())
+            .collect::<BTreeSet<PathBuf>>()
+    })
+    .await
+    .ok()
 }
 
 /// Watch a directory that appeared after startup, and sweep what is already
@@ -200,61 +460,92 @@ async fn run(
 /// A `git checkout` can populate a subtree faster than the watch on its
 /// parent can be placed, so the files already there would otherwise never
 /// produce an event at all.
-fn adopt(
-    native: &mut RecommendedWatcher,
-    placed: &mut BTreeSet<PathBuf>,
+async fn adopt<P: Place>(
+    placement: &mut Placement<P>,
     sweeper: &Arc<Sweeper>,
     directory: &Path,
-) {
-    let filter = sweeper.filter();
-    if placed.contains(directory) || !filter.admits_directory(directory) {
-        return;
+) -> Coverage {
+    if placement.holds(directory) || !sweeper.filter().admits_directory(directory) {
+        return Coverage::Whole;
     }
-    let set = watch_set(&filter, &[directory.to_path_buf()]);
+    let target: Arc<[PathBuf]> = Arc::from(vec![directory.to_path_buf()]);
+    let Some(set) = walk(sweeper, target).await else {
+        return Coverage::Whole;
+    };
+    placement.note_incomplete(&set.errors);
     for new in &set.directories {
-        if placed.contains(new) {
-            continue;
-        }
-        match native.watch(new, RecursiveMode::NonRecursive) {
-            Ok(()) => {
-                placed.insert(new.clone());
-            }
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    directory = %new.display(),
-                    "could not watch a new directory"
-                );
-            }
+        if placement.watch(new) == Coverage::Exhausted {
+            return Coverage::Exhausted;
         }
     }
+    placement.publish();
     sweeper.enqueue_from(&set.files, Origin::Watcher);
+    Coverage::Whole
 }
 
 /// Re-walk every root, place watches on directories that appeared, drop the
-/// ones that went, and enqueue every admitted file.
-fn rescan(
-    native: &mut RecommendedWatcher,
-    placed: &mut BTreeSet<PathBuf>,
+/// ones that went, and enqueue the files that have changed since the last
+/// sweep.
+///
+/// Not every file the walk finds. The paths on an overflowing event cannot
+/// be trusted, but the whole checkout is not a list of changes either:
+/// naming every admitted file in one `didChangeWatchedFiles` hands every
+/// language server a notification about the entire project, which for
+/// rust-analyzer is a full reload -- and an overflow happens exactly when
+/// the tree is already churning. So the walk decides what is watched and
+/// the mtimes decide what is swept: a file modified at or after the last
+/// completed sweep may have had its event dropped, and one older than that
+/// was already on disk in its current form when that sweep read it. A file
+/// whose mtime cannot be read is kept, and with no sweep yet to measure
+/// against the whole set goes, because this rule may narrow the sweep but
+/// not by guessing.
+async fn rescan<P: Place>(
+    placement: &mut Placement<P>,
     roots: &Arc<[PathBuf]>,
     sweeper: &Arc<Sweeper>,
-) {
-    let filter = sweeper.filter();
-    let set = watch_set(&filter, roots);
-    let gone: Vec<PathBuf> = placed.difference(&set.directories).cloned().collect();
-    for directory in gone {
-        let _ = native.unwatch(&directory);
-        placed.remove(&directory);
+) -> Coverage {
+    let Some(set) = walk(sweeper, Arc::clone(roots)).await else {
+        return Coverage::Whole;
+    };
+    placement.incomplete = incomplete_reason(&set.errors);
+    for directory in placement.vanished(&set.directories) {
+        placement.forget(&directory);
     }
     for new in &set.directories {
-        if placed.contains(new) {
-            continue;
-        }
-        if native.watch(new, RecursiveMode::NonRecursive).is_ok() {
-            placed.insert(new.clone());
+        if placement.watch(new) == Coverage::Exhausted {
+            return Coverage::Exhausted;
         }
     }
-    sweeper.enqueue_from(&set.files, Origin::Watcher);
+    placement.publish();
+
+    let cutoff = sweeper.last_sweep_at();
+    let files = set.files;
+    let Ok(changed) = tokio::task::spawn_blocking(move || changed_since(files, cutoff)).await
+    else {
+        return Coverage::Whole;
+    };
+    sweeper.enqueue_from(&changed, Origin::Watcher);
+    Coverage::Whole
+}
+
+/// The files of `files` modified at or after `cutoff`, or all of them when
+/// there is no cutoff to measure against.
+///
+/// Stats each file, so it belongs on the blocking pool.
+fn changed_since(files: Vec<PathBuf>, cutoff: Option<SystemTime>) -> Vec<PathBuf> {
+    let Some(cutoff) = cutoff else {
+        return files;
+    };
+    files
+        .into_iter()
+        .filter(|path| {
+            // A file whose mtime the platform will not give up is swept:
+            // this rule narrows, and never on a guess.
+            std::fs::metadata(path)
+                .and_then(|data| data.modified())
+                .map_or(true, |modified| modified >= cutoff)
+        })
+        .collect()
 }
 
 /// Why these roots cannot be watched, or `None` when they can.
@@ -350,6 +641,8 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
 
+    use notify::EventKind;
+    use notify::event::Flag;
     use tempfile::TempDir;
 
     use super::*;
@@ -362,6 +655,25 @@ mod tests {
     /// slow one.
     const SETTLE: Duration = Duration::from_secs(5);
 
+    /// A sweeper over `roots`, with no `run` loop spawned and a long quiet
+    /// period: these tests assert on what the watcher handed the sweeper,
+    /// not on what a sweep did with it, and a sweep firing mid-test would
+    /// empty the pending set out from under the assertion.
+    fn sweeper_over(roots: &[PathBuf]) -> Arc<Sweeper> {
+        let roots: Arc<[PathBuf]> = Arc::from(roots.to_vec());
+        let filter = PathFilter::new(
+            Arc::clone(&roots),
+            Arc::new(HashMap::from([("rs".to_string(), "rust".to_string())])),
+            None,
+        );
+        Arc::new(Sweeper::new(
+            Arc::new(Translator::new()),
+            filter,
+            Duration::from_secs(60),
+            usize::MAX,
+        ))
+    }
+
     /// A watcher running over a temporary workspace, with the sweeper it
     /// feeds and the sender whose drop stops both.
     struct Watching {
@@ -371,35 +683,39 @@ mod tests {
         _cancel: watch::Sender<bool>,
     }
 
-    /// A watched temporary workspace holding one `src/` directory.
+    /// A watched temporary workspace holding one `src/` directory, with
+    /// its watches already placed.
     ///
-    /// The sweeper's `run` loop is deliberately not spawned and the quiet
-    /// period is long: these tests assert on what the watcher handed the
-    /// sweeper, not on what a sweep did with it, and a sweep firing
-    /// mid-test would empty the pending set out from under the assertion.
-    fn watching() -> Watching {
+    /// Waits for placement, because `start` returns before the walk runs
+    /// and a file written into an unwatched directory produces no event at
+    /// all.
+    async fn watching() -> Watching {
         let dir = tempfile::tempdir().expect("a temp dir");
         std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
         let roots: Arc<[PathBuf]> = Arc::from(vec![dir.path().to_path_buf()]);
-        let filter = PathFilter::new(
-            Arc::clone(&roots),
-            Arc::new(HashMap::from([("rs".to_string(), "rust".to_string())])),
-            None,
-        );
-        let sweeper = Arc::new(Sweeper::new(
-            Arc::new(Translator::new()),
-            filter,
-            Duration::from_secs(60),
-            usize::MAX,
-        ));
+        let sweeper = sweeper_over(&roots);
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let watcher = ProjectWatcher::start(roots, &sweeper, cancel_rx);
-        Watching {
+        let fixture = Watching {
             dir,
             sweeper,
             watcher,
             _cancel: cancel_tx,
+        };
+        wait_until(|| matches!(fixture.watcher.state(), WatchState::Watching { .. })).await;
+        fixture
+    }
+
+    /// Poll `ready` until it holds, or fail this test at [`SETTLE`].
+    async fn wait_until(ready: impl Fn() -> bool) {
+        let deadline = tokio::time::Instant::now() + SETTLE;
+        while tokio::time::Instant::now() < deadline {
+            if ready() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        panic!("the condition did not hold within {SETTLE:?}");
     }
 
     /// Whether `path` reaches the sweeper's pending set before [`SETTLE`].
@@ -414,9 +730,121 @@ mod tests {
         false
     }
 
+    /// How many directories a watcher reports, or `None` while it is not
+    /// watching.
+    fn directories(watcher: &ProjectWatcher) -> Option<usize> {
+        match watcher.state() {
+            WatchState::Watching { directories, .. } => Some(directories),
+            _ => None,
+        }
+    }
+
+    /// A kernel that records what it was asked to watch and can run out of
+    /// descriptors, so the rules around the watch limit are testable
+    /// without exhausting a real kernel's.
+    struct FakePlace {
+        watched: BTreeSet<PathBuf>,
+        /// How many more watches this kernel has descriptors for; `None`
+        /// for as many as asked.
+        budget: Option<usize>,
+    }
+
+    impl Place for FakePlace {
+        fn watch(&mut self, path: &Path) -> notify::Result<()> {
+            match &mut self.budget {
+                Some(0) => {
+                    return Err(notify::Error::io(std::io::Error::from_raw_os_error(
+                        rustix::io::Errno::NOSPC.raw_os_error(),
+                    )));
+                }
+                Some(left) => *left -= 1,
+                None => {}
+            }
+            self.watched.insert(path.to_path_buf());
+            Ok(())
+        }
+
+        fn unwatch(&mut self, path: &Path) -> notify::Result<()> {
+            self.watched.remove(path);
+            Ok(())
+        }
+    }
+
+    /// A placement over a fake kernel with `budget` watches left.
+    fn fake_placement(budget: Option<usize>) -> Placement<FakePlace> {
+        let watcher = Arc::new(ProjectWatcher {
+            state: StdMutex::new(WatchState::Starting),
+        });
+        let placement = Placement::new(
+            FakePlace {
+                watched: BTreeSet::new(),
+                budget,
+            },
+            watcher,
+            None,
+        );
+        placement.publish();
+        placement
+    }
+
+    /// A `run` loop over a fake kernel, with the channel that feeds it the
+    /// events a real `notify` would send.
+    ///
+    /// Driving `run` directly rather than a real watcher keeps these tests
+    /// off the kernel's own delivery schedule: the event under test is the
+    /// one sent, and nothing else arrives to race it.
+    struct Driven {
+        events: mpsc::UnboundedSender<notify::Result<Event>>,
+        watcher: Arc<ProjectWatcher>,
+        _cancel: watch::Sender<bool>,
+    }
+
+    fn drive(sweeper: &Arc<Sweeper>, roots: &Arc<[PathBuf]>, budget: Option<usize>) -> Driven {
+        let placement = fake_placement(budget);
+        let watcher = Arc::clone(&placement.watcher);
+        let (events, rx) = mpsc::unbounded_channel();
+        let (cancel, cancel_rx) = watch::channel(false);
+        tokio::spawn(run(
+            placement,
+            rx,
+            cancel_rx,
+            Arc::clone(roots),
+            Arc::clone(sweeper),
+        ));
+        Driven {
+            events,
+            watcher,
+            _cancel: cancel,
+        }
+    }
+
+    impl Driven {
+        /// Report `path` the way `notify` reports a change to it.
+        fn report(&self, path: &Path) {
+            self.events
+                .send(Ok(Event::new(EventKind::Any).add_path(path.to_path_buf())))
+                .expect("the run loop to still be draining");
+        }
+
+        /// Report the queue overflowed, which is not a list of paths.
+        fn report_overflow(&self) {
+            self.events
+                .send(Ok(Event::new(EventKind::Any).set_flag(Flag::Rescan)))
+                .expect("the run loop to still be draining");
+        }
+
+        /// Why this watcher stopped, or `None` while it is still running.
+        fn unwatched_reason(&self) -> Option<String> {
+            match self.watcher.state() {
+                WatchState::Unwatched { reason } => Some(reason),
+                _ => None,
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_an_external_write_reaches_the_sweeper() {
-        let fixture = watching();
+        let fixture = watching().await;
         assert!(
             matches!(fixture.watcher.state(), WatchState::Watching { .. }),
             "a plain temporary directory must be watchable, or every other \
@@ -435,7 +863,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_a_directory_created_after_startup_is_watched() {
-        let fixture = watching();
+        let fixture = watching().await;
 
         let created = fixture.dir.path().join("late");
         std::fs::create_dir(&created).expect("mkdir");
@@ -457,7 +885,7 @@ mod tests {
     /// filtering rather than one that is switched off.
     #[tokio::test]
     async fn test_a_build_artifact_never_reaches_the_sweeper() {
-        let fixture = watching();
+        let fixture = watching().await;
         let target = fixture.dir.path().join("target/debug");
         std::fs::create_dir_all(&target).expect("mkdir");
         let artifact = target.join("build.rs");
@@ -474,6 +902,184 @@ mod tests {
             !fixture.sweeper.pending_paths().contains(&artifact),
             "no watch is placed under target/, and the sweeper's filter drops \
              anything from it that arrives by another route"
+        );
+    }
+
+    /// `Runtime::start` is on the path the MCP `initialize` handshake
+    /// waits on, and this runtime is single-threaded: the placement task
+    /// cannot have run by the time `start` returns, so a state that is
+    /// already `Watching` here means the walk and every `inotify_add_watch`
+    /// ran on the caller's thread.
+    #[tokio::test]
+    async fn test_start_returns_before_it_places_any_watch() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let roots: Arc<[PathBuf]> = Arc::from(vec![dir.path().to_path_buf()]);
+        let sweeper = sweeper_over(&roots);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let watcher = ProjectWatcher::start(roots, &sweeper, cancel_rx);
+
+        assert_eq!(
+            watcher.state(),
+            WatchState::Starting,
+            "the startup walk and its watches must not run on the thread \
+             Runtime::start is holding, which the initialize handshake is \
+             waiting on"
+        );
+        wait_until(|| matches!(watcher.state(), WatchState::Watching { .. })).await;
+    }
+
+    /// `rm -rf src/foo && git checkout src/foo`, and every branch switch
+    /// that drops and re-adds a directory. Nothing pruned a path from the
+    /// watch set when its directory went, so `adopt` saw the recreated
+    /// directory as one already covered, placed no watch, and every later
+    /// edit under it was invisible for the rest of the session while the
+    /// doctor still reported the checkout watched.
+    #[tokio::test]
+    async fn test_a_directory_that_went_is_adopted_again_when_it_comes_back() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let roots: Arc<[PathBuf]> = Arc::from(vec![dir.path().to_path_buf()]);
+        let sweeper = sweeper_over(&roots);
+        let driven = drive(&sweeper, &roots, None);
+        let late = dir.path().join("late");
+
+        std::fs::create_dir(&late).expect("mkdir");
+        driven.report(&late);
+        wait_until(|| directories(&driven.watcher) == Some(1)).await;
+
+        std::fs::remove_dir_all(&late).expect("rm -rf");
+        driven.report(&late);
+        wait_until(|| directories(&driven.watcher) == Some(0)).await;
+
+        std::fs::create_dir(&late).expect("mkdir");
+        let path = late.join("arrived.rs");
+        std::fs::write(&path, "fn main() {}").expect("write");
+        driven.report(&late);
+
+        wait_until(|| sweeper.pending_paths().contains(&path)).await;
+    }
+
+    /// The watch limit is the same failure after startup as at it: a
+    /// checkout that grows past `fs.inotify.max_user_watches` while a
+    /// session runs would otherwise end up partly watched, with no
+    /// teardown, and a doctor line reporting a directory count for a
+    /// watcher covering an arbitrary, walk-order-dependent fraction of the
+    /// tree.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_the_watch_limit_after_startup_tears_the_watcher_down() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let roots: Arc<[PathBuf]> = Arc::from(vec![dir.path().to_path_buf()]);
+        let sweeper = sweeper_over(&roots);
+        let driven = drive(&sweeper, &roots, Some(0));
+        let late = dir.path().join("late");
+        std::fs::create_dir(&late).expect("mkdir");
+
+        driven.report(&late);
+
+        wait_until(|| driven.unwatched_reason().is_some()).await;
+        assert!(
+            driven
+                .unwatched_reason()
+                .is_some_and(|reason| reason.contains("watch limit")),
+            "the doctor has to name the limit, because raising \
+             fs.inotify.max_user_watches is the only thing that fixes it"
+        );
+    }
+
+    /// The same rule on the other post-startup walk. `rescan` discarded
+    /// its watch errors entirely, so an overflow on a checkout past the
+    /// limit left the watcher reporting whatever count the last successful
+    /// walk had set.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_a_rescan_that_hits_the_watch_limit_tears_the_watcher_down() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        std::fs::create_dir(dir.path().join("src")).expect("mkdir");
+        let roots: Arc<[PathBuf]> = Arc::from(vec![dir.path().to_path_buf()]);
+        let sweeper = sweeper_over(&roots);
+        let driven = drive(&sweeper, &roots, Some(0));
+
+        driven.report_overflow();
+
+        wait_until(|| driven.unwatched_reason().is_some()).await;
+    }
+
+    /// A watch added after startup moves the count the doctor prints. It
+    /// stayed frozen at whatever the startup walk placed, so a session
+    /// that adopted half a monorepo still reported the number it started
+    /// with.
+    #[tokio::test]
+    async fn test_a_watch_placed_after_startup_moves_the_reported_count() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let roots: Arc<[PathBuf]> = Arc::from(vec![dir.path().to_path_buf()]);
+        let sweeper = sweeper_over(&roots);
+        let driven = drive(&sweeper, &roots, None);
+        assert_eq!(directories(&driven.watcher), Some(0));
+
+        let late = dir.path().join("late/deeper");
+        std::fs::create_dir_all(&late).expect("mkdir");
+        driven.report(&dir.path().join("late"));
+
+        wait_until(|| directories(&driven.watcher) == Some(2)).await;
+    }
+
+    /// A subtree the walk cannot traverse is silently unwatched, and the
+    /// incomplete-scan warning that `session_start_output` used to surface
+    /// went with `FileChanged`. A directory count on its own would call
+    /// that coverage.
+    #[tokio::test]
+    async fn test_a_root_the_walk_cannot_reach_is_reported_as_incomplete() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let unreachable = dir.path().join("no-such-subtree");
+        let roots: Arc<[PathBuf]> = Arc::from(vec![dir.path().to_path_buf(), unreachable.clone()]);
+        let sweeper = sweeper_over(&roots);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let watcher = ProjectWatcher::start(roots, &sweeper, cancel_rx);
+
+        wait_until(|| matches!(watcher.state(), WatchState::Watching { .. })).await;
+        let WatchState::Watching { incomplete, .. } = watcher.state() else {
+            panic!("a temporary directory must be watchable");
+        };
+        assert!(
+            incomplete.is_some_and(|reason| reason.contains("could not be walked")),
+            "the doctor has to say the count is not the whole checkout, or a \
+             partly walked tree reads exactly like a fully walked one"
+        );
+    }
+
+    /// An overflow is most likely exactly when the tree is churning.
+    /// Enqueueing every admitted file the walk finds names the entire
+    /// checkout in one `didChangeWatchedFiles` to every language server,
+    /// which for rust-analyzer is a full reload.
+    #[tokio::test]
+    async fn test_a_rescan_sweeps_only_what_changed_since_the_last_sweep() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let roots: Arc<[PathBuf]> = Arc::from(vec![dir.path().to_path_buf()]);
+        let sweeper = sweeper_over(&roots);
+        let settled = dir.path().join("settled.rs");
+        std::fs::write(&settled, "fn main() {}").expect("write");
+        sweeper.enqueue(std::slice::from_ref(&settled));
+        sweeper.sweep_now().await;
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let churned = dir.path().join("churned.rs");
+        std::fs::write(&churned, "fn main() {}").expect("write");
+        let mut placement = fake_placement(None);
+        rescan(&mut placement, &roots, &sweeper).await;
+
+        let pending = sweeper.pending_paths();
+        assert!(
+            pending.contains(&churned),
+            "an overflow drops events, so a file changed since the last sweep \
+             has to be swept on the walk that answers it"
+        );
+        assert!(
+            !pending.contains(&settled),
+            "a file that has not moved since the last sweep was already \
+             reported, and naming it again hands every server a notification \
+             about the whole checkout"
         );
     }
 

@@ -178,7 +178,17 @@ fn watcher_line(watcher: Option<&WatcherStatus>) -> String {
     };
     match (&watcher.unwatched_reason, watcher.watching) {
         (Some(reason), _) => format!("watcher: not watching; {reason}"),
-        (None, true) => format!("watcher: {} directories watched", watcher.directories),
+        // A count with a subtree missing from it reads exactly like a
+        // count with nothing missing, so the reason travels with it.
+        (None, true) => watcher.incomplete_reason.as_ref().map_or_else(
+            || format!("watcher: {} directories watched", watcher.directories),
+            |reason| {
+                format!(
+                    "watcher: {} directories watched; coverage is incomplete: {reason}",
+                    watcher.directories
+                )
+            },
+        ),
         (None, false) => "watcher: not watching; this backend predates the watcher".to_string(),
     }
 }
@@ -254,7 +264,7 @@ async fn doctor_scanning(
     // Filled by the one arm that gets an answer from this project's own
     // backend, which is the only place the watcher's state exists now that
     // the watching is the backend's rather than the host's.
-    let mut reported_watcher: Option<WatcherStatus> = None;
+    let mut reported_watcher: Option<Box<WatcherStatus>> = None;
 
     match probe(identity, &Request::Status, SOCKET_TIMEOUT).await {
         // Only the socket's owner can identify this project's service.
@@ -339,7 +349,7 @@ async fn doctor_scanning(
     }
 
     lines.push(on_path_line(mcpls_on_path().as_deref()));
-    lines.push(watcher_line(reported_watcher.as_ref()));
+    lines.push(watcher_line(reported_watcher.as_deref()));
 
     lines.join("\n")
 }
@@ -1091,7 +1101,7 @@ mod tests {
                     sessions: vec!["s1".to_string(), "connection-4".to_string()],
                     servers: vec![status("rust", ServerLifecycle::Running)],
                     config_fingerprint: "00000000000000ff".to_string(),
-                    watcher: behavior.status_watcher.clone(),
+                    watcher: Box::new(behavior.status_watcher.clone()),
                 },
                 |message| Response::Error {
                     message: message.clone(),
@@ -1249,6 +1259,7 @@ mod tests {
                         watching: true,
                         directories: 7,
                         unwatched_reason: None,
+                        incomplete_reason: None,
                     },
                     ..OwnerBehavior::default()
                 },
@@ -2183,6 +2194,37 @@ mod tests {
     /// label, and the line count pinned too: a deleted line, a bare label
     /// with its payload dropped, or a value swapped for a look-alike (the
     /// requesting hash for the owner's own, `project_dir` for the
+    /// A directory count says nothing about whether the walk reached the
+    /// whole checkout, so the reason it did not has to travel with it: a
+    /// partly walked tree otherwise reads exactly like a fully walked one.
+    #[test]
+    fn test_the_watcher_line_says_when_coverage_is_incomplete() {
+        let line = watcher_line(Some(&WatcherStatus {
+            watching: true,
+            directories: 56,
+            unwatched_reason: None,
+            incomplete_reason: Some("2 path(s) could not be walked: vendor".to_string()),
+        }));
+
+        assert_eq!(
+            line,
+            "watcher: 56 directories watched; coverage is incomplete: \
+             2 path(s) could not be walked: vendor"
+        );
+    }
+
+    #[test]
+    fn test_the_watcher_line_is_plain_when_the_walk_reached_everything() {
+        let line = watcher_line(Some(&WatcherStatus {
+            watching: true,
+            directories: 56,
+            unwatched_reason: None,
+            incomplete_reason: None,
+        }));
+
+        assert_eq!(line, "watcher: 56 directories watched");
+    }
+
     /// owner's `root`) must all fail this, which `out.contains("server
     /// sees")`-style checks would not have caught.
     #[tokio::test]
@@ -2309,7 +2351,7 @@ mod tests {
                     sessions: vec!["s1".to_string(), "connection-4".to_string()],
                     servers: vec![status("rust", ServerLifecycle::Running)],
                     config_fingerprint: "00000000000000ff".to_string(),
-                    watcher: WatcherStatus::default(),
+                    watcher: Box::new(WatcherStatus::default()),
                 }
             )
         );

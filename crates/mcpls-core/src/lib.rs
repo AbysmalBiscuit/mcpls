@@ -815,15 +815,26 @@ impl Runtime {
                 .collect(),
             config_fingerprint: config_fingerprint.clone(),
             watcher: match watcher.state() {
-                hooks::WatchState::Watching { directories } => hooks::WatcherStatus {
+                hooks::WatchState::Starting => hooks::WatcherStatus {
+                    watching: false,
+                    directories: 0,
+                    unwatched_reason: Some("still placing its watches".to_string()),
+                    incomplete_reason: None,
+                },
+                hooks::WatchState::Watching {
+                    directories,
+                    incomplete,
+                } => hooks::WatcherStatus {
                     watching: true,
                     directories,
                     unwatched_reason: None,
+                    incomplete_reason: incomplete,
                 },
                 hooks::WatchState::Unwatched { reason } => hooks::WatcherStatus {
                     watching: false,
                     directories: 0,
                     unwatched_reason: Some(reason),
+                    incomplete_reason: None,
                 },
             },
         })

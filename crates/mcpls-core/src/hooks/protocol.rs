@@ -95,6 +95,14 @@ pub struct WatcherStatus {
     /// Why no watcher runs, absent while one does.
     #[serde(default)]
     pub unwatched_reason: Option<String>,
+    /// Why the directories watched are not the whole checkout, absent
+    /// while they are.
+    ///
+    /// A subtree the walk could not traverse -- a permissions failure, a
+    /// broken mount -- carries no watch, and a count on its own reads the
+    /// same whether the walk reached everything or half of it.
+    #[serde(default)]
+    pub incomplete_reason: Option<String>,
 }
 
 /// A message sent from a running mcpls back to a Claude Code hook.
@@ -157,7 +165,10 @@ pub enum Response {
         config_fingerprint: String,
         /// What the backend's filesystem watcher is doing.
         #[serde(default)]
-        watcher: WatcherStatus,
+        ///
+        /// Boxed: it is the largest thing on the largest variant, and an
+        /// unboxed one makes every `Response` the size of a status.
+        watcher: Box<WatcherStatus>,
     },
     /// Reports a failure or a response deadline exceeded while work continues.
     Error {
@@ -302,7 +313,7 @@ mod tests {
 
     #[test]
     fn test_the_status_response_pins_the_wire_shape() {
-        let literal = r#"{"op":"status","hash":"abc123","socket":"mcpls.sock","pid":42,"owner":true,"root":"/work","hooks_seen":7,"version":"0.3.9","uptime_ms":61000,"sessions":["s1","connection-4"],"servers":[{"id":"rust","state":"running"},{"id":"lua","state":"not_installed"}],"config_fingerprint":"00000000000000ff","watcher":{"watching":true,"directories":56,"unwatched_reason":null}}"#;
+        let literal = r#"{"op":"status","hash":"abc123","socket":"mcpls.sock","pid":42,"owner":true,"root":"/work","hooks_seen":7,"version":"0.3.9","uptime_ms":61000,"sessions":["s1","connection-4"],"servers":[{"id":"rust","state":"running"},{"id":"lua","state":"not_installed"}],"config_fingerprint":"00000000000000ff","watcher":{"watching":true,"directories":56,"unwatched_reason":null,"incomplete_reason":"1 path(s) could not be walked: /work/vendor: permission denied"}}"#;
         let value = Response::Status {
             hash: "abc123".to_string(),
             socket: PathBuf::from("mcpls.sock"),
@@ -323,11 +334,14 @@ mod tests {
                     state: ServerLifecycle::NotInstalled,
                 },
             ],
-            watcher: WatcherStatus {
+            watcher: Box::new(WatcherStatus {
                 watching: true,
                 directories: 56,
                 unwatched_reason: None,
-            },
+                incomplete_reason: Some(
+                    "1 path(s) could not be walked: /work/vendor: permission denied".to_string(),
+                ),
+            }),
             config_fingerprint: "00000000000000ff".to_string(),
         };
         assert_eq!(
@@ -360,7 +374,7 @@ mod tests {
                     state,
                 }],
                 config_fingerprint: "00000000000000ff".to_string(),
-                watcher: WatcherStatus::default(),
+                watcher: Box::new(WatcherStatus::default()),
             };
 
             let wire = serde_json::to_value(&value).expect("serialize");
@@ -392,6 +406,20 @@ mod tests {
              which is exactly what it has; a doctor that failed to parse it \
              would report nothing at all instead"
         );
+    }
+
+    /// A backend that knows about the watcher but not about incomplete
+    /// coverage: the field is newer than the struct it sits on, and a
+    /// doctor that failed to parse it would report nothing at all.
+    #[test]
+    fn test_a_watcher_status_without_the_incomplete_field_parses() {
+        let literal = r#"{"watching":true,"directories":56,"unwatched_reason":null}"#;
+
+        let watcher = serde_json::from_str::<WatcherStatus>(literal).expect("deserialize");
+
+        assert!(watcher.watching);
+        assert_eq!(watcher.directories, 56);
+        assert_eq!(watcher.incomplete_reason, None);
     }
 
     #[test]
