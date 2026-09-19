@@ -367,6 +367,24 @@ impl Sweeper {
                 watched_only.push(path);
                 continue;
             }
+            // The other half of the rule `ensure_servers_for_edits`
+            // applies. A created path never reaches that check, because a
+            // path the tracker has never held is opened rather than
+            // ensured -- and the open resolves a client, which starts the
+            // server. So a `git pull` adding one `src/new_module.rs`, or a
+            // rescan after an overflow, would start every configured
+            // server the checkout has. Only a server that is already up
+            // may take a watcher-origin created path; the rest goes to
+            // `watched_only`, where the servers that registered a glob for
+            // it still hear about it and no process starts.
+            if origins.get(&path) == Some(&Origin::Watcher)
+                && self.translator.server_for_path(&path).is_none_or(|id| {
+                    self.translator.lifecycle_of(&id) != Some(ServerLifecycle::Running)
+                })
+            {
+                watched_only.push(path);
+                continue;
+            }
             match self
                 .translator
                 .open_untracked_document(&path, opened < headroom)
@@ -936,6 +954,12 @@ mod tests {
     /// a file the agent has asked a tool about looks like. Isolates the
     /// spawn trigger from the separate open path for created files, the
     /// same way [`test_an_edit_starts_the_language_server`] does.
+    ///
+    /// Every test that calls this is about the `SweepKind::Changed`
+    /// branch, and only that branch. The origin rule has a second half
+    /// that a tracked path never reaches -- a created path is opened
+    /// rather than ensured, and the open resolves a client of its own --
+    /// which the `_created_` tests below cover instead.
     async fn seed_tracked(sweeper: &TestSweeper, path: &Path) {
         let (transport, _fake_server) = crate::test_support::fake_lsp_transport();
         let client = crate::lsp::LspClient::from_transport(
@@ -953,8 +977,11 @@ mod tests {
             .set_lifecycle(&ServerId::from(SERVER), ServerLifecycle::Idle);
     }
 
+    /// The `SweepKind::Changed` half of the origin rule: a path the
+    /// tracker already holds, which `ensure_servers_for_edits` is what
+    /// decides the spawn for.
     #[tokio::test]
-    async fn test_a_watcher_path_does_not_start_a_language_server() {
+    async fn test_a_watcher_change_does_not_start_a_language_server() {
         let sweeper = idle_sweeper();
         let path = sweeper.write("main.rs");
         seed_tracked(&sweeper, &path).await;
@@ -971,8 +998,45 @@ mod tests {
         );
     }
 
+    /// The `SweepKind::Created` half of the same rule, which the tracked
+    /// test above cannot reach. A path the tracker has never held skips
+    /// `ensure_servers_for_edits` and is handed to
+    /// `open_untracked_document` instead, which resolves a client and so
+    /// starts the server -- the same cold start by the other door.
     #[tokio::test]
-    async fn test_a_hook_path_still_starts_a_language_server() {
+    async fn test_a_watcher_created_path_does_not_start_a_language_server() {
+        let sweeper = idle_sweeper();
+        let path = sweeper.write("new_module.rs");
+
+        sweeper.enqueue_from(std::slice::from_ref(&path), Origin::Watcher);
+        sweeper.sweep_now().await;
+
+        assert_eq!(
+            sweeper.last_kinds(),
+            vec![(path.clone(), SweepKind::Created)],
+            "the control: a path the tracker has never held must reach the \
+             sweep as Created, or this test is asserting about the branch the \
+             tracked test already covers"
+        );
+        assert_eq!(
+            sweeper.translator.lifecycle_of(&ServerId::from(SERVER)),
+            Some(ServerLifecycle::Idle),
+            "a git pull adding one src/new_module.rs must not start \
+             rust-analyzer in a session that only ever opened TypeScript, and \
+             an overflow rescan or a git checkout creating a directory must \
+             not start every configured server at once"
+        );
+        assert_eq!(
+            sweeper.opened_count(),
+            0,
+            "the path must not be opened either: opening is what resolves the \
+             client that starts the server"
+        );
+    }
+
+    /// The `SweepKind::Changed` half of the positive control.
+    #[tokio::test]
+    async fn test_a_hook_change_still_starts_a_language_server() {
         let sweeper = idle_sweeper();
         let path = sweeper.write("main.rs");
         seed_tracked(&sweeper, &path).await;
@@ -985,6 +1049,50 @@ mod tests {
             Some(ServerLifecycle::Idle),
             "an agent's own edit is the signal the lazy spawn design starts a \
              server on, and the origin rule must not take it away"
+        );
+    }
+
+    /// The `SweepKind::Created` half of the positive control: the rule
+    /// above withholds the spawn from the watcher, and must not withhold
+    /// it from the agent creating a file in a language it has not used
+    /// yet, which is lazy spawn's actual trigger.
+    #[tokio::test]
+    async fn test_a_hook_created_path_still_starts_a_language_server() {
+        let sweeper = idle_sweeper();
+        let path = sweeper.write("new_module.rs");
+
+        sweeper.enqueue_from(std::slice::from_ref(&path), Origin::Hook);
+        sweeper.sweep_now().await;
+
+        assert_ne!(
+            sweeper.translator.lifecycle_of(&ServerId::from(SERVER)),
+            Some(ServerLifecycle::Idle),
+            "a file the agent itself made is the session asking for that \
+             language, and narrowing the created branch must not disable the \
+             trigger lazy spawn exists to serve"
+        );
+    }
+
+    /// The other side of the created rule: a watcher-origin path whose
+    /// server is already up costs nothing to open, and declining it would
+    /// leave a running server holding no document for a file that exists.
+    #[tokio::test]
+    async fn test_a_watcher_created_path_is_opened_when_the_server_runs() {
+        let sweeper = served_sweeper(usize::MAX).await;
+        sweeper
+            .harness
+            .translator
+            .set_lifecycle(&ServerId::from(SERVER), ServerLifecycle::Running);
+        let path = sweeper.write("new_module.rs", "fn main() {}");
+
+        sweeper.enqueue_from(std::slice::from_ref(&path), Origin::Watcher);
+        sweeper.sweep_now().await;
+
+        assert_eq!(sweeper.opened_count(), 1);
+        assert!(
+            sweeper
+                .notifications()
+                .contains(&"textDocument/didOpen".to_string())
         );
     }
 
