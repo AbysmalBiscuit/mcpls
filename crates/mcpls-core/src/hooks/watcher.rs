@@ -661,6 +661,7 @@ mod tests {
     use std::time::Duration;
 
     use notify::EventKind;
+    #[cfg(unix)]
     use notify::event::Flag;
     use tempfile::TempDir;
 
@@ -768,13 +769,30 @@ mod tests {
         budget: Option<usize>,
     }
 
+    /// The errno the kernel gives when it has no watch descriptors left,
+    /// spelled the same way [`is_watch_limit`] recognises it, so the fake
+    /// exercises that function rather than agreeing with it by
+    /// construction.
+    ///
+    /// `rustix` is a unix-only dependency and Windows has no watch limit
+    /// for `is_watch_limit` to find, so there the fake refuses with a
+    /// plain error and the tests that drive it out of descriptors do not
+    /// run at all.
+    #[cfg(unix)]
+    fn exhausted() -> std::io::Error {
+        std::io::Error::from_raw_os_error(rustix::io::Errno::NOSPC.raw_os_error())
+    }
+
+    #[cfg(not(unix))]
+    fn exhausted() -> std::io::Error {
+        std::io::Error::other("out of watch descriptors")
+    }
+
     impl Place for FakePlace {
         fn watch(&mut self, path: &Path) -> notify::Result<()> {
             match &mut self.budget {
                 Some(0) => {
-                    return Err(notify::Error::io(std::io::Error::from_raw_os_error(
-                        rustix::io::Errno::NOSPC.raw_os_error(),
-                    )));
+                    return Err(notify::Error::io(exhausted()));
                 }
                 Some(left) => *left -= 1,
                 None => {}
@@ -846,6 +864,12 @@ mod tests {
         }
 
         /// Report the queue overflowed, which is not a list of paths.
+        ///
+        /// Only the watch-limit tests drive this, and the watch limit is
+        /// a unix notion, so on Windows this helper has no caller and an
+        /// ungated one would be dead code in a workspace that denies
+        /// warnings.
+        #[cfg(unix)]
         fn report_overflow(&self) {
             self.events
                 .send(Ok(Event::new(EventKind::Any).set_flag(Flag::Rescan)))
@@ -853,6 +877,9 @@ mod tests {
         }
 
         /// Why this watcher stopped, or `None` while it is still running.
+        ///
+        /// Gated for the same reason as [`Driven::report_overflow`].
+        #[cfg(unix)]
         fn unwatched_reason(&self) -> Option<String> {
             match self.watcher.state() {
                 WatchState::Unwatched { reason } => Some(reason),
