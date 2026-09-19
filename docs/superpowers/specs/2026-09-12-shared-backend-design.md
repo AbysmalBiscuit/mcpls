@@ -155,13 +155,17 @@ The process stops being the session, so the session can no longer come from the 
 - **A Codex connection starts anonymous.** `initialize` carries no thread id, so the frontend has nothing to put in the handshake and the backend holds the connection under its own id until the first identified tool call arrives (`codex-rs/codex-mcp/src/rmcp_client.rs:1049`). A connection therefore adopts an identity mid-life and its records merge into that thread's at that point. This is also how a session recovers its history after a refresh: the replacement process presents the same thread id, since Codex keeps it on the session rather than deriving it from the connection (`codex-rs/core/src/session/mcp_runtime.rs:322`; `codex-rs/core/src/mcp_tool_call.rs:512`), but only once a call reveals it. A connection that never makes an identified call keeps its own records and loses them on close.
 - **Neither:** the connection's own id, which keeps two anonymous sessions apart. This is where the HTTP transport lands, which is already better than the process-wide key it uses today.
 
-Records are keyed by session and agent. A diagnostic goes to exactly one of them:
+Records are keyed by session and agent. File ownership is separate from delivery history:
 
-- a diagnostic in a file goes to every agent that wrote that file since the last time the file's diagnostics were delivered, which is one agent in every ordinary case;
+- a diagnostic in a file goes to its current writer set, which contains one agent in every ordinary case;
 - a diagnostic in a file nobody in the session wrote goes to the root session, which is where the fallout from a signature change lands;
 - nobody else is told.
 
 Keeping the recipient list to the file's own writers is the point. A shared record would let a subagent hear about a file another subagent is still editing, and a broadcast would have every agent in a workflow racing to fix the same error. Two agents writing one file in a turn is a conflict they both need to see, so both are told rather than only the later one; tooling that hands out file claims makes this case rare in the first place. Where a host names no agent, the session tree shares one record, which is the behaviour today.
+
+Writer sets belong to a file within a root session. Writers accumulate until diagnostics for that ownership cycle are first committed as delivered. Delivery does not clear the writer set: later diagnostic publications, including cleared diagnostics, still belong to those writers. The first edit after delivery starts a new ownership cycle with that editor as its writer; further editors before delivery join that set. Root fallback applies only when the session has no known writer for the file, not merely because its writers have already received a report.
+
+A report freezes its diagnostic state and recipient set, with delivery tracked separately for each recipient. One recipient consuming a report cannot consume another recipient's pending report. Starting a new ownership cycle does not discard pending reports from the previous cycle. An acknowledgment commits only the report it names and cannot erase a newer write, change the newer cycle's writers, or mark newer diagnostics delivered. Files omitted by output limits remain pending. Hook delivery commits on acknowledgment; MCP tool and footer delivery commit in the flush, as specified by the diagnostics design.
 
 Codex has a hook door too, and mcpls does not speak it. Hooks are enabled by default at this version, load from `.codex/hooks.json` among other places, and a synchronous `PostToolUse` hook returns the same `hookSpecificOutput.additionalContext` shape mcpls already emits for Claude Code (`codex-rs/hooks/src/schema.rs:228`; `codex-rs/core/src/tools/registry.rs:674`). mcpls cannot read it yet because the hooks file is Claude-only and the parser expects Claude's payload (`plugin/hooks/hooks.json`; `crates/mcpls-cli/src/hook.rs:31-56`). An adapter is feasible rather than speculative, with two obstacles. Codex has no changed-files field: `apply_patch` hands over the raw patch as `tool_input.command` (`codex-rs/core/src/tools/handlers/apply_patch.rs:458`), so an adapter has to parse the patch to learn which files were touched. It also has no `CLAUDE_PROJECT_DIR`, so it reads its project directory from the payload's `cwd`, which every Codex hook payload carries as a required field (`codex-rs/hooks/src/schema.rs:283`).
 
@@ -176,6 +180,8 @@ A session's records live as long as its connections, counted rather than assumed
 Those rules are written for Claude Code, which is the host that names both events. Codex names neither for a subagent. Its `SessionEnd` is root-only, and `SubagentStop` is a turn-stop hook rather than a lifetime one: it fires after a child's turn settles, can fire again when the child takes more work, can itself block stopping, and is skipped on interrupt, on a sampling error, on parent cancellation and on a crash (`codex-rs/core/src/session/turn.rs:552,615`; `codex-rs/core/src/tasks/mod.rs:900`; `codex-rs/core/src/hook_runtime.rs:464,486`).
 
 So no event is authoritative. Closing a connection plus the grace is what expires a record, and a host event only accelerates it where the host offers one. Treating `SubagentStop` as a teardown would both leak records for children that never fire it and delete records for children still working.
+
+An agent identified through a hook belongs to the root named by the hook's `session_id`, even if that agent has never opened an MCP connection. Root-session connections keep these agent records alive, and an agent's own connection also keeps its record alive. When neither the root nor the agent has an open MCP connection, the grace runs from the last connection close or hook activity, whichever is later. Further hook activity renews it. This also gives a hook-only record an expiry when no connection has ever opened. Root `SessionEnd` marks its agent records for cleanup under the same rule: records with no protecting connection drop immediately, and the others drop when their last protecting connection closes.
 
 The grace defaults to 60 seconds and is configurable. Claude Code is the reason it exists; Codex has no crash-to-relaunch supervisor for a stdio server at all, only an explicit MCP refresh that preserves the owning identities (`codex-rs/core/src/session/handlers.rs:237`), so on Codex the grace covers a deliberate refresh rather than a crash. It only has to outlive either, because a backend holding no sessions at all exits on the idle timer and takes every record with it. A grace longer than the idle timer therefore only has effect while some other session holds the backend open.
 
@@ -249,9 +255,17 @@ None at present.
 - The backend's own output: nothing it writes reaches the host's MCP stream, and the host sees EOF when its frontend exits.
 - Two sessions in one project, each asking for diagnostics: each reads its own record, and neither consumes the other's.
 - A Codex root and a subagent it spawned: each reads its own record, though both carry the same `session_id`.
+- Two agents editing different files: each receives only its own file's diagnostics; a file with no writer in that root session reaches only the root.
+- Two agents editing one file before delivery: both receive its report, and either agent acknowledging first leaves the other's report pending.
+- A file omitted by output limits: its intended recipients can still receive it on a later flush.
+- An edit racing an older report's acknowledgment: the acknowledgment preserves the newer ownership cycle and its undelivered diagnostics.
+- A later diagnostic publication without another edit: it reaches the retained writers rather than falling back to root. The next edit starts a new writer set, while older pending reports retain their recipients.
+- A hook-only agent: root connections keep its record alive; with no root or agent connection, hook activity renews its grace and inactivity expires it. `SubagentStop` does not remove it.
+- Root `SessionEnd`: records without protecting connections drop immediately, and records with protecting connections drop after the last one closes.
 - A Codex session ending: the backend outlives the group cleanup that kills the frontend.
 - Two sessions subscribed to different files: each is notified about its own and neither about the other's, and one of them disconnecting does not stop the other's diagnostics.
-- A session whose connection drops and comes back inside the grace: its already-delivered diagnostics stay delivered.
+- A session whose connection drops and comes back inside the grace while another session keeps the same backend alive: its already-delivered diagnostics stay delivered.
+- The last session disconnecting past the backend idle timeout: the backend exits even if record grace remains, and a replacement backend starts fresh delivery history.
 - A Codex connection whose first tool call names a thread the backend already holds records for: those records carry over rather than starting empty.
 - On Windows, a session that fires no hook: the frontend says why there is no backend rather than appearing to work.
 - The interactive Codex interface on Windows: it contains a server's descendants the way `codex exec` does, so the hook route is still the one that works.
