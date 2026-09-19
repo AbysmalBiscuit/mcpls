@@ -198,6 +198,13 @@ pub(crate) fn normalize(path: &Path) -> PathBuf {
     if let Ok(canonical) = dunce::canonicalize(path) {
         return canonical;
     }
+    if path.components().next_back() == Some(std::path::Component::ParentDir)
+        && let Some(parent) = path.parent()
+    {
+        let mut normalized = normalize(parent);
+        normalized.pop();
+        return normalized;
+    }
     match (path.parent(), path.file_name()) {
         (Some(parent), Some(name)) => normalize(parent).join(name),
         _ => path.to_path_buf(),

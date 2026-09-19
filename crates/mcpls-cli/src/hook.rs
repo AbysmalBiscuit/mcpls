@@ -1607,6 +1607,122 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn real_dispatchers_deliver_only_each_agents_written_file() {
+        use mcpls_core::bridge::{
+            DiagnosticsDelivery, FloorTable, NotificationCache, ResourceSubscriptions,
+            ServerSettle, Translator,
+        };
+        use mcpls_core::config::{DiagnosticsConfig, ServerId};
+        use mcpls_core::hooks::service::{HookLocation, HookStats, StatusExtras, build_handler};
+        use mcpls_core::hooks::sweep::Sweeper;
+        use mcpls_core::hooks::{HookListener, PathFilter};
+        use mcpls_core::mcp::McplsServer;
+        for host in [Host::Claude, Host::Codex] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dunce::canonicalize(dir.path()).unwrap();
+            let identity = temp_identity(&root);
+            let cache = Arc::new(tokio::sync::Mutex::new(NotificationCache::new()));
+            let delivery = Arc::new(tokio::sync::Mutex::new(DiagnosticsDelivery::new(
+                DiagnosticsConfig::default(),
+            )));
+            delivery
+                .lock()
+                .await
+                .set_baseline(std::collections::HashMap::new());
+            let translator = Arc::new(Translator::new());
+            let roots: Arc<[PathBuf]> = Arc::from(vec![root.clone()]);
+            let server = Arc::new(McplsServer::new(
+                Arc::clone(&translator),
+                Arc::clone(&cache),
+                Arc::clone(&roots),
+                Arc::new(ResourceSubscriptions::new()),
+                false,
+                delivery,
+                Arc::new(FloorTable::new(&DiagnosticsConfig::default(), &[])),
+                DiagnosticsConfig::default(),
+                Arc::new(ServerSettle::new(
+                    Duration::from_millis(1),
+                    Duration::from_secs(1),
+                )),
+            ));
+            let sweeper = Arc::new(Sweeper::new(
+                translator,
+                PathFilter::new(
+                    roots,
+                    Arc::new(std::collections::HashMap::from([(
+                        "rs".into(),
+                        "rust".into(),
+                    )])),
+                    None,
+                ),
+                Duration::from_millis(500),
+                100,
+            ));
+            let (cancel, rx) = tokio::sync::watch::channel(false);
+            let listener = HookListener::acquire(&identity).await.unwrap().unwrap();
+            let listener_task = tokio::spawn(listener.serve(
+                build_handler(
+                    server,
+                    sweeper,
+                    HookLocation {
+                        identity: identity.clone(),
+                        root: root.clone(),
+                    },
+                    Arc::new(HookStats::default()),
+                    Arc::new(StatusExtras::default),
+                    rx.clone(),
+                ),
+                Duration::from_secs(1),
+                rx,
+            ));
+            for agent in ["a", "b"] {
+                let path = root.join(format!("{agent}.rs"));
+                std::fs::write(&path, "broken").unwrap();
+                let payload = json!({
+                    "hook_event_name": if matches!(host, Host::Codex) { "PostToolUse" } else { "PostToolBatch" },
+                    "session_id": "root", "agent_id": agent, "cwd": root,
+                    "tool_name": "apply_patch", "tool_input": {"command": format!("*** Begin Patch\n*** Update File: {agent}.rs\n@@\n-old\n+new\n*** End Patch\n")},
+                    "tool_calls": [{"tool_input": {"file_path": path}}]
+                });
+                super::dispatch_payload(host, &payload.to_string(), &root, Some(&identity)).await;
+            }
+            for name in ["a", "b", "unowned"] {
+                let uri =
+                    mcpls_core::bridge::path_to_uri(&root.join(format!("{name}.rs"))).unwrap();
+                let diagnostic = serde_json::from_value(json!({
+                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+                    "severity": 1, "message": format!("{name} error")
+                })).unwrap();
+                cache.lock().await.store_diagnostics(
+                    &ServerId::from("rust"),
+                    &uri,
+                    None,
+                    vec![diagnostic],
+                );
+            }
+            for (agent, expected) in [(Some("a"), "a"), (Some("b"), "b"), (None, "unowned")] {
+                let payload = json!({"hook_event_name": "UserPromptSubmit", "session_id": "root", "agent_id": agent, "cwd": root});
+                let output =
+                    super::dispatch_payload(host, &payload.to_string(), &root, Some(&identity))
+                        .await;
+                assert!(output.contains(&format!("{expected} error")), "{output}");
+                for other in ["a", "b", "unowned"] {
+                    if other != expected {
+                        assert!(!output.contains(&format!("{other} error")), "{output}");
+                    }
+                }
+                let repeated =
+                    super::dispatch_payload(host, &payload.to_string(), &root, Some(&identity))
+                        .await;
+                assert!(!repeated.contains(" error"), "{repeated}");
+            }
+            cancel.send(true).unwrap();
+            listener_task.await.unwrap();
+        }
+    }
+
     #[test]
     fn test_the_flush_timeout_tracks_the_op_deadline_default() {
         assert_eq!(

@@ -55,6 +55,94 @@ struct SubResult {
     outcome: Result<(), String>,
 }
 
+fn sc_attributed_writes_receive_separate_diagnostics(
+    client: &mut McpClient,
+    workspace: &Path,
+) -> Result<(), String> {
+    let metadata = |thread: &str| json!({"threadId": thread, "x-codex-turn-metadata": {"session_id": "attribution-root"}});
+    wait_for_settled_diagnostics_baseline(client)?;
+    for thread in ["attribution-root", "attribution-a", "attribution-b"] {
+        client
+            .call_tool_with_meta("get_new_diagnostics", &json!({}), Some(&metadata(thread)))
+            .map_err(|e| e.to_string())?;
+    }
+    fs::write(
+        workspace.join("src/attribution_a.rs"),
+        "pub fn value()->&'static str{let _:i32=\"wrong\";\"wrong\"}",
+    )
+    .map_err(|e| e.to_string())?;
+    fs::write(
+        workspace.join("src/attribution_b.rs"),
+        "pub fn value()->i32{\"wrong\"}",
+    )
+    .map_err(|e| e.to_string())?;
+    for (thread, name) in [
+        ("attribution-a", "attribution_a"),
+        ("attribution-b", "attribution_b"),
+    ] {
+        let path = workspace.join(format!("src/{name}.rs"));
+        let response = client
+            .call_tool_with_meta(
+                "format_document",
+                &json!({
+                    "file_path": path, "apply": true, "tab_size": 4, "insert_spaces": true
+                }),
+                Some(&metadata(thread)),
+            )
+            .map_err(|e| e.to_string())?;
+        let result: Value = serde_json::from_str(&assertions::assert_tool_ok(&response))
+            .map_err(|e| e.to_string())?;
+        if result["applied"] != true || result["files_written"].as_array().is_none_or(Vec::is_empty)
+        {
+            return Err(format!("format did not write {name}: {result}"));
+        }
+    }
+    for (thread, expected) in [
+        ("attribution-a", "attribution_a.rs"),
+        ("attribution-b", "attribution_b.rs"),
+        ("attribution-root", "attribution_dependent.rs"),
+    ] {
+        let deadline = Instant::now() + Duration::from_secs(ra_index_timeout_secs());
+        loop {
+            let response = client
+                .call_tool_with_meta("get_new_diagnostics", &json!({}), Some(&metadata(thread)))
+                .map_err(|e| e.to_string())?;
+            let report: Value = serde_json::from_str(&assertions::assert_tool_ok(&response))
+                .map_err(|e| e.to_string())?;
+            let changed = report["changed"]
+                .as_array()
+                .ok_or_else(|| format!("bad report {report}"))?;
+            let mut found = false;
+            for file in changed {
+                let path = file["file_path"].as_str().unwrap_or_default();
+                if thread != "attribution-root" && !path.ends_with(expected) {
+                    return Err(format!("{thread} received another file: {report}"));
+                }
+                if thread == "attribution-root"
+                    && (path.ends_with("attribution_a.rs") || path.ends_with("attribution_b.rs"))
+                {
+                    return Err(format!("root received a writer's file: {report}"));
+                }
+                if path.ends_with(expected)
+                    && file["diagnostics"]
+                        .as_array()
+                        .is_some_and(|diagnostics| diagnostics.iter().any(|d| d["code"] == "E0308"))
+                {
+                    found = true;
+                }
+            }
+            if found {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(format!("{thread} never received {expected}: {report}"));
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+    Ok(())
+}
+
 type SubCaseFn = fn(&mut McpClient, &Path) -> Result<(), String>;
 
 struct SubCase {
@@ -122,6 +210,22 @@ fn stage_workspace() -> TempDir {
     let untouched_dst = tmp.path().join("src/untouched.rs");
     fs::copy(&untouched_src, &untouched_dst).expect("failed to copy untouched.rs");
 
+    for name in ["attribution_a", "attribution_b", "attribution_dependent"] {
+        fs::write(
+            tmp.path().join(format!("src/{name}.rs")),
+            if name == "attribution_dependent" {
+                "pub fn value() -> i32 { super::attribution_a::value() }\n"
+            } else {
+                "pub fn value() -> i32 { 1 }\n"
+            },
+        )
+        .unwrap();
+        let mut lib = fs::read_to_string(&lib_path).unwrap();
+        lib.push_str("\npub mod ");
+        lib.push_str(name);
+        lib.push_str(";\n");
+        fs::write(&lib_path, lib).unwrap();
+    }
     tmp
 }
 
@@ -162,6 +266,7 @@ struct E2eConfig {
 #[derive(Serialize, Deserialize)]
 struct ApplyTable {
     rename: bool,
+    format_document: bool,
 }
 
 /// How long the debounce must see no outstanding `$/progress` work before
@@ -235,7 +340,10 @@ fn write_config(ra_binary: &Path, workspace_root: &Path, config_path: &Path) {
         }],
         // Only `rename` is on: the earlier read-only sub-cases must keep
         // proving that a tool called without `apply` writes nothing.
-        apply: ApplyTable { rename: true },
+        apply: ApplyTable {
+            rename: true,
+            format_document: true,
+        },
         diagnostics: DiagnosticsTable {
             settle_quiet_ms: SETTLE_QUIET_MS,
             settle_deadline_ms: settle_deadline_ms(),
@@ -1932,7 +2040,9 @@ fn ra_e2e_suite() {
     let mut client =
         McpClient::spawn_with_args(&["--config", &config_str]).expect("failed to spawn mcpls");
 
-    client.initialize().expect("MCP initialize failed");
+    client
+        .initialize_as("codex-mcp-client")
+        .expect("MCP initialize failed");
 
     // Wait for rust-analyzer to index.
     let lib_rs = workspace.join("src/lib.rs");
@@ -1975,6 +2085,7 @@ fn ra_e2e_suite() {
         // Last: this one writes to the staged workspace, and every anchor
         // above it looks for text this rename moves.
         sub_case!(sc_rename_symbol_apply),
+        sub_case!(sc_attributed_writes_receive_separate_diagnostics),
     ];
 
     let filter = std::env::var("MCPLS_RA_FILTER").ok();

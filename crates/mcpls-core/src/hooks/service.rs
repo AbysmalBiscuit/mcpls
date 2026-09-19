@@ -1280,6 +1280,158 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn socket_reports_keep_other_writers_snapshots_across_edits_and_caps() {
+        async fn request(harness: &HookHarness, value: serde_json::Value) -> Response {
+            crate::hooks::send(
+                &harness.identity,
+                &serde_json::from_value(value).unwrap(),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap()
+        }
+        for host in ["claude", "codex"] {
+            let harness = HookHarness::owner_without_baseline_with(DiagnosticsConfig {
+                max_total: 1,
+                ..Default::default()
+            })
+            .await;
+            harness.delivery.lock().await.set_baseline(HashMap::new());
+            let a = harness.fixture("a.rs");
+            let b = harness.fixture("b.rs");
+            let unowned = harness.fixture("unowned.rs");
+            for agent in ["a", "b"] {
+                request(
+                    &harness,
+                    serde_json::json!({
+                        "op": "changed", "session": "root", "agent_id": agent, "host": host,
+                        "attributed": true, "event": "change", "paths": [a, b]
+                    }),
+                )
+                .await;
+            }
+            for path in [&a, &b, &unowned] {
+                harness.notification_cache.lock().await.store_diagnostics(
+                    &ServerId::from("rust"),
+                    &crate::bridge::path_to_uri(path).unwrap(),
+                    None,
+                    vec![diagnostic("old snapshot")],
+                );
+            }
+            let Response::Flush {
+                context: Some(first),
+                token: Some(token),
+            } = request(
+                &harness,
+                serde_json::json!({
+                    "op": "flush", "session": "root", "agent_id": "a", "host": host
+                }),
+            )
+            .await
+            else {
+                panic!("first report");
+            };
+            assert!(
+                first.contains("a.rs") && !first.contains("b.rs") && !first.contains("unowned.rs"),
+                "{first}"
+            );
+            request(&harness, serde_json::json!({"op": "ack", "session": "root", "agent_id": "a", "host": host, "token": token})).await;
+            request(
+                &harness,
+                serde_json::json!({
+                    "op": "changed", "session": "root", "agent_id": "c", "host": host,
+                    "attributed": true, "event": "change", "paths": [a]
+                }),
+            )
+            .await;
+            harness.notification_cache.lock().await.store_diagnostics(
+                &ServerId::from("rust"),
+                &crate::bridge::path_to_uri(&a).unwrap(),
+                None,
+                vec![diagnostic("new snapshot")],
+            );
+            for (agent, expected, absent) in [
+                ("b", "old snapshot", "new snapshot"),
+                ("c", "new snapshot", "old snapshot"),
+            ] {
+                let Response::Flush {
+                    context: Some(text),
+                    token: Some(token),
+                } = request(
+                    &harness,
+                    serde_json::json!({
+                        "op": "flush", "session": "root", "agent_id": agent, "host": host
+                    }),
+                )
+                .await
+                else {
+                    panic!("retained report");
+                };
+                assert!(text.contains(expected) && !text.contains(absent), "{text}");
+                request(&harness, serde_json::json!({"op": "ack", "session": "root", "agent_id": agent, "host": host, "token": token})).await;
+            }
+            for agent in ["a", "b"] {
+                let Response::Flush {
+                    context: Some(text),
+                    token: Some(token),
+                } = request(
+                    &harness,
+                    serde_json::json!({
+                        "op": "flush", "session": "root", "agent_id": agent, "host": host
+                    }),
+                )
+                .await
+                else {
+                    panic!("deferred file");
+                };
+                assert!(
+                    text.contains("b.rs")
+                        && text.contains("old snapshot")
+                        && !text.contains("a.rs"),
+                    "{text}"
+                );
+                request(&harness, serde_json::json!({"op": "ack", "session": "root", "agent_id": agent, "host": host, "token": token})).await;
+            }
+            let Response::Flush {
+                context: Some(text),
+                ..
+            } = request(
+                &harness,
+                serde_json::json!({
+                    "op": "flush", "session": "root", "host": host
+                }),
+            )
+            .await
+            else {
+                panic!("root report");
+            };
+            assert!(
+                text.contains("unowned.rs") && !text.contains("a.rs") && !text.contains("b.rs"),
+                "{text}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn admitted_paths_resolve_aliases_and_missing_parent_traversal() {
+        let harness = HookHarness::owner().await;
+        let actual = harness.fixture("actual.rs");
+        let alias = harness.fixture("alias.rs");
+        std::fs::write(&actual, "source").unwrap();
+        std::os::unix::fs::symlink(&actual, &alias).unwrap();
+        assert_eq!(harness.sweeper.admitted_paths(&[alias]), vec![actual]);
+        let escape = harness.fixture("missing/../../escape.rs");
+        assert!(harness.sweeper.admitted_paths(&[escape]).is_empty());
+        let deleted = harness.fixture("missing/../deleted.rs");
+        assert_eq!(
+            harness.sweeper.admitted_paths(&[deleted]),
+            vec![harness.fixture("deleted.rs")]
+        );
+    }
+
     /// A config over `root` with no language servers at all.
     #[cfg(feature = "transport-http")]
     fn bare_config_over(root: &std::path::Path) -> crate::config::ServerConfig {

@@ -1,6 +1,6 @@
 # One mcpls backend per project
 
-Status: Stage 1 is built. Stages 2 to 4 are not.
+Implementation and verification: [agent diagnostic attribution plan](../plans/2026-09-19-agent-diagnostic-attribution.md), with delivery tests in `crates/mcpls-core/src/bridge/delivery_tests.rs` and real-language-server coverage in `crates/mcpls-core/tests/ra_e2e.rs`. Watcher work is specified separately below.
 
 Target: the `AbysmalBiscuit/mcpls` fork, not upstream. Defaults are tuned for one user running many agents on a desktop or laptop, and breaking changes to configuration are acceptable when they buy ergonomics.
 
