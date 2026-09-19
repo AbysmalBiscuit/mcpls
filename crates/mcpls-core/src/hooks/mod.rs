@@ -20,4 +20,4 @@ pub use listener::{
 };
 pub use protocol::{ChangeEvent, Request, Response};
 pub use service::{HookLocation, HookStats, StatusExtras, StatusSource, build_handler};
-pub use sweep::{SweepKind, Sweeper};
+pub use sweep::{Origin, SweepKind, Sweeper};
