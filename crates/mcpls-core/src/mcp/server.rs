@@ -34,8 +34,9 @@ use crate::bridge::resources::{make_uri, parse_uri};
 use crate::bridge::{
     ConnectionId, DefinitionResult, Diagnostic, DiagnosticInfo, DiagnosticSeverity,
     DiagnosticsDelivery, DiagnosticsResult, DocumentSymbolsResult, FileEntry, FloorTable,
-    FlushReport, NotificationCache, PositionEncoding, ReferencesResult, ResourceSubscriptions,
-    ServerSettle, SessionId, Translator, uri_to_path, validate_path_against_roots,
+    FlushReport, NotificationCache, PositionEncoding, RecordId, ReferencesResult,
+    ResourceSubscriptions, ServerSettle, SessionId, Translator, uri_to_path,
+    validate_path_against_roots,
 };
 use crate::config::{DiagnosticsConfig, ServerId, ToolKind};
 
@@ -1121,7 +1122,10 @@ impl McplsServer {
         // per changed file, and holding the cache lock across those awaits
         // would block the diagnostics pump, which loses publishes rather than
         // waiting for them.
-        to_tool_result(Ok(self.flush_now(&session, Advance::Now).await.0))
+        to_tool_result(Ok(self
+            .flush_now(&RecordId::from(&session), Advance::Now)
+            .await
+            .0))
     }
 
     /// Flush `session`'s record and render it, advancing the record as
@@ -1141,7 +1145,7 @@ impl McplsServer {
     #[allow(clippy::significant_drop_tightening)]
     async fn flush_now(
         &self,
-        session: &SessionId,
+        session: &RecordId,
         advance: Advance,
     ) -> (NewDiagnosticsResult, Option<u64>) {
         let (report, token, sources, baseline_pending) = {
@@ -1185,8 +1189,9 @@ impl McplsServer {
     /// permanently believing the workspace started clean.
     pub(crate) async fn flush_for_hook(
         &self,
-        session: &SessionId,
+        session: impl Into<RecordId>,
     ) -> (Option<String>, Option<u64>) {
+        let session = &session.into();
         if !self.context.delivery.lock().await.has_baseline() {
             return (None, None);
         }
@@ -1199,7 +1204,7 @@ impl McplsServer {
     /// Takes `delivery` alone. `false` when `token` no longer names the
     /// session's staged report, in which case the record already reflects
     /// something sent more recently, or nothing.
-    pub(crate) async fn commit_for_hook(&self, session: &SessionId, token: u64) -> bool {
+    pub(crate) async fn commit_for_hook(&self, session: impl Into<RecordId>, token: u64) -> bool {
         self.context.delivery.lock().await.commit(session, token)
     }
 
@@ -1317,7 +1322,10 @@ impl McplsServer {
         .await;
 
         let session = self.session.clone();
-        let mut report = self.flush_now(&session, Advance::Now).await.0;
+        let mut report = self
+            .flush_now(&RecordId::from(&session), Advance::Now)
+            .await
+            .0;
         report.note = Some(report.note.take().map_or_else(
             || {
                 "This footer is best effort; anything slower than the wait arrives in the \
@@ -2032,12 +2040,15 @@ mod tests {
 
         let (staged, token) = parts
             .server
-            .flush_now(&session, Advance::OnAcknowledgement)
+            .flush_now(&RecordId::from(&session), Advance::OnAcknowledgement)
             .await;
         assert_eq!(staged.changed.len(), 1);
         let token = token.expect("a staged report with content carries a token");
 
-        let (now, none) = parts.server.flush_now(&session, Advance::Now).await;
+        let (now, none) = parts
+            .server
+            .flush_now(&RecordId::from(&session), Advance::Now)
+            .await;
         assert_eq!(
             now.changed.len(),
             1,
@@ -2055,7 +2066,7 @@ mod tests {
 
         let (after, _) = parts
             .server
-            .flush_now(&session, Advance::OnAcknowledgement)
+            .flush_now(&RecordId::from(&session), Advance::OnAcknowledgement)
             .await;
         assert!(after.changed.is_empty());
     }

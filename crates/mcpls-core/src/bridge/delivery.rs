@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
+use super::RecordId;
 use crate::config::{DiagnosticsConfig, LspServerConfig, ServerId, SeverityFloor};
 
 /// Identity of one client session.
@@ -130,12 +131,12 @@ struct PendingFlush {
 #[derive(Debug)]
 pub struct DiagnosticsDelivery {
     config: DiagnosticsConfig,
-    sessions: HashMap<SessionId, HashMap<String, u64>>,
+    sessions: HashMap<RecordId, HashMap<String, u64>>,
     baseline: Option<HashMap<String, u64>>,
     /// At most one staged report per session. Never names a session
     /// `sessions` lacks: `stage` seeds the record before it stages, and
     /// `end_session` drops both.
-    pending: HashMap<SessionId, PendingFlush>,
+    pending: HashMap<RecordId, PendingFlush>,
     next_token: u64,
 }
 
@@ -190,14 +191,21 @@ impl DiagnosticsDelivery {
 
     /// Drop `session`'s record, so a later flush for the same id starts
     /// from the baseline again.
-    pub fn end_session(&mut self, session: &SessionId) {
+    pub fn end_session(&mut self, session: impl Into<RecordId>) {
+        let session = &session.into();
         self.sessions.remove(session);
         self.pending.remove(session);
     }
 
     /// Move committed history into `target`, keeping its history on conflicts.
     /// Unacknowledged reports from `source` are discarded.
-    pub(crate) fn merge_session(&mut self, source: &SessionId, target: &SessionId) {
+    pub(crate) fn merge_session(
+        &mut self,
+        source: impl Into<RecordId>,
+        target: impl Into<RecordId>,
+    ) {
+        let source = &source.into();
+        let target = &target.into();
         if source == target {
             return;
         }
@@ -277,9 +285,10 @@ impl DiagnosticsDelivery {
     /// forever.
     pub fn stage(
         &mut self,
-        session: &SessionId,
+        session: impl Into<RecordId>,
         entries: &[FileEntry<'_>],
     ) -> (FlushReport, Option<u64>) {
+        let session = &session.into();
         let (report, updates) = self.diff(session, entries);
         if updates.is_empty() {
             self.pending.remove(session);
@@ -298,7 +307,8 @@ impl DiagnosticsDelivery {
     /// staged report: a later stage replaced it, an immediate flush
     /// superseded it, or the session ended. The record then already
     /// reflects something a reader was sent more recently, or nothing.
-    pub fn commit(&mut self, session: &SessionId, token: u64) -> bool {
+    pub fn commit(&mut self, session: impl Into<RecordId>, token: u64) -> bool {
+        let session = &session.into();
         let staged = match self.pending.get(session) {
             Some(pending) if pending.token == token => self.pending.remove(session),
             _ => None,
@@ -323,7 +333,12 @@ impl DiagnosticsDelivery {
     /// [`Self::stage`] and [`Self::commit`] in one call, for a reader whose
     /// answer either arrives or ends the session: the MCP tool and the
     /// footer, whose transport is the session's own.
-    pub fn flush(&mut self, session: &SessionId, entries: &[FileEntry<'_>]) -> FlushReport {
+    pub fn flush(
+        &mut self,
+        session: impl Into<RecordId>,
+        entries: &[FileEntry<'_>],
+    ) -> FlushReport {
+        let session = &session.into();
         let (report, token) = self.stage(session, entries);
         if let Some(token) = token {
             self.commit(session, token);
@@ -336,7 +351,7 @@ impl DiagnosticsDelivery {
     /// gives them.
     fn diff(
         &mut self,
-        session: &SessionId,
+        session: &RecordId,
         entries: &[FileEntry<'_>],
     ) -> (FlushReport, Vec<(String, Option<u64>)>) {
         let record = &*self

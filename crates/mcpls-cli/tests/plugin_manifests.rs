@@ -95,7 +95,6 @@ fn test_every_entry_runs_mcpls_from_path() {
                 "PostToolUse",
                 "SessionEnd",
                 "SessionStart",
-                "SubagentStop",
                 "UserPromptSubmit",
             ],
         ),

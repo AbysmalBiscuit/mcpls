@@ -72,6 +72,34 @@ fn changed(result: &Value) -> usize {
 }
 
 #[tokio::test]
+async fn codex_hook_and_mcp_share_the_thread_record() {
+    for hook_first in [true, false] {
+        let server = server_with_one_error().await;
+        let request: crate::hooks::Request = serde_json::from_value(json!({
+            "op": "flush", "session": "root", "agent_id": "child", "host": "codex"
+        }))
+        .unwrap();
+        let crate::hooks::Request::Flush { session, agent } = request else {
+            panic!("flush request");
+        };
+        let caller = agent.caller(&session);
+        let mut client = Client::connect(server.for_connection(None), "codex-mcp-client").await;
+        if hook_first {
+            let (context, token) = server.flush_for_hook(&caller.record).await;
+            assert!(context.is_some());
+            assert!(server.commit_for_hook(&caller.record, token.unwrap()).await);
+            assert_eq!(changed(&client.diagnostics(metadata("child")).await), 0);
+        } else {
+            assert_eq!(changed(&client.diagnostics(metadata("child")).await), 1);
+            let (context, token) = server.flush_for_hook(&caller.record).await;
+            assert!(context.is_none());
+            assert!(token.is_none());
+        }
+        client.close().await;
+    }
+}
+
+#[tokio::test]
 async fn codex_adopts_anonymous_history_only_once() {
     let server = server_with_one_error().await;
     let mut client = Client::connect(server.for_connection(None), "codex-mcp-client").await;

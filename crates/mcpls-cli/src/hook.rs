@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Result;
+use mcpls_core::bridge::{HookAgent, HookHost};
 use mcpls_core::hooks::protocol::ServerStatus;
 use mcpls_core::hooks::{
     ChangeEvent, ProbeOutcome, Request, Response, SocketIdentity, WatcherStatus, probe, send,
@@ -60,6 +61,8 @@ struct HookPayload {
     #[serde(default)]
     session_id: String,
     #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
     tool_calls: Vec<ToolCall>,
 }
 
@@ -96,6 +99,10 @@ pub async fn dispatch_payload(
 
 async fn run(stdin: &str, identity: Option<&SocketIdentity>) -> Result<String> {
     let payload: HookPayload = serde_json::from_str(stdin)?;
+    let agent = HookAgent {
+        agent_id: payload.agent_id.clone(),
+        host: HookHost::Claude,
+    };
 
     match payload.hook_event_name.as_str() {
         "PostToolBatch" => {
@@ -109,11 +116,13 @@ async fn run(stdin: &str, identity: Option<&SocketIdentity>) -> Result<String> {
                 .collect();
             let requests = [
                 Request::Changed {
+                    agent: agent.clone(),
                     session: payload.session_id.clone(),
                     paths,
                     event: ChangeEvent::Change,
                 },
                 Request::Flush {
+                    agent: agent.clone(),
                     session: payload.session_id,
                 },
             ];
@@ -129,6 +138,7 @@ async fn run(stdin: &str, identity: Option<&SocketIdentity>) -> Result<String> {
             let responses = send_and_acknowledge(
                 identity,
                 &[Request::Flush {
+                    agent: agent.clone(),
                     session: payload.session_id,
                 }],
                 FLUSH_SOCKET_TIMEOUT,
@@ -1692,11 +1702,11 @@ mod tests {
             vec!["flush".to_string(), "ack".to_string()],
             "a flush with content is acknowledged once its answer is in hand: {requests:?}"
         );
-        let Request::Flush { session } = &requests[0] else {
+        let Request::Flush { session, .. } = &requests[0] else {
             panic!("expected a flush request: {:?}", requests[0]);
         };
         assert_eq!(session.as_str(), "s1");
-        let Request::Ack { session, token } = &requests[1] else {
+        let Request::Ack { session, token, .. } = &requests[1] else {
             panic!("expected an ack request: {:?}", requests[1]);
         };
         assert_eq!(session.as_str(), "s1");
@@ -1779,6 +1789,7 @@ mod tests {
             session: changed_session,
             paths,
             event,
+            ..
         } = &requests[0]
         else {
             panic!(
@@ -1788,6 +1799,7 @@ mod tests {
         };
         let Request::Flush {
             session: flush_session,
+            ..
         } = &requests[1]
         else {
             panic!("expected the second request to be flush: {:?}", requests[1]);
@@ -3438,25 +3450,26 @@ mod tests {
             session,
             paths,
             event,
+            ..
         } = &requests[0]
         else {
             panic!("expected a changed request: {:?}", requests[0]);
         };
-        assert_eq!(session.as_str(), "s1/a1");
+        assert_eq!(session.as_str(), "s1");
         assert_eq!(
             *paths,
             vec![cwd.join("src/a.rs")],
             "apply_patch paths are relative to the session's cwd"
         );
         assert_eq!(*event, ChangeEvent::Change);
-        let Request::Flush { session } = &requests[1] else {
+        let Request::Flush { session, .. } = &requests[1] else {
             panic!("expected a flush request: {:?}", requests[1]);
         };
-        assert_eq!(session.as_str(), "s1/a1");
+        assert_eq!(session.as_str(), "s1");
     }
 
     #[tokio::test]
-    async fn test_codex_subagent_stop_ends_the_subagent_session() {
+    async fn test_codex_subagent_stop_keeps_the_subagent_session() {
         let recorder = RecordingOwner::start();
         let out = dispatch_as(
             Host::Codex,
@@ -3466,11 +3479,39 @@ mod tests {
         .await;
 
         assert_eq!(out, "");
-        let requests = recorder.requests();
-        let Request::EndSession { session } = &requests[0] else {
-            panic!("expected an end-session request: {:?}", requests[0]);
-        };
-        assert_eq!(session.as_str(), "s1/a1");
+        assert!(recorder.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_hook_agent_identity_survives_changed_flush_and_ack() {
+        for host in [Host::Claude, Host::Codex] {
+            let recorder = RecordingOwner::start_with_flush(Some(DEFAULT_FLUSH_TEXT.to_string()));
+            let payload = json!({
+                "hook_event_name": if matches!(host, Host::Claude) { "PostToolBatch" } else { "PostToolUse" },
+                "session_id": "root/one",
+                "agent_id": "child/two",
+                "cwd": recorder.project_dir(),
+                "tool_name": "apply_patch",
+                "tool_calls": [{"tool_input": {"file_path": "src/a.rs"}}],
+                "tool_input": {"command": "*** Begin Patch\n*** Update File: src/a.rs\n@@\n-old\n+new\n*** End Patch\n"}
+            });
+            dispatch_as(host, &payload, &recorder).await;
+            let requests = recorder.requests();
+            assert_eq!(requests.len(), 3);
+            for request in requests {
+                let wire = serde_json::to_value(request).unwrap();
+                assert_eq!(wire["session"], "root/one");
+                assert_eq!(wire["agent_id"], "child/two");
+                assert_eq!(
+                    wire["host"],
+                    if matches!(host, Host::Claude) {
+                        "claude"
+                    } else {
+                        "codex"
+                    }
+                );
+            }
+        }
     }
 
     #[test]

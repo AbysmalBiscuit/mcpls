@@ -8,6 +8,7 @@ use std::sync::{Mutex as StdMutex, MutexGuard, PoisonError};
 pub mod apply;
 mod delivery;
 mod encoding;
+mod identity;
 mod notifications;
 pub mod resources;
 mod settle;
@@ -18,6 +19,7 @@ pub use delivery::{
     ChangedFile, ConnectionId, DiagnosticsDelivery, FileEntry, FloorTable, FlushReport, SessionId,
 };
 pub use encoding::{PositionEncoding, lsp_to_mcp_position, mcp_to_lsp_position};
+pub use identity::{Caller, HookAgent, HookHost, RecordId};
 pub use notifications::{
     DiagnosticInfo, LogEntry, LogLevel, MessageType, NotificationCache, ServerMessage,
 };

@@ -119,9 +119,9 @@ pub fn build_handler(
                         queued: sweeper.enqueue(&paths),
                     }
                 }
-                Request::Flush { session } => {
+                Request::Flush { agent, session } => {
                     stats.record_hook_request();
-                    let session = SessionId::from(session);
+                    let session = agent.caller(&session).record;
                     let (report, token) = server.flush_for_hook(&session).await;
                     let mut parts: Vec<String> = Vec::new();
                     if let Some(text) = report {
@@ -135,9 +135,13 @@ pub fn build_handler(
                         token,
                     }
                 }
-                Request::Ack { session, token } => {
+                Request::Ack {
+                    agent,
+                    session,
+                    token,
+                } => {
                     server
-                        .commit_for_hook(&SessionId::from(session), token)
+                        .commit_for_hook(&agent.caller(&session).record, token)
                         .await;
                     Response::Ack
                 }
@@ -474,6 +478,7 @@ mod tests {
             crate::hooks::send_and_acknowledge(
                 &self.identity,
                 &[Request::Flush {
+                    agent: Default::default(),
                     session: session.to_string(),
                 }],
                 Duration::from_secs(5),
@@ -619,6 +624,7 @@ mod tests {
 
         let response = harness
             .send(Request::Changed {
+                agent: Default::default(),
                 session: "s1".to_string(),
                 paths: vec![path],
                 event: ChangeEvent::Change,
@@ -650,6 +656,7 @@ mod tests {
             assert_eq!(
                 harness
                     .send(Request::Changed {
+                        agent: Default::default(),
                         session: "s1".to_string(),
                         paths: vec![path.clone()],
                         event: ChangeEvent::Change,
@@ -706,6 +713,7 @@ mod tests {
 
         let latest = harness
             .send(Request::Flush {
+                agent: Default::default(),
                 session: "s1".to_string(),
             })
             .await;
@@ -739,6 +747,7 @@ mod tests {
             assert_eq!(
                 harness
                     .send(Request::Changed {
+                        agent: Default::default(),
                         session: "s1".to_string(),
                         paths: vec![path.clone()],
                         event: ChangeEvent::Change,
@@ -797,6 +806,7 @@ mod tests {
 
         let second = harness
             .send(Request::Flush {
+                agent: Default::default(),
                 session: "s1".to_string(),
             })
             .await;
@@ -839,6 +849,7 @@ mod tests {
         let harness = HookHarness::owner_with_one_error().await;
         let first = harness
             .send(Request::Flush {
+                agent: Default::default(),
                 session: "s1".to_string(),
             })
             .await;
@@ -855,6 +866,7 @@ mod tests {
 
         let second = harness
             .send(Request::Flush {
+                agent: Default::default(),
                 session: "s1".to_string(),
             })
             .await;
@@ -879,6 +891,7 @@ mod tests {
             token: Some(stale), ..
         } = harness
             .send(Request::Flush {
+                agent: Default::default(),
                 session: "s1".to_string(),
             })
             .await
@@ -890,6 +903,7 @@ mod tests {
             ..
         } = harness
             .send(Request::Flush {
+                agent: Default::default(),
                 session: "s1".to_string(),
             })
             .await
@@ -900,6 +914,7 @@ mod tests {
 
         let answer = harness
             .send(Request::Ack {
+                agent: Default::default(),
                 session: "s1".to_string(),
                 token: stale,
             })
@@ -908,6 +923,7 @@ mod tests {
 
         let third = harness
             .send(Request::Flush {
+                agent: Default::default(),
                 session: "s1".to_string(),
             })
             .await;
@@ -929,11 +945,13 @@ mod tests {
         let harness = HookHarness::owner_with_one_error().await;
         let _ = harness
             .send(Request::Flush {
+                agent: Default::default(),
                 session: "s1".to_string(),
             })
             .await;
         let other = harness
             .send(Request::Flush {
+                agent: Default::default(),
                 session: "s2".to_string(),
             })
             .await;
@@ -955,6 +973,7 @@ mod tests {
         let harness = HookHarness::owner_with_one_error().await;
         let _ = harness
             .send(Request::Flush {
+                agent: Default::default(),
                 session: "s1".to_string(),
             })
             .await;
@@ -965,6 +984,7 @@ mod tests {
             .await;
         let again = harness
             .send(Request::Flush {
+                agent: Default::default(),
                 session: "s1".to_string(),
             })
             .await;
@@ -992,6 +1012,7 @@ mod tests {
             ..
         } = harness
             .send(Request::Flush {
+                agent: Default::default(),
                 session: "s1".to_string(),
             })
             .await
@@ -1036,6 +1057,7 @@ mod tests {
 
         let early = harness
             .send(Request::Flush {
+                agent: Default::default(),
                 session: "s1".to_string(),
             })
             .await;
@@ -1053,6 +1075,7 @@ mod tests {
             ..
         } = harness
             .send(Request::Flush {
+                agent: Default::default(),
                 session: "s1".to_string(),
             })
             .await
@@ -1149,6 +1172,7 @@ mod tests {
         cancel_tx.send(true).expect("cancel");
 
         let response = handler(Request::Changed {
+            agent: Default::default(),
             session: "s1".to_string(),
             paths: vec![path],
             event: ChangeEvent::Change,
@@ -1294,6 +1318,7 @@ mod tests {
         let queued = crate::hooks::send(
             &identity,
             &Request::Changed {
+                agent: Default::default(),
                 session: "s1".to_string(),
                 paths: vec![dunce::canonicalize(&changed).expect("canonicalize")],
                 event: ChangeEvent::Change,
@@ -1313,6 +1338,7 @@ mod tests {
             }) = crate::hooks::send(
                 &identity,
                 &Request::Flush {
+                    agent: Default::default(),
                     session: "s1".to_string(),
                 },
                 Duration::from_secs(5),

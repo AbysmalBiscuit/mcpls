@@ -8,6 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use mcpls_core::bridge::{HookAgent, HookHost};
 use mcpls_core::hooks::{ChangeEvent, Request, SocketIdentity, send, send_and_acknowledge};
 use serde::Deserialize;
 use serde_json::Value;
@@ -37,15 +38,6 @@ struct CodexPayload {
 }
 
 impl CodexPayload {
-    /// The session a request is filed under. A subagent files under
-    /// `session/agent`, so its diagnostics reach it rather than its parent.
-    fn session(&self) -> String {
-        match self.agent_id.as_deref() {
-            Some(agent) if !agent.is_empty() => format!("{}/{agent}", self.session_id),
-            _ => self.session_id.clone(),
-        }
-    }
-
     /// The files an `apply_patch` call touched, resolved against the
     /// session's `cwd`, which the envelope's relative paths are written
     /// against.
@@ -86,17 +78,25 @@ pub(super) async fn run(
     let Some(identity) = identity else {
         return Ok(String::new());
     };
-    let session = payload.session();
+    let session = payload.session_id.clone();
+    let agent = HookAgent {
+        agent_id: payload.agent_id.clone(),
+        host: HookHost::Codex,
+    };
 
     match payload.hook_event_name.as_str() {
         "PostToolUse" => {
             let requests = [
                 Request::Changed {
+                    agent: agent.clone(),
                     session: session.clone(),
                     paths: payload.patched_paths(project_dir),
                     event: ChangeEvent::Change,
                 },
-                Request::Flush { session },
+                Request::Flush {
+                    agent: agent.clone(),
+                    session,
+                },
             ];
             let responses = send_and_acknowledge(identity, &requests, FLUSH_SOCKET_TIMEOUT).await?;
             let context = responses.into_iter().nth(1).and_then(flush_context);
@@ -106,7 +106,10 @@ pub(super) async fn run(
         "UserPromptSubmit" => {
             let responses = send_and_acknowledge(
                 identity,
-                &[Request::Flush { session }],
+                &[Request::Flush {
+                    agent: agent.clone(),
+                    session,
+                }],
                 FLUSH_SOCKET_TIMEOUT,
             )
             .await?;
@@ -114,7 +117,7 @@ pub(super) async fn run(
             Ok(additional_context_output("UserPromptSubmit", context))
         }
 
-        "SubagentStop" | "SessionEnd" => {
+        "SessionEnd" => {
             send(identity, &Request::EndSession { session }, SOCKET_TIMEOUT).await?;
             Ok(String::new())
         }

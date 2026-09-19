@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::bridge::ServerLifecycle;
+use crate::bridge::{HookAgent, ServerLifecycle};
 
 /// A message sent from a Claude Code hook to a running mcpls.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,6 +23,9 @@ pub enum Request {
     /// Sent by the `PostToolBatch` hook for a batch's paths ahead of its
     /// `flush`.
     Changed {
+        /// Agent identity supplied by the host, absent for root hooks.
+        #[serde(flatten)]
+        agent: HookAgent,
         /// The Claude Code session that made the edit.
         session: String,
         /// The files the host reports as touched.
@@ -34,6 +37,9 @@ pub enum Request {
     /// the `UserPromptSubmit` hook, asking for the diagnostics context to
     /// inject before the next turn.
     Flush {
+        /// Agent whose delivery record is read.
+        #[serde(flatten)]
+        agent: HookAgent,
         /// The Claude Code session to flush.
         session: String,
     },
@@ -42,6 +48,9 @@ pub enum Request {
     /// same connection as the `flush`. Never sent for an answer with no
     /// token, which had nothing to mark.
     Ack {
+        /// Agent whose report is acknowledged.
+        #[serde(flatten)]
+        agent: HookAgent,
         /// The Claude Code session the acknowledged flush was for.
         session: String,
         /// The token the `flush` answer carried.
@@ -201,6 +210,7 @@ mod tests {
     #[test]
     fn test_a_changed_request_round_trips() {
         let request = Request::Changed {
+            agent: Default::default(),
             session: "s1".to_string(),
             paths: vec![abs("src/a.rs")],
             event: ChangeEvent::Change,
@@ -216,6 +226,7 @@ mod tests {
     #[test]
     fn test_the_wire_names_match_the_spec() {
         let line = serde_json::to_string(&Request::Flush {
+            agent: Default::default(),
             session: "s1".to_string(),
         })
         .expect("serialize");
@@ -454,8 +465,9 @@ mod tests {
 
     #[test]
     fn test_the_ack_request_pins_the_wire_shape() {
-        let literal = r#"{"op":"ack","session":"s1","token":7}"#;
+        let literal = r#"{"op":"ack","host":"claude","session":"s1","token":7}"#;
         let value = Request::Ack {
+            agent: Default::default(),
             session: "s1".to_string(),
             token: 7,
         };
