@@ -23,6 +23,9 @@ pub enum Request {
     /// Sent by the `PostToolBatch` hook for a batch's paths ahead of its
     /// `flush`.
     Changed {
+        /// Whether a tool payload identifies the writer of these paths.
+        #[serde(default)]
+        attributed: bool,
         /// Agent identity supplied by the host, absent for root hooks.
         #[serde(flatten)]
         agent: HookAgent,
@@ -210,6 +213,7 @@ mod tests {
     #[test]
     fn test_a_changed_request_round_trips() {
         let request = Request::Changed {
+            attributed: false,
             agent: crate::bridge::HookAgent::default(),
             session: "s1".to_string(),
             paths: vec![abs("src/a.rs")],

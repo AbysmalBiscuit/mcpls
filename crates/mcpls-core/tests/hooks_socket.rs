@@ -445,6 +445,7 @@ async fn test_two_requests_share_one_connection() {
         &identity,
         &[
             Request::Changed {
+                attributed: false,
                 agent: mcpls_core::bridge::HookAgent::default(),
                 session: "s1".to_string(),
                 paths: vec![std::path::PathBuf::from("a.rs")],

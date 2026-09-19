@@ -15,6 +15,12 @@ pub use journal::{Step, execute};
 pub use offsets::LineTable;
 pub use plan::{EditPlan, Operation};
 
+pub(crate) type WriteObserver = Arc<dyn Fn(&[PathBuf]) + Send + Sync>;
+
+tokio::task_local! {
+    pub(crate) static WRITE_OBSERVER: WriteObserver;
+}
+
 use crate::bridge::encoding::{EncodingConverter, PositionEncoding};
 use crate::bridge::translator::ResourceOperation;
 use crate::bridge::{lock_std, uri_to_path, validate_path_against_roots};
@@ -156,6 +162,7 @@ impl Applier {
             ));
         }
 
+        let observer = WRITE_OBSERVER.try_with(Arc::clone).ok();
         let roots = self.roots.clone();
         let config = self.config.clone();
         let invalidated = invalidated.clone();
@@ -171,7 +178,7 @@ impl Applier {
             // Queued before the first step runs: from here on the tree is
             // going to change whether or not anyone is still awaiting this.
             invalidated.extend(&outcome.paths_invalidated);
-            journal::execute(&outcome.steps)?;
+            journal::execute_observed(&outcome.steps, observer.as_ref())?;
             Ok(ApplySummary {
                 files_changed: outcome.files_changed,
                 resource_operations: outcome.resource_operations,
@@ -187,7 +194,7 @@ impl Applier {
 /// [`Planner::resolve`] shapes every overlay key: an existing path becomes
 /// its canonical self, and one that does not exist yet becomes its canonical
 /// parent plus the names below it.
-fn normalize(path: &Path) -> PathBuf {
+pub(crate) fn normalize(path: &Path) -> PathBuf {
     if let Ok(canonical) = dunce::canonicalize(path) {
         return canonical;
     }

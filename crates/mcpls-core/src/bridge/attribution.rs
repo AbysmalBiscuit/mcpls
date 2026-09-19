@@ -8,20 +8,51 @@ impl DiagnosticsDelivery {
         self.sources = sources;
     }
 
+    pub(crate) fn caller(&self, record: RecordId) -> Caller {
+        let root = self.roots.get(&record).cloned().flatten();
+        Caller { record, root }
+    }
+
     /// Associate a caller's record with its root session when known.
     pub fn register_caller(&mut self, caller: &Caller) {
-        let root = self.roots.entry(caller.record.clone()).or_default();
-        if caller.root.is_some() {
-            root.clone_from(&caller.root);
+        let previous = self.roots.entry(caller.record.clone()).or_default().clone();
+        if let Some(root) = &caller.root {
+            if previous.is_none()
+                && let RecordId::Session(provisional) = &caller.record
+                && provisional != root
+            {
+                let keys: Vec<_> = self
+                    .ownership
+                    .keys()
+                    .filter(|(session, _)| session == provisional)
+                    .cloned()
+                    .collect();
+                for key in keys {
+                    if let Some(owner) = self.ownership.remove(&key) {
+                        self.ownership
+                            .entry((root.clone(), key.1))
+                            .and_modify(|existing| existing.writers.extend(owner.writers.clone()))
+                            .or_insert(owner);
+                    }
+                }
+            }
+            self.roots.insert(caller.record.clone(), Some(root.clone()));
         }
     }
 
     /// Attribute changed URI keys to the issuing caller.
     pub fn record_write(&mut self, caller: &Caller, keys: &[String]) {
         self.register_caller(caller);
-        let Some(root) = self.roots.get(&caller.record).cloned().flatten() else {
-            return;
-        };
+        let root = self
+            .roots
+            .get(&caller.record)
+            .cloned()
+            .flatten()
+            .unwrap_or_else(|| match &caller.record {
+                RecordId::Session(session) | RecordId::ClaudeAgent { root: session, .. } => {
+                    session.clone()
+                }
+            });
         for key in keys {
             let owner = self
                 .ownership
@@ -36,7 +67,7 @@ impl DiagnosticsDelivery {
         }
     }
 
-    pub(super) fn observe_owned(&mut self, entries: &[FileEntry<'_>]) {
+    pub(crate) fn observe_owned(&mut self, entries: &[FileEntry<'_>]) {
         for entry in entries {
             let hash = Self::visible_hash(entry.diagnostics, entry.floor);
             for ((root, key), owner) in &self.ownership {
@@ -129,7 +160,14 @@ impl DiagnosticsDelivery {
                 continue;
             }
             if let Some(report) = queue.pop_front()
-                && let Some(owner) = self.ownership.get_mut(&(report.root.clone(), key.clone()))
+                && let Some(owner) = self.ownership.get_mut(&(
+                    self.roots
+                        .get(record)
+                        .cloned()
+                        .flatten()
+                        .unwrap_or_else(|| report.root.clone()),
+                    key.clone(),
+                ))
                 && owner.generation == report.generation
                 && report.file.floor != SeverityFloor::Off
             {

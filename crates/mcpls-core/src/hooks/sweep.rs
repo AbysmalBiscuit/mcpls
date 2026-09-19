@@ -122,6 +122,16 @@ impl Sweeper {
         }
     }
 
+    /// The paths that belong to a configured root, in the spelling a
+    /// published diagnostic carries.
+    pub fn admitted_paths(&self, paths: &[PathBuf]) -> Vec<PathBuf> {
+        paths
+            .iter()
+            .map(|path| crate::bridge::apply::normalize(path))
+            .filter(|path| self.filter.admits(path))
+            .collect()
+    }
+
     /// Queue paths a host hook reported. Returns how many survived the
     /// filters.
     pub fn enqueue(&self, paths: &[PathBuf]) -> usize {
@@ -143,10 +153,7 @@ impl Sweeper {
     /// take away the spawn the agent's edit earned.
     pub fn enqueue_from(&self, paths: &[PathBuf], origin: Origin) -> usize {
         let mut admitted = 0;
-        for path in paths {
-            if !self.filter.admits(path) {
-                continue;
-            }
+        for path in self.admitted_paths(paths) {
             admitted += 1;
             lock_std(&self.pending)
                 .entry(path.clone())

@@ -15,10 +15,6 @@ use serde_json::Value;
 
 use super::{FLUSH_SOCKET_TIMEOUT, SOCKET_TIMEOUT, additional_context_output, flush_context};
 
-/// Envelope headers that name a file. `Move to` is a rename's destination,
-/// so a rename reports both ends.
-const PATCH_VERBS: [&str; 4] = ["Add File", "Update File", "Delete File", "Move to"];
-
 /// The Codex hook payload, keeping only the fields the dispatch below reads.
 /// Every field but the event name is defaulted, since which ones are present
 /// depends on the event.
@@ -59,14 +55,57 @@ impl CodexPayload {
 
 /// Every file path an `apply_patch` envelope names, in order, verbatim.
 fn apply_patch_paths(envelope: &str) -> Vec<&str> {
-    envelope
-        .lines()
-        .filter_map(|line| {
-            let (verb, path) = line.trim().strip_prefix("*** ")?.split_once(": ")?;
-            let path = path.trim();
-            (PATCH_VERBS.contains(&verb) && !path.is_empty()).then_some(path)
-        })
-        .collect()
+    let mut lines = envelope.lines();
+    if lines.next() != Some("*** Begin Patch") {
+        return Vec::new();
+    }
+    let mut paths = Vec::new();
+    let mut mode = "";
+    let mut can_move = false;
+    let mut ended = false;
+    for line in lines {
+        if ended {
+            if !line.is_empty() {
+                return Vec::new();
+            }
+            continue;
+        }
+        if line == "*** End Patch" {
+            ended = true;
+        } else if let Some(header) = line.strip_prefix("*** ") {
+            let Some((verb, path)) = header.split_once(": ") else {
+                if line == "*** End of File" && mode == "Update File" {
+                    continue;
+                }
+                return Vec::new();
+            };
+            if path.is_empty() {
+                return Vec::new();
+            }
+            match verb {
+                "Add File" | "Update File" | "Delete File" => {
+                    mode = verb;
+                    can_move = verb == "Update File";
+                }
+                "Move to" if can_move => {
+                    can_move = false;
+                }
+                _ => return Vec::new(),
+            }
+            paths.push(path);
+        } else {
+            can_move = false;
+            let valid = match mode {
+                "Add File" => line.starts_with('+'),
+                "Update File" => line.starts_with([' ', '+', '-']) || line.starts_with("@@"),
+                _ => false,
+            };
+            if !valid {
+                return Vec::new();
+            }
+        }
+    }
+    if ended { paths } else { Vec::new() }
 }
 
 pub(super) async fn run(
@@ -88,6 +127,7 @@ pub(super) async fn run(
         "PostToolUse" => {
             let requests = [
                 Request::Changed {
+                    attributed: true,
                     agent: agent.clone(),
                     session: session.clone(),
                     paths: payload.patched_paths(project_dir),

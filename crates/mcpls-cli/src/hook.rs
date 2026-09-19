@@ -116,6 +116,7 @@ async fn run(stdin: &str, identity: Option<&SocketIdentity>) -> Result<String> {
                 .collect();
             let requests = [
                 Request::Changed {
+                    attributed: true,
                     agent: agent.clone(),
                     session: payload.session_id.clone(),
                     paths,
@@ -1560,6 +1561,49 @@ mod tests {
                     ));
                 }
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_patch_envelopes_control_writer_claims() {
+        for (patch, expected) in [
+            ("*** Update File: outside.rs", vec![]),
+            (
+                "*** Begin Patch\r\n*** Add File: new name.rs\r\n+*** Delete File: content.rs\r\n*** Update File: old.rs\r\n*** Move to: moved.rs\r\n@@\r\n-old\r\n+new\r\n*** Delete File: gone.rs\r\n*** End Patch\r\n",
+                vec!["new name.rs", "old.rs", "moved.rs", "gone.rs"],
+            ),
+            (
+                "*** Begin Patch\n*** Move to: orphan.rs\n*** End Patch",
+                vec![],
+            ),
+            ("*** Begin Patch\n*** Delete File: lost.rs", vec![]),
+        ] {
+            let recorder = RecordingOwner::start();
+            let cwd = recorder.project_dir().join("subdir");
+            dispatch_as(
+                Host::Codex,
+                &json!({
+                    "hook_event_name": "PostToolUse", "session_id": "root",
+                    "agent_id": "child", "cwd": cwd, "tool_name": "apply_patch",
+                    "tool_input": {"command": patch}
+                }),
+                &recorder,
+            )
+            .await;
+            let requests = recorder.requests();
+            let Request::Changed { paths, .. } = &requests[0] else {
+                panic!("changed");
+            };
+            assert_eq!(
+                *paths,
+                expected
+                    .iter()
+                    .map(|path| cwd.join(path))
+                    .collect::<Vec<_>>(),
+                "{patch}"
+            );
+            let wire = serde_json::to_value(&requests[0]).unwrap();
+            assert_eq!(wire["attributed"], true);
         }
     }
 

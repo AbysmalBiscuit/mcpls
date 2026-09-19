@@ -13,6 +13,31 @@ fn caller(root: &str, agent: &str) -> Caller {
 }
 
 #[test]
+fn a_writer_without_root_metadata_keeps_its_claim_when_resolved() {
+    let mut delivery = DiagnosticsDelivery::new(DiagnosticsConfig::default());
+    let mut a = caller("root", "a");
+    a.root = None;
+    delivery.record_write(&a, &["a.rs".into()]);
+    let errors = vec![diagnostic(0, DiagnosticSeverity::ERROR, "broken")];
+    let entries = [
+        entry("a.rs", &errors, SeverityFloor::Warning),
+        entry("unowned.rs", &errors, SeverityFloor::Warning),
+    ];
+    let report = delivery.flush(&a.record, &entries);
+    assert_eq!(report.changed.len(), 1);
+    assert_eq!(report.changed[0].key, "a.rs");
+    a.root = Some("root".to_string().into());
+    delivery.register_caller(&a);
+    let root = caller("root", "root");
+    delivery.register_caller(&root);
+    assert_eq!(
+        delivery.flush(&root.record, &entries).changed[0].key,
+        "unowned.rs"
+    );
+    assert!(delivery.flush(&a.record, &entries).changed.is_empty());
+}
+
+#[test]
 fn deferred_files_keep_their_snapshot_when_the_cache_disappears() {
     let mut delivery = DiagnosticsDelivery::new(DiagnosticsConfig {
         max_total: 1,

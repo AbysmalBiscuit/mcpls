@@ -1156,28 +1156,7 @@ impl McplsServer {
             let pending_baselines = self.context.settle.pending_diagnostics_baselines();
             let entries =
                 routable_entries_borrowed(&cache, &self.context.floors, &pending_baselines);
-            let snapshots = entries
-                .iter()
-                .filter_map(|entry| {
-                    let info = cache.get_diagnostics(entry.key)?;
-                    let owner = cache.diagnostics_owner(entry.key)?;
-                    let text = uri_to_path(&info.uri).and_then(|path| {
-                        self.context
-                            .translator
-                            .document_tracker()
-                            .get(&path)
-                            .map(|document| Arc::<str>::from(document.content()))
-                    });
-                    Some((
-                        entry.key.to_string(),
-                        Arc::new(DiagnosticSnapshot {
-                            uri: info.uri.clone(),
-                            encoding: self.context.translator.position_encoding_for(owner),
-                            text,
-                        }),
-                    ))
-                })
-                .collect();
+            let snapshots = self.diagnostic_sources(&cache, &entries);
             delivery.capture_sources(snapshots);
             let (report, token) = match advance {
                 Advance::Now => (delivery.flush(session, &entries), None),
@@ -1229,6 +1208,56 @@ impl McplsServer {
     /// something sent more recently, or nothing.
     pub(crate) async fn commit_for_hook(&self, session: impl Into<RecordId>, token: u64) -> bool {
         self.context.delivery.lock().await.commit(session, token)
+    }
+
+    fn diagnostic_sources(
+        &self,
+        cache: &NotificationCache,
+        entries: &[FileEntry<'_>],
+    ) -> HashMap<String, Arc<DiagnosticSnapshot>> {
+        entries
+            .iter()
+            .filter_map(|entry| {
+                let info = cache.get_diagnostics(entry.key)?;
+                let owner = cache.diagnostics_owner(entry.key)?;
+                let text = uri_to_path(&info.uri).and_then(|path| {
+                    self.context
+                        .translator
+                        .document_tracker()
+                        .get(&path)
+                        .map(|document| Arc::<str>::from(document.content()))
+                });
+                Some((
+                    entry.key.to_string(),
+                    Arc::new(DiagnosticSnapshot {
+                        uri: info.uri.clone(),
+                        encoding: self.context.translator.position_encoding_for(owner),
+                        text,
+                    }),
+                ))
+            })
+            .collect()
+    }
+
+    pub(crate) async fn attribute_paths(&self, caller: &Caller, paths: &[PathBuf]) {
+        let mut delivery = self.context.delivery.lock().await;
+        let cache = self.context.notification_cache.lock().await;
+        if delivery.has_baseline() {
+            let pending = self.context.settle.pending_diagnostics_baselines();
+            let entries = routable_entries_borrowed(&cache, &self.context.floors, &pending);
+            delivery.capture_sources(self.diagnostic_sources(&cache, &entries));
+            delivery.observe_owned(&entries);
+        }
+        drop(cache);
+        let keys = paths
+            .iter()
+            .filter_map(|path| {
+                crate::bridge::path_to_uri(path)
+                    .ok()
+                    .map(|uri| uri.to_string())
+            })
+            .collect::<Vec<_>>();
+        delivery.record_write(caller, &keys);
     }
 
     pub(crate) async fn register_caller(&self, caller: &Caller) {
@@ -1583,8 +1612,21 @@ impl ServerHandler for McplsServer {
                 })
                 .await;
         }
+        let caller = server
+            .context
+            .delivery
+            .lock()
+            .await
+            .caller(RecordId::from(&server.session));
+        let writer = server.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let observer: crate::bridge::apply::WriteObserver = Arc::new(move |paths| {
+            runtime.block_on(writer.attribute_paths(&caller, paths));
+        });
         let call = rmcp::handler::server::tool::ToolCallContext::new(&server, request, context);
-        Self::tool_router().call(call).await
+        crate::bridge::apply::WRITE_OBSERVER
+            .scope(observer, Self::tool_router().call(call))
+            .await
     }
 
     /// What `#[tool_handler]` would generate, plus the pass that fits each
@@ -1930,6 +1972,144 @@ mod tests {
                 .unwrap()
                 .contains("broken.rs")
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn cancelled_mcp_write_keeps_its_writer_after_the_future_drops() {
+        use rmcp::ServiceExt as _;
+        use tokio::io::{AsyncWriteExt as _, BufReader, BufStream};
+
+        use crate::bridge::apply::journal::{StepBarrier, install_step_barrier};
+        let mut fixture = CausalWriteFixture::new(WriteTool::Format);
+        fixture
+            .server
+            .context
+            .delivery
+            .lock()
+            .await
+            .set_baseline(HashMap::new());
+        let owner = ServerId::from("rust");
+        if let Some(generation) = fixture.settle.diagnostics_baseline_generation(&owner) {
+            fixture
+                .settle
+                .finish_diagnostics_baseline_merge(&owner, generation);
+        }
+        let arrived = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        install_step_barrier(Some(StepBarrier {
+            path: fixture.path.clone(),
+            arrived: Arc::clone(&arrived),
+            resume: Arc::clone(&resume),
+        }));
+        let (server_io, client_io) = tokio::io::duplex(65_536);
+        let server = fixture.server.for_connection(None);
+        let started = tokio::spawn(async move { server.serve(server_io).await.unwrap() });
+        let mut wire = BufStream::new(client_io);
+        mcp_test_request(
+            &mut wire,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2025-11-25", "capabilities": {},
+                    "clientInfo": {"name": "codex-mcp-client", "version": "1"}}
+            }),
+        )
+        .await;
+        wire.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+            .await
+            .unwrap();
+        wire.flush().await.unwrap();
+        let running = started.await.unwrap();
+        let request = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "format_document", "arguments": WriteTool::Format.mcp_arguments(&fixture.path.display().to_string()),
+                "_meta": {"threadId": "writer", "x-codex-turn-metadata": {"session_id": "root"}}}});
+        wire.write_all(format!("{request}\n").as_bytes())
+            .await
+            .unwrap();
+        wire.flush().await.unwrap();
+        let mut lsp = BufReader::new(&mut fixture.fake.write_stdout);
+        let opened = crate::test_support::read_framed_message(&mut lsp).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let request = crate::test_support::read_framed_message(&mut lsp).await;
+        write_response(
+            &mut fixture.fake.read_half_stdin,
+            &request["id"],
+            WriteTool::Format.reply_rewriting(&fixture.uri),
+        )
+        .await;
+        tokio::task::spawn_blocking(move || arrived.wait())
+            .await
+            .unwrap();
+        wire.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":2}}\n").await.unwrap();
+        wire.flush().await.unwrap();
+        running.cancel().await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&fixture.path).unwrap(),
+            "fn old() {}\n"
+        );
+        tokio::task::spawn_blocking(move || resume.wait())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if std::fs::read_to_string(&fixture.path).unwrap() == "fn new() {}\n" {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        install_step_barrier(None);
+        fixture
+            .server
+            .context
+            .notification_cache
+            .lock()
+            .await
+            .store_diagnostics(
+                &owner,
+                &fixture.uri,
+                None,
+                vec![lsp_types::Diagnostic {
+                    severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+                    message: "after cancellation".into(),
+                    ..Default::default()
+                }],
+            );
+        let caller = crate::bridge::HookAgent {
+            agent_id: Some("writer".into()),
+            host: crate::bridge::HookHost::Codex,
+        }
+        .caller("root");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if fixture
+                    .server
+                    .flush_for_hook(&caller.record)
+                    .await
+                    .0
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let root = crate::bridge::HookAgent::default().caller("root");
+        fixture.server.register_caller(&root).await;
+        assert!(
+            fixture
+                .server
+                .flush_for_hook(&root.record)
+                .await
+                .0
+                .is_none()
+        );
+        let _ = fixture.pump_cancel.send(true);
+        fixture.pump.abort();
     }
 
     #[test]
@@ -2743,7 +2923,7 @@ mod tests {
                     "jsonrpc": "2.0", "id": 1, "method": "initialize",
                     "params": {
                         "protocolVersion": "2025-11-25", "capabilities": {},
-                        "clientInfo": {"name": "causal-write-test", "version": "1"}
+                        "clientInfo": {"name": "codex-mcp-client", "version": "1"}
                     }
                 }),
             )
@@ -2759,7 +2939,7 @@ mod tests {
             let path = self.path.display().to_string();
             let request = json!({
                 "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-                "params": {"name": tool.mcp_name(), "arguments": tool.mcp_arguments(&path)}
+                "params": {"name": tool.mcp_name(), "arguments": tool.mcp_arguments(&path), "_meta": {"threadId": "writer", "x-codex-turn-metadata": {"session_id": "root"}}}
             });
             let call = tokio::spawn(async move {
                 let response = mcp_test_request(&mut wire, request).await;
@@ -2908,6 +3088,9 @@ mod tests {
                 "{tool:?} footer omitted the final diagnostic: {payload}"
             );
 
+            let root = crate::bridge::HookAgent::default().caller("root");
+            self.server.register_caller(&root).await;
+            assert!(self.server.flush_for_hook(&root.record).await.0.is_none());
             let _ = self.pump_cancel.send(true);
             self.pump.abort();
             running.cancel().await.unwrap();
