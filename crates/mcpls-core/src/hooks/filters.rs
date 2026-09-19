@@ -205,69 +205,6 @@ fn read_gitignore(root: &Path) -> (Gitignore, Vec<String>) {
     (ignore, errors)
 }
 
-/// Selected watch paths and failures encountered while inspecting the root.
-///
-/// Superseded by [`WatchSet`], and kept only until the Claude plugin stops
-/// registering the `SessionStart` reply that consumes it.
-#[derive(Debug)]
-pub struct WatchPaths {
-    /// Top-level entries admitted by the scan and ignore rules.
-    pub paths: Vec<PathBuf>,
-    /// Traversal or ignore-rule failures; selected paths may be incomplete.
-    pub errors: Vec<String>,
-}
-
-/// Scan top-level entries using ignore rules; hidden entries are excluded by default.
-///
-/// Explicit allow rules can include hidden entries.
-/// This does not verify that a host registered the paths or can watch their descendants.
-///
-/// Superseded by [`watch_set`], which walks the whole tree rather than one
-/// level of it, and kept only until the `SessionStart` reply goes.
-#[must_use]
-pub fn watch_paths(root: &Path) -> WatchPaths {
-    let (ignore, errors) = read_gitignore(root);
-    let mut result = WatchPaths {
-        paths: Vec::new(),
-        errors,
-    };
-    if root.is_file() {
-        result.errors.push(format!(
-            "{}: project root is not a directory",
-            root.display()
-        ));
-        return result;
-    }
-    for entry in WalkBuilder::new(root)
-        .hidden(true)
-        .max_depth(Some(1))
-        .build()
-    {
-        match entry {
-            Ok(entry) => {
-                if let Some(error) = entry.error() {
-                    result.errors.push(error.to_string());
-                }
-                if entry.path() == root {
-                    continue;
-                }
-                let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
-                if !ignore
-                    .matched_path_or_any_parents(entry.path(), is_dir)
-                    .is_ignore()
-                {
-                    result.paths.push(entry.into_path());
-                }
-            }
-            Err(error) => result.errors.push(error.to_string()),
-        }
-    }
-    result.paths.sort();
-    result.errors.sort();
-    result.errors.dedup();
-    result
-}
-
 /// The directories to watch and the files under them worth sweeping.
 #[derive(Debug, Default)]
 pub struct WatchSet {
@@ -727,27 +664,6 @@ mod tests {
              directory of its own build output"
         );
         assert!(!directories.contains(&dir.path().join("node_modules")));
-    }
-
-    #[test]
-    fn test_watch_paths_names_children_rather_than_the_root() {
-        let dir = tempfile::tempdir().expect("a temp dir");
-        std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
-        std::fs::create_dir_all(dir.path().join("target")).expect("mkdir");
-        std::fs::create_dir_all(dir.path().join(".git")).expect("mkdir");
-        std::fs::write(dir.path().join("Cargo.toml"), "").expect("write");
-        std::fs::write(dir.path().join(".gitignore"), "/target\n").expect("write");
-
-        let paths = watch_paths(dir.path()).paths;
-
-        assert!(paths.contains(&dir.path().join("src")));
-        assert!(paths.contains(&dir.path().join("Cargo.toml")));
-        assert!(
-            !paths.contains(&dir.path().join("target")),
-            "the host's watcher passes no ignore list, so this list is the only \
-             thing keeping a hook process off every build artifact"
-        );
-        assert!(!paths.contains(&dir.path().join(".git")));
     }
 
     #[test]

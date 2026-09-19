@@ -122,7 +122,7 @@
       "properties": {
         "enabled": {
           "default": true,
-          "description": "Whether the listener binds at all.\n\nDefaults on, because reaching this configuration means installing\nthe plugin and installing the plugin is the opt-in. With this off,\nno listener binds, but `SessionStart` still performs its local watch scan.",
+          "description": "Whether the listener binds at all.\n\nDefaults on, because reaching this configuration means installing\nthe plugin and installing the plugin is the opt-in. With this off,\nno listener binds and the agent's own edits reach no language\nserver, though the backend's watcher still reports what changes on\ndisk.",
           "type": "boolean"
         },
         "op_deadline_ms": {

@@ -81,7 +81,6 @@ fn test_every_entry_runs_mcpls_from_path() {
             "mcpls hook",
             "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" bootstrap-binaries claude",
             &[
-                "FileChanged",
                 "PostToolBatch",
                 "SessionEnd",
                 "SessionStart",

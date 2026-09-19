@@ -3,8 +3,7 @@
 //! Codex's payloads differ from Claude Code's in the fields read here: a
 //! subagent carries its own `agent_id`, and the `apply_patch` edit tool names
 //! its files inside a patch envelope rather than in a `file_path`. Codex
-//! fails a hook whose JSON output carries a field it does not know, so
-//! nothing here emits Claude Code's `watchPaths`.
+//! fails a hook whose JSON output carries a field it does not know.
 
 use std::path::{Path, PathBuf};
 

@@ -726,62 +726,6 @@ fn test_completions_survives_a_closed_pipe() {
     }
 }
 
-/// Unset `CLAUDE_PROJECT_DIR` exercises canonicalization of the relative CWD fallback.
-#[test]
-fn test_hook_session_start_emits_absolute_watch_paths() {
-    let temp_dir = TempDir::new().unwrap();
-    fs::create_dir_all(temp_dir.path().join("src")).unwrap();
-
-    let mut cmd = assert_cmd::Command::cargo_bin("mcpls").unwrap();
-    cmd.env_remove("MCPLS_LOG")
-        .env_remove("MCPLS_CONFIG")
-        .env_remove("MCPLS_TRUST_PROJECT_CONFIG")
-        .env_remove("MCPLS_LOG_JSON")
-        .env_remove("MCPLS_NO_BACKEND")
-        .env_remove("CLAUDE_PROJECT_DIR");
-    let assert = cmd
-        .arg("hook")
-        .current_dir(temp_dir.path())
-        .write_stdin(r#"{"hook_event_name":"SessionStart"}"#)
-        .assert()
-        .success();
-
-    let output = assert.get_output();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(
-        parsed["hookSpecificOutput"]["hookEventName"],
-        "SessionStart"
-    );
-    let paths = parsed["hookSpecificOutput"]["watchPaths"]
-        .as_array()
-        .unwrap();
-    assert!(!paths.is_empty());
-    for path in paths {
-        let path = path.as_str().unwrap();
-        assert!(
-            std::path::Path::new(path).is_absolute(),
-            "a watch path must be absolute, not relative to the hook \
-             process's own working directory: {path}"
-        );
-    }
-}
-
-fn session_start(project: &std::path::Path) -> serde_json::Value {
-    let mut cmd = Command::cargo_bin("mcpls").unwrap();
-    clear_ambient_env(&mut cmd);
-    let output = assert_cmd::Command::from_std(cmd)
-        .env("CLAUDE_PROJECT_DIR", project)
-        .arg("hook")
-        .write_stdin(r#"{"hook_event_name":"SessionStart"}"#)
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    serde_json::from_slice(&output).unwrap()
-}
-
 fn doctor_output(project: &std::path::Path) -> String {
     let runtime = TempDir::new().unwrap();
     let mut cmd = Command::cargo_bin("mcpls").unwrap();
@@ -1047,49 +991,89 @@ async fn test_codex_hook_reaches_the_owner_named_by_the_payload_cwd() {
 /// A hook invocation must never panic on a closed stdout, the same
 /// guarantee `test_completions_survives_a_closed_pipe` proves for
 /// `completions`: a hook branch that wrote with `print!` would panic past
-/// the `LineWriter`'s buffer, so the project directory here has enough
-/// top-level entries to force a real write rather than one that sits in
-/// that buffer until the ignored exit-time flush.
+/// the `LineWriter`'s buffer. `SessionStart` used to force that real write
+/// on its own, but it now falls through to the empty catch-all, so this
+/// answers `UserPromptSubmit` from a live owner instead, which is what
+/// gives the hook non-empty JSON to write against the closed pipe.
 #[cfg(unix)]
-#[test]
-fn test_hook_survives_a_closed_pipe() {
+#[tokio::test]
+async fn test_hook_survives_a_closed_pipe() {
     use std::io::Write as _;
     use std::process::Stdio;
 
-    let temp_dir = TempDir::new().unwrap();
-    for i in 0..200 {
-        fs::create_dir_all(temp_dir.path().join(format!("dir{i}"))).unwrap();
-    }
+    use mcpls_core::hooks::{HookListener, Request, Response};
 
-    let mut departed_reader = Command::new("true").stdin(Stdio::piped()).spawn().unwrap();
-    let closed_pipe = departed_reader.stdin.take().unwrap();
-    departed_reader.wait().unwrap();
+    let project = TempDir::new().unwrap();
+    let runtime = TempDir::new().unwrap();
+    let hash = mcpls_core::hooks::identity_hash(project.path()).unwrap();
+    let identity = mcpls_core::hooks::SocketIdentity {
+        socket: runtime
+            .path()
+            .join("mcpls-mcpls-test")
+            .join(format!("{hash}.sock")),
+        lock: runtime
+            .path()
+            .join("mcpls-mcpls-test")
+            .join(format!("{hash}.lock")),
+        hash,
+    };
+    let listener = HookListener::acquire(&identity).await.unwrap().unwrap();
+    let (cancel, rx) = tokio::sync::watch::channel(false);
+    let owner = tokio::spawn(listener.serve(
+        |request| {
+            Box::pin(async move {
+                match request {
+                    Request::Flush { .. } => Response::Flush {
+                        context: Some("diagnostic".into()),
+                        token: None,
+                    },
+                    _ => unreachable!(),
+                }
+            })
+        },
+        Duration::from_secs(1),
+        rx,
+    ));
 
-    let mut cmd = Command::cargo_bin("mcpls").unwrap();
-    let mut child = clear_ambient_env(&mut cmd)
-        .arg("hook")
-        .env("CLAUDE_PROJECT_DIR", temp_dir.path())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::from(closed_pipe))
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(br#"{"hook_event_name":"SessionStart"}"#)
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    tokio::task::spawn_blocking(move || {
+        let mut departed_reader = Command::new("true").stdin(Stdio::piped()).spawn().unwrap();
+        let closed_pipe = departed_reader.stdin.take().unwrap();
+        departed_reader.wait().unwrap();
 
-    assert!(
-        !stderr.contains("panicked"),
-        "a closed pipe must not panic: {stderr}"
-    );
-    assert!(
-        output.status.success(),
-        "a closed pipe is a clean exit, got {:?}: {stderr}",
-        output.status
-    );
+        let mut cmd = Command::cargo_bin("mcpls").unwrap();
+        let mut child = clear_ambient_env(&mut cmd)
+            .arg("hook")
+            .env("CLAUDE_PROJECT_DIR", project.path())
+            .env_remove("XDG_RUNTIME_DIR")
+            .env("TMPDIR", runtime.path())
+            .env("USER", "mcpls-test")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::from(closed_pipe))
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(br#"{"hook_event_name":"UserPromptSubmit","session_id":"s1"}"#)
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            !stderr.contains("panicked"),
+            "a closed pipe must not panic: {stderr}"
+        );
+        assert!(
+            output.status.success(),
+            "a closed pipe is a clean exit, got {:?}: {stderr}",
+            output.status
+        );
+    })
+    .await
+    .unwrap();
+
+    cancel.send(true).unwrap();
+    owner.await.unwrap();
 }

@@ -14,11 +14,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Result;
-use mcpls_core::hooks::filters::WatchPaths;
 use mcpls_core::hooks::protocol::ServerStatus;
 use mcpls_core::hooks::{
     ChangeEvent, ProbeOutcome, Request, Response, SocketIdentity, WatcherStatus, probe, send,
-    send_and_acknowledge, watch_paths,
+    send_and_acknowledge,
 };
 use serde::Deserialize;
 
@@ -61,10 +60,6 @@ struct HookPayload {
     #[serde(default)]
     session_id: String,
     #[serde(default)]
-    file_path: Option<PathBuf>,
-    #[serde(default)]
-    event: Option<ChangeEvent>,
-    #[serde(default)]
     tool_calls: Vec<ToolCall>,
 }
 
@@ -87,8 +82,6 @@ async fn silently<T: Default>(body: impl Future<Output = Result<T>>) -> T {
 }
 
 /// Return hook JSON, or an empty answer on payload or socket failure.
-/// Claude Code's `SessionStart` works without an identity and reports local
-/// watch-scan failures.
 pub async fn dispatch_payload(
     host: Host,
     stdin: &str,
@@ -96,39 +89,15 @@ pub async fn dispatch_payload(
     identity: Option<&SocketIdentity>,
 ) -> String {
     match host {
-        Host::Claude => silently(run(stdin, project_dir, identity)).await,
+        Host::Claude => silently(run(stdin, identity)).await,
         Host::Codex => silently(codex::run(stdin, project_dir, identity)).await,
     }
 }
 
-async fn run(stdin: &str, project_dir: &Path, identity: Option<&SocketIdentity>) -> Result<String> {
+async fn run(stdin: &str, identity: Option<&SocketIdentity>) -> Result<String> {
     let payload: HookPayload = serde_json::from_str(stdin)?;
 
     match payload.hook_event_name.as_str() {
-        // The owner may still be starting, so watch-path selection is local.
-        "SessionStart" => Ok(session_start_output(&watch_paths(project_dir))),
-
-        "FileChanged" => {
-            let Some(identity) = identity else {
-                return Ok(String::new());
-            };
-            let Some(file_path) = payload.file_path else {
-                return Ok(String::new());
-            };
-            let event = payload.event.unwrap_or(ChangeEvent::Change);
-            send(
-                identity,
-                &Request::Changed {
-                    session: payload.session_id,
-                    paths: vec![file_path],
-                    event,
-                },
-                SOCKET_TIMEOUT,
-            )
-            .await?;
-            Ok(String::new())
-        }
-
         "PostToolBatch" => {
             let Some(identity) = identity else {
                 return Ok(String::new());
@@ -198,26 +167,6 @@ fn flush_context(response: Response) -> Option<String> {
     }
 }
 
-/// The `SessionStart` hook's JSON, naming the directories to watch.
-fn session_start_output(scan: &WatchPaths) -> String {
-    let watch_paths: Vec<String> = scan
-        .paths
-        .iter()
-        .map(|path| path.display().to_string())
-        .collect();
-    let mut output = serde_json::json!({ "hookSpecificOutput": {
-        "hookEventName": "SessionStart", "watchPaths": watch_paths
-    }});
-    if !scan.errors.is_empty() {
-        output["systemMessage"] = serde_json::json!(format!(
-            "mcpls: watch-path scan incomplete; external edits may be missed. {}. \
-             Fix the reported scan errors and restart the session; inspect with mcpls hook doctor.",
-            scan.errors.join("; ")
-        ));
-    }
-    output.to_string()
-}
-
 /// The doctor's line for the backend's filesystem watcher.
 ///
 /// The watcher lives in the backend now, so unlike the local scan this
@@ -259,7 +208,6 @@ const MAX_FOREIGN_CANDIDATES: usize = 16;
 /// resolves on `PATH`.
 ///
 /// Socket failures are silent in hooks; this command reports their cause.
-/// `SessionStart` separately warns when its watch-path scan is incomplete.
 pub async fn doctor(
     project_dir: &Path,
     root: &Path,
@@ -427,11 +375,11 @@ const fn foreign_scan_prefix() -> String {
 /// requests the answering owner has served since it started.
 ///
 /// A count of zero does not, on its own, mean a plugin was never wired up:
-/// `SessionStart` never touches the socket by design, so a server that
-/// started moments ago, or just took over from a previous owner, reads
-/// exactly the same as one nobody ever registered. The doctor cannot tell
-/// those apart, so it states the count and hands the reader the one thing
-/// that resolves the ambiguity, rather than guessing at a cause.
+/// a server that started moments ago, or just took over from a previous
+/// owner, reads exactly the same as one nobody ever registered. The
+/// doctor cannot tell those apart, so it states the count and hands the
+/// reader the one thing that resolves the ambiguity, rather than guessing
+/// at a cause.
 fn hooks_seen_line(count: u64) -> String {
     if count == 0 {
         "hooks seen: none since this owner started; send a prompt or make an \
@@ -1613,31 +1561,6 @@ mod tests {
     const SLOW_FLUSH_DELAY: Duration = Duration::from_millis(100);
 
     #[tokio::test]
-    async fn test_a_missing_identity_still_lets_session_start_answer() {
-        let dir = tempfile::tempdir().expect("a temp dir");
-        std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
-
-        let out = super::dispatch_payload(
-            Host::Claude,
-            &json!({ "hook_event_name": "SessionStart" }).to_string(),
-            dir.path(),
-            None,
-        )
-        .await;
-
-        let parsed: serde_json::Value = serde_json::from_str(&out).expect("json");
-        assert!(
-            !parsed["hookSpecificOutput"]["watchPaths"]
-                .as_array()
-                .expect("watchPaths")
-                .is_empty(),
-            "SessionStart never touches the socket, so a missing identity \
-             (an unreachable or over-long project directory) must not \
-             suppress it: {out}"
-        );
-    }
-
-    #[tokio::test]
     async fn test_a_missing_identity_produces_no_output_for_socket_using_arms() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let out = super::dispatch_payload(
@@ -1699,35 +1622,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_session_start_returns_watch_paths_without_a_socket() {
-        let dir = tempfile::tempdir().expect("a temp dir");
-        std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
-
-        let out = dispatch(&json!({ "hook_event_name": "SessionStart" }), dir.path()).await;
-
-        let parsed: serde_json::Value = serde_json::from_str(&out).expect("json");
-        let paths = parsed["hookSpecificOutput"]["watchPaths"]
-            .as_array()
-            .expect("watchPaths");
-        assert!(!paths.is_empty());
-        for path in paths {
-            let path = path.as_str().expect("a string path");
-            assert!(
-                Path::new(path).starts_with(dir.path()),
-                "SessionStart must watch the project directory it was given, \
-                 not some other directory: {path}"
-            );
-        }
-        // No listener is bound in this test at all.
-        assert!(
-            !out.contains("error"),
-            "SessionStart fires while the host is still spawning the MCP server, \
-             so asking a socket that is not bound yet would leave the session \
-             with either no coverage or an unbounded watcher over target/"
-        );
-    }
-
-    #[tokio::test]
     async fn test_an_unreachable_socket_produces_no_output_and_exit_zero() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let out = dispatch(
@@ -1753,80 +1647,6 @@ mod tests {
         let dir = tempfile::tempdir().expect("a temp dir");
         let out = dispatch_raw("not json at all", dir.path()).await;
         assert_eq!(out, "");
-    }
-
-    #[tokio::test]
-    async fn test_file_changed_sends_a_changed_request_with_the_path_and_event() {
-        let recorder = RecordingOwner::start();
-        let file = recorder.project_dir().join("a.rs");
-        let out = dispatch_against(
-            &json!({
-                "hook_event_name": "FileChanged",
-                "session_id": "s1",
-                "file_path": file.display().to_string(),
-                "event": "add"
-            }),
-            &recorder,
-        )
-        .await;
-
-        assert_eq!(out, "", "FileChanged never injects context");
-        let requests = recorder.requests();
-        assert_eq!(requests.len(), 1);
-        let Request::Changed {
-            session,
-            paths,
-            event,
-        } = &requests[0]
-        else {
-            panic!("expected a changed request: {:?}", requests[0]);
-        };
-        assert_eq!(session.as_str(), "s1");
-        assert_eq!(*paths, vec![file]);
-        assert_eq!(*event, ChangeEvent::Add);
-    }
-
-    #[tokio::test]
-    async fn test_file_changed_without_an_event_defaults_to_change() {
-        let recorder = RecordingOwner::start();
-        let file = recorder.project_dir().join("a.rs");
-        dispatch_against(
-            &json!({
-                "hook_event_name": "FileChanged",
-                "session_id": "s1",
-                "file_path": file.display().to_string()
-            }),
-            &recorder,
-        )
-        .await;
-
-        let requests = recorder.requests();
-        assert_eq!(requests.len(), 1);
-        let Request::Changed { event, .. } = &requests[0] else {
-            panic!("expected a changed request: {:?}", requests[0]);
-        };
-        assert_eq!(
-            *event,
-            ChangeEvent::Change,
-            "an event kind the host omits must default to Change, not some \
-             other kind that would mislead the sweep's hint"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_file_changed_without_a_file_path_sends_nothing() {
-        let recorder = RecordingOwner::start();
-        let out = dispatch_against(
-            &json!({ "hook_event_name": "FileChanged", "session_id": "s1" }),
-            &recorder,
-        )
-        .await;
-        assert_eq!(out, "");
-        assert_eq!(
-            recorder.ops(),
-            Vec::<String>::new(),
-            "a FileChanged payload with no file_path must not open a connection at all"
-        );
     }
 
     #[tokio::test]
@@ -2496,13 +2316,12 @@ mod tests {
         assert_eq!(lines[4], super::BACKEND_PID_UNKNOWN);
     }
 
-    /// `SessionStart` never touches the socket by design, so a server
-    /// that started moments ago, or just took over from a previous
-    /// owner, reads exactly like one nobody ever registered. The old
-    /// wording asserted "may not be registered" on this state, which is a
-    /// false alarm against a perfectly healthy, freshly started owner;
-    /// the doctor cannot tell the two apart and must not guess which one
-    /// it is looking at.
+    /// A server that started moments ago, or just took over from a
+    /// previous owner, reads exactly like one nobody ever registered. The
+    /// old wording asserted "may not be registered" on this state, which
+    /// is a false alarm against a perfectly healthy, freshly started
+    /// owner; the doctor cannot tell the two apart and must not guess
+    /// which one it is looking at.
     #[tokio::test]
     async fn test_doctor_states_zero_hooks_seen_without_claiming_the_plugin_is_unregistered() {
         let project = tempfile::tempdir().expect("a temp dir");
@@ -3592,26 +3411,6 @@ mod tests {
             panic!("expected a flush request: {:?}", requests[1]);
         };
         assert_eq!(session.as_str(), "s1/a1");
-    }
-
-    #[tokio::test]
-    async fn test_codex_session_start_prints_nothing() {
-        let dir = tempfile::tempdir().expect("a temp dir");
-        std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
-
-        let out = super::dispatch_payload(
-            Host::Codex,
-            &json!({ "hook_event_name": "SessionStart", "session_id": "s1" }).to_string(),
-            dir.path(),
-            None,
-        )
-        .await;
-
-        assert_eq!(
-            out, "",
-            "Codex fails a SessionStart hook whose JSON carries a field it does \
-             not know, and watchPaths is one"
-        );
     }
 
     #[tokio::test]

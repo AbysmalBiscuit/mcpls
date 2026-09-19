@@ -20,8 +20,8 @@ use crate::bridge::ServerLifecycle;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
-    /// Sent by the `FileChanged` hook for one path, and by the
-    /// `PostToolBatch` hook for a batch's paths ahead of its `flush`.
+    /// Sent by the `PostToolBatch` hook for a batch's paths ahead of its
+    /// `flush`.
     Changed {
         /// The Claude Code session that made the edit.
         session: String,
