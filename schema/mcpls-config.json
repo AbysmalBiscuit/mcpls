@@ -94,6 +94,13 @@
           "minimum": 0,
           "type": "integer"
         },
+        "record_grace_ms": {
+          "default": 60000,
+          "description": "How long an unprotected delivery record survives without hook activity.\nZero expires it immediately once no connection protects it.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "settle_deadline_ms": {
           "default": 300000,
           "description": "How long to wait for that quiet before giving up and baselining\nanyway. Bounds the damage from a server that never finishes, or from\na progress notification dropped before its pump existed.\n\nCounted from the moment the language servers are spawned, so it\ncovers indexing rather than the handshake that precedes it. It must\noutlast a full index of the workspace: firing before that captures a\npartial baseline, and every file analyzed afterwards then reads as\nnewly changed.",

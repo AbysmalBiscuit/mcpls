@@ -61,17 +61,17 @@ pub struct McplsServer {
     connection: ConnectionId,
     session: SessionId,
     adopted_anonymous: Arc<Mutex<bool>>,
-    _http_cleanup: Option<Arc<HttpConnectionCleanup>>,
+    _connection_cleanup: Option<Arc<ConnectionCleanup>>,
     /// Sentences appended to this connection's instructions.
     notes: Arc<[String]>,
 }
 
-struct HttpConnectionCleanup {
+struct ConnectionCleanup {
     context: Arc<BridgeContext>,
     connection: ConnectionId,
 }
 
-impl Drop for HttpConnectionCleanup {
+impl Drop for ConnectionCleanup {
     fn drop(&mut self) {
         let context = Arc::clone(&self.context);
         let connection = self.connection;
@@ -81,7 +81,7 @@ impl Drop for HttpConnectionCleanup {
                 .delivery
                 .lock()
                 .await
-                .end_session(&SessionId::for_connection(connection));
+                .close(connection, tokio::time::Instant::now());
             context.subscriptions.remove_connection(connection).await;
         });
     }
@@ -557,7 +557,7 @@ impl McplsServer {
             connection,
             session: SessionId::for_connection(connection),
             adopted_anonymous: Arc::new(Mutex::new(false)),
-            _http_cleanup: None,
+            _connection_cleanup: None,
             notes: Arc::from(Vec::new()),
         }
     }
@@ -573,21 +573,17 @@ impl McplsServer {
             connection,
             session: session.unwrap_or_else(|| SessionId::for_connection(connection)),
             adopted_anonymous: Arc::new(Mutex::new(false)),
-            _http_cleanup: None,
+            _connection_cleanup: Some(Arc::new(ConnectionCleanup {
+                context: Arc::clone(&self.context),
+                connection,
+            })),
             notes: Arc::clone(&self.notes),
         }
     }
 
     #[cfg(feature = "transport-http")]
     pub(crate) fn for_http_connection(&self) -> Self {
-        let server = self.for_connection(None);
-        Self {
-            _http_cleanup: Some(Arc::new(HttpConnectionCleanup {
-                context: Arc::clone(&server.context),
-                connection: server.connection,
-            })),
-            ..server
-        }
+        self.for_connection(None)
     }
 
     /// This server with `notes` appended to its instructions.
@@ -1260,13 +1256,38 @@ impl McplsServer {
         delivery.record_write(caller, &keys);
     }
 
+    pub(crate) async fn attach_connection(&self) {
+        let caller = Caller {
+            record: RecordId::from(&self.session),
+            root: (self.session != SessionId::for_connection(self.connection))
+                .then(|| self.session.clone()),
+        };
+        self.context
+            .delivery
+            .lock()
+            .await
+            .attach(self.connection, &caller);
+    }
+
+    pub(crate) async fn touch_hook(&self, caller: &Caller) {
+        self.context
+            .delivery
+            .lock()
+            .await
+            .touch_hook(caller, tokio::time::Instant::now());
+    }
+
     pub(crate) async fn register_caller(&self, caller: &Caller) {
         self.context.delivery.lock().await.register_caller(caller);
     }
 
     /// Drop `session`'s delivery record.
     pub(crate) async fn end_session(&self, session: &SessionId) {
-        self.context.delivery.lock().await.end_session(session);
+        self.context
+            .delivery
+            .lock()
+            .await
+            .end_root(session, tokio::time::Instant::now());
     }
 
     /// Build `get_new_diagnostics`'s payload from one flush's report.
@@ -1618,6 +1639,12 @@ impl ServerHandler for McplsServer {
             .lock()
             .await
             .caller(RecordId::from(&server.session));
+        server
+            .context
+            .delivery
+            .lock()
+            .await
+            .attach(server.connection, &caller);
         let writer = server.clone();
         let runtime = tokio::runtime::Handle::current();
         let observer: crate::bridge::apply::WriteObserver = Arc::new(move |paths| {

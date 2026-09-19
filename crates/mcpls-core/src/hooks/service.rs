@@ -120,6 +120,7 @@ pub fn build_handler(
                         };
                     }
                     stats.record_hook_request();
+                    server.touch_hook(&agent.caller(&session)).await;
                     let paths = sweeper.admitted_paths(&paths);
                     if attributed {
                         server
@@ -133,7 +134,7 @@ pub fn build_handler(
                 Request::Flush { agent, session } => {
                     stats.record_hook_request();
                     let caller = agent.caller(&session);
-                    server.register_caller(&caller).await;
+                    server.touch_hook(&caller).await;
                     let (report, token) = server.flush_for_hook(&caller.record).await;
                     let mut parts: Vec<String> = Vec::new();
                     if let Some(text) = report {
@@ -152,6 +153,7 @@ pub fn build_handler(
                     session,
                     token,
                 } => {
+                    server.touch_hook(&agent.caller(&session)).await;
                     server
                         .commit_for_hook(&agent.caller(&session).record, token)
                         .await;

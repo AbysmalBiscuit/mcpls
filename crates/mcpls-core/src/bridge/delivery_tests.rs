@@ -12,6 +12,131 @@ fn caller(root: &str, agent: &str) -> Caller {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn expiry_worker_rechecks_renewed_hook_deadlines() {
+    let delivery = Arc::new(tokio::sync::Mutex::new(DiagnosticsDelivery::new(
+        DiagnosticsConfig::default(),
+    )));
+    let (cancel, rx) = tokio::sync::watch::channel(false);
+    let worker = tokio::spawn(DiagnosticsDelivery::run_expiry(Arc::clone(&delivery), rx));
+    let child = caller("root", "child");
+    delivery
+        .lock()
+        .await
+        .touch_hook(&child, tokio::time::Instant::now());
+    delivery.lock().await.record_write(&child, &["a.rs".into()]);
+    let errors = vec![diagnostic(0, DiagnosticSeverity::ERROR, "broken")];
+    let (_, token) = delivery.lock().await.stage(
+        &child.record,
+        &[entry("a.rs", &errors, SeverityFloor::Warning)],
+    );
+    tokio::task::yield_now().await;
+    tokio::time::advance(std::time::Duration::from_secs(59)).await;
+    delivery
+        .lock()
+        .await
+        .touch_hook(&child, tokio::time::Instant::now());
+    tokio::time::advance(std::time::Duration::from_secs(2)).await;
+    tokio::task::yield_now().await;
+    assert!(delivery.lock().await.pending.contains_key(&child.record));
+    tokio::time::advance(std::time::Duration::from_secs(59)).await;
+    tokio::task::yield_now().await;
+    assert!(!delivery.lock().await.commit(&child.record, token.unwrap()));
+    cancel.send(true).unwrap();
+    worker.await.unwrap();
+}
+
+#[test]
+fn a_root_arriving_after_a_hook_protects_it_and_zero_grace_expires_on_close() {
+    let mut delivery = DiagnosticsDelivery::new(DiagnosticsConfig {
+        record_grace_ms: 0,
+        ..Default::default()
+    });
+    let root = caller("root", "root");
+    let child = caller("root", "child");
+    let t = tokio::time::Instant::now();
+    delivery.touch_hook(&child, t);
+    delivery.record_write(&child, &["a.rs".into()]);
+    let connection = ConnectionId::next();
+    delivery.attach(connection, &root);
+    delivery.expire(t + std::time::Duration::from_secs(100));
+    assert!(delivery.roots.contains_key(&child.record));
+    delivery.close(connection, t + std::time::Duration::from_secs(100));
+    assert!(!delivery.roots.contains_key(&child.record));
+    assert!(delivery.ownership.is_empty());
+}
+
+#[test]
+fn root_connections_and_the_child_connection_protect_pending_tokens() {
+    let mut delivery = DiagnosticsDelivery::new(DiagnosticsConfig::default());
+    let root = caller("root", "root");
+    let child = caller("root", "child");
+    let one = ConnectionId::next();
+    let two = ConnectionId::next();
+    let own = ConnectionId::next();
+    let now = tokio::time::Instant::now();
+    delivery.attach(one, &root);
+    delivery.attach(two, &root);
+    delivery.touch_hook(&child, now);
+    delivery.record_write(&child, &["a.rs".into()]);
+    let errors = vec![diagnostic(0, DiagnosticSeverity::ERROR, "broken")];
+    let (_, token) = delivery.stage(
+        &child.record,
+        &[entry("a.rs", &errors, SeverityFloor::Warning)],
+    );
+    delivery.end_root(root.root.as_ref().unwrap(), now);
+    delivery.close(one, now);
+    assert!(delivery.pending.contains_key(&child.record));
+    delivery.attach(own, &child);
+    delivery.close(two, now);
+    assert!(delivery.pending.contains_key(&child.record));
+    delivery.close(own, now);
+    assert!(!delivery.commit(&child.record, token.unwrap()));
+    assert!(!delivery.roots.contains_key(&child.record));
+    assert!(delivery.ownership.is_empty());
+}
+
+#[test]
+fn hook_only_grace_renews_and_expiry_discards_pending_reports() {
+    let mut delivery = DiagnosticsDelivery::new(DiagnosticsConfig::default());
+    let child = caller("root", "child");
+    let t = tokio::time::Instant::now();
+    delivery.touch_hook(&child, t);
+    delivery.record_write(&child, &["a.rs".into()]);
+    let errors = vec![diagnostic(0, DiagnosticSeverity::ERROR, "broken")];
+    let (_, token) = delivery.stage(
+        &child.record,
+        &[entry("a.rs", &errors, SeverityFloor::Warning)],
+    );
+    delivery.touch_hook(&child, t + std::time::Duration::from_secs(59));
+    delivery.expire(t + std::time::Duration::from_secs(60));
+    assert!(delivery.pending.contains_key(&child.record));
+    delivery.expire(t + std::time::Duration::from_secs(119));
+    assert!(!delivery.commit(&child.record, token.unwrap()));
+    assert!(delivery.retained.is_empty());
+    assert!(delivery.ownership.is_empty());
+}
+
+#[test]
+fn reconnect_preserves_history_until_the_last_close_plus_grace() {
+    let mut delivery = DiagnosticsDelivery::new(DiagnosticsConfig::default());
+    let root = caller("root", "root");
+    let first = ConnectionId::next();
+    let second = ConnectionId::next();
+    let t = tokio::time::Instant::now();
+    delivery.attach(first, &root);
+    let errors = vec![diagnostic(0, DiagnosticSeverity::ERROR, "broken")];
+    let entries = [entry("a.rs", &errors, SeverityFloor::Warning)];
+    delivery.flush(&root.record, &entries);
+    delivery.close(first, t);
+    delivery.attach(second, &root);
+    delivery.expire(t + std::time::Duration::from_secs(61));
+    assert!(delivery.flush(&root.record, &entries).changed.is_empty());
+    delivery.close(second, t + std::time::Duration::from_secs(61));
+    delivery.expire(t + std::time::Duration::from_secs(121));
+    assert_eq!(delivery.flush(&root.record, &entries).changed.len(), 1);
+}
+
 #[test]
 fn a_writer_without_root_metadata_keeps_its_claim_when_resolved() {
     let mut delivery = DiagnosticsDelivery::new(DiagnosticsConfig::default());

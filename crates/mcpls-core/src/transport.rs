@@ -324,8 +324,10 @@ pub(crate) async fn run_stdio(
 ) -> Result<(), crate::Error> {
     use crate::bridge::SessionId;
 
+    let mcp_server = mcp_server.for_connection(SessionId::from_host_env());
+    mcp_server.attach_connection().await;
     let service = tokio::select! {
-        result = mcp_server.for_connection(SessionId::from_host_env()).serve(rmcp::transport::stdio()) => {
+        result = mcp_server.serve(rmcp::transport::stdio()) => {
             result.map_err(|e| crate::Error::McpServer(format!("Failed to start MCP server: {e}")))?
         }
         () = shutdown_signal.recv() => {

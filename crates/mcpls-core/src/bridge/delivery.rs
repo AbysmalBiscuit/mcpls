@@ -18,6 +18,9 @@ mod attribution_tests;
 
 #[path = "attribution.rs"]
 mod attribution;
+
+#[path = "record_lifetime.rs"]
+mod record_lifetime;
 use crate::config::{DiagnosticsConfig, LspServerConfig, ServerId, SeverityFloor};
 
 /// Identity of one client session.
@@ -189,6 +192,7 @@ pub struct DiagnosticsDelivery {
     retained: HashMap<RecordId, BTreeMap<String, VecDeque<Arc<RetainedFile>>>>,
     sources: HashMap<String, Arc<DiagnosticSnapshot>>,
     next_snapshot: u64,
+    lifetime: record_lifetime::RecordLifetime,
 }
 
 impl DiagnosticsDelivery {
@@ -211,6 +215,9 @@ impl DiagnosticsDelivery {
             retained: HashMap::new(),
             sources: HashMap::new(),
             next_snapshot: 0,
+            lifetime: record_lifetime::RecordLifetime::new(std::time::Duration::from_millis(
+                config.record_grace_ms,
+            )),
         }
     }
 
@@ -249,6 +256,7 @@ impl DiagnosticsDelivery {
     /// from the baseline again.
     pub fn end_session(&mut self, session: impl Into<RecordId>) {
         let session = &session.into();
+        self.lifetime.forget(session);
         self.sessions.remove(session);
         self.pending.remove(session);
         self.retained.remove(session);
