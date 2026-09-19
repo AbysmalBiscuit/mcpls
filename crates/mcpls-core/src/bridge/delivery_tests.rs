@@ -12,6 +12,106 @@ fn caller(root: &str, agent: &str) -> Caller {
     }
 }
 
+#[test]
+fn adopted_history_does_not_block_newer_retained_reports() {
+    let mut delivery = DiagnosticsDelivery::new(DiagnosticsConfig::default());
+    let child = caller("root", "child");
+    let anonymous = SessionId::from("anonymous".to_string());
+    let old = vec![diagnostic(0, DiagnosticSeverity::ERROR, "old")];
+    let new = vec![diagnostic(0, DiagnosticSeverity::ERROR, "new")];
+    let entries = [entry("a.rs", &old, SeverityFloor::Warning)];
+    delivery.flush(&anonymous, &entries);
+    delivery.record_write(&child, &["a.rs".into()]);
+    delivery.stage(&child.record, &entries);
+    delivery.merge_session(&anonymous, &child.record);
+    let report = delivery.flush(
+        &child.record,
+        &[entry("a.rs", &new, SeverityFloor::Warning)],
+    );
+    assert_eq!(report.changed.len(), 1);
+    assert_eq!(report.changed[0].diagnostics[0].message, "new");
+}
+
+#[test]
+fn expired_cycles_cannot_be_acknowledged_as_replacement_cycles() {
+    let mut delivery = DiagnosticsDelivery::new(DiagnosticsConfig::default());
+    let first = caller("root", "a");
+    let pending = caller("root", "b");
+    let expired = caller("root", "c");
+    let current = caller("root", "d");
+    let joining = caller("root", "e");
+    let old = vec![diagnostic(0, DiagnosticSeverity::ERROR, "old")];
+    let new = vec![diagnostic(0, DiagnosticSeverity::ERROR, "new")];
+    let entries = [entry("first.rs", &old, SeverityFloor::Warning)];
+    for writer in [&first, &pending] {
+        delivery.record_write(writer, &["first.rs".into()]);
+    }
+    delivery.flush(&first.record, &entries);
+    let (_, token) = delivery.stage(&pending.record, &entries);
+    delivery.record_write(&expired, &["first.rs".into()]);
+    delivery.end_session(&expired.record);
+    delivery.record_write(&current, &["first.rs".into()]);
+    assert!(delivery.commit(&pending.record, token.unwrap()));
+    delivery.record_write(&joining, &["first.rs".into()]);
+    assert_eq!(
+        delivery
+            .flush(
+                &current.record,
+                &[entry("first.rs", &new, SeverityFloor::Warning)]
+            )
+            .changed
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn late_root_resolution_preserves_an_undelivered_write_cycle() {
+    let mut delivery = DiagnosticsDelivery::new(DiagnosticsConfig::default());
+    let a = caller("root", "a");
+    let mut b = caller("root", "b");
+    let c = caller("root", "c");
+    let old = vec![diagnostic(0, DiagnosticSeverity::ERROR, "old")];
+    let new = vec![diagnostic(0, DiagnosticSeverity::ERROR, "new")];
+    delivery.record_write(&a, &["a.rs".into()]);
+    delivery.flush(&a.record, &[entry("a.rs", &old, SeverityFloor::Warning)]);
+    b.root = None;
+    delivery.record_write(&b, &["a.rs".into()]);
+    b.root = a.root.clone();
+    delivery.register_caller(&b);
+    delivery.record_write(&c, &["a.rs".into()]);
+    assert_eq!(
+        delivery
+            .flush(&b.record, &[entry("a.rs", &new, SeverityFloor::Warning)])
+            .changed
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn root_fallback_survives_child_ownership_and_output_caps() {
+    let mut delivery = DiagnosticsDelivery::new(DiagnosticsConfig {
+        max_total: 1,
+        ..Default::default()
+    });
+    let root = caller("root", "root");
+    let child = caller("root", "child");
+    delivery.register_caller(&root);
+    let old = vec![diagnostic(0, DiagnosticSeverity::ERROR, "old")];
+    let entries = [
+        entry("a.rs", &old, SeverityFloor::Warning),
+        entry("b.rs", &old, SeverityFloor::Warning),
+    ];
+    let (first, _) = delivery.stage(&root.record, &entries);
+    assert_eq!(first.changed[0].key, "a.rs");
+    delivery.record_write(&child, &["a.rs".into(), "b.rs".into()]);
+    let retry = delivery.flush(&root.record, &[]);
+    assert_eq!(retry.changed.len(), 1);
+    assert_eq!(retry.changed[0].key, "a.rs");
+    assert_eq!(delivery.flush(&root.record, &[]).changed[0].key, "b.rs");
+}
+
 #[tokio::test(start_paused = true)]
 async fn expiry_worker_rechecks_renewed_hook_deadlines() {
     let delivery = Arc::new(tokio::sync::Mutex::new(DiagnosticsDelivery::new(

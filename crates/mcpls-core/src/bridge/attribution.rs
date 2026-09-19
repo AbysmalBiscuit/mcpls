@@ -29,10 +29,27 @@ impl DiagnosticsDelivery {
                     .collect();
                 for key in keys {
                     if let Some(owner) = self.ownership.remove(&key) {
-                        self.ownership
-                            .entry((root.clone(), key.1))
-                            .and_modify(|existing| existing.writers.extend(owner.writers.clone()))
-                            .or_insert(owner);
+                        let destination = (root.clone(), key.1.clone());
+                        let mut merged = owner;
+                        if let Some(existing) = self.ownership.remove(&destination) {
+                            if !existing.delivered && merged.delivered {
+                                merged = existing;
+                            } else if existing.delivered == merged.delivered {
+                                let old_generation = existing.generation;
+                                merged.writers.extend(existing.writers);
+                                for files in self.retained.values_mut() {
+                                    if let Some(reports) = files.get_mut(&key.1) {
+                                        for report in reports {
+                                            if report.generation == old_generation {
+                                                Arc::make_mut(report).generation =
+                                                    merged.generation;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        self.ownership.insert(destination, merged);
                     }
                 }
             }
@@ -58,41 +75,66 @@ impl DiagnosticsDelivery {
                 .ownership
                 .entry((root.clone(), key.clone()))
                 .or_default();
-            if owner.delivered {
-                owner.generation += 1;
-                owner.writers.clear();
-                owner.delivered = false;
+            if owner.generation == 0 || owner.delivered {
+                self.next_generation += 1;
+                *owner = super::Ownership {
+                    generation: self.next_generation,
+                    ..Default::default()
+                };
             }
             owner.writers.insert(caller.record.clone());
         }
     }
 
     pub(crate) fn observe_owned(&mut self, entries: &[FileEntry<'_>]) {
+        self.observe_for(None, entries);
+    }
+
+    pub(super) fn observe_for(&mut self, recipient: Option<&RecordId>, entries: &[FileEntry<'_>]) {
         for entry in entries {
             let hash = Self::visible_hash(entry.diagnostics, entry.floor);
-            for ((root, key), owner) in &self.ownership {
-                if key != entry.key {
-                    continue;
-                }
+            let owners = self
+                .ownership
+                .iter()
+                .filter(|((_, key), _)| key == entry.key)
+                .map(|((root, _), owner)| (root.clone(), owner.generation, owner.writers.clone()));
+            let fallback = self.roots.iter().filter_map(|(record, root)| {
+                let root = root.as_ref()?;
+                (recipient == Some(record)
+                    && *record == RecordId::Session(root.clone())
+                    && !self
+                        .ownership
+                        .contains_key(&(root.clone(), entry.key.to_string())))
+                .then(|| {
+                    (
+                        root.clone(),
+                        0,
+                        std::collections::HashSet::from([record.clone()]),
+                    )
+                })
+            });
+            let recipients: Vec<_> = owners.chain(fallback).collect();
+            for (root, generation, writers) in recipients {
+                let key = entry.key.to_string();
                 self.next_snapshot += 1;
                 let snapshot = Arc::new(RetainedFile {
                     id: self.next_snapshot,
                     root: root.clone(),
-                    generation: owner.generation,
+                    generation,
                     file: OwnedEntry {
                         key: key.clone(),
                         diagnostics: entry.diagnostics.to_vec(),
                         floor: entry.floor,
                     },
                     hash,
-                    source: self.sources.get(key).cloned(),
+                    source: self.sources.get(&key).cloned(),
                 });
-                for writer in &owner.writers {
+                for writer in &writers {
                     let committed = self
                         .sessions
                         .get(writer)
                         .or(self.baseline.as_ref())
-                        .and_then(|record| record.get(key))
+                        .and_then(|record| record.get(&key))
                         .copied();
                     let queue = self
                         .retained
@@ -106,6 +148,26 @@ impl DiagnosticsDelivery {
                     }
                 }
             }
+        }
+    }
+
+    pub(super) fn discard_consumed_snapshots(&mut self, record: &RecordId) {
+        loop {
+            let consumed: Vec<_> = self
+                .retained
+                .get(record)
+                .into_iter()
+                .flat_map(|files| files.iter())
+                .filter_map(|(key, queue)| {
+                    let report = queue.front()?;
+                    let committed = self.sessions.get(record)?.get(key).copied();
+                    (committed == report.hash).then(|| (key.clone(), report.id))
+                })
+                .collect();
+            if consumed.is_empty() {
+                break;
+            }
+            self.commit_snapshots(record, &consumed);
         }
     }
 

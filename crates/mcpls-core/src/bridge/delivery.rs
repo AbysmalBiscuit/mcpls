@@ -155,7 +155,7 @@ struct OwnedEntry {
     floor: SeverityFloor,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct RetainedFile {
     id: u64,
     root: SessionId,
@@ -192,6 +192,7 @@ pub struct DiagnosticsDelivery {
     retained: HashMap<RecordId, BTreeMap<String, VecDeque<Arc<RetainedFile>>>>,
     sources: HashMap<String, Arc<DiagnosticSnapshot>>,
     next_snapshot: u64,
+    next_generation: u64,
     lifetime: record_lifetime::RecordLifetime,
 }
 
@@ -215,6 +216,7 @@ impl DiagnosticsDelivery {
             retained: HashMap::new(),
             sources: HashMap::new(),
             next_snapshot: 0,
+            next_generation: 0,
             lifetime: record_lifetime::RecordLifetime::new(std::time::Duration::from_millis(
                 config.record_grace_ms,
             )),
@@ -283,10 +285,11 @@ impl DiagnosticsDelivery {
         let Some(source) = self.sessions.remove(source) else {
             return;
         };
-        let target = self.sessions.entry(target.clone()).or_default();
+        let history = self.sessions.entry(target.clone()).or_default();
         for (key, hash) in source {
-            target.entry(key).or_insert(hash);
+            history.entry(key).or_insert(hash);
         }
+        self.discard_consumed_snapshots(target);
     }
 
     /// Hash one file's visible diagnostics.
@@ -359,7 +362,7 @@ impl DiagnosticsDelivery {
         entries: &[FileEntry<'_>],
     ) -> (FlushReport, Option<u64>) {
         let session = &session.into();
-        self.observe_owned(entries);
+        self.observe_for(Some(session), entries);
         let routed = self.routed_entries(session, entries);
         let borrowed: Vec<_> = routed
             .iter()
