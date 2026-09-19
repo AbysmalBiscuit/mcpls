@@ -27,6 +27,6 @@ How the agent plugin's hooks reach the running backend.
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `enabled` | boolean | `true` | Whether the hook listener binds. With it off, `SessionStart` still runs its local scan. |
+| `enabled` | boolean | `true` | Whether the hook listener binds. With it off, nothing injects diagnostics between turns, and an edit alone no longer starts a language server for a language that has none running; a tool call still does. The backend's watcher does not depend on this, so changes on disk still reach the servers that are running. |
 | `op_deadline_ms` | integer (ms) | `1500` | How long one hook operation may run before it answers anyway, so a stuck backend never blocks the agent. Work already started may continue, but delivery is not guaranteed. |
 | `sweep_quiet_ms` | integer (ms) | `500` | How long pending saves must be quiet before the sweep runs. Each save restarts rust-analyzer's check, so sweeping mid-burst yields cancelled checks and no diagnostics. |

@@ -1,5 +1,5 @@
 ---
-applyTo: ".github/workflows/**,deny.toml,.cargo/**"
+applyTo: ".github/workflows/**,.cargo/**"
 ---
 
 ## Feature flag parity
@@ -14,13 +14,14 @@ links and missing `///` on public items pass silently in CI.
 Nightly toolchain is required only for `cargo fmt`. All other jobs must use stable to
 avoid failures caused by nightly regressions unrelated to this project.
 
-## Dependency and license policy
+## Dependency policy
 
-New dependencies require a license check in the same PR. `cargo deny check licenses`
-fails fast and blocks the pipeline — do not merge before it passes.
+This fork keeps no license allow-list. It does not upstream, so a dependency's license
+is the author's call rather than a gate, and there is no `deny.toml` to add one to.
 
-`cargo deny check advisories` must be clean. Suppress an advisory only with an explicit
-`ignore` entry and a comment explaining why the vulnerable code path is unreachable.
+The Security Audit job runs `rustsec/audit-check` over `Cargo.lock` and must be clean.
+An advisory with no fixed version available is the one case worth discussing in the PR
+rather than bumping past.
 
 When a newer stable `std` API covers functionality provided by a dependency, suggest
 removing the dependency and bumping `rust-version` instead. Fewer dependencies reduce
