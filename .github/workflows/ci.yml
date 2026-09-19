@@ -367,9 +367,21 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
+      checks: write
+      issues: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+      # Vulnerability scanning only. This fork does not upstream, so it keeps
+      # no license allow-list and no `deny.toml`; `cargo audit` needs neither,
+      # reading `Cargo.lock` against the RustSec database directly.
+      #
+      # Not SHA-pinned like every other action here, because the digest could
+      # not be verified from the environment this was written in and a wrong
+      # one fails the job at checkout. Dependabot watches `github-actions` in
+      # this repository weekly and will pin it.
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   coverage:
     name: Coverage

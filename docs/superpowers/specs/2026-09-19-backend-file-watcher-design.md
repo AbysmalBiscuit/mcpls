@@ -114,7 +114,7 @@ Both failure modes degrade to hooks-only coverage with the doctor saying why, so
 
 `notify` 8.2.0. Its MSRV of 1.77 sits under the workspace's 1.88. Version 9 is at `rc.5` and is not taken.
 
-It is licensed CC0-1.0, which `deny.toml`'s allow list does not carry, and `cargo deny check licenses` blocks CI (`.github/workflows/ci.yml:372`). The line is added. CC0 is a public-domain dedication, more permissive in practice than MIT, and withholds only a patent grant.
+It is licensed CC0-1.0, a public-domain dedication, more permissive in practice than MIT, withholding only a patent grant. That licence was briefly a CI question: `deny.toml`'s allow list did not carry it and `cargo deny check licenses` blocked the pipeline. The allow-list entry was added and then the whole file was retired, because this fork does not upstream and so has no audience for a licence policy. The Security Audit job now runs `rustsec/audit-check` over `Cargo.lock` instead, which needs no configuration and keeps the vulnerability scanning the licence check was bundled with.
 
 ## Landing
 

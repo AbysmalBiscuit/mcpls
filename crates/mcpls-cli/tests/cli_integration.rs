@@ -726,28 +726,6 @@ fn test_completions_survives_a_closed_pipe() {
     }
 }
 
-fn doctor_output(project: &std::path::Path) -> String {
-    let runtime = TempDir::new().unwrap();
-    let mut cmd = Command::cargo_bin("mcpls").unwrap();
-    let output = clear_ambient_env(&mut cmd)
-        .env("CLAUDE_PROJECT_DIR", project)
-        .env_remove("XDG_RUNTIME_DIR")
-        .env("TMPDIR", runtime.path())
-        .env("USER", "mcpls-test")
-        .env(
-            "USERNAME",
-            format!(
-                "mcpls-test-{}",
-                runtime.path().file_name().unwrap().to_string_lossy()
-            ),
-        )
-        .args(["hook", "doctor"])
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    String::from_utf8(output.stdout).unwrap()
-}
-
 #[test]
 fn test_doctor_does_not_claim_a_path_candidate_can_launch() {
     let project = TempDir::new().unwrap();

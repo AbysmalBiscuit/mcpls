@@ -15,7 +15,6 @@ dependencies:
           - "Cargo.toml"
           - "Cargo.lock"
           - "crates/*/Cargo.toml"
-          - "deny.toml"
 
 rust:
   - changed-files:

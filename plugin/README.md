@@ -24,7 +24,9 @@ Restart the session once after installing, from a new terminal if `~/.cargo/bin`
 
 When the `mcpls` on `PATH` does not match the plugin's version, the plugin tells the agent at session start, including which version to install and where to get it. That covers an `mcpls` you installed yourself, an install that failed, and an install still running in another session. A failed install is not retried every session: run the installer from the release page, or delete `~/.local/state/mcpls/bootstrap-failed` and restart.
 
-Edits made outside the agent's own edit tools (a terminal, another agent, a `git checkout`) reach mcpls only once the shared backend's file watcher lands (#23, #25). Claude Code's `FileChanged` covers some of them, but only for paths the host already watches: the plugin no longer hands it the checkout to watch, because registering a recursive watch per directory costs more at session start than the reports are worth on a large tree.
+Edits made outside the agent's own edit tools (a terminal, another agent, a `git checkout`) reach mcpls through the backend's own filesystem watcher, on every host rather than only where the host offers a file-changed hook. It places one watch per directory the project's ignore rules keep, so generated trees like `target/` and `node_modules/` cost nothing, and it picks up directories created after the session started. A checkout it cannot watch, a Windows drive under WSL2 or a network mount, is reported as unwatched by `mcpls hook doctor` rather than silently missing edits.
+
+A change the watcher reports never starts a language server that is not already running. Starting one is what an agent's own edit does, or what any tool call on a file does; a `git pull` touching a language this session never opens is not a reason to pay for its server.
 
 To run a local build instead of the release, put it first on `PATH` and stop the plugin from installing over it on upgrade:
 
@@ -63,7 +65,7 @@ sessions: 2 attached (s1, connection-4)
 language servers: rust
 config: 00000000000000ff
 mcpls on PATH: /path/to/mcpls; launch not checked
-watch scan: selected 4 top-level path(s); hidden entries excluded by default; ignore rules applied; host registration unverified
+watcher: 56 directories watched
 ```
 
 Line by line:
@@ -83,7 +85,7 @@ Line by line:
 - **`backend pid:`** the process id holding the socket, `none` if nothing does, or `unknown` if an owner exists but the exchange did not get far enough to learn its pid (see the fault messages above). When it does print a pid, confirm it names a live `mcpls` process; a pid that no longer exists or belongs to something else means the socket is orphaned: delete the socket file at the path in `socket:` above (a Windows named pipe clears on its own once nothing holds it) so a new mcpls can bind it.
 - **`hooks seen:`** how many `Changed`, `Flush`, or `EndSession` requests this owner has served since it started; a `Status` probe, including the doctor's own, is never counted. Zero is not by itself a fault: `SessionStart` never touches the socket, so an owner that just started, or just took over from a previous one, looks identical to one that has never received a hook. The line's own wording says what to do about a zero.
 - **`mcpls on PATH:`** the absolute path of a candidate found on `PATH`, or `not found`. The doctor does not execute it: a text file named `mcpls.exe` on Windows is still a candidate, not a verified installation. The plugin's MCP server and hooks run this same `PATH` lookup, so this is the binary they run.
-- **`watch scan:`** what a fresh local scan selects as the top of the tree worth watching. Nothing consumes it today: the plugin does not hand the host a watch list, and the backend's own watcher has not landed. An empty successful scan says `no eligible top-level paths`; traversal or ignore-rule failures say `incomplete` and include their causes. Hidden top-level files and directories, including `.github`, are excluded by default. Explicit allow rules in ignore files can include them; for example, `!.github/` in a Git repository's `.gitignore` includes `.github` in the watch scan.
+- **`watcher:`** what the backend's filesystem watcher is doing, reported by the backend rather than measured locally, so it says `unknown; no backend answered` whenever the lines above show nothing answering. A working watcher says how many directories carry a watch: one per directory the project's ignore rules keep, which excludes `.git`, `target` and `node_modules` whether or not a `.gitignore` names them. Otherwise it says `not watching` and why. Two reasons are worth knowing: a checkout on a filesystem inotify does not report changes for, which is a Windows drive under WSL2 (`9p`, `drvfs`) or a network mount, and the kernel's per-user watch limit, which names `fs.inotify.max_user_watches` and the count reached before it ran out. In both cases mcpls declines to watch at all rather than watch part of the tree, because which part would depend on the order the walk happened to take. Edits the agent makes through its own tools still reach the language servers either way.
 
 An operation that exceeds the owner's response deadline keeps running in the background. Hook clients remain silent on that response; the deadline does not establish whether the work will succeed or whether a later report will contain diagnostics. The doctor reports a deadline response if it receives one during its probe window.
 
@@ -95,7 +97,7 @@ hook sees: /home/lev/project -> unknown
 server sees: nothing can run here; no socket exists to probe
 backend pid: none
 mcpls on PATH: /path/to/mcpls; launch not checked
-watch scan: selected 4 top-level path(s); hidden entries excluded by default; ignore rules applied; host registration unverified
+watcher: 56 directories watched
 ```
 
 This is a different failure from a missing owner: there, a socket exists and nothing answers it; here, no socket could ever exist for this directory on either side. Fix the reported reason, for example moving the project or `TMPDIR` to a shorter path, then run the doctor again.
