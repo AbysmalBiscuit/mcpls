@@ -11,7 +11,7 @@ pub mod protocol;
 pub mod service;
 pub mod sweep;
 
-pub use filters::{PathFilter, watch_paths};
+pub use filters::{PathFilter, WatchSet, watch_paths, watch_set};
 #[cfg(windows)]
 pub use identity::windows_pipe_prefix;
 pub use identity::{SocketIdentity, identity_for, identity_hash, project_root};
