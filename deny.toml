@@ -17,6 +17,10 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    # notify, the filesystem watcher the backend is built on. A public-domain
+    # dedication, more permissive in practice than MIT; it withholds only a
+    # patent grant.
+    "CC0-1.0",
     "ISC",
     "Zlib",
     "MPL-2.0",

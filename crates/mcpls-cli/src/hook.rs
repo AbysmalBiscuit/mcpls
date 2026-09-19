@@ -17,7 +17,7 @@ use anyhow::Result;
 use mcpls_core::hooks::filters::WatchPaths;
 use mcpls_core::hooks::protocol::ServerStatus;
 use mcpls_core::hooks::{
-    ChangeEvent, ProbeOutcome, Request, Response, SocketIdentity, probe, send,
+    ChangeEvent, ProbeOutcome, Request, Response, SocketIdentity, WatcherStatus, probe, send,
     send_and_acknowledge, watch_paths,
 };
 use serde::Deserialize;
@@ -218,22 +218,20 @@ fn session_start_output(scan: &WatchPaths) -> String {
     output.to_string()
 }
 
-fn watch_scan_line(project_dir: &Path) -> String {
-    let scan = watch_paths(project_dir);
-    let status = if !scan.errors.is_empty() {
-        format!(
-            "incomplete; selected {} top-level path(s); {}",
-            scan.paths.len(),
-            scan.errors.join("; ")
-        )
-    } else if scan.paths.is_empty() {
-        "no eligible top-level paths".to_string()
-    } else {
-        format!("selected {} top-level path(s)", scan.paths.len())
+/// The doctor's line for the backend's filesystem watcher.
+///
+/// The watcher lives in the backend now, so unlike the local scan this
+/// replaces, the answer has to come back over the socket. `None` means
+/// nothing answered, which the lines above this one have already explained.
+fn watcher_line(watcher: Option<&WatcherStatus>) -> String {
+    let Some(watcher) = watcher else {
+        return "watcher: unknown; no backend answered".to_string();
     };
-    format!(
-        "watch scan: {status}; hidden entries excluded by default; ignore rules applied; host registration unverified"
-    )
+    match (&watcher.unwatched_reason, watcher.watching) {
+        (Some(reason), _) => format!("watcher: not watching; {reason}"),
+        (None, true) => format!("watcher: {} directories watched", watcher.directories),
+        (None, false) => "watcher: not watching; this backend predates the watcher".to_string(),
+    }
 }
 
 /// The hook JSON carrying diagnostics context, or the empty string when
@@ -305,6 +303,11 @@ async fn doctor_scanning(
         format!("root: {} -> {}", root.display(), identity.hash),
     ];
 
+    // Filled by the one arm that gets an answer from this project's own
+    // backend, which is the only place the watcher's state exists now that
+    // the watching is the backend's rather than the host's.
+    let mut reported_watcher: Option<WatcherStatus> = None;
+
     match probe(identity, &Request::Status, SOCKET_TIMEOUT).await {
         // Only the socket's owner can identify this project's service.
         ProbeOutcome::Answered(Response::Status {
@@ -317,9 +320,11 @@ async fn doctor_scanning(
             sessions,
             servers,
             config_fingerprint,
+            watcher,
             owner: true,
             ..
         }) => {
+            reported_watcher = Some(watcher);
             lines.push(format!("server sees: {} -> {hash}", root.display()));
             lines.push(format!("backend pid: {pid}"));
             lines.push(hooks_seen_line(hooks_seen));
@@ -386,7 +391,7 @@ async fn doctor_scanning(
     }
 
     lines.push(on_path_line(mcpls_on_path().as_deref()));
-    lines.push(watch_scan_line(root));
+    lines.push(watcher_line(reported_watcher.as_ref()));
 
     lines.join("\n")
 }
@@ -826,18 +831,16 @@ const PIPE_LISTINGS: usize = 3;
 /// exists and nothing answers it; this means no socket could ever exist
 /// here at all, on either side, which a user needs to be able to tell
 /// apart from a server that simply is not running right now.
-pub fn doctor_without_identity(
-    project_dir: &Path,
-    root: &Path,
-    error: &mcpls_core::Error,
-) -> String {
+pub fn doctor_without_identity(project_dir: &Path, error: &mcpls_core::Error) -> String {
     let lines = [
         format!("socket: none; could not derive an identity for this directory: {error}"),
         format!("hook sees: {} -> unknown", project_dir.display()),
         "server sees: nothing can run here; no socket exists to probe".to_string(),
         "backend pid: none".to_string(),
         on_path_line(mcpls_on_path().as_deref()),
-        watch_scan_line(root),
+        // Nothing can run here, so nothing can have answered about a
+        // watcher either.
+        watcher_line(None),
     ];
     lines.join("\n")
 }
@@ -1048,6 +1051,10 @@ mod tests {
         status_hash: String,
         status_root: PathBuf,
         status_hooks_seen: u64,
+        /// What `Status` reports its filesystem watcher is doing. Not
+        /// watching by default, which is what a backend that predates the
+        /// field reports too.
+        status_watcher: WatcherStatus,
         /// Whether `Status` answers as the socket's owner. `true` by
         /// default, since only an owner ever answers in every other test;
         /// one test sets this to `false` to prove the foreign-owner scan
@@ -1088,6 +1095,7 @@ mod tests {
                 status_hash: String::new(),
                 status_root: PathBuf::new(),
                 status_hooks_seen: 0,
+                status_watcher: WatcherStatus::default(),
                 status_owner: true,
                 silent: false,
                 status_error: None,
@@ -1135,6 +1143,7 @@ mod tests {
                     sessions: vec!["s1".to_string(), "connection-4".to_string()],
                     servers: vec![status("rust", ServerLifecycle::Running)],
                     config_fingerprint: "00000000000000ff".to_string(),
+                    watcher: behavior.status_watcher.clone(),
                 },
                 |message| Response::Error {
                     message: message.clone(),
@@ -1284,6 +1293,15 @@ mod tests {
                     status_hash: hash,
                     status_root: root.to_path_buf(),
                     status_hooks_seen: hooks_seen,
+                    // A backend that is actually watching, so the doctor's
+                    // watcher line is asserted against a reported state
+                    // rather than against the empty default every other
+                    // behavior carries.
+                    status_watcher: WatcherStatus {
+                        watching: true,
+                        directories: 7,
+                        unwatched_reason: None,
+                    },
                     ..OwnerBehavior::default()
                 },
             )
@@ -2358,10 +2376,7 @@ mod tests {
 
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 12, "expected exactly twelve lines: {out}");
-        assert_eq!(
-            lines[11],
-            "watch scan: no eligible top-level paths; hidden entries excluded by default; ignore rules applied; host registration unverified"
-        );
+        assert_eq!(lines[11], "watcher: 7 directories watched");
         assert_eq!(lines[0], format!("socket: {}", identity.socket.display()));
         assert_eq!(lines[1], format!("hook sees: {}", project.path().display()));
         assert_eq!(lines[2], format!("root: {} -> {hash}", root.display()));
@@ -2457,10 +2472,7 @@ mod tests {
 
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 7, "expected exactly seven lines: {out}");
-        assert_eq!(
-            lines[6],
-            "watch scan: no eligible top-level paths; hidden entries excluded by default; ignore rules applied; host registration unverified"
-        );
+        assert_eq!(lines[6], "watcher: unknown; no backend answered");
         assert_eq!(
             lines[3],
             format!(
@@ -2477,6 +2489,7 @@ mod tests {
                     sessions: vec!["s1".to_string(), "connection-4".to_string()],
                     servers: vec![status("rust", ServerLifecycle::Running)],
                     config_fingerprint: "00000000000000ff".to_string(),
+                    watcher: WatcherStatus::default(),
                 }
             )
         );
@@ -2527,10 +2540,7 @@ mod tests {
 
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 7, "expected exactly seven lines: {out}");
-        assert_eq!(
-            lines[6],
-            "watch scan: no eligible top-level paths; hidden entries excluded by default; ignore rules applied; host registration unverified"
-        );
+        assert_eq!(lines[6], "watcher: unknown; no backend answered");
         assert_eq!(lines[0], format!("socket: {}", identity.socket.display()));
         assert_eq!(lines[1], format!("hook sees: {}", project.path().display()));
         assert_eq!(lines[2], format!("root: {} -> {hash}", root.display()));
@@ -2542,8 +2552,12 @@ mod tests {
         assert!(lines[5].starts_with("mcpls on PATH: "));
     }
 
+    /// Named for what it still proves. It used to assert the local watch
+    /// scan ran against the checkout root rather than the start directory;
+    /// the watching is the backend's now, and what survives is the
+    /// identity resolution that scan depended on.
     #[tokio::test]
-    async fn test_doctor_scans_the_checkout_root_from_a_nested_start() {
+    async fn test_doctor_resolves_the_checkout_root_from_a_nested_start() {
         let project = tempfile::tempdir().expect("project dir");
         let root = dunce::canonicalize(project.path()).expect("canonical root");
         mark_checkout(&root);
@@ -2570,9 +2584,8 @@ mod tests {
         );
         assert_eq!(
             lines.last().copied(),
-            Some(
-                "watch scan: selected 2 top-level path(s); hidden entries excluded by default; ignore rules applied; host registration unverified"
-            )
+            Some("watcher: unknown; no backend answered"),
+            "nothing is bound here, so no backend can have reported a watcher"
         );
     }
 
@@ -3508,15 +3521,11 @@ mod tests {
         let missing = project.path().join("does-not-exist");
         let error = mcpls_core::hooks::identity_for(&missing).expect_err("an unreachable dir");
 
-        let out =
-            super::doctor_without_identity(project.path(), &checkout_root(project.path()), &error);
+        let out = super::doctor_without_identity(project.path(), &error);
 
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 6, "expected exactly six lines: {out}");
-        assert_eq!(
-            lines[5],
-            "watch scan: no eligible top-level paths; hidden entries excluded by default; ignore rules applied; host registration unverified"
-        );
+        assert_eq!(lines[5], "watcher: unknown; no backend answered");
         assert_eq!(
             lines[0],
             format!("socket: none; could not derive an identity for this directory: {error}")

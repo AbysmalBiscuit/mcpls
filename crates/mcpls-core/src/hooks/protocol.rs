@@ -81,6 +81,22 @@ pub struct ServerStatus {
     pub state: ServerLifecycle,
 }
 
+/// What the backend's filesystem watcher is doing.
+///
+/// A struct rather than a rendered line, following [`ServerStatus`], so
+/// later detail lands on the type instead of growing a parallel field on
+/// the response.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatcherStatus {
+    /// Whether a watcher is running at all.
+    pub watching: bool,
+    /// How many directories carry a watch.
+    pub directories: usize,
+    /// Why no watcher runs, absent while one does.
+    #[serde(default)]
+    pub unwatched_reason: Option<String>,
+}
+
 /// A message sent from a running mcpls back to a Claude Code hook.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -139,6 +155,9 @@ pub enum Response {
         /// The configuration fingerprint the backend started with.
         #[serde(default)]
         config_fingerprint: String,
+        /// What the backend's filesystem watcher is doing.
+        #[serde(default)]
+        watcher: WatcherStatus,
     },
     /// Reports a failure or a response deadline exceeded while work continues.
     Error {
@@ -283,7 +302,7 @@ mod tests {
 
     #[test]
     fn test_the_status_response_pins_the_wire_shape() {
-        let literal = r#"{"op":"status","hash":"abc123","socket":"mcpls.sock","pid":42,"owner":true,"root":"/work","hooks_seen":7,"version":"0.3.9","uptime_ms":61000,"sessions":["s1","connection-4"],"servers":[{"id":"rust","state":"running"},{"id":"lua","state":"not_installed"}],"config_fingerprint":"00000000000000ff"}"#;
+        let literal = r#"{"op":"status","hash":"abc123","socket":"mcpls.sock","pid":42,"owner":true,"root":"/work","hooks_seen":7,"version":"0.3.9","uptime_ms":61000,"sessions":["s1","connection-4"],"servers":[{"id":"rust","state":"running"},{"id":"lua","state":"not_installed"}],"config_fingerprint":"00000000000000ff","watcher":{"watching":true,"directories":56,"unwatched_reason":null}}"#;
         let value = Response::Status {
             hash: "abc123".to_string(),
             socket: PathBuf::from("mcpls.sock"),
@@ -304,6 +323,11 @@ mod tests {
                     state: ServerLifecycle::NotInstalled,
                 },
             ],
+            watcher: WatcherStatus {
+                watching: true,
+                directories: 56,
+                unwatched_reason: None,
+            },
             config_fingerprint: "00000000000000ff".to_string(),
         };
         assert_eq!(
@@ -336,6 +360,7 @@ mod tests {
                     state,
                 }],
                 config_fingerprint: "00000000000000ff".to_string(),
+                watcher: WatcherStatus::default(),
             };
 
             let wire = serde_json::to_value(&value).expect("serialize");
@@ -351,13 +376,22 @@ mod tests {
     fn test_an_older_status_parses_with_empty_backend_fields() {
         let literal = r#"{"op":"status","hash":"a","socket":"s","pid":1,"owner":true,"root":"/w","hooks_seen":0}"#;
         let Response::Status {
-            sessions, version, ..
+            sessions,
+            version,
+            watcher,
+            ..
         } = serde_json::from_str::<Response>(literal).expect("deserialize")
         else {
             panic!("a status");
         };
         assert!(sessions.is_empty());
         assert!(version.is_empty());
+        assert!(
+            !watcher.watching,
+            "a backend from before this field existed reports no watcher, \
+             which is exactly what it has; a doctor that failed to parse it \
+             would report nothing at all instead"
+        );
     }
 
     #[test]

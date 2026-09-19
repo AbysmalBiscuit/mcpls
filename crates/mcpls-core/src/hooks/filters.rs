@@ -503,7 +503,8 @@ mod tests {
         let set = watch_set(&filter, &[dir.path().to_path_buf()]);
 
         assert!(
-            set.directories.contains(&dir.path().join("src/deep/deeper")),
+            set.directories
+                .contains(&dir.path().join("src/deep/deeper")),
             "watchPaths only ever saw the top level, which is the gap this \
              walk closes"
         );

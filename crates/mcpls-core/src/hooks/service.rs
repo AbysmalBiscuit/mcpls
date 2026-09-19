@@ -69,6 +69,8 @@ pub struct StatusExtras {
     pub servers: Vec<ServerStatus>,
     /// The configuration fingerprint this process started with.
     pub config_fingerprint: String,
+    /// What the filesystem watcher is doing.
+    pub watcher: crate::hooks::protocol::WatcherStatus,
 }
 
 /// Computes [`StatusExtras`] at the moment a status is asked for.
@@ -158,6 +160,7 @@ pub fn build_handler(
                         sessions: extras.sessions,
                         servers: extras.servers,
                         config_fingerprint: extras.config_fingerprint,
+                        watcher: extras.watcher,
                     }
                 }
             }
