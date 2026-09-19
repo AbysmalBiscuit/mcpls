@@ -973,6 +973,16 @@ async fn test_codex_hook_reaches_the_owner_named_by_the_payload_cwd() {
 /// on its own, but it now falls through to the empty catch-all, so this
 /// answers `UserPromptSubmit` from a live owner instead, which is what
 /// gives the hook non-empty JSON to write against the closed pipe.
+///
+/// Two properties have to hold for that to actually exercise anything:
+/// the context text has to be bigger than any std `LineWriter` buffer, or
+/// the whole write sits in the buffer and an exit-time flush silently
+/// swallows the error a refactor back to `print!` would trigger; and the
+/// write has to be proven non-empty against a real, captured stdout
+/// first, or a socket-derivation drift that makes the hook answer empty
+/// would leave the closed-pipe run below asserting nothing at all
+/// (`write_all("")` never touches a closed fd). Both are checked here
+/// rather than assumed.
 #[cfg(unix)]
 #[tokio::test]
 async fn test_hook_survives_a_closed_pipe() {
@@ -980,6 +990,13 @@ async fn test_hook_survives_a_closed_pipe() {
     use std::process::Stdio;
 
     use mcpls_core::hooks::{HookListener, Request, Response};
+
+    // Comfortably past the ~8KiB that forced the overflow this test
+    // guards against before this rewrite (200 top-level directories'
+    // worth of `SessionStart` JSON, in the version this replaced):
+    // shrinking this back down to something "tidy" would silently stop
+    // testing the unbuffered-write path at all.
+    const OVERSIZED_CONTEXT_LEN: usize = 16 * 1024;
 
     let project = TempDir::new().unwrap();
     let runtime = TempDir::new().unwrap();
@@ -1002,7 +1019,7 @@ async fn test_hook_survives_a_closed_pipe() {
             Box::pin(async move {
                 match request {
                     Request::Flush { .. } => Response::Flush {
-                        context: Some("diagnostic".into()),
+                        context: Some("x".repeat(OVERSIZED_CONTEXT_LEN)),
                         token: None,
                     },
                     _ => unreachable!(),
@@ -1014,28 +1031,50 @@ async fn test_hook_survives_a_closed_pipe() {
     ));
 
     tokio::task::spawn_blocking(move || {
+        const PAYLOAD: &[u8] = br#"{"hook_event_name":"UserPromptSubmit","session_id":"s1"}"#;
+
+        let new_cmd = || {
+            let mut cmd = Command::cargo_bin("mcpls").unwrap();
+            clear_ambient_env(&mut cmd)
+                .arg("hook")
+                .env("CLAUDE_PROJECT_DIR", project.path())
+                .env_remove("XDG_RUNTIME_DIR")
+                .env("TMPDIR", runtime.path())
+                .env("USER", "mcpls-test");
+            cmd
+        };
+
+        // First, against a captured stdout: proves the hook actually
+        // reached the owner and wrote its oversized answer, so the
+        // closed-pipe run below is provably exercising a real write
+        // rather than a silently empty one.
+        let captured = assert_cmd::Command::from_std(new_cmd())
+            .write_stdin(PAYLOAD)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        assert!(
+            captured.len() > OVERSIZED_CONTEXT_LEN,
+            "the owner's oversized context must reach the hook's stdout \
+             untruncated, or the closed-pipe run below is not proven to \
+             exercise a write past the LineWriter buffer at all: got {} \
+             bytes",
+            captured.len()
+        );
+
         let mut departed_reader = Command::new("true").stdin(Stdio::piped()).spawn().unwrap();
         let closed_pipe = departed_reader.stdin.take().unwrap();
         departed_reader.wait().unwrap();
 
-        let mut cmd = Command::cargo_bin("mcpls").unwrap();
-        let mut child = clear_ambient_env(&mut cmd)
-            .arg("hook")
-            .env("CLAUDE_PROJECT_DIR", project.path())
-            .env_remove("XDG_RUNTIME_DIR")
-            .env("TMPDIR", runtime.path())
-            .env("USER", "mcpls-test")
+        let mut child = new_cmd()
             .stdin(Stdio::piped())
             .stdout(Stdio::from(closed_pipe))
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(br#"{"hook_event_name":"UserPromptSubmit","session_id":"s1"}"#)
-            .unwrap();
+        child.stdin.take().unwrap().write_all(PAYLOAD).unwrap();
         let output = child.wait_with_output().unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);
 

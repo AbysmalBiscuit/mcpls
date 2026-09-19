@@ -284,9 +284,11 @@ pub struct HooksConfig {
     ///
     /// Defaults on, because reaching this configuration means installing
     /// the plugin and installing the plugin is the opt-in. With this off,
-    /// no listener binds and the agent's own edits reach no language
-    /// server, though the backend's watcher still reports what changes on
-    /// disk.
+    /// no listener binds, so nothing injects diagnostics between turns and
+    /// an edit alone no longer starts a language server for a language
+    /// that has none running; a tool call still does. The backend's
+    /// watcher does not depend on this: changes on disk, the agent's own
+    /// included, still reach the servers that are running.
     #[serde(default = "default_hooks_enabled")]
     pub enabled: bool,
     /// How long the pending set must be quiet before the sweep runs.
