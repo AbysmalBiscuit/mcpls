@@ -15,6 +15,7 @@ mod settle;
 mod state;
 mod translator;
 
+pub(crate) use delivery::DiagnosticSnapshot;
 pub use delivery::{
     ChangedFile, ConnectionId, DiagnosticsDelivery, FileEntry, FloorTable, FlushReport, SessionId,
 };

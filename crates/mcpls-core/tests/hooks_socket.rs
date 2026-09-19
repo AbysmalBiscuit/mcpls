@@ -152,11 +152,11 @@ async fn test_two_concurrent_clients_reach_one_owner_before_either_finishes() {
         rx,
     ));
     let first = Request::Flush {
-        agent: Default::default(),
+        agent: mcpls_core::bridge::HookAgent::default(),
         session: "first".into(),
     };
     let second = Request::Flush {
-        agent: Default::default(),
+        agent: mcpls_core::bridge::HookAgent::default(),
         session: "second".into(),
     };
     let (a, b) = tokio::join!(
@@ -290,7 +290,7 @@ async fn test_a_request_reaches_the_owner_and_is_answered() {
     let response = send(
         &identity,
         &Request::Flush {
-            agent: Default::default(),
+            agent: mcpls_core::bridge::HookAgent::default(),
             session: "s1".to_string(),
         },
         Duration::from_secs(5),
@@ -341,7 +341,7 @@ async fn test_an_op_answers_within_its_deadline_while_its_work_runs_on() {
     let response = send(
         &identity,
         &Request::Flush {
-            agent: Default::default(),
+            agent: mcpls_core::bridge::HookAgent::default(),
             session: "s1".to_string(),
         },
         Duration::from_secs(5),
@@ -395,7 +395,7 @@ async fn test_overrunning_work_completes_after_its_deadline_answered() {
     let answer = send(
         &identity,
         &Request::Flush {
-            agent: Default::default(),
+            agent: mcpls_core::bridge::HookAgent::default(),
             session: "s1".to_string(),
         },
         Duration::from_secs(5),
@@ -445,13 +445,13 @@ async fn test_two_requests_share_one_connection() {
         &identity,
         &[
             Request::Changed {
-                agent: Default::default(),
+                agent: mcpls_core::bridge::HookAgent::default(),
                 session: "s1".to_string(),
                 paths: vec![std::path::PathBuf::from("a.rs")],
                 event: mcpls_core::hooks::ChangeEvent::Change,
             },
             Request::Flush {
-                agent: Default::default(),
+                agent: mcpls_core::bridge::HookAgent::default(),
                 session: "s1".to_string(),
             },
         ],
@@ -507,7 +507,7 @@ async fn test_send_and_acknowledge_acks_a_tokened_flush_on_the_same_connection()
     let answers = mcpls_core::hooks::send_and_acknowledge(
         &identity,
         &[Request::Flush {
-            agent: Default::default(),
+            agent: mcpls_core::bridge::HookAgent::default(),
             session: "s1".to_string(),
         }],
         Duration::from_secs(5),
@@ -529,11 +529,11 @@ async fn test_send_and_acknowledge_acks_a_tokened_flush_on_the_same_connection()
         seen,
         vec![
             Request::Flush {
-                agent: Default::default(),
+                agent: mcpls_core::bridge::HookAgent::default(),
                 session: "s1".to_string(),
             },
             Request::Ack {
-                agent: Default::default(),
+                agent: mcpls_core::bridge::HookAgent::default(),
                 session: "s1".to_string(),
                 token: 7,
             },
@@ -582,7 +582,7 @@ async fn test_an_acknowledgement_outlasts_a_flush_that_spent_the_callers_bound()
     let answers = mcpls_core::hooks::send_and_acknowledge(
         &identity,
         &[Request::Flush {
-            agent: Default::default(),
+            agent: mcpls_core::bridge::HookAgent::default(),
             session: "s1".to_string(),
         }],
         Duration::from_millis(250),

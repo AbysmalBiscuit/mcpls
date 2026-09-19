@@ -32,9 +32,9 @@ use super::tools::{
 };
 use crate::bridge::resources::{make_uri, parse_uri};
 use crate::bridge::{
-    ConnectionId, DefinitionResult, Diagnostic, DiagnosticInfo, DiagnosticSeverity,
-    DiagnosticsDelivery, DiagnosticsResult, DocumentSymbolsResult, FileEntry, FloorTable,
-    FlushReport, NotificationCache, PositionEncoding, RecordId, ReferencesResult,
+    Caller, ConnectionId, DefinitionResult, Diagnostic, DiagnosticInfo, DiagnosticSeverity,
+    DiagnosticSnapshot, DiagnosticsDelivery, DiagnosticsResult, DocumentSymbolsResult, FileEntry,
+    FloorTable, FlushReport, NotificationCache, PositionEncoding, RecordId, ReferencesResult,
     ResourceSubscriptions, ServerSettle, SessionId, Translator, uri_to_path,
     validate_path_against_roots,
 };
@@ -1156,6 +1156,29 @@ impl McplsServer {
             let pending_baselines = self.context.settle.pending_diagnostics_baselines();
             let entries =
                 routable_entries_borrowed(&cache, &self.context.floors, &pending_baselines);
+            let snapshots = entries
+                .iter()
+                .filter_map(|entry| {
+                    let info = cache.get_diagnostics(entry.key)?;
+                    let owner = cache.diagnostics_owner(entry.key)?;
+                    let text = uri_to_path(&info.uri).and_then(|path| {
+                        self.context
+                            .translator
+                            .document_tracker()
+                            .get(&path)
+                            .map(|document| Arc::<str>::from(document.content()))
+                    });
+                    Some((
+                        entry.key.to_string(),
+                        Arc::new(DiagnosticSnapshot {
+                            uri: info.uri.clone(),
+                            encoding: self.context.translator.position_encoding_for(owner),
+                            text,
+                        }),
+                    ))
+                })
+                .collect();
+            delivery.capture_sources(snapshots);
             let (report, token) = match advance {
                 Advance::Now => (delivery.flush(session, &entries), None),
                 Advance::OnAcknowledgement => delivery.stage(session, &entries),
@@ -1208,6 +1231,10 @@ impl McplsServer {
         self.context.delivery.lock().await.commit(session, token)
     }
 
+    pub(crate) async fn register_caller(&self, caller: &Caller) {
+        self.context.delivery.lock().await.register_caller(caller);
+    }
+
     /// Drop `session`'s delivery record.
     pub(crate) async fn end_session(&self, session: &SessionId) {
         self.context.delivery.lock().await.end_session(session);
@@ -1226,6 +1253,20 @@ impl McplsServer {
     ) -> NewDiagnosticsResult {
         let mut changed = Vec::with_capacity(report.changed.len());
         for file in &report.changed {
+            if let Some(source) = report.sources.get(&file.key) {
+                if let Some(path) = uri_to_path(&source.uri) {
+                    changed.push(NewDiagnosticsFile {
+                        file_path: path.display().to_string(),
+                        diagnostics: file
+                            .diagnostics
+                            .iter()
+                            .map(|diagnostic| source.render(diagnostic))
+                            .collect(),
+                        omitted: file.omitted,
+                    });
+                }
+                continue;
+            }
             let Some(source) = sources.get(&file.key) else {
                 continue;
             };
@@ -1256,8 +1297,14 @@ impl McplsServer {
         let cleared = report
             .cleared
             .iter()
-            .filter_map(|key| sources.get(key))
-            .filter_map(|source| uri_to_path(&source.uri))
+            .filter_map(|key| {
+                report
+                    .sources
+                    .get(key)
+                    .map(|source| &source.uri)
+                    .or_else(|| sources.get(key).map(|source| &source.uri))
+            })
+            .filter_map(uri_to_path)
             .map(|path| path.display().to_string())
             .collect();
 
@@ -1508,10 +1555,33 @@ impl ServerHandler for McplsServer {
                         .merge_session(&anonymous, &session);
                     *adopted = true;
                 }
+                drop(adopted);
+                let root = context
+                    .meta
+                    .get("x-codex-turn-metadata")
+                    .and_then(|meta| meta.get("session_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|root| SessionId::named(Some(root.to_owned())));
+                self.context.delivery.lock().await.register_caller(&Caller {
+                    record: RecordId::from(&session),
+                    root,
+                });
                 session
             } else {
                 anonymous
             };
+        }
+        if server.session != SessionId::for_connection(server.connection)
+            && context
+                .client_info()
+                .is_none_or(|client| client.name != "codex-mcp-client")
+        {
+            server
+                .register_caller(&Caller {
+                    record: RecordId::from(&server.session),
+                    root: Some(server.session.clone()),
+                })
+                .await;
         }
         let call = rmcp::handler::server::tool::ToolCallContext::new(&server, request, context);
         Self::tool_router().call(call).await

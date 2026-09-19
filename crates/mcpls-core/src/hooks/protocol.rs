@@ -210,7 +210,7 @@ mod tests {
     #[test]
     fn test_a_changed_request_round_trips() {
         let request = Request::Changed {
-            agent: Default::default(),
+            agent: crate::bridge::HookAgent::default(),
             session: "s1".to_string(),
             paths: vec![abs("src/a.rs")],
             event: ChangeEvent::Change,
@@ -226,7 +226,7 @@ mod tests {
     #[test]
     fn test_the_wire_names_match_the_spec() {
         let line = serde_json::to_string(&Request::Flush {
-            agent: Default::default(),
+            agent: crate::bridge::HookAgent::default(),
             session: "s1".to_string(),
         })
         .expect("serialize");
@@ -467,7 +467,7 @@ mod tests {
     fn test_the_ack_request_pins_the_wire_shape() {
         let literal = r#"{"op":"ack","host":"claude","session":"s1","token":7}"#;
         let value = Request::Ack {
-            agent: Default::default(),
+            agent: crate::bridge::HookAgent::default(),
             session: "s1".to_string(),
             token: 7,
         };

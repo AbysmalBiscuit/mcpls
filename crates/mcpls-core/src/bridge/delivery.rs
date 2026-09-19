@@ -6,10 +6,18 @@
 //! full current error list is more useful than a delta against a list that
 //! has left the context window.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
-use super::RecordId;
+use super::{Caller, RecordId};
+
+#[cfg(test)]
+#[path = "delivery_tests.rs"]
+mod attribution_tests;
+
+#[path = "attribution.rs"]
+mod attribution;
 use crate::config::{DiagnosticsConfig, LspServerConfig, ServerId, SeverityFloor};
 
 /// Identity of one client session.
@@ -107,6 +115,8 @@ pub struct ChangedFile {
 /// What one flush found.
 #[derive(Debug, Clone, Default)]
 pub struct FlushReport {
+    /// Rendering context retained with a report instead of read from the live cache.
+    pub(crate) sources: HashMap<String, Arc<DiagnosticSnapshot>>,
     /// Files whose visible diagnostics differ from the last flush.
     pub changed: Vec<ChangedFile>,
     /// Cache keys of files that had visible diagnostics and now have none.
@@ -125,6 +135,42 @@ struct PendingFlush {
     /// `Some(hash)` records the file as delivered at that hash; `None`
     /// forgets it, for a file that cleared or was muted.
     updates: Vec<(String, Option<u64>)>,
+    snapshots: Vec<(String, u64)>,
+}
+
+#[derive(Debug, Default)]
+struct Ownership {
+    generation: u64,
+    writers: HashSet<RecordId>,
+    delivered: bool,
+}
+
+#[derive(Debug, Clone)]
+struct OwnedEntry {
+    key: String,
+    diagnostics: Vec<lsp_types::Diagnostic>,
+    floor: SeverityFloor,
+}
+
+#[derive(Debug)]
+struct RetainedFile {
+    id: u64,
+    root: SessionId,
+    generation: u64,
+    file: OwnedEntry,
+    hash: Option<u64>,
+    source: Option<Arc<DiagnosticSnapshot>>,
+}
+
+/// The source and document text used to render retained diagnostics.
+#[derive(Debug)]
+pub struct DiagnosticSnapshot {
+    /// Original diagnostic document URI.
+    pub uri: lsp_types::Uri,
+    /// Encoding negotiated with the publishing server.
+    pub encoding: super::PositionEncoding,
+    /// Document text at snapshot time.
+    pub text: Option<Arc<str>>,
 }
 
 /// Per-session records of what has already been delivered.
@@ -138,6 +184,11 @@ pub struct DiagnosticsDelivery {
     /// `end_session` drops both.
     pending: HashMap<RecordId, PendingFlush>,
     next_token: u64,
+    roots: HashMap<RecordId, Option<SessionId>>,
+    ownership: HashMap<(SessionId, String), Ownership>,
+    retained: HashMap<RecordId, BTreeMap<String, VecDeque<Arc<RetainedFile>>>>,
+    sources: HashMap<String, Arc<DiagnosticSnapshot>>,
+    next_snapshot: u64,
 }
 
 impl DiagnosticsDelivery {
@@ -155,6 +206,11 @@ impl DiagnosticsDelivery {
             baseline: None,
             pending: HashMap::new(),
             next_token: 0,
+            roots: HashMap::new(),
+            ownership: HashMap::new(),
+            retained: HashMap::new(),
+            sources: HashMap::new(),
+            next_snapshot: 0,
         }
     }
 
@@ -195,6 +251,12 @@ impl DiagnosticsDelivery {
         let session = &session.into();
         self.sessions.remove(session);
         self.pending.remove(session);
+        self.retained.remove(session);
+        self.roots.remove(session);
+        self.ownership.retain(|_, owner| {
+            owner.writers.remove(session);
+            !owner.writers.is_empty()
+        });
     }
 
     /// Move committed history into `target`, keeping its history on conflicts.
@@ -289,15 +351,41 @@ impl DiagnosticsDelivery {
         entries: &[FileEntry<'_>],
     ) -> (FlushReport, Option<u64>) {
         let session = &session.into();
-        let (report, updates) = self.diff(session, entries);
+        self.observe_owned(entries);
+        let routed = self.routed_entries(session, entries);
+        let borrowed: Vec<_> = routed
+            .iter()
+            .map(|file| FileEntry {
+                key: &file.key,
+                diagnostics: &file.diagnostics,
+                floor: file.floor,
+            })
+            .collect();
+        let (mut report, updates) = self.diff(session, &borrowed);
+        let snapshots: Vec<_> = updates
+            .iter()
+            .filter_map(|(key, _)| {
+                let snapshot = self.retained.get(session)?.get(key)?.front()?;
+                if let Some(source) = &snapshot.source {
+                    report.sources.insert(key.clone(), Arc::clone(source));
+                }
+                Some((key.clone(), snapshot.id))
+            })
+            .collect();
         if updates.is_empty() {
             self.pending.remove(session);
             return (report, None);
         }
         self.next_token += 1;
         let token = self.next_token;
-        self.pending
-            .insert(session.clone(), PendingFlush { token, updates });
+        self.pending.insert(
+            session.clone(),
+            PendingFlush {
+                token,
+                updates,
+                snapshots,
+            },
+        );
         (report, Some(token))
     }
 
@@ -313,7 +401,10 @@ impl DiagnosticsDelivery {
             Some(pending) if pending.token == token => self.pending.remove(session),
             _ => None,
         };
-        let Some(PendingFlush { updates, .. }) = staged else {
+        let Some(PendingFlush {
+            updates, snapshots, ..
+        }) = staged
+        else {
             return false;
         };
         let record = self.sessions.entry(session.clone()).or_default();
@@ -327,6 +418,7 @@ impl DiagnosticsDelivery {
                 }
             }
         }
+        self.commit_snapshots(session, &snapshots);
         true
     }
 
@@ -504,7 +596,7 @@ mod tests {
         );
     }
 
-    fn diagnostic(line: u32, severity: DiagnosticSeverity, message: &str) -> Diagnostic {
+    pub(super) fn diagnostic(line: u32, severity: DiagnosticSeverity, message: &str) -> Diagnostic {
         Diagnostic {
             range: Range {
                 start: Position::new(line, 0),
@@ -516,7 +608,7 @@ mod tests {
         }
     }
 
-    fn entry<'a>(
+    pub(super) fn entry<'a>(
         key: &'a str,
         diagnostics: &'a [Diagnostic],
         floor: SeverityFloor,

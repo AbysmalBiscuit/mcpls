@@ -1063,7 +1063,7 @@ mod client_rule_tests {
 
     fn flush(session: &str) -> Request {
         Request::Flush {
-            agent: Default::default(),
+            agent: crate::bridge::HookAgent::default(),
             session: session.to_string(),
         }
     }
@@ -1082,7 +1082,7 @@ mod client_rule_tests {
         assert_eq!(
             acknowledgement_for(&requests, &responses),
             Some(Request::Ack {
-                agent: Default::default(),
+                agent: crate::bridge::HookAgent::default(),
                 session: "s2".to_string(),
                 token: 2,
             }),
@@ -1099,7 +1099,7 @@ mod client_rule_tests {
         assert_eq!(
             acknowledgement_for(&requests, &responses),
             Some(Request::Ack {
-                agent: Default::default(),
+                agent: crate::bridge::HookAgent::default(),
                 session: "s1".to_string(),
                 token: 1,
             }),

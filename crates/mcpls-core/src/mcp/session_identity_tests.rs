@@ -63,8 +63,12 @@ impl Client {
 
 fn metadata(thread: &str) -> Value {
     json!({"threadId": thread, "x-codex-turn-metadata": {
-        "thread_id": thread, "session_id": "root"
+        "thread_id": thread, "session_id": thread
     }})
+}
+
+fn child_metadata(thread: &str) -> Value {
+    json!({"threadId": thread, "x-codex-turn-metadata": {"thread_id": thread, "session_id": "root"}})
 }
 
 fn changed(result: &Value) -> usize {
@@ -83,14 +87,31 @@ async fn codex_hook_and_mcp_share_the_thread_record() {
             panic!("flush request");
         };
         let caller = agent.caller(&session);
+        let key = if cfg!(windows) {
+            "file:///C:/workspace/broken.rs"
+        } else {
+            "file:///workspace/broken.rs"
+        };
+        server
+            .context
+            .delivery
+            .lock()
+            .await
+            .record_write(&caller, &[key.to_string()]);
         let mut client = Client::connect(server.for_connection(None), "codex-mcp-client").await;
         if hook_first {
             let (context, token) = server.flush_for_hook(&caller.record).await;
             assert!(context.is_some());
             assert!(server.commit_for_hook(&caller.record, token.unwrap()).await);
-            assert_eq!(changed(&client.diagnostics(metadata("child")).await), 0);
+            assert_eq!(
+                changed(&client.diagnostics(child_metadata("child")).await),
+                0
+            );
         } else {
-            assert_eq!(changed(&client.diagnostics(metadata("child")).await), 1);
+            assert_eq!(
+                changed(&client.diagnostics(child_metadata("child")).await),
+                1
+            );
             let (context, token) = server.flush_for_hook(&caller.record).await;
             assert!(context.is_none());
             assert!(token.is_none());
@@ -178,11 +199,72 @@ async fn codex_root_and_child_use_their_thread_records() {
     let mut root = Client::connect(server.for_connection(session()), "codex-mcp-client").await;
     let mut child = Client::connect(server.for_connection(session()), "codex-mcp-client").await;
     assert_eq!(changed(&root.diagnostics(metadata("root")).await), 1);
-    assert_eq!(changed(&child.diagnostics(metadata("child")).await), 1);
+    assert_eq!(
+        changed(&child.diagnostics(child_metadata("child")).await),
+        0
+    );
     assert_eq!(changed(&root.diagnostics(metadata("root")).await), 0);
-    assert_eq!(changed(&child.diagnostics(metadata("child")).await), 0);
+    assert_eq!(
+        changed(&child.diagnostics(child_metadata("child")).await),
+        0
+    );
     root.close().await;
     child.close().await;
+}
+
+#[tokio::test]
+async fn mcp_diagnostics_are_limited_to_the_callers_written_files() {
+    let server = server_with_one_error().await;
+    let prefix = if cfg!(windows) {
+        "file:///C:/workspace/"
+    } else {
+        "file:///workspace/"
+    };
+    let mut uris = Vec::new();
+    for file in ["a.rs", "b.rs"] {
+        let uri: Uri = format!("{prefix}{file}").parse().unwrap();
+        server
+            .context
+            .notification_cache
+            .lock()
+            .await
+            .store_diagnostics(
+                &ServerId::from("rust"),
+                &uri,
+                Some(1),
+                vec![lsp_types::Diagnostic {
+                    severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+                    message: file.to_string(),
+                    ..Default::default()
+                }],
+            );
+        uris.push(uri.to_string());
+    }
+    for (thread, key) in [("a", &uris[0]), ("b", &uris[1])] {
+        server.context.delivery.lock().await.record_write(
+            &crate::bridge::Caller {
+                record: RecordId::Session(SessionId::from(thread.to_string())),
+                root: Some(SessionId::from("root".to_string())),
+            },
+            std::slice::from_ref(key),
+        );
+    }
+    for (thread, expected) in [("a", "a.rs"), ("b", "b.rs"), ("root", "broken.rs")] {
+        let mut client = Client::connect(server.for_connection(None), "codex-mcp-client").await;
+        let result = client.diagnostics(child_metadata(thread)).await;
+        assert_eq!(changed(&result), 1, "{thread}: {result}");
+        assert!(
+            result["changed"][0]["file_path"]
+                .as_str()
+                .unwrap()
+                .ends_with(expected)
+        );
+        assert_eq!(
+            changed(&client.diagnostics(child_metadata(thread)).await),
+            0
+        );
+        client.close().await;
+    }
 }
 
 #[tokio::test]
@@ -217,13 +299,14 @@ async fn codex_adopts_anonymous_history_on_the_first_identified_call() {
 async fn codex_thread_metadata_falls_back_and_prefers_thread_id() {
     let server = server_with_one_error().await;
     let mut client = Client::connect(server.for_connection(None), "codex-mcp-client").await;
-    let nested = || Some(json!({"x-codex-turn-metadata": {"thread_id": "nested"}}));
+    let nested =
+        || Some(json!({"x-codex-turn-metadata": {"thread_id": "nested", "session_id": "nested"}}));
     assert_eq!(changed(&client.diagnostics(nested()).await), 1);
     assert_eq!(
         changed(
             &client
                 .diagnostics(Some(json!({
-                    "threadId": "top", "x-codex-turn-metadata": {"thread_id": "nested"}
+                    "threadId": "top", "x-codex-turn-metadata": {"thread_id": "nested", "session_id": "top"}
                 })))
                 .await
         ),

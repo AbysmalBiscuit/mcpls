@@ -24,8 +24,8 @@ impl From<&SessionId> for RecordId {
     }
 }
 
-impl From<&RecordId> for RecordId {
-    fn from(record: &RecordId) -> Self {
+impl From<&Self> for RecordId {
+    fn from(record: &Self) -> Self {
         record.clone()
     }
 }
