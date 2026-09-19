@@ -26,12 +26,14 @@ use crate::lsp::WatchRegistry;
 /// for example `!target/keep.rs`: everything else under `target/` stays
 /// dropped, but that one path is not.
 ///
-/// `.git` is here because no project writes it into its own `.gitignore`,
-/// git having no need of that, and because the watcher's walk takes every
-/// exclusion from this module: without the line it would place a watch on
-/// every directory of the object store, which git rewrites on each commit,
-/// fetch and index update.
-const BUILT_IN_IGNORES: &[&str] = &[".git", "target", "node_modules"];
+/// The VCS stores are here because no project writes them into its own
+/// `.gitignore`, the VCS having no need of that, and because the watcher's
+/// walk takes every exclusion from this module: without the lines it would
+/// place a watch on every directory of the store, which the VCS rewrites on
+/// each commit, fetch and index update. `.git` is one of four: `.jj`, `.hg`
+/// and `.svn` are rewritten just as often by the tools that own them, and a
+/// checkout is as likely to be any of them.
+const BUILT_IN_IGNORES: &[&str] = &[".git", ".jj", ".hg", ".svn", "target", "node_modules"];
 
 /// Decides which changed paths are worth waking a language server for.
 pub struct PathFilter {
@@ -686,5 +688,42 @@ mod tests {
              every commit, fetch and index update, and a watch on it would \
              wake the sweeper for each one"
         );
+    }
+
+    /// `.git` is not the only store a VCS rewrites under the checkout.
+    /// jujutsu, Mercurial and Subversion each keep one, none of them is
+    /// written into a project's `.gitignore`, and each is rewritten on
+    /// every operation the VCS performs.
+    #[test]
+    fn test_the_watch_set_excludes_the_other_vcs_stores() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
+        for store in [".jj/repo/store", ".hg/store", ".svn/pristine"] {
+            std::fs::create_dir_all(dir.path().join(store)).expect("mkdir");
+        }
+        let filter = Arc::new(filter_over(dir.path()));
+
+        let directories = watch_set(&filter, &[dir.path().to_path_buf()]).directories;
+
+        assert!(directories.contains(&dir.path().join("src")));
+        for store in [".jj", ".hg", ".svn"] {
+            assert!(
+                !directories.contains(&dir.path().join(store)),
+                "a {store} checkout rewrites this store on every operation, so \
+                 a watch on it wakes the sweeper constantly -- the same defect \
+                 the .git line already fixes"
+            );
+        }
+    }
+
+    /// The floor is about the store, not about every path a VCS touches:
+    /// a file the working copy carries under one of these names is still a
+    /// source file and must keep its admission.
+    #[test]
+    fn test_a_vcs_store_name_outside_the_floor_is_still_admitted() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let filter = filter_over(dir.path());
+
+        assert!(filter.admits(&dir.path().join("src/hg.rs")));
     }
 }
