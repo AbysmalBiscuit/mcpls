@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{RwLock, mpsc, watch};
 use tracing::{debug, info, warn};
 
 use crate::backend::handshake::{
@@ -43,6 +43,7 @@ struct TrackedService {
     server: McplsServer,
     handlers: mpsc::UnboundedSender<()>,
     closing: watch::Receiver<bool>,
+    closed: Arc<RwLock<bool>>,
 }
 
 impl rmcp::Service<rmcp::RoleServer> for TrackedService {
@@ -52,19 +53,28 @@ impl rmcp::Service<rmcp::RoleServer> for TrackedService {
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<<rmcp::RoleServer as rmcp::service::ServiceRole>::Resp, rmcp::ErrorData> {
         let _handler = self.handlers.clone();
+        let closed = self.closed.read().await;
+        if *closed {
+            return Err(rmcp::ErrorData::internal_error(
+                "the connection is closed",
+                None,
+            ));
+        }
         let mut closing = self.closing.clone();
         let request = <McplsServer as rmcp::Service<rmcp::RoleServer>>::handle_request(
             &self.server,
             request,
             context,
         );
-        tokio::select! {
+        let result = tokio::select! {
             result = request => result,
             _ = closing.wait_for(|closing| *closing) => Err(rmcp::ErrorData::internal_error(
                 "the endpoint is closing",
                 None,
             )),
-        }
+        };
+        drop(closed);
+        result
     }
 
     async fn handle_notification(
@@ -287,7 +297,6 @@ impl Endpoint {
         handler_tx: mpsc::UnboundedSender<()>,
     ) {
         use rmcp::ServiceExt as _;
-
         let notes = request
             .config
             .as_ref()
@@ -300,10 +309,12 @@ impl Endpoint {
             .with_notes(notes);
         let connection = server.connection();
         let subscriptions = Arc::clone(server.subscriptions());
+        let connection_state = Arc::new(RwLock::new(false));
         let server = TrackedService {
             server,
             handlers: handler_tx,
             closing: closing.clone(),
+            closed: Arc::clone(&connection_state),
         };
         let _attached = self
             .attachments
@@ -327,7 +338,12 @@ impl Endpoint {
         let _ = running.waiting().await;
         closer.abort();
         let _ = closer.await;
+        // rmcp can return while detached tool handlers are still finishing.
+        *connection_state.write().await = true;
         subscriptions.remove_connection(connection).await;
+        self.template
+            .end_session(&SessionId::for_connection(connection))
+            .await;
     }
 }
 
@@ -512,6 +528,161 @@ mod tests {
         let answer = initialize(&mut stream).await;
         assert_eq!(answer["result"]["serverInfo"]["name"], "mcpls", "{answer}");
         backend.task.abort();
+    }
+
+    #[rstest::rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test(start_paused = true)]
+    #[allow(clippy::too_many_lines)]
+    async fn test_anonymous_delivery_record_is_removed_when_connection_closes(
+        #[case] with_pending_call: bool,
+    ) {
+        use crate::bridge::{FileEntry, SessionId};
+        use crate::config::{ServerId, SeverityFloor};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let path = root.join("broken.rs");
+        std::fs::write(&path, "fn old() {}\n").unwrap();
+        let (translator, mut lsp) = crate::bridge::translator_with_capabilities(
+            &dir,
+            &ServerId::from("rust"),
+            lsp_types::ServerCapabilities {
+                document_formatting_provider: Some(lsp_types::OneOf::Left(true)),
+                ..Default::default()
+            },
+        );
+        let translator = translator.with_applier(Arc::new(crate::bridge::apply::Applier::new(
+            vec![root.clone()],
+            crate::config::ApplyConfig {
+                format_document: true,
+                ..Default::default()
+            },
+        )));
+        let runtime = crate::Runtime::start(&config(60_000), Ok(root.clone()))
+            .await
+            .unwrap();
+        runtime
+            .context
+            .delivery
+            .lock()
+            .await
+            .set_baseline(std::collections::HashMap::new());
+        let uri = crate::bridge::path_to_uri(&root.join("broken.rs")).unwrap();
+        let diagnostics = vec![lsp_types::Diagnostic {
+            severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+            message: "broken".to_string(),
+            ..lsp_types::Diagnostic::default()
+        }];
+        runtime
+            .context
+            .notification_cache
+            .lock()
+            .await
+            .store_diagnostics(&ServerId::from("rust"), &uri, Some(1), diagnostics.clone());
+        let mut endpoint = Endpoint::new(
+            &runtime,
+            &config(60_000),
+            root.clone(),
+            temp_identity(&root),
+        );
+        Arc::get_mut(&mut endpoint).unwrap().template = McplsServer::new(
+            Arc::new(translator),
+            Arc::clone(&runtime.context.notification_cache),
+            Arc::clone(&runtime.context.workspace_roots),
+            Arc::clone(&runtime.context.subscriptions),
+            false,
+            Arc::clone(&runtime.context.delivery),
+            Arc::clone(&runtime.context.floors),
+            crate::config::DiagnosticsConfig {
+                footer: true,
+                footer_grace_ms: 0,
+                footer_quiet_ms: 0,
+                footer_wait_ms: 0,
+                ..Default::default()
+            },
+            Arc::clone(&runtime.context.settle),
+        );
+        let (mut client, server) = tokio::io::duplex(65_536);
+        let (handler_tx, _handler_rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(Arc::clone(&endpoint).connection(Box::new(server), handler_tx));
+        handshake::write(
+            &mut client,
+            &Handshake::mcp(root, None, ConfigStamp::of(&config(0))),
+        )
+        .await
+        .unwrap();
+        assert!(
+            handshake::read::<_, HandshakeReply>(&mut client)
+                .await
+                .unwrap()
+                .refusal
+                .is_none()
+        );
+        let mut client: Box<dyn crate::hooks::listener::HookStream> = Box::new(client);
+        initialize(&mut client).await;
+        client.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"get_new_diagnostics\",\"arguments\":{}}}\n").await.unwrap();
+        let mut response = String::new();
+        BufReader::new(&mut client)
+            .read_line(&mut response)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert!(
+            value["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("broken.rs")
+        );
+        let session = SessionId::from(endpoint.attachments.sessions().pop().unwrap());
+        let cache = runtime.context.notification_cache.lock().await;
+        let key = cache.diagnostics_entries()[0].0.to_string();
+        drop(cache);
+        if with_pending_call {
+            let mut call = serde_json::to_vec(&serde_json::json!({
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {"name": "format_document", "arguments": {"file_path": path, "apply": true}}
+            })).unwrap();
+            call.push(b'\n');
+            client.write_all(&call).await.unwrap();
+            let request =
+                crate::bridge::read_framed_reply(&mut BufReader::new(&mut lsp.write_stdout)).await;
+            assert_eq!(request["method"], "textDocument/formatting");
+            drop(client);
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            assert!(
+                !task.is_finished(),
+                "cleanup must wait for the active tool call"
+            );
+            crate::bridge::write_response(&mut lsp.read_half_stdin, &request["id"], serde_json::json!([{
+                "range": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 6}},
+                "newText": "new"
+            }])).await;
+        } else {
+            drop(client);
+        }
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        if with_pending_call {
+            assert_eq!(std::fs::read_to_string(path).unwrap(), "fn new() {}\n");
+        }
+        let report = runtime.context.delivery.lock().await.flush(
+            &session,
+            &[FileEntry {
+                key: &key,
+                diagnostics: &diagnostics,
+                floor: SeverityFloor::Warning,
+            }],
+        );
+        assert_eq!(
+            report.changed.len(),
+            1,
+            "the disconnected connection's delivered record survived"
+        );
+        runtime.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

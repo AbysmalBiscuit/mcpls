@@ -39,6 +39,11 @@ use crate::bridge::{
 };
 use crate::config::{DiagnosticsConfig, ServerId, ToolKind};
 
+#[cfg(test)]
+#[path = "session_identity_tests.rs"]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod session_identity_tests;
+
 /// What every mcpls tells an agent about itself at `initialize`.
 #[allow(clippy::redundant_pub_crate)]
 pub(crate) const INSTRUCTIONS: &str = concat!(
@@ -54,8 +59,31 @@ pub struct McplsServer {
     context: Arc<BridgeContext>,
     connection: ConnectionId,
     session: SessionId,
+    adopted_anonymous: Arc<Mutex<bool>>,
+    _http_cleanup: Option<Arc<HttpConnectionCleanup>>,
     /// Sentences appended to this connection's instructions.
     notes: Arc<[String]>,
+}
+
+struct HttpConnectionCleanup {
+    context: Arc<BridgeContext>,
+    connection: ConnectionId,
+}
+
+impl Drop for HttpConnectionCleanup {
+    fn drop(&mut self) {
+        let context = Arc::clone(&self.context);
+        let connection = self.connection;
+        // The last server clone outlives rmcp's detached request handlers.
+        tokio::spawn(async move {
+            context
+                .delivery
+                .lock()
+                .await
+                .end_session(&SessionId::for_connection(connection));
+            context.subscriptions.remove_connection(connection).await;
+        });
+    }
 }
 
 /// The apply toggle a tool's writes answer to, for the tools that write.
@@ -527,6 +555,8 @@ impl McplsServer {
             context,
             connection,
             session: SessionId::for_connection(connection),
+            adopted_anonymous: Arc::new(Mutex::new(false)),
+            _http_cleanup: None,
             notes: Arc::from(Vec::new()),
         }
     }
@@ -541,7 +571,21 @@ impl McplsServer {
             context: Arc::clone(&self.context),
             connection,
             session: session.unwrap_or_else(|| SessionId::for_connection(connection)),
+            adopted_anonymous: Arc::new(Mutex::new(false)),
+            _http_cleanup: None,
             notes: Arc::clone(&self.notes),
+        }
+    }
+
+    #[cfg(feature = "transport-http")]
+    pub(crate) fn for_http_connection(&self) -> Self {
+        let server = self.for_connection(None);
+        Self {
+            _http_cleanup: Some(Arc::new(HttpConnectionCleanup {
+                context: Arc::clone(&server.context),
+                connection: server.connection,
+            })),
+            ..server
         }
     }
 
@@ -1422,6 +1466,49 @@ impl McplsServer {
 #[allow(clippy::unused_async_trait_impl)]
 #[tool_handler]
 impl ServerHandler for McplsServer {
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, McpError> {
+        let mut server = self.clone();
+        if context
+            .client_info()
+            .is_some_and(|client| client.name == "codex-mcp-client")
+        {
+            let thread = context
+                .meta
+                .get("threadId")
+                .and_then(serde_json::Value::as_str)
+                .filter(|thread| !thread.is_empty())
+                .or_else(|| {
+                    context
+                        .meta
+                        .get("x-codex-turn-metadata")?
+                        .get("thread_id")?
+                        .as_str()
+                        .filter(|thread| !thread.is_empty())
+                });
+            let anonymous = SessionId::for_connection(self.connection);
+            server.session = if let Some(session) = SessionId::named(thread.map(str::to_owned)) {
+                let mut adopted = self.adopted_anonymous.lock().await;
+                if !*adopted {
+                    self.context
+                        .delivery
+                        .lock()
+                        .await
+                        .merge_session(&anonymous, &session);
+                    *adopted = true;
+                }
+                session
+            } else {
+                anonymous
+            };
+        }
+        let call = rmcp::handler::server::tool::ToolCallContext::new(&server, request, context);
+        Self::tool_router().call(call).await
+    }
+
     /// What `#[tool_handler]` would generate, plus the pass that fits each
     /// tool's annotations to this deployment. Defining it here is what stops
     /// the macro generating its own.
@@ -1676,7 +1763,7 @@ mod tests {
 
     /// A server over one context, with an adopted empty baseline and one
     /// error cached, so a flush has something to report.
-    async fn server_with_one_error() -> McplsServer {
+    pub(super) async fn server_with_one_error() -> McplsServer {
         let (delivery, floors) = default_delivery_and_floors();
         let cache = Arc::new(Mutex::new(NotificationCache::new()));
         let uri: lsp_types::Uri = if cfg!(windows) {
@@ -3350,7 +3437,7 @@ mod tests {
         }).await.expect("bounded MCP rename and LSP notification exchange");
     }
 
-    async fn mcp_test_request(
+    pub(super) async fn mcp_test_request(
         wire: &mut tokio::io::BufStream<tokio::io::DuplexStream>,
         request: serde_json::Value,
     ) -> serde_json::Value {

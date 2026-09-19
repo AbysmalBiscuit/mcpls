@@ -444,7 +444,7 @@ pub(crate) async fn serve_http_on(
     http_cfg.max_request_body_bytes = cfg.max_request_body_bytes;
 
     let service = StreamableHttpService::new(
-        move || Ok::<_, std::io::Error>(mcp_for_factory.for_connection(None)),
+        move || Ok::<_, std::io::Error>(mcp_for_factory.for_http_connection()),
         session_manager,
         http_cfg,
     );
@@ -949,6 +949,130 @@ mod tests {
             server_task.abort();
         }
 
+        #[rstest::rstest]
+        #[case(false, false)]
+        #[case(true, false)]
+        #[case(false, true)]
+        #[tokio::test]
+        #[allow(clippy::too_many_lines)]
+        async fn test_http_session_close_cleans_only_anonymous_history(
+            #[case] identified: bool,
+            #[case] pending_call: bool,
+        ) {
+            use std::sync::Arc;
+            use std::time::Duration;
+
+            use serde_json::json;
+
+            let context = test_context();
+            context
+                .delivery
+                .lock()
+                .await
+                .set_baseline(std::collections::HashMap::new());
+            let uri: lsp_types::Uri = if cfg!(windows) {
+                "file:///C:/workspace/broken.rs"
+            } else {
+                "file:///workspace/broken.rs"
+            }
+            .parse()
+            .unwrap();
+            context.notification_cache.lock().await.store_diagnostics(
+                &crate::config::ServerId::from("rust"),
+                &uri,
+                Some(1),
+                vec![lsp_types::Diagnostic {
+                    message: "broken".into(),
+                    severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+                    ..Default::default()
+                }],
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server_task = tokio::spawn(super::super::serve_http_on(
+                listener,
+                crate::mcp::McplsServer::from_context(Arc::clone(&context)),
+                HttpConfig::new(addr, "/mcp"),
+                super::super::ShutdownSignal::new(),
+            ));
+            let headers =
+                "Accept: application/json, text/event-stream\r\nContent-Type: application/json\r\n";
+            let initialized = raw_http_post(addr, "/mcp", headers, br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"codex-mcp-client","version":"0"}}}"#).await;
+            assert!(initialized.starts_with("HTTP/1.1 200"), "{initialized}");
+            let id = initialized
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("mcp-session-id")
+                        .then(|| value.trim())
+                })
+                .unwrap();
+            let headers = format!("{headers}Mcp-Session-Id: {id}\r\n");
+            let response = raw_http_post(
+                addr,
+                "/mcp",
+                &headers,
+                br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            )
+            .await;
+            assert!(response.starts_with("HTTP/1.1 202"), "{response}");
+            let mut params = json!({"name": "get_new_diagnostics", "arguments": {}});
+            if identified {
+                params["_meta"] = json!({"threadId": "http-thread"});
+            }
+            let call = serde_json::to_vec(
+                &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": params}),
+            )
+            .unwrap();
+            let response = raw_http_post(addr, "/mcp", &headers, &call).await;
+            assert!(
+                response.starts_with("HTTP/1.1 200") && response.contains("broken"),
+                "{response}"
+            );
+            assert_eq!(context.delivery.lock().await.session_count(), 1);
+
+            let cache_guard = if pending_call {
+                let guard = context.notification_cache.lock().await;
+                let response = raw_http_post(addr, "/mcp", &headers, br#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_server_messages","arguments":{}}}"#).await;
+                assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+                Some(guard)
+            } else {
+                None
+            };
+            let deleted = raw_http_request(addr, "DELETE", "/mcp", &headers, b"").await;
+            assert!(deleted.starts_with("HTTP/1.1 202"), "{deleted}");
+            if pending_call {
+                tokio::time::sleep(Duration::from_secs(6)).await;
+                assert_eq!(
+                    context.delivery.lock().await.session_count(),
+                    1,
+                    "history must remain until the in-flight tool finishes"
+                );
+            }
+            drop(cache_guard);
+            if identified {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                assert_eq!(
+                    context.delivery.lock().await.session_count(),
+                    1,
+                    "named thread history must survive session close"
+                );
+            } else {
+                let cleaned = tokio::time::timeout(Duration::from_secs(3), async {
+                    while context.delivery.lock().await.session_count() != 0 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await;
+                assert!(
+                    cleaned.is_ok(),
+                    "closed HTTP session must release its anonymous history"
+                );
+            }
+            server_task.abort();
+            let _ = server_task.await;
+        }
+
         /// #241 C1 regression: `run_http` must not self-terminate after
         /// `HTTP_GRACEFUL_SHUTDOWN_TIMEOUT` of ordinary uptime when no
         /// shutdown signal has been sent — the graceful-shutdown timeout
@@ -1144,6 +1268,10 @@ mod tests {
         /// Builds a `McplsServer` with empty/default collaborators, matching the
         /// setup shared by every HTTP-serving test in this module.
         fn test_server() -> crate::mcp::McplsServer {
+            crate::mcp::McplsServer::from_context(test_context())
+        }
+
+        fn test_context() -> std::sync::Arc<crate::mcp::BridgeContext> {
             use std::path::PathBuf;
             use std::sync::Arc;
 
@@ -1154,7 +1282,6 @@ mod tests {
                 ServerSettle, Translator,
             };
             use crate::config::DiagnosticsConfig;
-            use crate::mcp::McplsServer;
 
             let translator = Arc::new(Translator::new());
             let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
@@ -1168,7 +1295,7 @@ mod tests {
                 std::time::Duration::from_secs(1),
                 std::time::Duration::from_secs(300),
             ));
-            McplsServer::new(
+            Arc::new(crate::mcp::BridgeContext::new(
                 translator,
                 notification_cache,
                 workspace_roots,
@@ -1178,7 +1305,7 @@ mod tests {
                 floors,
                 DiagnosticsConfig::default(),
                 settle,
-            )
+            ))
         }
 
         /// Serves the MCP HTTP transport on a fresh loopback port, returning
@@ -1216,11 +1343,21 @@ mod tests {
             extra_headers: &str,
             body: &[u8],
         ) -> String {
+            raw_http_request(addr, "POST", path, extra_headers, body).await
+        }
+
+        async fn raw_http_request(
+            addr: SocketAddr,
+            method: &str,
+            path: &str,
+            extra_headers: &str,
+            body: &[u8],
+        ) -> String {
             use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
             let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
             let request = format!(
-                "POST {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n{extra_headers}Content-Length: {}\r\n\r\n",
+                "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n{extra_headers}Content-Length: {}\r\n\r\n",
                 body.len()
             );
             stream.write_all(request.as_bytes()).await.unwrap();

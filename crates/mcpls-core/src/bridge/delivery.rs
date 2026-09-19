@@ -140,6 +140,11 @@ pub struct DiagnosticsDelivery {
 }
 
 impl DiagnosticsDelivery {
+    #[cfg(all(test, feature = "transport-http"))]
+    pub(crate) fn session_count(&self) -> usize {
+        self.sessions.len()
+    }
+
     /// Build a delivery core answering to `config`.
     #[must_use]
     pub fn new(config: DiagnosticsConfig) -> Self {
@@ -188,6 +193,22 @@ impl DiagnosticsDelivery {
     pub fn end_session(&mut self, session: &SessionId) {
         self.sessions.remove(session);
         self.pending.remove(session);
+    }
+
+    /// Move committed history into `target`, keeping its history on conflicts.
+    /// Unacknowledged reports from `source` are discarded.
+    pub(crate) fn merge_session(&mut self, source: &SessionId, target: &SessionId) {
+        if source == target {
+            return;
+        }
+        self.pending.remove(source);
+        let Some(source) = self.sessions.remove(source) else {
+            return;
+        };
+        let target = self.sessions.entry(target.clone()).or_default();
+        for (key, hash) in source {
+            target.entry(key).or_insert(hash);
+        }
     }
 
     /// Hash one file's visible diagnostics.
