@@ -41,6 +41,14 @@ use crate::hooks::sweep::{Origin, Sweeper};
 const UNWATCHABLE_FILESYSTEMS: &[&str] =
     &["9p", "drvfs", "virtiofs", "cifs", "smb3", "nfs", "nfs4"];
 
+/// Reported when a blocking step of the startup walk never came back.
+///
+/// In practice that is the runtime shutting down under the watcher, where
+/// nobody is left to read the answer; the reason exists for the case that
+/// is not, a panic somewhere inside the walk, which would otherwise leave
+/// the doctor reporting a state that says to look again in a moment.
+const UNFINISHED: &str = "the walk of this checkout did not finish";
+
 /// How many unwalkable paths a doctor line names before it just counts
 /// them. A permissions failure over a large subtree reports one error per
 /// entry, and this line is read at a terminal.
@@ -244,11 +252,16 @@ impl<P: Place> Placement<P> {
         self.placed.difference(found).cloned().collect()
     }
 
-    /// Widen what the doctor reports as unreachable.
+    /// Record what the doctor reports as unreachable, when this walk
+    /// could not reach something.
     ///
     /// A walk of one adopted subtree says nothing about the rest of the
     /// checkout, so a clean one does not clear a reason an earlier walk
-    /// recorded. Only [`rescan`], which walks everything, replaces it.
+    /// recorded; that is what the guard below is for. A dirty one names
+    /// what it hit in place of the older reason rather than appending to
+    /// it, so the reported reason is the most recent rather than the
+    /// complete list. The flag itself, which is the part the doctor acts
+    /// on, stays set either way.
     fn note_incomplete(&mut self, errors: &[String]) {
         if let Some(reason) = incomplete_reason(errors) {
             self.incomplete = Some(reason);
@@ -288,6 +301,10 @@ impl<P: Place> Placement<P> {
 ///
 /// The whole of this runs off [`ProjectWatcher::start`]'s caller, which is
 /// `Runtime::start`.
+///
+/// Every path out of here settles the state. Returning while it still
+/// reads [`WatchState::Starting`] would wedge the doctor on a line that
+/// invites the reader to look again in a moment, forever.
 async fn place(
     watcher: Arc<ProjectWatcher>,
     roots: Arc<[PathBuf]>,
@@ -297,6 +314,7 @@ async fn place(
     let probed = Arc::clone(&roots);
     let Ok(unwatchable) = tokio::task::spawn_blocking(move || unwatchable_reason(&probed)).await
     else {
+        watcher.unwatched(UNFINISHED.to_string());
         return;
     };
     if let Some(reason) = unwatchable {
@@ -305,6 +323,7 @@ async fn place(
     }
 
     let Some(set) = walk(&sweeper, Arc::clone(&roots)).await else {
+        watcher.unwatched(UNFINISHED.to_string());
         return;
     };
     let incomplete = incomplete_reason(&set.errors);
@@ -1063,7 +1082,18 @@ mod tests {
         sweeper.enqueue(std::slice::from_ref(&settled));
         sweeper.sweep_now().await;
 
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Both files are written within the same instant, and a
+        // filesystem that stores mtimes to the second would then give
+        // them the same one and put the settled file back in the sweep.
+        // Dating it an hour back says what the test means -- a file that
+        // has not moved since the sweep -- on any granularity, and drops
+        // the sleep that stood in for it.
+        std::fs::File::options()
+            .write(true)
+            .open(&settled)
+            .expect("reopen")
+            .set_modified(SystemTime::now() - Duration::from_secs(3600))
+            .expect("backdate");
         let churned = dir.path().join("churned.rs");
         std::fs::write(&churned, "fn main() {}").expect("write");
         let mut placement = fake_placement(None);

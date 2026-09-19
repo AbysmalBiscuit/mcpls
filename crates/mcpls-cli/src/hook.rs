@@ -2190,10 +2190,6 @@ mod tests {
         .await
     }
 
-    /// Every line asserted by its exact text and position, not merely by
-    /// label, and the line count pinned too: a deleted line, a bare label
-    /// with its payload dropped, or a value swapped for a look-alike (the
-    /// requesting hash for the owner's own, `project_dir` for the
     /// A directory count says nothing about whether the walk reached the
     /// whole checkout, so the reason it did not has to travel with it: a
     /// partly walked tree otherwise reads exactly like a fully walked one.
@@ -2225,6 +2221,10 @@ mod tests {
         assert_eq!(line, "watcher: 56 directories watched");
     }
 
+    /// Every line asserted by its exact text and position, not merely by
+    /// label, and the line count pinned too: a deleted line, a bare label
+    /// with its payload dropped, or a value swapped for a look-alike (the
+    /// requesting hash for the owner's own, `project_dir` for the
     /// owner's `root`) must all fail this, which `out.contains("server
     /// sees")`-style checks would not have caught.
     #[tokio::test]
