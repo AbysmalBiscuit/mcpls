@@ -64,12 +64,18 @@ struct HookPayload {
     agent_id: Option<String>,
     #[serde(default)]
     tool_calls: Vec<ToolCall>,
+    #[serde(default)]
+    tool_name: String,
+    #[serde(default)]
+    tool_input: Option<ToolInput>,
 }
 
 /// One entry of `PostToolBatch`'s `tool_calls`, keeping only the field its
 /// `changed` request needs.
 #[derive(Debug, Deserialize)]
 struct ToolCall {
+    #[serde(default)]
+    tool_name: String,
     tool_input: ToolInput,
 }
 
@@ -97,6 +103,32 @@ pub async fn dispatch_payload(
     }
 }
 
+async fn attribute_claude_write(
+    payload: HookPayload,
+    agent: HookAgent,
+    identity: Option<&SocketIdentity>,
+) -> Result<String> {
+    let Some(identity) = identity else {
+        return Ok(String::new());
+    };
+    let Some(path) = payload.tool_input.and_then(|input| input.file_path) else {
+        return Ok(String::new());
+    };
+    send(
+        identity,
+        &Request::Changed {
+            attributed: true,
+            agent,
+            session: payload.session_id,
+            paths: vec![path],
+            event: ChangeEvent::Change,
+        },
+        SOCKET_TIMEOUT,
+    )
+    .await?;
+    Ok(String::new())
+}
+
 async fn run(stdin: &str, identity: Option<&SocketIdentity>) -> Result<String> {
     let payload: HookPayload = serde_json::from_str(stdin)?;
     let agent = HookAgent {
@@ -105,6 +137,10 @@ async fn run(stdin: &str, identity: Option<&SocketIdentity>) -> Result<String> {
     };
 
     match payload.hook_event_name.as_str() {
+        "PostToolUse" if matches!(payload.tool_name.as_str(), "Write" | "Edit" | "MultiEdit") => {
+            attribute_claude_write(payload, agent, identity).await
+        }
+
         "PostToolBatch" => {
             let Some(identity) = identity else {
                 return Ok(String::new());
@@ -112,11 +148,12 @@ async fn run(stdin: &str, identity: Option<&SocketIdentity>) -> Result<String> {
             let paths = payload
                 .tool_calls
                 .into_iter()
+                .filter(|call| matches!(call.tool_name.as_str(), "Write" | "Edit" | "MultiEdit"))
                 .filter_map(|call| call.tool_input.file_path)
                 .collect();
             let requests = [
                 Request::Changed {
-                    attributed: true,
+                    attributed: false,
                     agent: agent.clone(),
                     session: payload.session_id.clone(),
                     paths,
@@ -1681,10 +1718,10 @@ mod tests {
                 let path = root.join(format!("{agent}.rs"));
                 std::fs::write(&path, "broken").unwrap();
                 let payload = json!({
-                    "hook_event_name": if matches!(host, Host::Codex) { "PostToolUse" } else { "PostToolBatch" },
+                    "hook_event_name": "PostToolUse",
                     "session_id": "root", "agent_id": agent, "cwd": root,
-                    "tool_name": "apply_patch", "tool_input": {"command": format!("*** Begin Patch\n*** Update File: {agent}.rs\n@@\n-old\n+new\n*** End Patch\n")},
-                    "tool_calls": [{"tool_input": {"file_path": path}}]
+                    "tool_name": if matches!(host, Host::Codex) { "apply_patch" } else { "Edit" }, "tool_input": {"file_path": path, "command": format!("*** Begin Patch\n*** Update File: {agent}.rs\n@@\n-old\n+new\n*** End Patch\n")},
+                    "tool_calls": [{"tool_name": "Edit", "tool_input": {"file_path": path}}]
                 });
                 super::dispatch_payload(host, &payload.to_string(), &root, Some(&identity)).await;
             }
@@ -1787,7 +1824,7 @@ mod tests {
             &json!({
                 "hook_event_name": "PostToolBatch",
                 "session_id": "s1",
-                "tool_calls": [{ "tool_input": { "file_path": file.display().to_string() } }]
+                "tool_calls": [{ "tool_name": "Edit", "tool_input": { "file_path": file.display().to_string() } }]
             }),
             &recorder,
         )
@@ -1921,6 +1958,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_only_successful_claude_write_events_claim_paths() {
+        let recorder = RecordingOwner::start();
+        for (event, tool) in [
+            ("PostToolUseFailure", "Edit"),
+            ("PostToolUse", "Read"),
+            ("PostToolUse", "Edit"),
+        ] {
+            dispatch_against(
+                &json!({
+                    "hook_event_name": event, "session_id": "s1",
+                    "tool_name": tool, "tool_input": {"file_path": "a.rs"}
+                }),
+                &recorder,
+            )
+            .await;
+        }
+        let requests = recorder.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            matches!(&requests[0], Request::Changed { attributed: true, paths, .. } if paths == &[PathBuf::from("a.rs")])
+        );
+    }
+
+    #[tokio::test]
     async fn test_post_tool_batch_sends_changed_then_flush() {
         let recorder = RecordingOwner::start();
         let file = recorder.project_dir().join("a.rs");
@@ -1929,7 +1990,11 @@ mod tests {
             &json!({
                 "hook_event_name": "PostToolBatch",
                 "session_id": "s1",
-                "tool_calls": [{ "tool_input": { "file_path": file.display().to_string() } }]
+                "tool_calls": [
+                    { "tool_name": "Read", "tool_input": { "file_path": "read.rs" } },
+                    { "tool_name": "Edit", "tool_input": { "file_path": file.display().to_string() } },
+                    { "tool_name": "Unknown", "tool_input": { "file_path": "unknown.rs" } }
+                ]
             }),
             &recorder,
         )
@@ -1946,6 +2011,7 @@ mod tests {
             "a changed, the flush, then the acknowledgement: {requests:?}"
         );
         let Request::Changed {
+            attributed,
             session: changed_session,
             paths,
             event,
@@ -1964,6 +2030,7 @@ mod tests {
         else {
             panic!("expected the second request to be flush: {:?}", requests[1]);
         };
+        assert!(!attributed, "batch results do not expose success status");
         assert_eq!(changed_session.as_str(), "s1");
         assert_eq!(
             *paths,
@@ -2007,7 +2074,7 @@ mod tests {
             &json!({
                 "hook_event_name": "PostToolBatch",
                 "session_id": "s1",
-                "tool_calls": [{ "tool_input": { "file_path": file.display().to_string() } }]
+                "tool_calls": [{ "tool_name": "Edit", "tool_input": { "file_path": file.display().to_string() } }]
             }),
             &recorder,
         )
@@ -3652,7 +3719,7 @@ mod tests {
                 "agent_id": "child/two",
                 "cwd": recorder.project_dir(),
                 "tool_name": "apply_patch",
-                "tool_calls": [{"tool_input": {"file_path": "src/a.rs"}}],
+                "tool_calls": [{"tool_name": "Edit", "tool_input": {"file_path": "src/a.rs"}}],
                 "tool_input": {"command": "*** Begin Patch\n*** Update File: src/a.rs\n@@\n-old\n+new\n*** End Patch\n"}
             });
             dispatch_as(host, &payload, &recorder).await;
