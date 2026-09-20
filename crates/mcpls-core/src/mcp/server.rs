@@ -2814,6 +2814,112 @@ mod tests {
         }
     }
 
+    /// A rename that moves a file claims the path it left as well as the
+    /// one it arrived at, so the errors left behind on the old spelling
+    /// reach the agent that moved it rather than the root session.
+    #[tokio::test]
+    async fn a_rename_that_moves_a_file_attributes_both_ends() {
+        use rmcp::ServiceExt as _;
+        use tokio::io::{AsyncWriteExt as _, BufReader, BufStream};
+
+        use crate::bridge::{FileEntry, RecordId, SessionId};
+
+        let mut fixture = WriteFixture::new(WriteTool::Rename, DiagnosticsConfig::default())
+            .with_one_error()
+            .await;
+        let moved = fixture.path.with_file_name("renamed.rs");
+        let moved_uri = crate::bridge::path_to_uri(&moved).expect("a uri for the destination");
+        let reply = json!({"documentChanges": [
+            {"kind": "rename", "oldUri": fixture.uri.as_str(), "newUri": moved_uri.as_str()}
+        ]});
+
+        let (server_io, client_io) = tokio::io::duplex(65_536);
+        let served = fixture.server.for_connection(None);
+        let started = tokio::spawn(async move { served.serve(server_io).await.unwrap() });
+        let mut wire = BufStream::new(client_io);
+        mcp_test_request(
+            &mut wire,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2025-11-25", "capabilities": {},
+                    "clientInfo": {"name": "codex-mcp-client", "version": "1"}}
+            }),
+        )
+        .await;
+        wire.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+            .await
+            .unwrap();
+        wire.flush().await.unwrap();
+        let running = started.await.unwrap();
+
+        let call = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+            "name": "rename_symbol",
+            "arguments": WriteTool::Rename.mcp_arguments(&fixture.path.display().to_string()),
+            "_meta": {"threadId": "mover", "x-codex-turn-metadata": {"session_id": "root"}}
+        }});
+        let answered = async {
+            let mut lsp = BufReader::new(&mut fixture.fake.write_stdout);
+            loop {
+                let message = crate::test_support::read_framed_message(&mut lsp).await;
+                if message["method"] == "textDocument/rename" {
+                    write_response(&mut fixture.fake.read_half_stdin, &message["id"], reply).await;
+                    break;
+                }
+            }
+        };
+        let (response, ()) = tokio::join!(mcp_test_request(&mut wire, call), answered);
+        assert!(response.get("error").is_none(), "{response}");
+        let payload: serde_json::Value =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .expect("write result JSON");
+        assert_eq!(payload["applied"], true, "{payload}");
+        assert!(
+            moved.exists(),
+            "the rename did not move the file: {payload}"
+        );
+
+        let diagnostics = vec![diagnostic_at("stale")];
+        let entries = [
+            FileEntry {
+                key: fixture.uri.as_str(),
+                diagnostics: &diagnostics,
+                floor: crate::config::SeverityFloor::Warning,
+            },
+            FileEntry {
+                key: moved_uri.as_str(),
+                diagnostics: &diagnostics,
+                floor: crate::config::SeverityFloor::Warning,
+            },
+        ];
+        let writer = RecordId::Session(SessionId::from("mover".to_string()));
+        let root_session = SessionId::from("root".to_string());
+        let root = RecordId::Session(root_session.clone());
+        let mut delivery = fixture.server.context.delivery.lock().await;
+        // Without this the root is an unidentified record, which is handed
+        // every file rather than only the ones nobody claimed.
+        delivery.register_caller(&crate::bridge::Caller {
+            record: root.clone(),
+            root: Some(root_session),
+        });
+        let claimed: Vec<_> = delivery
+            .flush(&writer, &entries)
+            .changed
+            .iter()
+            .map(|file| file.key.clone())
+            .collect();
+        assert!(
+            claimed.contains(&fixture.uri.as_str().to_string())
+                && claimed.contains(&moved_uri.as_str().to_string()),
+            "the mover was not given both ends of its rename: {claimed:?}"
+        );
+        assert!(
+            delivery.flush(&root, &entries).changed.is_empty(),
+            "the root was told about a file the mover owns"
+        );
+        drop(delivery);
+        running.cancel().await.unwrap();
+    }
+
     async fn write_lsp_notification<W>(writer: &mut W, method: &str, params: serde_json::Value)
     where
         W: tokio::io::AsyncWrite + Unpin,
