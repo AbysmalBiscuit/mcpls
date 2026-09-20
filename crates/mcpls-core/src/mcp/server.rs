@@ -1652,20 +1652,16 @@ impl ServerHandler for McplsServer {
                 })
                 .await;
         }
-        let caller = server
-            .context
-            .delivery
-            .lock()
-            .await
-            .caller(RecordId::from(&server.session));
-        server
-            .context
-            .delivery
-            .lock()
-            .await
-            .attach(server.connection, &caller);
+        let caller = {
+            let mut delivery = server.context.delivery.lock().await;
+            let caller = delivery.caller(RecordId::from(&server.session));
+            delivery.attach(server.connection, &caller);
+            caller
+        };
         let writer = server.clone();
         let runtime = tokio::runtime::Handle::current();
+        // The applier runs this on its `spawn_blocking` task, never on a
+        // runtime worker, which is what makes `block_on` legal here.
         let observer: crate::bridge::apply::WriteObserver = Arc::new(move |paths| {
             runtime.block_on(writer.attribute_paths(&caller, paths));
         });
