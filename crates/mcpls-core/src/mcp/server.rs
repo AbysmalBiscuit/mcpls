@@ -2879,14 +2879,18 @@ mod tests {
         );
 
         let diagnostics = vec![diagnostic_at("stale")];
+        // The delivery core sees the keys the notification cache files a
+        // published diagnostic under, not the URI a server spelled it with.
+        let from = crate::bridge::uri_cache_key(fixture.uri.as_str()).into_owned();
+        let to = crate::bridge::uri_cache_key(moved_uri.as_str()).into_owned();
         let entries = [
             FileEntry {
-                key: fixture.uri.as_str(),
+                key: &from,
                 diagnostics: &diagnostics,
                 floor: crate::config::SeverityFloor::Warning,
             },
             FileEntry {
-                key: moved_uri.as_str(),
+                key: &to,
                 diagnostics: &diagnostics,
                 floor: crate::config::SeverityFloor::Warning,
             },
@@ -2908,8 +2912,7 @@ mod tests {
             .map(|file| file.key.clone())
             .collect();
         assert!(
-            claimed.contains(&fixture.uri.as_str().to_string())
-                && claimed.contains(&moved_uri.as_str().to_string()),
+            claimed.contains(&from) && claimed.contains(&to),
             "the mover was not given both ends of its rename: {claimed:?}"
         );
         assert!(

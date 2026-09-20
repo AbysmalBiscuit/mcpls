@@ -102,7 +102,17 @@ impl DiagnosticsDelivery {
     }
 
     /// Attribute changed URI keys to the issuing caller.
+    ///
+    /// Keys arrive in whatever spelling the writer's URI carried, which on
+    /// Windows is the drive letter the path had. The cache a diagnostic is
+    /// read back from keys case-insensitively there, so a claim spelled
+    /// `C:` would never meet the `c:` the published diagnostic is filed
+    /// under.
     pub fn record_write(&mut self, caller: &Caller, keys: &[String]) {
+        let keys: Vec<String> = keys
+            .iter()
+            .map(|key| crate::bridge::uri_cache_key(key).into_owned())
+            .collect();
         self.register_caller(caller);
         let root = self
             .roots

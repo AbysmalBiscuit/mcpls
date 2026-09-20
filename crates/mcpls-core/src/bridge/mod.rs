@@ -21,6 +21,7 @@ pub use delivery::{
 };
 pub use encoding::{PositionEncoding, lsp_to_mcp_position, mcp_to_lsp_position};
 pub use identity::{Caller, HookAgent, HookHost, RecordId};
+pub(crate) use notifications::uri_cache_key;
 pub use notifications::{
     DiagnosticInfo, LogEntry, LogLevel, MessageType, NotificationCache, ServerMessage,
 };
