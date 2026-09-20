@@ -236,11 +236,22 @@ impl DiagnosticsDelivery {
     /// baseline and live session records.
     ///
     /// A key nobody holds yet is pre-existing for every session. A key a
-    /// session already holds belongs to that session's history, so replacing
-    /// it would hide a change the session has not been told about.
+    /// session already holds, or one a caller has written and is still owed,
+    /// belongs to that history instead: a server started on first use settles
+    /// after the session has been running, so its first snapshot can already
+    /// carry the error an agent's own edit caused.
     pub fn merge_baseline(&mut self, entries: HashMap<String, u64>) {
+        let owed: std::collections::HashSet<String> = self
+            .ownership
+            .iter()
+            .filter(|(_, owner)| !owner.delivered)
+            .map(|((_, key), _)| key.clone())
+            .collect();
         let baseline = self.baseline.get_or_insert_with(HashMap::new);
         for (key, hash) in entries {
+            if owed.contains(&key) {
+                continue;
+            }
             baseline.entry(key.clone()).or_insert(hash);
             for record in self.sessions.values_mut() {
                 record.entry(key.clone()).or_insert(hash);
