@@ -116,7 +116,7 @@ cargo install --path crates/mcpls-cli
 
 ### File-change diagnostics never fire for files under `target/` or `node_modules/`
 
-**Behavior, not a bug**: the Claude Code file-change hook always treats `target/` and `node_modules/` as build output, at any depth, whether or not your project's `.gitignore` names them. This keeps a `cargo build` or an `npm install` from flooding mcpls with thousands of generated paths.
+**Behavior, not a bug**: mcpls always treats `target/` and `node_modules/` as build output, at any depth, whether or not your project's `.gitignore` names them. This keeps a `cargo build` or an `npm install` from flooding mcpls with thousands of generated paths. The same floor excludes the version control stores, `.git`, `.jj`, `.hg` and `.svn`.
 
 **Partial workaround**: if you keep real source under one of these names, add a negation to your project's `.gitignore`:
 ```gitignore
@@ -124,7 +124,7 @@ cargo install --path crates/mcpls-cli
 ```
 Everything else under `target/` stays excluded, and mcpls diagnoses the negated path whenever it hears about it: when you edit the file through one of mcpls's own write tools, and when a tool call the agent made reports it. That covers edits made inside the session.
 
-The negation does not put the file back under the session's file watcher, so an edit made outside the session — by a build script, or by another editor — is still not seen. The watch list the `SessionStart` hook hands Claude Code names the project's top-level entries, `target/` is excluded there as a directory, and `.gitignore` rules cannot re-include a file whose parent directory is excluded. To have such a file watched, keep it outside `target/` and `node_modules/`.
+The negation does not put the file back under the backend's filesystem watcher, so an edit made outside the session, by a build script or by another editor, is still not seen. The watcher places one watch per directory, and it never descends into `target/` to place one there, so no watch exists that could report the negated file. A `.gitignore` negation cannot re-include a file whose parent directory the walk refused to enter. To have such a file watched, keep it outside `target/` and `node_modules/`.
 
 ### "Failed to start MCP server"
 

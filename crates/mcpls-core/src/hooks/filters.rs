@@ -4,10 +4,10 @@
 //! list of their own: a `cargo build` or an `npm install` can report
 //! thousands of paths under `target/` or `node_modules/`, and the document
 //! tracker has a ceiling. `PathFilter` is what keeps that flood out, and
-//! `watch_paths` is what keeps the host's watcher from ever picking it up
-//! in the first place.
+//! `watch_set` is what keeps the backend's own watcher from ever placing a
+//! descriptor inside one of those trees to begin with.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -16,15 +16,24 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
 use crate::lsp::WatchRegistry;
 
-/// Directories that hold generated or vendored files, dropped under every
-/// root even when a project's own `.gitignore` does not name them.
+/// Directories that hold generated, vendored or repository-internal files,
+/// dropped under every root even when a project's own `.gitignore` does not
+/// name them.
 ///
 /// These lines are added to each root's matcher before that root's own
 /// `.gitignore`, so a project that genuinely keeps sources under one of
 /// these names can re-admit a specific path with a `.gitignore` negation,
 /// for example `!target/keep.rs`: everything else under `target/` stays
 /// dropped, but that one path is not.
-const BUILT_IN_IGNORES: &[&str] = &["target", "node_modules"];
+///
+/// The VCS stores are here because no project writes them into its own
+/// `.gitignore`, the VCS having no need of that, and because the watcher's
+/// walk takes every exclusion from this module: without the lines it would
+/// place a watch on every directory of the store, which the VCS rewrites on
+/// each commit, fetch and index update. `.git` is one of four: `.jj`, `.hg`
+/// and `.svn` are rewritten just as often by the tools that own them, and a
+/// checkout is as likely to be any of them.
+const BUILT_IN_IGNORES: &[&str] = &[".git", ".jj", ".hg", ".svn", "target", "node_modules"];
 
 /// Decides which changed paths are worth waking a language server for.
 pub struct PathFilter {
@@ -86,6 +95,29 @@ impl PathFilter {
     /// never enters into it.
     #[must_use]
     pub fn admits(&self, path: &Path) -> bool {
+        if !self.within_unignored_root(path, false) {
+            return false;
+        }
+
+        if self.routable_extension(path) {
+            return true;
+        }
+        self.registry
+            .as_ref()
+            .is_some_and(|registry| registry.is_watched(path))
+    }
+
+    /// Whether `path` lives under a configured root and survives every
+    /// containing root's ignore rules, with `is_dir` selecting how the
+    /// matchers are asked about it.
+    ///
+    /// The shared body of [`Self::admits`] and [`Self::admits_directory`].
+    /// One fold is what keeps the watch set and the admitted set from
+    /// drifting apart: a directory refused here whose files `admits`
+    /// accepts loses their events with nothing to show for it, and one
+    /// accepted whose files `admits` rejects spends a watch descriptor on
+    /// a subtree nobody will ever be told about.
+    fn within_unignored_root(&self, path: &Path, is_dir: bool) -> bool {
         let containing: Vec<(&PathBuf, &Gitignore)> = self
             .roots
             .iter()
@@ -99,24 +131,33 @@ impl PathFilter {
         else {
             return false;
         };
+        if path == deepest {
+            // Configuring a root is the statement that its contents are
+            // wanted, and asking a root's own matcher about its base path
+            // is not a question `ignore` promises an answer to.
+            return true;
+        }
         let ignored = containing.iter().any(|(root, ignore)| {
             let excludes_the_deepest_root = *root != deepest
                 && ignore
                     .matched_path_or_any_parents(deepest, true)
                     .is_ignore();
             !excludes_the_deepest_root
-                && ignore.matched_path_or_any_parents(path, false).is_ignore()
+                && ignore.matched_path_or_any_parents(path, is_dir).is_ignore()
         });
-        if ignored {
-            return false;
-        }
+        !ignored
+    }
 
-        if self.routable_extension(path) {
-            return true;
-        }
-        self.registry
-            .as_ref()
-            .is_some_and(|registry| registry.is_watched(path))
+    /// Whether the watcher should place a watch on `dir` and descend into
+    /// it.
+    ///
+    /// The same question [`Self::admits`] answers about a file, without
+    /// the extension and registry checks, which only mean something for a
+    /// file. A directory is never admitted for being routable; it is
+    /// admitted for not being excluded.
+    #[must_use]
+    pub fn admits_directory(&self, dir: &Path) -> bool {
+        self.within_unignored_root(dir, true)
     }
 
     /// Whether `path`'s extension is one this filter routes directly to a
@@ -166,58 +207,82 @@ fn read_gitignore(root: &Path) -> (Gitignore, Vec<String>) {
     (ignore, errors)
 }
 
-/// Selected watch paths and failures encountered while inspecting the root.
-#[derive(Debug)]
-pub struct WatchPaths {
-    /// Top-level entries admitted by the scan and ignore rules.
-    pub paths: Vec<PathBuf>,
-    /// Traversal or ignore-rule failures; selected paths may be incomplete.
+/// The directories to watch and the files under them worth sweeping.
+#[derive(Debug, Default)]
+pub struct WatchSet {
+    /// Directories to place one non-recursive watch on each.
+    ///
+    /// Directories rather than files, because a watch on a file's inode
+    /// misses an atomic save: the writer creates a temporary file and
+    /// renames it over the target, destroying the inode the watch was
+    /// placed on. The rename arrives on the parent directory instead.
+    pub directories: BTreeSet<PathBuf>,
+    /// Files under those directories that [`PathFilter::admits`] accepts.
+    ///
+    /// Used when an event overflow forces a full sweep, where the paths on
+    /// the events cannot be trusted and the walk is the only honest answer
+    /// to what may have changed.
+    pub files: Vec<PathBuf>,
+    /// Traversal failures; the set may be incomplete.
     pub errors: Vec<String>,
 }
 
-/// Scan top-level entries using ignore rules; hidden entries are excluded by default.
+/// Walk `roots` and collect every directory `filter` admits, with the
+/// admitted files under them.
 ///
-/// Explicit allow rules can include hidden entries.
-/// This does not verify that a host registered the paths or can watch their descendants.
+/// `ignore`'s own standard filters are switched off and every ruling is
+/// taken from `filter`. Letting `WalkBuilder` apply its own `.gitignore`
+/// handling would honour nested ignore files that [`PathFilter`] does not
+/// read, making the watch set narrower than the admitted set, which is the
+/// silent-loss direction.
 #[must_use]
-pub fn watch_paths(root: &Path) -> WatchPaths {
-    let (ignore, errors) = read_gitignore(root);
-    let mut result = WatchPaths {
-        paths: Vec::new(),
-        errors,
-    };
-    if root.is_file() {
-        result.errors.push(format!(
-            "{}: project root is not a directory",
-            root.display()
-        ));
-        return result;
-    }
-    for entry in WalkBuilder::new(root)
-        .hidden(true)
-        .max_depth(Some(1))
-        .build()
-    {
-        match entry {
-            Ok(entry) => {
-                if let Some(error) = entry.error() {
-                    result.errors.push(error.to_string());
+pub fn watch_set(filter: &Arc<PathFilter>, roots: &[PathBuf]) -> WatchSet {
+    let mut result = WatchSet::default();
+    for root in roots {
+        if root.is_file() {
+            result.errors.push(format!(
+                "{}: project root is not a directory",
+                root.display()
+            ));
+            continue;
+        }
+        result.directories.insert(root.clone());
+        let walk_filter = Arc::clone(filter);
+        let root_owned = root.clone();
+        let walk = WalkBuilder::new(root)
+            .standard_filters(false)
+            .filter_entry(move |entry| {
+                if entry.path() == root_owned {
+                    return true;
                 }
-                if entry.path() == root {
-                    continue;
+                if entry.file_type().is_some_and(|kind| kind.is_dir()) {
+                    walk_filter.admits_directory(entry.path())
+                } else {
+                    true
                 }
-                let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
-                if !ignore
-                    .matched_path_or_any_parents(entry.path(), is_dir)
-                    .is_ignore()
-                {
-                    result.paths.push(entry.into_path());
+            })
+            .build();
+        for entry in walk {
+            match entry {
+                Ok(entry) => {
+                    if let Some(error) = entry.error() {
+                        result.errors.push(error.to_string());
+                    }
+                    if entry.path() == root {
+                        continue;
+                    }
+                    if entry.file_type().is_some_and(|kind| kind.is_dir()) {
+                        result.directories.insert(entry.into_path());
+                    } else if filter.admits(entry.path()) {
+                        result.files.push(entry.into_path());
+                    }
                 }
+                Err(error) => result.errors.push(error.to_string()),
             }
-            Err(error) => result.errors.push(error.to_string()),
         }
     }
-    result.paths.sort();
+    result.files.sort();
+    result.files.dedup();
     result.errors.sort();
     result.errors.dedup();
     result
@@ -348,6 +413,96 @@ mod tests {
     }
 
     #[test]
+    fn test_a_generated_directory_is_not_watchable() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        std::fs::create_dir_all(dir.path().join("target/debug")).expect("mkdir");
+        std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
+        let filter = filter_over(dir.path());
+
+        assert!(
+            filter.admits_directory(&dir.path().join("src")),
+            "a source directory must carry a watch or nothing under it is ever \
+             heard about"
+        );
+        assert!(
+            !filter.admits_directory(&dir.path().join("target")),
+            "a watch under target/ is the descriptor exhaustion this design \
+             exists to avoid"
+        );
+    }
+
+    #[test]
+    fn test_the_watch_set_reaches_below_the_top_level() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        std::fs::create_dir_all(dir.path().join("src/deep/deeper")).expect("mkdir");
+        std::fs::create_dir_all(dir.path().join("target/debug")).expect("mkdir");
+        std::fs::write(dir.path().join("src/deep/a.rs"), "").expect("write");
+        let filter = Arc::new(filter_over(dir.path()));
+
+        let set = watch_set(&filter, &[dir.path().to_path_buf()]);
+
+        assert!(
+            set.directories
+                .contains(&dir.path().join("src/deep/deeper")),
+            "watchPaths only ever saw the top level, which is the gap this \
+             walk closes"
+        );
+        assert!(
+            !set.directories
+                .iter()
+                .any(|d| d.starts_with(dir.path().join("target"))),
+            "a watch under target/ is the descriptor exhaustion this design \
+             avoids by construction rather than by filtering events"
+        );
+        assert!(set.files.contains(&dir.path().join("src/deep/a.rs")));
+    }
+
+    #[test]
+    fn test_the_watch_set_includes_the_root_itself() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let filter = Arc::new(filter_over(dir.path()));
+
+        let set = watch_set(&filter, &[dir.path().to_path_buf()]);
+
+        assert!(
+            set.directories.contains(&dir.path().to_path_buf()),
+            "a file created directly in the root has no other watch to \
+             arrive on, and asking a root's own matcher about its base path \
+             is not a question ignore promises to answer"
+        );
+    }
+
+    #[test]
+    fn test_a_directory_under_two_roots_is_watched_once() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let sub = dir.path().join("sub");
+        std::fs::create_dir_all(sub.join("src")).expect("mkdir");
+        let roots = vec![dir.path().to_path_buf(), sub.clone()];
+        let filter = Arc::new(PathFilter::new(
+            Arc::from(roots.clone()),
+            extensions(),
+            None,
+        ));
+
+        let set = watch_set(&filter, &roots);
+
+        assert!(
+            set.directories.contains(&sub.join("src")),
+            "a monorepo configures the repository root and a subproject \
+             both, and the subproject's sources must still be watched"
+        );
+        assert_eq!(
+            set.directories
+                .iter()
+                .filter(|d| **d == sub.join("src"))
+                .count(),
+            1,
+            "a set, not a list: two roots containing one directory must not \
+             cost two inotify descriptors for it"
+        );
+    }
+
+    #[test]
     fn test_a_build_artifact_is_dropped() {
         let dir = tempfile::tempdir().expect("a temp dir");
         std::fs::create_dir_all(dir.path().join("target/debug")).expect("mkdir");
@@ -463,10 +618,10 @@ mod tests {
 
     /// The two facts a `.gitignore` negation under a built-in ignore buys,
     /// which are not one fact: the negated file is admitted, so mcpls
-    /// checks it whenever it hears about it, and its directory is still
-    /// kept off the host's watcher, so nothing outside the session's own
-    /// tool calls ever tells mcpls it changed. A negation cannot re-include
-    /// a file whose parent directory is excluded, and the watcher is handed
+    /// checks it whenever it hears about it, and its directory still
+    /// carries no watch, so nothing outside the session's own tool calls
+    /// ever tells mcpls it changed. A negation cannot re-include a file
+    /// whose parent directory is excluded, and the watcher is handed
     /// directories.
     #[test]
     fn test_a_negated_path_is_admitted_and_still_not_watched() {
@@ -475,61 +630,100 @@ mod tests {
         let kept = dir.path().join("target/keep.rs");
         std::fs::write(&kept, "").expect("write");
         std::fs::write(dir.path().join(".gitignore"), "!target/keep.rs\n").expect("write");
+        let filter = Arc::new(filter_over(dir.path()));
 
-        assert!(filter_over(dir.path()).admits(&kept));
+        assert!(filter.admits(&kept));
+
+        let set = watch_set(&filter, &[dir.path().to_path_buf()]);
         assert!(
-            !watch_paths(dir.path())
-                .paths
-                .contains(&dir.path().join("target")),
+            !set.directories.contains(&dir.path().join("target")),
             "the troubleshooting guide tells a user what this workaround does \
              and does not buy them, and it can only be true while these two \
              answers stay apart"
         );
         assert!(
-            !watch_paths(dir.path()).paths.contains(&kept),
-            "the guide's sentence is about the negated file, and a list that \
-             named the file rather than its directory would honour the \
-             negation the guide says the watcher does not honour"
+            !set.files.contains(&kept),
+            "the walk never descends into target/, so the negated file is not \
+             reached by it either"
         );
     }
 
     #[test]
-    fn test_watch_paths_drops_the_built_in_floor_with_no_gitignore_present() {
+    fn test_the_watch_set_drops_the_built_in_floor_with_no_gitignore_present() {
         let dir = tempfile::tempdir().expect("a temp dir");
         std::fs::create_dir_all(dir.path().join("target/debug")).expect("mkdir");
         std::fs::create_dir_all(dir.path().join("node_modules")).expect("mkdir");
         std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
+        let filter = Arc::new(filter_over(dir.path()));
 
-        let paths = watch_paths(dir.path()).paths;
+        let directories = watch_set(&filter, &[dir.path().to_path_buf()]).directories;
 
-        assert!(paths.contains(&dir.path().join("src")));
+        assert!(directories.contains(&dir.path().join("src")));
         assert!(
-            !paths.contains(&dir.path().join("target")),
-            "watch_paths must apply the same built-in floor admits does, or a \
-             project with no .gitignore hands the host a watcher over its own \
-             build output"
+            !directories.contains(&dir.path().join("target")),
+            "the walk must apply the same built-in floor admits does, or a \
+             project with no .gitignore spends a watch descriptor on every \
+             directory of its own build output"
         );
-        assert!(!paths.contains(&dir.path().join("node_modules")));
+        assert!(!directories.contains(&dir.path().join("node_modules")));
     }
 
     #[test]
-    fn test_watch_paths_names_children_rather_than_the_root() {
+    fn test_the_watch_set_excludes_the_git_directory() {
         let dir = tempfile::tempdir().expect("a temp dir");
         std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
         std::fs::create_dir_all(dir.path().join("target")).expect("mkdir");
-        std::fs::create_dir_all(dir.path().join(".git")).expect("mkdir");
-        std::fs::write(dir.path().join("Cargo.toml"), "").expect("write");
+        std::fs::create_dir_all(dir.path().join(".git/objects")).expect("mkdir");
         std::fs::write(dir.path().join(".gitignore"), "/target\n").expect("write");
+        let filter = Arc::new(filter_over(dir.path()));
 
-        let paths = watch_paths(dir.path()).paths;
+        let directories = watch_set(&filter, &[dir.path().to_path_buf()]).directories;
 
-        assert!(paths.contains(&dir.path().join("src")));
-        assert!(paths.contains(&dir.path().join("Cargo.toml")));
+        assert!(directories.contains(&dir.path().join("src")));
+        assert!(!directories.contains(&dir.path().join("target")));
         assert!(
-            !paths.contains(&dir.path().join("target")),
-            "the host's watcher passes no ignore list, so this list is the only \
-             thing keeping a hook process off every build artifact"
+            !directories.contains(&dir.path().join(".git/objects")),
+            "no project writes .git into its own .gitignore, so only the \
+             built-in floor keeps it out; git rewrites the object store on \
+             every commit, fetch and index update, and a watch on it would \
+             wake the sweeper for each one"
         );
-        assert!(!paths.contains(&dir.path().join(".git")));
+    }
+
+    /// `.git` is not the only store a VCS rewrites under the checkout.
+    /// jujutsu, Mercurial and Subversion each keep one, none of them is
+    /// written into a project's `.gitignore`, and each is rewritten on
+    /// every operation the VCS performs.
+    #[test]
+    fn test_the_watch_set_excludes_the_other_vcs_stores() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
+        for store in [".jj/repo/store", ".hg/store", ".svn/pristine"] {
+            std::fs::create_dir_all(dir.path().join(store)).expect("mkdir");
+        }
+        let filter = Arc::new(filter_over(dir.path()));
+
+        let directories = watch_set(&filter, &[dir.path().to_path_buf()]).directories;
+
+        assert!(directories.contains(&dir.path().join("src")));
+        for store in [".jj", ".hg", ".svn"] {
+            assert!(
+                !directories.contains(&dir.path().join(store)),
+                "a {store} checkout rewrites this store on every operation, so \
+                 a watch on it wakes the sweeper constantly -- the same defect \
+                 the .git line already fixes"
+            );
+        }
+    }
+
+    /// The floor is about the store, not about every path a VCS touches:
+    /// a file the working copy carries under one of these names is still a
+    /// source file and must keep its admission.
+    #[test]
+    fn test_a_vcs_store_name_outside_the_floor_is_still_admitted() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let filter = filter_over(dir.path());
+
+        assert!(filter.admits(&dir.path().join("src/hg.rs")));
     }
 }

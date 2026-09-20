@@ -572,6 +572,9 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
 pub(crate) struct Runtime {
     pub(crate) context: Arc<mcp::BridgeContext>,
     pub(crate) sweeper: Arc<hooks::Sweeper>,
+    /// The project's filesystem watcher, held so the doctor can report
+    /// what it is doing and so its task lives as long as the runtime.
+    pub(crate) watcher: Arc<hooks::ProjectWatcher>,
     pub(crate) cancel_rx: tokio::sync::watch::Receiver<bool>,
     translator: Arc<Translator>,
     cancel_tx: tokio::sync::watch::Sender<bool>,
@@ -707,6 +710,17 @@ impl Runtime {
         ));
         tokio::spawn(Arc::clone(&sweeper).run(cancel_rx.clone()));
 
+        // One watcher per project, built here so the shared backend and an
+        // in-process `--no-backend` run get the same one: both reach this
+        // function. It takes its ignore rulings from the sweeper's own
+        // filter, so the directories it watches and the paths the sweeper
+        // admits cannot disagree.
+        let watcher = hooks::ProjectWatcher::start(
+            Arc::clone(&workspace_roots_snapshot),
+            &sweeper,
+            cancel_rx.clone(),
+        );
+
         let pump_shared = PumpShared {
             notification_cache: Arc::clone(&notification_cache),
             subs: Arc::clone(&subscriptions),
@@ -762,6 +776,7 @@ impl Runtime {
         Ok(Self {
             context: Arc::new(context),
             sweeper,
+            watcher,
             cancel_rx,
             translator,
             cancel_tx,
@@ -777,6 +792,7 @@ impl Runtime {
     ) -> hooks::StatusSource {
         let translator = Arc::clone(&self.translator);
         let started = self.started;
+        let watcher = Arc::clone(&self.watcher);
         Arc::new(move || hooks::StatusExtras {
             version: env!("CARGO_PKG_VERSION").to_string(),
             uptime_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -798,6 +814,29 @@ impl Runtime {
                 })
                 .collect(),
             config_fingerprint: config_fingerprint.clone(),
+            watcher: match watcher.state() {
+                hooks::WatchState::Starting => hooks::WatcherStatus {
+                    watching: false,
+                    directories: 0,
+                    unwatched_reason: Some("still placing its watches".to_string()),
+                    incomplete_reason: None,
+                },
+                hooks::WatchState::Watching {
+                    directories,
+                    incomplete,
+                } => hooks::WatcherStatus {
+                    watching: true,
+                    directories,
+                    unwatched_reason: None,
+                    incomplete_reason: incomplete,
+                },
+                hooks::WatchState::Unwatched { reason } => hooks::WatcherStatus {
+                    watching: false,
+                    directories: 0,
+                    unwatched_reason: Some(reason),
+                    incomplete_reason: None,
+                },
+            },
         })
     }
 

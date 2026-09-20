@@ -1,5 +1,5 @@
 ---
-applyTo: "crates/mcpls-core/src/config/**,deny.toml,Cargo.toml,crates/*/Cargo.toml"
+applyTo: "crates/mcpls-core/src/config/**,Cargo.toml,crates/*/Cargo.toml"
 ---
 
 ## Type safety and idiomatic config
@@ -26,8 +26,9 @@ When introducing a new dependency, check whether the functionality is already av
 in `std` for the current MSRV. Prefer `std` over external crates to reduce
 compile time and supply-chain surface.
 
-New crates require a license check in the same PR. Add the license to `deny.toml`
-before merging — `cargo deny check licenses` fails fast and blocks the pipeline.
+A new crate needs no license entry: this fork does not upstream and keeps no allow-list.
+What it does need is to be clean under the Security Audit job, which runs
+`rustsec/audit-check` over `Cargo.lock`.
 
 If a new stable Rust API (e.g. `OnceLock` at 1.70 replacing `once_cell::sync::OnceCell`)
 makes an existing dependency redundant, suggest removing the dependency and bumping

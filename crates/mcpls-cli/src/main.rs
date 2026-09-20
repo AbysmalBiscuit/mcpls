@@ -120,7 +120,7 @@ async fn main() {
                         hook::doctor(&project_dir, &root, &identity, local_fingerprint.as_deref())
                             .await
                     }
-                    Err(error) => hook::doctor_without_identity(&project_dir, &root, &error),
+                    Err(error) => hook::doctor_without_identity(&project_dir, &error),
                 };
                 println!("{out}");
             }

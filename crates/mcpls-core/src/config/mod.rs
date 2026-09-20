@@ -284,7 +284,11 @@ pub struct HooksConfig {
     ///
     /// Defaults on, because reaching this configuration means installing
     /// the plugin and installing the plugin is the opt-in. With this off,
-    /// no listener binds, but `SessionStart` still performs its local watch scan.
+    /// no listener binds, so nothing injects diagnostics between turns and
+    /// an edit alone no longer starts a language server for a language
+    /// that has none running; a tool call still does. The backend's
+    /// watcher does not depend on this: changes on disk, the agent's own
+    /// included, still reach the servers that are running.
     #[serde(default = "default_hooks_enabled")]
     pub enabled: bool,
     /// How long the pending set must be quiet before the sweep runs.

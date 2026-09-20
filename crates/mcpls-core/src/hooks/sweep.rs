@@ -9,11 +9,11 @@
 //! as they arrive and acts on the whole set once it goes quiet, off the hook
 //! connection that reported them.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use lsp_types::FileChangeType;
 use tokio::sync::watch;
@@ -38,19 +38,34 @@ pub enum SweepKind {
     Changed,
 }
 
+/// Where a pending path came from, which decides whether it may start a
+/// language server that is not running.
+///
+/// A hook reports what the agent itself did, which is the signal the lazy
+/// spawn design starts a server on. The watcher reports what the disk did,
+/// which includes a `git pull`, a background formatter and another editor,
+/// none of which is this session asking for a language it does not use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// A host hook reported an edit the agent made.
+    Hook,
+    /// The project watcher saw the path change on disk.
+    Watcher,
+}
+
 /// Collects changed paths and acts on them once the burst settles.
 pub struct Sweeper {
     translator: Arc<Translator>,
-    filter: PathFilter,
+    filter: Arc<PathFilter>,
     quiet_for: Duration,
     max_documents: usize,
-    /// Paths admitted since the last sweep, deduplicated.
+    /// Paths admitted since the last sweep, each with where it came from.
     ///
     /// Holds one entry per distinct admitted path between two sweeps, and a
-    /// sweep empties it, so its size follows how much the host actually
-    /// changed rather than how many events it sent: an unlink and an add
-    /// for the same save are one entry.
-    pending: StdMutex<HashSet<PathBuf>>,
+    /// sweep empties it, so its size follows how much actually changed
+    /// rather than how many events arrived: an unlink and an add for the
+    /// same save are one entry.
+    pending: StdMutex<HashMap<PathBuf, Origin>>,
     /// When the most recent path arrived; `None` before the first one ever
     /// does.
     last_arrival: StdMutex<Option<Instant>>,
@@ -62,6 +77,13 @@ pub struct Sweeper {
     last_opened_count: AtomicUsize,
     /// Files the last sweep could not check, and why.
     last_shortfall: StdMutex<Option<String>>,
+    /// When the last sweep began taking the pending set, or `None` before
+    /// any sweep has.
+    ///
+    /// Read by the project watcher: an inotify overflow is answered by a
+    /// full walk, and this is what tells that walk which of the files it
+    /// finds may have had an event dropped.
+    last_sweep_at: StdMutex<Option<SystemTime>>,
     /// Publishes the sweep count each time a sweep finishes.
     ///
     /// A watcher subscribed before the sweep it cares about sees exactly one
@@ -86,39 +108,66 @@ impl Sweeper {
     ) -> Self {
         Self {
             translator,
-            filter,
+            filter: Arc::new(filter),
             quiet_for,
             max_documents,
-            pending: StdMutex::new(HashSet::new()),
+            pending: StdMutex::new(HashMap::new()),
             last_arrival: StdMutex::new(None),
             sweeps_run: AtomicUsize::new(0),
             last_kinds: StdMutex::new(Vec::new()),
             last_opened_count: AtomicUsize::new(0),
             last_shortfall: StdMutex::new(None),
+            last_sweep_at: StdMutex::new(None),
             completed: watch::channel(0).0,
         }
     }
 
-    /// Queue paths. Returns how many survived the filters.
+    /// Queue paths a host hook reported. Returns how many survived the
+    /// filters.
+    pub fn enqueue(&self, paths: &[PathBuf]) -> usize {
+        self.enqueue_from(paths, Origin::Hook)
+    }
+
+    /// Queue paths from `origin`. Returns how many survived the filters.
     ///
     /// Answers from the path and the configured roots alone -- no
     /// filesystem call, no lock held longer than an insert -- because this
-    /// runs on the hook connection, which has a deadline to answer within.
-    /// What each path actually is gets decided at sweep time, off that
-    /// connection.
-    pub fn enqueue(&self, paths: &[PathBuf]) -> usize {
+    /// runs on the hook connection, which has a deadline to answer within,
+    /// and on the watcher's event loop, which must not block the thread
+    /// `notify` hands its events to. What each path actually is gets
+    /// decided at sweep time, off both.
+    ///
+    /// A path already pending from a hook keeps that origin when the
+    /// watcher reports it too, which it will: the agent's own write is a
+    /// disk event like any other. Letting the watcher overwrite it would
+    /// take away the spawn the agent's edit earned.
+    pub fn enqueue_from(&self, paths: &[PathBuf], origin: Origin) -> usize {
         let mut admitted = 0;
         for path in paths {
             if !self.filter.admits(path) {
                 continue;
             }
             admitted += 1;
-            lock_std(&self.pending).insert(path.clone());
+            lock_std(&self.pending)
+                .entry(path.clone())
+                .and_modify(|held| {
+                    if origin == Origin::Hook {
+                        *held = Origin::Hook;
+                    }
+                })
+                .or_insert(origin);
         }
         if admitted > 0 {
             *lock_std(&self.last_arrival) = Some(Instant::now());
         }
         admitted
+    }
+
+    /// The filter this sweeper admits paths through, so the project
+    /// watcher can place its watches by the same ruling rather than a
+    /// second one built beside it.
+    pub(crate) fn filter(&self) -> Arc<PathFilter> {
+        Arc::clone(&self.filter)
     }
 
     /// Run until `cancel` fires, sweeping whenever the set goes quiet.
@@ -149,6 +198,11 @@ impl Sweeper {
     #[must_use]
     pub fn last_shortfall(&self) -> Option<String> {
         lock_std(&self.last_shortfall).clone()
+    }
+
+    /// When the last sweep began taking the pending set.
+    pub(crate) fn last_sweep_at(&self) -> Option<SystemTime> {
+        *lock_std(&self.last_sweep_at)
     }
 
     /// Whether the pending set is non-empty and has gone quiet for
@@ -198,14 +252,24 @@ impl Sweeper {
 
     /// The paths waiting for the next sweep. Test-only.
     #[cfg(test)]
-    pub(crate) fn pending_paths(&self) -> HashSet<PathBuf> {
-        lock_std(&self.pending).clone()
+    pub(crate) fn pending_paths(&self) -> std::collections::HashSet<PathBuf> {
+        lock_std(&self.pending).keys().cloned().collect()
     }
 
-    async fn ensure_servers_for_edits(&self, kinds: &[(PathBuf, SweepKind)]) -> Vec<PathBuf> {
+    async fn ensure_servers_for_edits(
+        &self,
+        kinds: &[(PathBuf, SweepKind)],
+        origins: &HashMap<PathBuf, Origin>,
+    ) -> Vec<PathBuf> {
         let mut waiting = Vec::new();
         for (path, kind) in kinds {
             if *kind == SweepKind::Deleted || !self.filter.routable_extension(path) {
+                continue;
+            }
+            // Only what the agent itself did may start a server. A `git
+            // pull` is not this session asking for a language it does not
+            // use.
+            if origins.get(path) != Some(&Origin::Hook) {
                 continue;
             }
             let Some(id) = self.translator.server_for_path(path) else {
@@ -253,10 +317,15 @@ impl Sweeper {
     /// queue until it lands, so a sweep dropped partway through leaves the
     /// remaining saves for the next one instead of losing them.
     async fn sweep(&self) {
-        let paths: Vec<PathBuf> = lock_std(&self.pending).drain().collect();
-        if paths.is_empty() {
+        let started = SystemTime::now();
+        let origins: HashMap<PathBuf, Origin> = lock_std(&self.pending).drain().collect();
+        if origins.is_empty() {
             return;
         }
+        // Before the stats below, not after them: a file written while
+        // this sweep runs must count as changed since it.
+        *lock_std(&self.last_sweep_at) = Some(started);
+        let paths: Vec<PathBuf> = origins.keys().cloned().collect();
         let tracker = self.translator.document_tracker();
         let mut kinds = Vec::with_capacity(paths.len());
         let mut settle = Vec::new();
@@ -282,12 +351,14 @@ impl Sweeper {
 
         // Run before opening untracked paths: changed tracked files skip the
         // later open trigger.
-        let waiting = self.ensure_servers_for_edits(&kinds).await;
+        let waiting = self.ensure_servers_for_edits(&kinds, &origins).await;
 
         if !waiting.is_empty() {
             let mut pending = lock_std(&self.pending);
             for path in &waiting {
-                pending.insert(path.clone());
+                // Only a hook-origin path can be waiting, since only a
+                // hook-origin path is offered a spawn at all.
+                pending.insert(path.clone(), Origin::Hook);
             }
             drop(pending);
             // Filter before the open loop consumes untracked paths.
@@ -310,6 +381,24 @@ impl Sweeper {
 
         for path in untracked {
             if !self.filter.routable_extension(&path) {
+                watched_only.push(path);
+                continue;
+            }
+            // The other half of the rule `ensure_servers_for_edits`
+            // applies. A created path never reaches that check, because a
+            // path the tracker has never held is opened rather than
+            // ensured -- and the open resolves a client, which starts the
+            // server. So a `git pull` adding one `src/new_module.rs`, or a
+            // rescan after an overflow, would start every configured
+            // server the checkout has. Only a server that is already up
+            // may take a watcher-origin created path; the rest goes to
+            // `watched_only`, where the servers that registered a glob for
+            // it still hear about it and no process starts.
+            if origins.get(&path) == Some(&Origin::Watcher)
+                && self.translator.server_for_path(&path).is_none_or(|id| {
+                    self.translator.lifecycle_of(&id) != Some(ServerLifecycle::Running)
+                })
+            {
                 watched_only.push(path);
                 continue;
             }
@@ -875,6 +964,170 @@ mod tests {
         assert_ne!(
             sweeper.translator.lifecycle_of(&ServerId::from(SERVER)),
             Some(ServerLifecycle::Idle)
+        );
+    }
+
+    /// Seed `path` as a document the tracker already holds, which is what
+    /// a file the agent has asked a tool about looks like. Isolates the
+    /// spawn trigger from the separate open path for created files, the
+    /// same way [`test_an_edit_starts_the_language_server`] does.
+    ///
+    /// Every test that calls this is about the `SweepKind::Changed`
+    /// branch, and only that branch. The origin rule has a second half
+    /// that a tracked path never reaches -- a created path is opened
+    /// rather than ensured, and the open resolves a client of its own --
+    /// which the `_created_` tests below cover instead.
+    async fn seed_tracked(sweeper: &TestSweeper, path: &Path) {
+        let (transport, _fake_server) = crate::test_support::fake_lsp_transport();
+        let client = crate::lsp::LspClient::from_transport(
+            crate::config::LspServerConfig::rust_analyzer(),
+            transport,
+        );
+        sweeper
+            .translator
+            .document_tracker()
+            .ensure_open(path, &ServerId::from(SERVER), &client)
+            .await
+            .expect("seed a tracked document");
+        sweeper
+            .translator
+            .set_lifecycle(&ServerId::from(SERVER), ServerLifecycle::Idle);
+    }
+
+    /// The `SweepKind::Changed` half of the origin rule: a path the
+    /// tracker already holds, which `ensure_servers_for_edits` is what
+    /// decides the spawn for.
+    #[tokio::test]
+    async fn test_a_watcher_change_does_not_start_a_language_server() {
+        let sweeper = idle_sweeper();
+        let path = sweeper.write("main.rs");
+        seed_tracked(&sweeper, &path).await;
+
+        sweeper.enqueue_from(std::slice::from_ref(&path), Origin::Watcher);
+        sweeper.sweep_now().await;
+
+        assert_eq!(
+            sweeper.translator.lifecycle_of(&ServerId::from(SERVER)),
+            Some(ServerLifecycle::Idle),
+            "a git pull in a mixed checkout must not start rust-analyzer for \
+             a session that only ever opens TypeScript, which is the cost the \
+             lazy spawn design exists to remove"
+        );
+    }
+
+    /// The `SweepKind::Created` half of the same rule, which the tracked
+    /// test above cannot reach. A path the tracker has never held skips
+    /// `ensure_servers_for_edits` and is handed to
+    /// `open_untracked_document` instead, which resolves a client and so
+    /// starts the server -- the same cold start by the other door.
+    #[tokio::test]
+    async fn test_a_watcher_created_path_does_not_start_a_language_server() {
+        let sweeper = idle_sweeper();
+        let path = sweeper.write("new_module.rs");
+
+        sweeper.enqueue_from(std::slice::from_ref(&path), Origin::Watcher);
+        sweeper.sweep_now().await;
+
+        assert_eq!(
+            sweeper.last_kinds(),
+            vec![(path.clone(), SweepKind::Created)],
+            "the control: a path the tracker has never held must reach the \
+             sweep as Created, or this test is asserting about the branch the \
+             tracked test already covers"
+        );
+        assert_eq!(
+            sweeper.translator.lifecycle_of(&ServerId::from(SERVER)),
+            Some(ServerLifecycle::Idle),
+            "a git pull adding one src/new_module.rs must not start \
+             rust-analyzer in a session that only ever opened TypeScript, and \
+             an overflow rescan or a git checkout creating a directory must \
+             not start every configured server at once"
+        );
+        assert_eq!(
+            sweeper.opened_count(),
+            0,
+            "the path must not be opened either: opening is what resolves the \
+             client that starts the server"
+        );
+    }
+
+    /// The `SweepKind::Changed` half of the positive control.
+    #[tokio::test]
+    async fn test_a_hook_change_still_starts_a_language_server() {
+        let sweeper = idle_sweeper();
+        let path = sweeper.write("main.rs");
+        seed_tracked(&sweeper, &path).await;
+
+        sweeper.enqueue_from(std::slice::from_ref(&path), Origin::Hook);
+        sweeper.sweep_now().await;
+
+        assert_ne!(
+            sweeper.translator.lifecycle_of(&ServerId::from(SERVER)),
+            Some(ServerLifecycle::Idle),
+            "an agent's own edit is the signal the lazy spawn design starts a \
+             server on, and the origin rule must not take it away"
+        );
+    }
+
+    /// The `SweepKind::Created` half of the positive control: the rule
+    /// above withholds the spawn from the watcher, and must not withhold
+    /// it from the agent creating a file in a language it has not used
+    /// yet, which is lazy spawn's actual trigger.
+    #[tokio::test]
+    async fn test_a_hook_created_path_still_starts_a_language_server() {
+        let sweeper = idle_sweeper();
+        let path = sweeper.write("new_module.rs");
+
+        sweeper.enqueue_from(std::slice::from_ref(&path), Origin::Hook);
+        sweeper.sweep_now().await;
+
+        assert_ne!(
+            sweeper.translator.lifecycle_of(&ServerId::from(SERVER)),
+            Some(ServerLifecycle::Idle),
+            "a file the agent itself made is the session asking for that \
+             language, and narrowing the created branch must not disable the \
+             trigger lazy spawn exists to serve"
+        );
+    }
+
+    /// The other side of the created rule: a watcher-origin path whose
+    /// server is already up costs nothing to open, and declining it would
+    /// leave a running server holding no document for a file that exists.
+    #[tokio::test]
+    async fn test_a_watcher_created_path_is_opened_when_the_server_runs() {
+        let sweeper = served_sweeper(usize::MAX).await;
+        sweeper
+            .harness
+            .translator
+            .set_lifecycle(&ServerId::from(SERVER), ServerLifecycle::Running);
+        let path = sweeper.write("new_module.rs", "fn main() {}");
+
+        sweeper.enqueue_from(std::slice::from_ref(&path), Origin::Watcher);
+        sweeper.sweep_now().await;
+
+        assert_eq!(sweeper.opened_count(), 1);
+        assert!(
+            sweeper
+                .notifications()
+                .contains(&"textDocument/didOpen".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_hook_origin_survives_a_watcher_report_of_the_same_path() {
+        let sweeper = idle_sweeper();
+        let path = sweeper.write("main.rs");
+        seed_tracked(&sweeper, &path).await;
+
+        sweeper.enqueue_from(std::slice::from_ref(&path), Origin::Hook);
+        sweeper.enqueue_from(std::slice::from_ref(&path), Origin::Watcher);
+        sweeper.sweep_now().await;
+
+        assert_ne!(
+            sweeper.translator.lifecycle_of(&ServerId::from(SERVER)),
+            Some(ServerLifecycle::Idle),
+            "the agent's own write reaches the watcher too, so a watcher \
+             report landing second must not cancel the spawn the edit earned"
         );
     }
 

@@ -630,7 +630,7 @@ pub async fn probe(
     let deadline = tokio::time::Instant::now() + timeout;
     let stream = match probe_connect_phase(identity, deadline).await {
         ConnectPhase::Connected(stream) => stream,
-        ConnectPhase::GaveUp(outcome) => return outcome,
+        ConnectPhase::GaveUp(outcome) => return *outcome,
     };
     let established = match tokio::time::timeout_at(deadline, establish(stream)).await {
         Ok(Ok(established)) => established,
@@ -659,9 +659,17 @@ pub async fn probe(
 
 /// What [`probe`]'s connect phase found: a stream, or a reason to stop
 /// with no stream at all.
+///
+/// The give-up outcome is boxed because `ProbeOutcome::Answered` carries a
+/// whole `Response`, whose `Status` variant is the widest message on this
+/// protocol. Nothing reached through this variant is ever an `Answered` --
+/// giving up is precisely not having an answer -- so the allocation lands
+/// only on a path that has already failed, and it keeps the size of every
+/// `ConnectPhase` off the back of a message that grows whenever the status
+/// gains a field.
 enum ConnectPhase {
     Connected(Box<dyn HookStream>),
-    GaveUp(ProbeOutcome),
+    GaveUp(Box<ProbeOutcome>),
 }
 
 /// On Unix, [`connect`]'s own error already means exactly "nobody is
@@ -680,7 +688,7 @@ async fn probe_connect_phase(
 ) -> ConnectPhase {
     match tokio::time::timeout_at(deadline, connect(identity)).await {
         Ok(Ok(stream)) => ConnectPhase::Connected(stream),
-        Ok(Err(_)) | Err(_) => ConnectPhase::GaveUp(ProbeOutcome::NoOwner),
+        Ok(Err(_)) | Err(_) => ConnectPhase::GaveUp(Box::new(ProbeOutcome::NoOwner)),
     }
 }
 
@@ -706,11 +714,11 @@ async fn probe_connect_phase(
             Ok(client) => return ConnectPhase::Connected(Box::new(client)),
             Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
                 if tokio::time::Instant::now() >= deadline {
-                    return ConnectPhase::GaveUp(classify_gave_up_connect(true));
+                    return ConnectPhase::GaveUp(Box::new(classify_gave_up_connect(true)));
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            Err(_) => return ConnectPhase::GaveUp(classify_gave_up_connect(false)),
+            Err(_) => return ConnectPhase::GaveUp(Box::new(classify_gave_up_connect(false))),
         }
     }
 }

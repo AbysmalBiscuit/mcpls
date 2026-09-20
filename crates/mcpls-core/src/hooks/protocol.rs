@@ -20,8 +20,8 @@ use crate::bridge::ServerLifecycle;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
-    /// Sent by the `FileChanged` hook for one path, and by the
-    /// `PostToolBatch` hook for a batch's paths ahead of its `flush`.
+    /// Sent by the `PostToolBatch` hook for a batch's paths ahead of its
+    /// `flush`.
     Changed {
         /// The Claude Code session that made the edit.
         session: String,
@@ -79,6 +79,30 @@ pub struct ServerStatus {
     pub id: String,
     /// What the server is doing.
     pub state: ServerLifecycle,
+}
+
+/// What the backend's filesystem watcher is doing.
+///
+/// A struct rather than a rendered line, following [`ServerStatus`], so
+/// later detail lands on the type instead of growing a parallel field on
+/// the response.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatcherStatus {
+    /// Whether a watcher is running at all.
+    pub watching: bool,
+    /// How many directories carry a watch.
+    pub directories: usize,
+    /// Why no watcher runs, absent while one does.
+    #[serde(default)]
+    pub unwatched_reason: Option<String>,
+    /// Why the directories watched are not the whole checkout, absent
+    /// while they are.
+    ///
+    /// A subtree the walk could not traverse -- a permissions failure, a
+    /// broken mount -- carries no watch, and a count on its own reads the
+    /// same whether the walk reached everything or half of it.
+    #[serde(default)]
+    pub incomplete_reason: Option<String>,
 }
 
 /// A message sent from a running mcpls back to a Claude Code hook.
@@ -139,6 +163,12 @@ pub enum Response {
         /// The configuration fingerprint the backend started with.
         #[serde(default)]
         config_fingerprint: String,
+        /// What the backend's filesystem watcher is doing.
+        #[serde(default)]
+        ///
+        /// Boxed: it is the largest thing on the largest variant, and an
+        /// unboxed one makes every `Response` the size of a status.
+        watcher: Box<WatcherStatus>,
     },
     /// Reports a failure or a response deadline exceeded while work continues.
     Error {
@@ -283,7 +313,7 @@ mod tests {
 
     #[test]
     fn test_the_status_response_pins_the_wire_shape() {
-        let literal = r#"{"op":"status","hash":"abc123","socket":"mcpls.sock","pid":42,"owner":true,"root":"/work","hooks_seen":7,"version":"0.3.9","uptime_ms":61000,"sessions":["s1","connection-4"],"servers":[{"id":"rust","state":"running"},{"id":"lua","state":"not_installed"}],"config_fingerprint":"00000000000000ff"}"#;
+        let literal = r#"{"op":"status","hash":"abc123","socket":"mcpls.sock","pid":42,"owner":true,"root":"/work","hooks_seen":7,"version":"0.3.9","uptime_ms":61000,"sessions":["s1","connection-4"],"servers":[{"id":"rust","state":"running"},{"id":"lua","state":"not_installed"}],"config_fingerprint":"00000000000000ff","watcher":{"watching":true,"directories":56,"unwatched_reason":null,"incomplete_reason":"1 path(s) could not be walked: /work/vendor: permission denied"}}"#;
         let value = Response::Status {
             hash: "abc123".to_string(),
             socket: PathBuf::from("mcpls.sock"),
@@ -304,6 +334,14 @@ mod tests {
                     state: ServerLifecycle::NotInstalled,
                 },
             ],
+            watcher: Box::new(WatcherStatus {
+                watching: true,
+                directories: 56,
+                unwatched_reason: None,
+                incomplete_reason: Some(
+                    "1 path(s) could not be walked: /work/vendor: permission denied".to_string(),
+                ),
+            }),
             config_fingerprint: "00000000000000ff".to_string(),
         };
         assert_eq!(
@@ -336,6 +374,7 @@ mod tests {
                     state,
                 }],
                 config_fingerprint: "00000000000000ff".to_string(),
+                watcher: Box::new(WatcherStatus::default()),
             };
 
             let wire = serde_json::to_value(&value).expect("serialize");
@@ -351,13 +390,36 @@ mod tests {
     fn test_an_older_status_parses_with_empty_backend_fields() {
         let literal = r#"{"op":"status","hash":"a","socket":"s","pid":1,"owner":true,"root":"/w","hooks_seen":0}"#;
         let Response::Status {
-            sessions, version, ..
+            sessions,
+            version,
+            watcher,
+            ..
         } = serde_json::from_str::<Response>(literal).expect("deserialize")
         else {
             panic!("a status");
         };
         assert!(sessions.is_empty());
         assert!(version.is_empty());
+        assert!(
+            !watcher.watching,
+            "a backend from before this field existed reports no watcher, \
+             which is exactly what it has; a doctor that failed to parse it \
+             would report nothing at all instead"
+        );
+    }
+
+    /// A backend that knows about the watcher but not about incomplete
+    /// coverage: the field is newer than the struct it sits on, and a
+    /// doctor that failed to parse it would report nothing at all.
+    #[test]
+    fn test_a_watcher_status_without_the_incomplete_field_parses() {
+        let literal = r#"{"watching":true,"directories":56,"unwatched_reason":null}"#;
+
+        let watcher = serde_json::from_str::<WatcherStatus>(literal).expect("deserialize");
+
+        assert!(watcher.watching);
+        assert_eq!(watcher.directories, 56);
+        assert_eq!(watcher.incomplete_reason, None);
     }
 
     #[test]
