@@ -340,7 +340,13 @@ impl McpClient {
     /// - The request cannot be sent
     /// - The response cannot be read or parsed
     /// - The server returns an error response
+    #[allow(dead_code)]
     pub fn initialize(&mut self) -> Result<Value> {
+        self.initialize_as("mcpls-e2e-test")
+    }
+
+    #[allow(dead_code)]
+    pub fn initialize_as(&mut self, name: &str) -> Result<Value> {
         let request = json!({
             "jsonrpc": "2.0",
             "id": self.next_id(),
@@ -349,7 +355,7 @@ impl McpClient {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
                 "clientInfo": {
-                    "name": "mcpls-e2e-test",
+                    "name": name,
                     "version": "0.1.0"
                 }
             }
@@ -399,10 +405,20 @@ impl McpClient {
     /// - The tool does not exist
     /// - The parameters are invalid
     pub fn call_tool(&mut self, name: &str, arguments: &Value) -> Result<Value> {
+        self.call_tool_with_meta(name, arguments, None)
+    }
+
+    #[allow(dead_code)]
+    pub fn call_tool_with_meta(
+        &mut self,
+        name: &str,
+        arguments: &Value,
+        meta: Option<&Value>,
+    ) -> Result<Value> {
         let retry_deadline = Instant::now() + CONTENT_MODIFIED_RETRY_BUDGET;
         let mut attempt = 1u32;
         loop {
-            let request = json!({
+            let mut request = json!({
                 "jsonrpc": "2.0",
                 "id": self.next_id(),
                 "method": "tools/call",
@@ -412,6 +428,9 @@ impl McpClient {
                 }
             });
 
+            if let Some(meta) = meta {
+                request["params"]["_meta"] = meta.clone();
+            }
             match self.send_request(&request) {
                 Ok(response) => return Ok(response),
                 // A concurrent re-analysis invalidated the document snapshot

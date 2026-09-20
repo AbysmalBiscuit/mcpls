@@ -562,11 +562,12 @@ fn acknowledgement_for(requests: &[Request], responses: &[Response]) -> Option<R
         .rev()
         .find_map(|(request, response)| match (request, response) {
             (
-                Request::Flush { session },
+                Request::Flush { agent, session },
                 Response::Flush {
                     token: Some(token), ..
                 },
             ) => Some(Request::Ack {
+                agent: agent.clone(),
                 session: session.clone(),
                 token: *token,
             }),
@@ -1062,6 +1063,7 @@ mod client_rule_tests {
 
     fn flush(session: &str) -> Request {
         Request::Flush {
+            agent: crate::bridge::HookAgent::default(),
             session: session.to_string(),
         }
     }
@@ -1080,6 +1082,7 @@ mod client_rule_tests {
         assert_eq!(
             acknowledgement_for(&requests, &responses),
             Some(Request::Ack {
+                agent: crate::bridge::HookAgent::default(),
                 session: "s2".to_string(),
                 token: 2,
             }),
@@ -1096,6 +1099,7 @@ mod client_rule_tests {
         assert_eq!(
             acknowledgement_for(&requests, &responses),
             Some(Request::Ack {
+                agent: crate::bridge::HookAgent::default(),
                 session: "s1".to_string(),
                 token: 1,
             }),

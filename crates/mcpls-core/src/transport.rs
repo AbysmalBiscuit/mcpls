@@ -324,8 +324,10 @@ pub(crate) async fn run_stdio(
 ) -> Result<(), crate::Error> {
     use crate::bridge::SessionId;
 
+    let mcp_server = mcp_server.for_connection(SessionId::from_host_env());
+    mcp_server.attach_connection().await;
     let service = tokio::select! {
-        result = mcp_server.for_connection(SessionId::from_host_env()).serve(rmcp::transport::stdio()) => {
+        result = mcp_server.serve(rmcp::transport::stdio()) => {
             result.map_err(|e| crate::Error::McpServer(format!("Failed to start MCP server: {e}")))?
         }
         () = shutdown_signal.recv() => {
@@ -1018,7 +1020,7 @@ mod tests {
             assert!(response.starts_with("HTTP/1.1 202"), "{response}");
             let mut params = json!({"name": "get_new_diagnostics", "arguments": {}});
             if identified {
-                params["_meta"] = json!({"threadId": "http-thread"});
+                params["_meta"] = json!({"threadId": "http-thread", "x-codex-turn-metadata": {"session_id": "http-thread"}});
             }
             let call = serde_json::to_vec(
                 &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": params}),

@@ -85,7 +85,7 @@ const MAX_DIAGNOSTIC_ENTRIES: usize = 1000;
 /// produce drive letters in different cases (`C:` vs `c:`).
 /// Lowercasing the entire URI is safe for `file://` URIs because they have
 /// no case-sensitive query or fragment components.
-fn uri_cache_key(uri: &str) -> std::borrow::Cow<'_, str> {
+pub fn uri_cache_key(uri: &str) -> std::borrow::Cow<'_, str> {
     if cfg!(windows) {
         std::borrow::Cow::Owned(uri.to_ascii_lowercase())
     } else {

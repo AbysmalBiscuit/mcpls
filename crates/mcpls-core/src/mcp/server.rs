@@ -32,10 +32,11 @@ use super::tools::{
 };
 use crate::bridge::resources::{make_uri, parse_uri};
 use crate::bridge::{
-    ConnectionId, DefinitionResult, Diagnostic, DiagnosticInfo, DiagnosticSeverity,
-    DiagnosticsDelivery, DiagnosticsResult, DocumentSymbolsResult, FileEntry, FloorTable,
-    FlushReport, NotificationCache, PositionEncoding, ReferencesResult, ResourceSubscriptions,
-    ServerSettle, SessionId, Translator, uri_to_path, validate_path_against_roots,
+    Caller, ConnectionId, DefinitionResult, Diagnostic, DiagnosticInfo, DiagnosticSeverity,
+    DiagnosticSnapshot, DiagnosticsDelivery, DiagnosticsResult, DocumentSymbolsResult, FileEntry,
+    FloorTable, FlushReport, NotificationCache, PositionEncoding, RecordId, ReferencesResult,
+    ResourceSubscriptions, ServerSettle, SessionId, Translator, uri_to_path,
+    validate_path_against_roots,
 };
 use crate::config::{DiagnosticsConfig, ServerId, ToolKind};
 
@@ -60,17 +61,17 @@ pub struct McplsServer {
     connection: ConnectionId,
     session: SessionId,
     adopted_anonymous: Arc<Mutex<bool>>,
-    _http_cleanup: Option<Arc<HttpConnectionCleanup>>,
+    _connection_cleanup: Option<Arc<ConnectionCleanup>>,
     /// Sentences appended to this connection's instructions.
     notes: Arc<[String]>,
 }
 
-struct HttpConnectionCleanup {
+struct ConnectionCleanup {
     context: Arc<BridgeContext>,
     connection: ConnectionId,
 }
 
-impl Drop for HttpConnectionCleanup {
+impl Drop for ConnectionCleanup {
     fn drop(&mut self) {
         let context = Arc::clone(&self.context);
         let connection = self.connection;
@@ -80,7 +81,7 @@ impl Drop for HttpConnectionCleanup {
                 .delivery
                 .lock()
                 .await
-                .end_session(&SessionId::for_connection(connection));
+                .close(connection, tokio::time::Instant::now());
             context.subscriptions.remove_connection(connection).await;
         });
     }
@@ -126,6 +127,20 @@ fn to_structured_tool_result<T: Serialize + JsonSchema>(
 /// page-size ceiling, large enough to rarely trigger for typical workspaces
 /// but small enough to stay well under stdio transport buffer limits.
 const RESOURCE_PAGE_SIZE: usize = 100;
+
+/// The `clientInfo.name` Codex introduces itself with.
+///
+/// Codex is the only host that keys a record on a thread rather than the
+/// connection, so the identity below is read for that client alone.
+const CODEX_CLIENT: &str = "codex-mcp-client";
+
+/// The `_meta` entry Codex attaches to every tool call in a turn.
+///
+/// Carries `thread_id` for the calling thread and `session_id` for the root
+/// the thread belongs to. A bare top-level `threadId` names the thread and
+/// nothing else, so the root stays unknown until this entry or a hook
+/// supplies it.
+const CODEX_TURN_METADATA: &str = "x-codex-turn-metadata";
 
 /// Slice `paths` into the page starting at the position `cursor` resumes
 /// from, returning the page and the cursor for the next page (`None` once
@@ -556,7 +571,7 @@ impl McplsServer {
             connection,
             session: SessionId::for_connection(connection),
             adopted_anonymous: Arc::new(Mutex::new(false)),
-            _http_cleanup: None,
+            _connection_cleanup: None,
             notes: Arc::from(Vec::new()),
         }
     }
@@ -572,21 +587,17 @@ impl McplsServer {
             connection,
             session: session.unwrap_or_else(|| SessionId::for_connection(connection)),
             adopted_anonymous: Arc::new(Mutex::new(false)),
-            _http_cleanup: None,
+            _connection_cleanup: Some(Arc::new(ConnectionCleanup {
+                context: Arc::clone(&self.context),
+                connection,
+            })),
             notes: Arc::clone(&self.notes),
         }
     }
 
     #[cfg(feature = "transport-http")]
     pub(crate) fn for_http_connection(&self) -> Self {
-        let server = self.for_connection(None);
-        Self {
-            _http_cleanup: Some(Arc::new(HttpConnectionCleanup {
-                context: Arc::clone(&server.context),
-                connection: server.connection,
-            })),
-            ..server
-        }
+        self.for_connection(None)
     }
 
     /// This server with `notes` appended to its instructions.
@@ -1121,7 +1132,10 @@ impl McplsServer {
         // per changed file, and holding the cache lock across those awaits
         // would block the diagnostics pump, which loses publishes rather than
         // waiting for them.
-        to_tool_result(Ok(self.flush_now(&session, Advance::Now).await.0))
+        to_tool_result(Ok(self
+            .flush_now(&RecordId::from(&session), Advance::Now)
+            .await
+            .0))
     }
 
     /// Flush `session`'s record and render it, advancing the record as
@@ -1141,7 +1155,7 @@ impl McplsServer {
     #[allow(clippy::significant_drop_tightening)]
     async fn flush_now(
         &self,
-        session: &SessionId,
+        session: &RecordId,
         advance: Advance,
     ) -> (NewDiagnosticsResult, Option<u64>) {
         let (report, token, sources, baseline_pending) = {
@@ -1152,6 +1166,8 @@ impl McplsServer {
             let pending_baselines = self.context.settle.pending_diagnostics_baselines();
             let entries =
                 routable_entries_borrowed(&cache, &self.context.floors, &pending_baselines);
+            let snapshots = self.diagnostic_sources(&cache, &entries);
+            delivery.capture_sources(snapshots);
             let (report, token) = match advance {
                 Advance::Now => (delivery.flush(session, &entries), None),
                 Advance::OnAcknowledgement => delivery.stage(session, &entries),
@@ -1185,8 +1201,9 @@ impl McplsServer {
     /// permanently believing the workspace started clean.
     pub(crate) async fn flush_for_hook(
         &self,
-        session: &SessionId,
+        session: impl Into<RecordId>,
     ) -> (Option<String>, Option<u64>) {
+        let session = &session.into();
         if !self.context.delivery.lock().await.has_baseline() {
             return (None, None);
         }
@@ -1199,13 +1216,95 @@ impl McplsServer {
     /// Takes `delivery` alone. `false` when `token` no longer names the
     /// session's staged report, in which case the record already reflects
     /// something sent more recently, or nothing.
-    pub(crate) async fn commit_for_hook(&self, session: &SessionId, token: u64) -> bool {
+    pub(crate) async fn commit_for_hook(&self, session: impl Into<RecordId>, token: u64) -> bool {
         self.context.delivery.lock().await.commit(session, token)
     }
 
-    /// Drop `session`'s delivery record.
+    fn diagnostic_sources(
+        &self,
+        cache: &NotificationCache,
+        entries: &[FileEntry<'_>],
+    ) -> HashMap<String, Arc<DiagnosticSnapshot>> {
+        entries
+            .iter()
+            .filter_map(|entry| {
+                let info = cache.get_diagnostics(entry.key)?;
+                let owner = cache.diagnostics_owner(entry.key)?;
+                let text = uri_to_path(&info.uri).and_then(|path| {
+                    self.context
+                        .translator
+                        .document_tracker()
+                        .get(&path)
+                        .map(|document| Arc::<str>::from(document.content()))
+                });
+                Some((
+                    entry.key.to_string(),
+                    Arc::new(DiagnosticSnapshot {
+                        uri: info.uri.clone(),
+                        encoding: self.context.translator.position_encoding_for(owner),
+                        text,
+                    }),
+                ))
+            })
+            .collect()
+    }
+
+    pub(crate) async fn attribute_paths(&self, caller: &Caller, paths: &[PathBuf]) {
+        let mut delivery = self.context.delivery.lock().await;
+        let cache = self.context.notification_cache.lock().await;
+        if delivery.has_baseline() {
+            let pending = self.context.settle.pending_diagnostics_baselines();
+            let entries = routable_entries_borrowed(&cache, &self.context.floors, &pending);
+            delivery.capture_sources(self.diagnostic_sources(&cache, &entries));
+            delivery.observe_owned(&entries);
+        }
+        drop(cache);
+        let keys = paths
+            .iter()
+            .filter_map(|path| {
+                crate::bridge::path_to_uri(path)
+                    .ok()
+                    .map(|uri| uri.to_string())
+            })
+            .collect::<Vec<_>>();
+        delivery.record_write(caller, &keys);
+    }
+
+    pub(crate) async fn attach_connection(&self) {
+        let caller = Caller {
+            record: RecordId::from(&self.session),
+            root: (self.session != SessionId::for_connection(self.connection))
+                .then(|| self.session.clone()),
+        };
+        self.context
+            .delivery
+            .lock()
+            .await
+            .attach(self.connection, &caller);
+    }
+
+    pub(crate) async fn touch_hook(&self, caller: &Caller) {
+        self.context
+            .delivery
+            .lock()
+            .await
+            .touch_hook(caller, tokio::time::Instant::now());
+    }
+
+    pub(crate) async fn register_caller(&self, caller: &Caller) {
+        self.context.delivery.lock().await.register_caller(caller);
+    }
+
+    /// Mark `session` and its agents ended.
+    ///
+    /// Records still held open by a connection outlive the mark and go when
+    /// the last one closes; the rest go on the next expiry pass.
     pub(crate) async fn end_session(&self, session: &SessionId) {
-        self.context.delivery.lock().await.end_session(session);
+        self.context
+            .delivery
+            .lock()
+            .await
+            .end_root(session, tokio::time::Instant::now());
     }
 
     /// Build `get_new_diagnostics`'s payload from one flush's report.
@@ -1221,6 +1320,20 @@ impl McplsServer {
     ) -> NewDiagnosticsResult {
         let mut changed = Vec::with_capacity(report.changed.len());
         for file in &report.changed {
+            if let Some(source) = report.sources.get(&file.key) {
+                if let Some(path) = uri_to_path(&source.uri) {
+                    changed.push(NewDiagnosticsFile {
+                        file_path: path.display().to_string(),
+                        diagnostics: file
+                            .diagnostics
+                            .iter()
+                            .map(|diagnostic| source.render(diagnostic))
+                            .collect(),
+                        omitted: file.omitted,
+                    });
+                }
+                continue;
+            }
             let Some(source) = sources.get(&file.key) else {
                 continue;
             };
@@ -1251,8 +1364,14 @@ impl McplsServer {
         let cleared = report
             .cleared
             .iter()
-            .filter_map(|key| sources.get(key))
-            .filter_map(|source| uri_to_path(&source.uri))
+            .filter_map(|key| {
+                report
+                    .sources
+                    .get(key)
+                    .map(|source| &source.uri)
+                    .or_else(|| sources.get(key).map(|source| &source.uri))
+            })
+            .filter_map(uri_to_path)
             .map(|path| path.display().to_string())
             .collect();
 
@@ -1317,7 +1436,10 @@ impl McplsServer {
         .await;
 
         let session = self.session.clone();
-        let mut report = self.flush_now(&session, Advance::Now).await.0;
+        let mut report = self
+            .flush_now(&RecordId::from(&session), Advance::Now)
+            .await
+            .0;
         report.note = Some(report.note.take().map_or_else(
             || {
                 "This footer is best effort; anything slower than the wait arrives in the \
@@ -1474,7 +1596,7 @@ impl ServerHandler for McplsServer {
         let mut server = self.clone();
         if context
             .client_info()
-            .is_some_and(|client| client.name == "codex-mcp-client")
+            .is_some_and(|client| client.name == CODEX_CLIENT)
         {
             let thread = context
                 .meta
@@ -1484,7 +1606,7 @@ impl ServerHandler for McplsServer {
                 .or_else(|| {
                     context
                         .meta
-                        .get("x-codex-turn-metadata")?
+                        .get(CODEX_TURN_METADATA)?
                         .get("thread_id")?
                         .as_str()
                         .filter(|thread| !thread.is_empty())
@@ -1500,13 +1622,53 @@ impl ServerHandler for McplsServer {
                         .merge_session(&anonymous, &session);
                     *adopted = true;
                 }
+                drop(adopted);
+                let root = context
+                    .meta
+                    .get(CODEX_TURN_METADATA)
+                    .and_then(|meta| meta.get("session_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|root| SessionId::named(Some(root.to_owned())));
+                server
+                    .register_caller(&Caller {
+                        record: RecordId::from(&session),
+                        root,
+                    })
+                    .await;
                 session
             } else {
                 anonymous
             };
         }
+        if server.session != SessionId::for_connection(server.connection)
+            && context
+                .client_info()
+                .is_none_or(|client| client.name != CODEX_CLIENT)
+        {
+            server
+                .register_caller(&Caller {
+                    record: RecordId::from(&server.session),
+                    root: Some(server.session.clone()),
+                })
+                .await;
+        }
+        let caller = {
+            let mut delivery = server.context.delivery.lock().await;
+            let caller = delivery.caller(RecordId::from(&server.session));
+            delivery.attach(server.connection, &caller);
+            caller
+        };
+        let writer = server.clone();
+        let runtime = tokio::runtime::Handle::current();
+        // The applier runs this on its `spawn_blocking` task, never on a
+        // runtime worker, which is what makes `block_on` legal here.
+        let observer: crate::bridge::apply::WriteObserver = Arc::new(move |paths| {
+            runtime.block_on(writer.attribute_paths(&caller, paths));
+        });
         let call = rmcp::handler::server::tool::ToolCallContext::new(&server, request, context);
-        Self::tool_router().call(call).await
+        crate::bridge::apply::WRITE_OBSERVER
+            .scope(observer, Self::tool_router().call(call))
+            .await
     }
 
     /// What `#[tool_handler]` would generate, plus the pass that fits each
@@ -1854,6 +2016,144 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn cancelled_mcp_write_keeps_its_writer_after_the_future_drops() {
+        use rmcp::ServiceExt as _;
+        use tokio::io::{AsyncWriteExt as _, BufReader, BufStream};
+
+        use crate::bridge::apply::journal::{StepBarrier, install_step_barrier};
+        let mut fixture = CausalWriteFixture::new(WriteTool::Format);
+        fixture
+            .server
+            .context
+            .delivery
+            .lock()
+            .await
+            .set_baseline(HashMap::new());
+        let owner = ServerId::from("rust");
+        if let Some(generation) = fixture.settle.diagnostics_baseline_generation(&owner) {
+            fixture
+                .settle
+                .finish_diagnostics_baseline_merge(&owner, generation);
+        }
+        let arrived = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        install_step_barrier(Some(StepBarrier {
+            path: fixture.path.clone(),
+            arrived: Arc::clone(&arrived),
+            resume: Arc::clone(&resume),
+        }));
+        let (server_io, client_io) = tokio::io::duplex(65_536);
+        let server = fixture.server.for_connection(None);
+        let started = tokio::spawn(async move { server.serve(server_io).await.unwrap() });
+        let mut wire = BufStream::new(client_io);
+        mcp_test_request(
+            &mut wire,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2025-11-25", "capabilities": {},
+                    "clientInfo": {"name": "codex-mcp-client", "version": "1"}}
+            }),
+        )
+        .await;
+        wire.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+            .await
+            .unwrap();
+        wire.flush().await.unwrap();
+        let running = started.await.unwrap();
+        let request = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "format_document", "arguments": WriteTool::Format.mcp_arguments(&fixture.path.display().to_string()),
+                "_meta": {"threadId": "writer", "x-codex-turn-metadata": {"session_id": "root"}}}});
+        wire.write_all(format!("{request}\n").as_bytes())
+            .await
+            .unwrap();
+        wire.flush().await.unwrap();
+        let mut lsp = BufReader::new(&mut fixture.fake.write_stdout);
+        let opened = crate::test_support::read_framed_message(&mut lsp).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let request = crate::test_support::read_framed_message(&mut lsp).await;
+        write_response(
+            &mut fixture.fake.read_half_stdin,
+            &request["id"],
+            WriteTool::Format.reply_rewriting(&fixture.uri),
+        )
+        .await;
+        tokio::task::spawn_blocking(move || arrived.wait())
+            .await
+            .unwrap();
+        wire.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":2}}\n").await.unwrap();
+        wire.flush().await.unwrap();
+        running.cancel().await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&fixture.path).unwrap(),
+            "fn old() {}\n"
+        );
+        tokio::task::spawn_blocking(move || resume.wait())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if std::fs::read_to_string(&fixture.path).unwrap() == "fn new() {}\n" {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        install_step_barrier(None);
+        fixture
+            .server
+            .context
+            .notification_cache
+            .lock()
+            .await
+            .store_diagnostics(
+                &owner,
+                &fixture.uri,
+                None,
+                vec![lsp_types::Diagnostic {
+                    severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+                    message: "after cancellation".into(),
+                    ..Default::default()
+                }],
+            );
+        let caller = crate::bridge::HookAgent {
+            agent_id: Some("writer".into()),
+            host: crate::bridge::HookHost::Codex,
+        }
+        .caller("root");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if fixture
+                    .server
+                    .flush_for_hook(&caller.record)
+                    .await
+                    .0
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let root = crate::bridge::HookAgent::default().caller("root");
+        fixture.server.register_caller(&root).await;
+        assert!(
+            fixture
+                .server
+                .flush_for_hook(&root.record)
+                .await
+                .0
+                .is_none()
+        );
+        let _ = fixture.pump_cancel.send(true);
+        fixture.pump.abort();
+    }
+
     #[test]
     fn test_notes_reach_the_instructions() {
         let (delivery, floors) = default_delivery_and_floors();
@@ -2032,12 +2332,15 @@ mod tests {
 
         let (staged, token) = parts
             .server
-            .flush_now(&session, Advance::OnAcknowledgement)
+            .flush_now(&RecordId::from(&session), Advance::OnAcknowledgement)
             .await;
         assert_eq!(staged.changed.len(), 1);
         let token = token.expect("a staged report with content carries a token");
 
-        let (now, none) = parts.server.flush_now(&session, Advance::Now).await;
+        let (now, none) = parts
+            .server
+            .flush_now(&RecordId::from(&session), Advance::Now)
+            .await;
         assert_eq!(
             now.changed.len(),
             1,
@@ -2055,7 +2358,7 @@ mod tests {
 
         let (after, _) = parts
             .server
-            .flush_now(&session, Advance::OnAcknowledgement)
+            .flush_now(&RecordId::from(&session), Advance::OnAcknowledgement)
             .await;
         assert!(after.changed.is_empty());
     }
@@ -2511,6 +2814,115 @@ mod tests {
         }
     }
 
+    /// A rename that moves a file claims the path it left as well as the
+    /// one it arrived at, so the errors left behind on the old spelling
+    /// reach the agent that moved it rather than the root session.
+    #[tokio::test]
+    async fn a_rename_that_moves_a_file_attributes_both_ends() {
+        use rmcp::ServiceExt as _;
+        use tokio::io::{AsyncWriteExt as _, BufReader, BufStream};
+
+        use crate::bridge::{FileEntry, RecordId, SessionId};
+
+        let mut fixture = WriteFixture::new(WriteTool::Rename, DiagnosticsConfig::default())
+            .with_one_error()
+            .await;
+        let moved = fixture.path.with_file_name("renamed.rs");
+        let moved_uri = crate::bridge::path_to_uri(&moved).expect("a uri for the destination");
+        let reply = json!({"documentChanges": [
+            {"kind": "rename", "oldUri": fixture.uri.as_str(), "newUri": moved_uri.as_str()}
+        ]});
+
+        let (server_io, client_io) = tokio::io::duplex(65_536);
+        let served = fixture.server.for_connection(None);
+        let started = tokio::spawn(async move { served.serve(server_io).await.unwrap() });
+        let mut wire = BufStream::new(client_io);
+        mcp_test_request(
+            &mut wire,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2025-11-25", "capabilities": {},
+                    "clientInfo": {"name": "codex-mcp-client", "version": "1"}}
+            }),
+        )
+        .await;
+        wire.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+            .await
+            .unwrap();
+        wire.flush().await.unwrap();
+        let running = started.await.unwrap();
+
+        let call = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+            "name": "rename_symbol",
+            "arguments": WriteTool::Rename.mcp_arguments(&fixture.path.display().to_string()),
+            "_meta": {"threadId": "mover", "x-codex-turn-metadata": {"session_id": "root"}}
+        }});
+        let answered = async {
+            let mut lsp = BufReader::new(&mut fixture.fake.write_stdout);
+            loop {
+                let message = crate::test_support::read_framed_message(&mut lsp).await;
+                if message["method"] == "textDocument/rename" {
+                    write_response(&mut fixture.fake.read_half_stdin, &message["id"], reply).await;
+                    break;
+                }
+            }
+        };
+        let (response, ()) = tokio::join!(mcp_test_request(&mut wire, call), answered);
+        assert!(response.get("error").is_none(), "{response}");
+        let payload: serde_json::Value =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .expect("write result JSON");
+        assert_eq!(payload["applied"], true, "{payload}");
+        assert!(
+            moved.exists(),
+            "the rename did not move the file: {payload}"
+        );
+
+        let diagnostics = vec![diagnostic_at("stale")];
+        // The delivery core sees the keys the notification cache files a
+        // published diagnostic under, not the URI a server spelled it with.
+        let from = crate::bridge::uri_cache_key(fixture.uri.as_str()).into_owned();
+        let to = crate::bridge::uri_cache_key(moved_uri.as_str()).into_owned();
+        let entries = [
+            FileEntry {
+                key: &from,
+                diagnostics: &diagnostics,
+                floor: crate::config::SeverityFloor::Warning,
+            },
+            FileEntry {
+                key: &to,
+                diagnostics: &diagnostics,
+                floor: crate::config::SeverityFloor::Warning,
+            },
+        ];
+        let writer = RecordId::Session(SessionId::from("mover".to_string()));
+        let root_session = SessionId::from("root".to_string());
+        let root = RecordId::Session(root_session.clone());
+        let mut delivery = fixture.server.context.delivery.lock().await;
+        // Without this the root is an unidentified record, which is handed
+        // every file rather than only the ones nobody claimed.
+        delivery.register_caller(&crate::bridge::Caller {
+            record: root.clone(),
+            root: Some(root_session),
+        });
+        let claimed: Vec<_> = delivery
+            .flush(&writer, &entries)
+            .changed
+            .iter()
+            .map(|file| file.key.clone())
+            .collect();
+        assert!(
+            claimed.contains(&from) && claimed.contains(&to),
+            "the mover was not given both ends of its rename: {claimed:?}"
+        );
+        assert!(
+            delivery.flush(&root, &entries).changed.is_empty(),
+            "the root was told about a file the mover owns"
+        );
+        drop(delivery);
+        running.cancel().await.unwrap();
+    }
+
     async fn write_lsp_notification<W>(writer: &mut W, method: &str, params: serde_json::Value)
     where
         W: tokio::io::AsyncWrite + Unpin,
@@ -2662,7 +3074,7 @@ mod tests {
                     "jsonrpc": "2.0", "id": 1, "method": "initialize",
                     "params": {
                         "protocolVersion": "2025-11-25", "capabilities": {},
-                        "clientInfo": {"name": "causal-write-test", "version": "1"}
+                        "clientInfo": {"name": "codex-mcp-client", "version": "1"}
                     }
                 }),
             )
@@ -2678,7 +3090,7 @@ mod tests {
             let path = self.path.display().to_string();
             let request = json!({
                 "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-                "params": {"name": tool.mcp_name(), "arguments": tool.mcp_arguments(&path)}
+                "params": {"name": tool.mcp_name(), "arguments": tool.mcp_arguments(&path), "_meta": {"threadId": "writer", "x-codex-turn-metadata": {"session_id": "root"}}}
             });
             let call = tokio::spawn(async move {
                 let response = mcp_test_request(&mut wire, request).await;
@@ -2827,6 +3239,9 @@ mod tests {
                 "{tool:?} footer omitted the final diagnostic: {payload}"
             );
 
+            let root = crate::bridge::HookAgent::default().caller("root");
+            self.server.register_caller(&root).await;
+            assert!(self.server.flush_for_hook(&root.record).await.0.is_none());
             let _ = self.pump_cancel.send(true);
             self.pump.abort();
             running.cancel().await.unwrap();

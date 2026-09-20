@@ -13,7 +13,7 @@ use tokio::sync::watch;
 use crate::bridge::SessionId;
 use crate::hooks::identity::SocketIdentity;
 use crate::hooks::protocol::{Request, Response, ServerStatus};
-use crate::hooks::sweep::Sweeper;
+use crate::hooks::sweep::{Origin, Sweeper};
 use crate::mcp::McplsServer;
 
 /// What the process holding the endpoint has served, for `mcpls hook
@@ -102,7 +102,13 @@ pub fn build_handler(
         let cancelled = *cancel.borrow();
         Box::pin(async move {
             match request {
-                Request::Changed { paths, .. } => {
+                Request::Changed {
+                    agent,
+                    session,
+                    attributed,
+                    paths,
+                    ..
+                } => {
                     // Nothing drains the pending set once the sweep loop has
                     // stopped, so paths accepted after cancellation would
                     // accumulate without limit and never be swept or
@@ -114,15 +120,22 @@ pub fn build_handler(
                         };
                     }
                     stats.record_hook_request();
-                    // The event kind is discarded: the sweep stats.
+                    server.touch_hook(&agent.caller(&session)).await;
+                    let paths = sweeper.admitted_paths(&paths);
+                    if attributed {
+                        server
+                            .attribute_paths(&agent.caller(&session), &paths)
+                            .await;
+                    }
                     Response::Changed {
-                        queued: sweeper.enqueue(&paths),
+                        queued: sweeper.queue_admitted(&paths, Origin::Hook),
                     }
                 }
-                Request::Flush { session } => {
+                Request::Flush { agent, session } => {
                     stats.record_hook_request();
-                    let session = SessionId::from(session);
-                    let (report, token) = server.flush_for_hook(&session).await;
+                    let caller = agent.caller(&session);
+                    server.touch_hook(&caller).await;
+                    let (report, token) = server.flush_for_hook(&caller.record).await;
                     let mut parts: Vec<String> = Vec::new();
                     if let Some(text) = report {
                         parts.push(text);
@@ -135,9 +148,14 @@ pub fn build_handler(
                         token,
                     }
                 }
-                Request::Ack { session, token } => {
+                Request::Ack {
+                    agent,
+                    session,
+                    token,
+                } => {
+                    server.touch_hook(&agent.caller(&session)).await;
                     server
-                        .commit_for_hook(&SessionId::from(session), token)
+                        .commit_for_hook(&agent.caller(&session).record, token)
                         .await;
                     Response::Ack
                 }
@@ -474,6 +492,7 @@ mod tests {
             crate::hooks::send_and_acknowledge(
                 &self.identity,
                 &[Request::Flush {
+                    agent: crate::bridge::HookAgent::default(),
                     session: session.to_string(),
                 }],
                 Duration::from_secs(5),
@@ -619,6 +638,8 @@ mod tests {
 
         let response = harness
             .send(Request::Changed {
+                attributed: false,
+                agent: crate::bridge::HookAgent::default(),
                 session: "s1".to_string(),
                 paths: vec![path],
                 event: ChangeEvent::Change,
@@ -650,6 +671,8 @@ mod tests {
             assert_eq!(
                 harness
                     .send(Request::Changed {
+                        attributed: false,
+                        agent: crate::bridge::HookAgent::default(),
                         session: "s1".to_string(),
                         paths: vec![path.clone()],
                         event: ChangeEvent::Change,
@@ -706,6 +729,7 @@ mod tests {
 
         let latest = harness
             .send(Request::Flush {
+                agent: crate::bridge::HookAgent::default(),
                 session: "s1".to_string(),
             })
             .await;
@@ -739,6 +763,8 @@ mod tests {
             assert_eq!(
                 harness
                     .send(Request::Changed {
+                        attributed: false,
+                        agent: crate::bridge::HookAgent::default(),
                         session: "s1".to_string(),
                         paths: vec![path.clone()],
                         event: ChangeEvent::Change,
@@ -797,6 +823,7 @@ mod tests {
 
         let second = harness
             .send(Request::Flush {
+                agent: crate::bridge::HookAgent::default(),
                 session: "s1".to_string(),
             })
             .await;
@@ -839,6 +866,7 @@ mod tests {
         let harness = HookHarness::owner_with_one_error().await;
         let first = harness
             .send(Request::Flush {
+                agent: crate::bridge::HookAgent::default(),
                 session: "s1".to_string(),
             })
             .await;
@@ -855,6 +883,7 @@ mod tests {
 
         let second = harness
             .send(Request::Flush {
+                agent: crate::bridge::HookAgent::default(),
                 session: "s1".to_string(),
             })
             .await;
@@ -879,6 +908,7 @@ mod tests {
             token: Some(stale), ..
         } = harness
             .send(Request::Flush {
+                agent: crate::bridge::HookAgent::default(),
                 session: "s1".to_string(),
             })
             .await
@@ -890,6 +920,7 @@ mod tests {
             ..
         } = harness
             .send(Request::Flush {
+                agent: crate::bridge::HookAgent::default(),
                 session: "s1".to_string(),
             })
             .await
@@ -900,6 +931,7 @@ mod tests {
 
         let answer = harness
             .send(Request::Ack {
+                agent: crate::bridge::HookAgent::default(),
                 session: "s1".to_string(),
                 token: stale,
             })
@@ -908,6 +940,7 @@ mod tests {
 
         let third = harness
             .send(Request::Flush {
+                agent: crate::bridge::HookAgent::default(),
                 session: "s1".to_string(),
             })
             .await;
@@ -929,11 +962,13 @@ mod tests {
         let harness = HookHarness::owner_with_one_error().await;
         let _ = harness
             .send(Request::Flush {
+                agent: crate::bridge::HookAgent::default(),
                 session: "s1".to_string(),
             })
             .await;
         let other = harness
             .send(Request::Flush {
+                agent: crate::bridge::HookAgent::default(),
                 session: "s2".to_string(),
             })
             .await;
@@ -955,6 +990,7 @@ mod tests {
         let harness = HookHarness::owner_with_one_error().await;
         let _ = harness
             .send(Request::Flush {
+                agent: crate::bridge::HookAgent::default(),
                 session: "s1".to_string(),
             })
             .await;
@@ -965,6 +1001,7 @@ mod tests {
             .await;
         let again = harness
             .send(Request::Flush {
+                agent: crate::bridge::HookAgent::default(),
                 session: "s1".to_string(),
             })
             .await;
@@ -992,6 +1029,7 @@ mod tests {
             ..
         } = harness
             .send(Request::Flush {
+                agent: crate::bridge::HookAgent::default(),
                 session: "s1".to_string(),
             })
             .await
@@ -1036,6 +1074,7 @@ mod tests {
 
         let early = harness
             .send(Request::Flush {
+                agent: crate::bridge::HookAgent::default(),
                 session: "s1".to_string(),
             })
             .await;
@@ -1053,6 +1092,7 @@ mod tests {
             ..
         } = harness
             .send(Request::Flush {
+                agent: crate::bridge::HookAgent::default(),
                 session: "s1".to_string(),
             })
             .await
@@ -1149,6 +1189,8 @@ mod tests {
         cancel_tx.send(true).expect("cancel");
 
         let response = handler(Request::Changed {
+            attributed: false,
+            agent: crate::bridge::HookAgent::default(),
             session: "s1".to_string(),
             paths: vec![path],
             event: ChangeEvent::Change,
@@ -1160,6 +1202,233 @@ mod tests {
             harness.sweeper.pending_len(),
             0,
             "a path queued after the last sweep is never swept and never reported"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_changes_claim_files_but_watcher_changes_do_not() {
+        let harness = HookHarness::owner().await;
+        let path = harness.fixture("owned.rs");
+        std::fs::write(&path, "broken").unwrap();
+        let uri = crate::bridge::path_to_uri(&path).unwrap();
+        for (attributed, agent) in [(true, Some("child")), (false, None)] {
+            let request = serde_json::from_value(serde_json::json!({
+                "op": "changed", "session": "root", "agent_id": agent,
+                "host": "codex", "paths": [path], "event": "change",
+                "attributed": attributed
+            }))
+            .unwrap();
+            crate::hooks::send(&harness.identity, &request, Duration::from_secs(5))
+                .await
+                .unwrap();
+        }
+        harness.notification_cache.lock().await.store_diagnostics(
+            &ServerId::from("rust"),
+            &uri,
+            Some(1),
+            vec![diagnostic("owned error")],
+        );
+        for (agent, expected) in [(None, false), (Some("child"), true)] {
+            let request = serde_json::from_value(serde_json::json!({
+                "op": "flush", "session": "root", "agent_id": agent, "host": "codex"
+            }))
+            .unwrap();
+            let response = crate::hooks::send(&harness.identity, &request, Duration::from_secs(5))
+                .await
+                .unwrap();
+            let Response::Flush { context, .. } = response else {
+                panic!("flush");
+            };
+            assert_eq!(context.is_some(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn attribution_admits_deleted_paths_and_rejects_ignored_and_outside_paths() {
+        let harness = HookHarness::owner().await;
+        let deleted = harness.fixture("gone.rs");
+        let ignored = harness.fixture("target/generated.rs");
+        let outside = tempfile::tempdir().unwrap().path().join("outside.rs");
+        let request = serde_json::from_value(serde_json::json!({
+            "op": "changed", "session": "root", "agent_id": "child", "host": "codex",
+            "paths": [deleted, ignored, outside], "event": "unlink", "attributed": true
+        }))
+        .unwrap();
+        let response = crate::hooks::send(&harness.identity, &request, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(response, Response::Changed { queued: 1 });
+        for path in [&deleted, &ignored, &outside] {
+            harness.notification_cache.lock().await.store_diagnostics(
+                &ServerId::from("rust"),
+                &crate::bridge::path_to_uri(path).unwrap(),
+                None,
+                vec![diagnostic("error")],
+            );
+        }
+        let caller = crate::bridge::HookAgent {
+            agent_id: Some("child".into()),
+            host: crate::bridge::HookHost::Codex,
+        }
+        .caller("root");
+        let (context, _) = harness.server.flush_for_hook(&caller.record).await;
+        let text = context.unwrap();
+        assert!(text.contains("gone.rs"), "{text}");
+        assert!(
+            !text.contains("generated.rs") && !text.contains("outside.rs"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn socket_reports_keep_other_writers_snapshots_across_edits_and_caps() {
+        async fn request(harness: &HookHarness, value: serde_json::Value) -> Response {
+            crate::hooks::send(
+                &harness.identity,
+                &serde_json::from_value(value).unwrap(),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap()
+        }
+        for host in ["claude", "codex"] {
+            let harness = HookHarness::owner_without_baseline_with(DiagnosticsConfig {
+                max_total: 1,
+                ..Default::default()
+            })
+            .await;
+            harness.delivery.lock().await.set_baseline(HashMap::new());
+            let a = harness.fixture("a.rs");
+            let b = harness.fixture("b.rs");
+            let unowned = harness.fixture("unowned.rs");
+            for agent in ["a", "b"] {
+                request(
+                    &harness,
+                    serde_json::json!({
+                        "op": "changed", "session": "root", "agent_id": agent, "host": host,
+                        "attributed": true, "event": "change", "paths": [a, b]
+                    }),
+                )
+                .await;
+            }
+            for path in [&a, &b, &unowned] {
+                harness.notification_cache.lock().await.store_diagnostics(
+                    &ServerId::from("rust"),
+                    &crate::bridge::path_to_uri(path).unwrap(),
+                    None,
+                    vec![diagnostic("old snapshot")],
+                );
+            }
+            let Response::Flush {
+                context: Some(first),
+                token: Some(token),
+            } = request(
+                &harness,
+                serde_json::json!({
+                    "op": "flush", "session": "root", "agent_id": "a", "host": host
+                }),
+            )
+            .await
+            else {
+                panic!("first report");
+            };
+            assert!(
+                first.contains("a.rs") && !first.contains("b.rs") && !first.contains("unowned.rs"),
+                "{first}"
+            );
+            request(&harness, serde_json::json!({"op": "ack", "session": "root", "agent_id": "a", "host": host, "token": token})).await;
+            request(
+                &harness,
+                serde_json::json!({
+                    "op": "changed", "session": "root", "agent_id": "c", "host": host,
+                    "attributed": true, "event": "change", "paths": [a]
+                }),
+            )
+            .await;
+            harness.notification_cache.lock().await.store_diagnostics(
+                &ServerId::from("rust"),
+                &crate::bridge::path_to_uri(&a).unwrap(),
+                None,
+                vec![diagnostic("new snapshot")],
+            );
+            for (agent, expected, absent) in [
+                ("b", "old snapshot", "new snapshot"),
+                ("c", "new snapshot", "old snapshot"),
+            ] {
+                let Response::Flush {
+                    context: Some(text),
+                    token: Some(token),
+                } = request(
+                    &harness,
+                    serde_json::json!({
+                        "op": "flush", "session": "root", "agent_id": agent, "host": host
+                    }),
+                )
+                .await
+                else {
+                    panic!("retained report");
+                };
+                assert!(text.contains(expected) && !text.contains(absent), "{text}");
+                request(&harness, serde_json::json!({"op": "ack", "session": "root", "agent_id": agent, "host": host, "token": token})).await;
+            }
+            for agent in ["a", "b"] {
+                let Response::Flush {
+                    context: Some(text),
+                    token: Some(token),
+                } = request(
+                    &harness,
+                    serde_json::json!({
+                        "op": "flush", "session": "root", "agent_id": agent, "host": host
+                    }),
+                )
+                .await
+                else {
+                    panic!("deferred file");
+                };
+                assert!(
+                    text.contains("b.rs")
+                        && text.contains("old snapshot")
+                        && !text.contains("a.rs"),
+                    "{text}"
+                );
+                request(&harness, serde_json::json!({"op": "ack", "session": "root", "agent_id": agent, "host": host, "token": token})).await;
+            }
+            let Response::Flush {
+                context: Some(text),
+                ..
+            } = request(
+                &harness,
+                serde_json::json!({
+                    "op": "flush", "session": "root", "host": host
+                }),
+            )
+            .await
+            else {
+                panic!("root report");
+            };
+            assert!(
+                text.contains("unowned.rs") && !text.contains("a.rs") && !text.contains("b.rs"),
+                "{text}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn admitted_paths_resolve_aliases_and_missing_parent_traversal() {
+        let harness = HookHarness::owner().await;
+        let actual = harness.fixture("actual.rs");
+        let alias = harness.fixture("alias.rs");
+        std::fs::write(&actual, "source").unwrap();
+        std::os::unix::fs::symlink(&actual, &alias).unwrap();
+        assert_eq!(harness.sweeper.admitted_paths(&[alias]), vec![actual]);
+        let escape = harness.fixture("missing/../../escape.rs");
+        assert!(harness.sweeper.admitted_paths(&[escape]).is_empty());
+        let deleted = harness.fixture("missing/../deleted.rs");
+        assert_eq!(
+            harness.sweeper.admitted_paths(&[deleted]),
+            vec![harness.fixture("deleted.rs")]
         );
     }
 
@@ -1294,6 +1563,8 @@ mod tests {
         let queued = crate::hooks::send(
             &identity,
             &Request::Changed {
+                attributed: false,
+                agent: crate::bridge::HookAgent::default(),
                 session: "s1".to_string(),
                 paths: vec![dunce::canonicalize(&changed).expect("canonicalize")],
                 event: ChangeEvent::Change,
@@ -1313,6 +1584,7 @@ mod tests {
             }) = crate::hooks::send(
                 &identity,
                 &Request::Flush {
+                    agent: crate::bridge::HookAgent::default(),
                     session: "s1".to_string(),
                 },
                 Duration::from_secs(5),

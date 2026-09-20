@@ -82,6 +82,7 @@ fn test_every_entry_runs_mcpls_from_path() {
             "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" bootstrap-binaries claude",
             &[
                 "PostToolBatch",
+                "PostToolUse",
                 "SessionEnd",
                 "SessionStart",
                 "UserPromptSubmit",
@@ -95,7 +96,6 @@ fn test_every_entry_runs_mcpls_from_path() {
                 "PostToolUse",
                 "SessionEnd",
                 "SessionStart",
-                "SubagentStop",
                 "UserPromptSubmit",
             ],
         ),

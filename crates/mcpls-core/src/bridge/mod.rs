@@ -8,16 +8,20 @@ use std::sync::{Mutex as StdMutex, MutexGuard, PoisonError};
 pub mod apply;
 mod delivery;
 mod encoding;
+mod identity;
 mod notifications;
 pub mod resources;
 mod settle;
 mod state;
 mod translator;
 
+pub(crate) use delivery::DiagnosticSnapshot;
 pub use delivery::{
     ChangedFile, ConnectionId, DiagnosticsDelivery, FileEntry, FloorTable, FlushReport, SessionId,
 };
 pub use encoding::{PositionEncoding, lsp_to_mcp_position, mcp_to_lsp_position};
+pub use identity::{Caller, HookAgent, HookHost, RecordId};
+pub(crate) use notifications::uri_cache_key;
 pub use notifications::{
     DiagnosticInfo, LogEntry, LogLevel, MessageType, NotificationCache, ServerMessage,
 };

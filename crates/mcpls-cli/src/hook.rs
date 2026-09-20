@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Result;
+use mcpls_core::bridge::{HookAgent, HookHost};
 use mcpls_core::hooks::protocol::ServerStatus;
 use mcpls_core::hooks::{
     ChangeEvent, ProbeOutcome, Request, Response, SocketIdentity, WatcherStatus, probe, send,
@@ -60,13 +61,21 @@ struct HookPayload {
     #[serde(default)]
     session_id: String,
     #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
     tool_calls: Vec<ToolCall>,
+    #[serde(default)]
+    tool_name: String,
+    #[serde(default)]
+    tool_input: Option<ToolInput>,
 }
 
 /// One entry of `PostToolBatch`'s `tool_calls`, keeping only the field its
 /// `changed` request needs.
 #[derive(Debug, Deserialize)]
 struct ToolCall {
+    #[serde(default)]
+    tool_name: String,
     tool_input: ToolInput,
 }
 
@@ -94,10 +103,53 @@ pub async fn dispatch_payload(
     }
 }
 
+async fn attribute_claude_write(
+    payload: HookPayload,
+    agent: HookAgent,
+    identity: Option<&SocketIdentity>,
+) -> Result<String> {
+    let Some(identity) = identity else {
+        return Ok(String::new());
+    };
+    let Some(path) = payload.tool_input.and_then(|input| input.file_path) else {
+        return Ok(String::new());
+    };
+    send(
+        identity,
+        &Request::Changed {
+            attributed: true,
+            agent,
+            session: payload.session_id,
+            paths: vec![path],
+            event: ChangeEvent::Change,
+        },
+        SOCKET_TIMEOUT,
+    )
+    .await?;
+    Ok(String::new())
+}
+
+/// Whether a Claude tool name is one that puts a file on disk.
+///
+/// `plugin/hooks/hooks.json` matches `PostToolUse` against the same set, so
+/// a tool added to one and not the other either writes unattributed or is
+/// dispatched for nothing.
+fn writes_a_file(tool_name: &str) -> bool {
+    matches!(tool_name, "Write" | "Edit" | "MultiEdit")
+}
+
 async fn run(stdin: &str, identity: Option<&SocketIdentity>) -> Result<String> {
     let payload: HookPayload = serde_json::from_str(stdin)?;
+    let agent = HookAgent {
+        agent_id: payload.agent_id.clone(),
+        host: HookHost::Claude,
+    };
 
     match payload.hook_event_name.as_str() {
+        "PostToolUse" if writes_a_file(&payload.tool_name) => {
+            attribute_claude_write(payload, agent, identity).await
+        }
+
         "PostToolBatch" => {
             let Some(identity) = identity else {
                 return Ok(String::new());
@@ -105,15 +157,19 @@ async fn run(stdin: &str, identity: Option<&SocketIdentity>) -> Result<String> {
             let paths = payload
                 .tool_calls
                 .into_iter()
+                .filter(|call| writes_a_file(&call.tool_name))
                 .filter_map(|call| call.tool_input.file_path)
                 .collect();
             let requests = [
                 Request::Changed {
+                    attributed: false,
+                    agent: agent.clone(),
                     session: payload.session_id.clone(),
                     paths,
                     event: ChangeEvent::Change,
                 },
                 Request::Flush {
+                    agent: agent.clone(),
                     session: payload.session_id,
                 },
             ];
@@ -129,6 +185,7 @@ async fn run(stdin: &str, identity: Option<&SocketIdentity>) -> Result<String> {
             let responses = send_and_acknowledge(
                 identity,
                 &[Request::Flush {
+                    agent: agent.clone(),
                     session: payload.session_id,
                 }],
                 FLUSH_SOCKET_TIMEOUT,
@@ -1553,6 +1610,165 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_patch_envelopes_control_writer_claims() {
+        for (patch, expected) in [
+            ("*** Update File: outside.rs", vec![]),
+            (
+                "*** Begin Patch\r\n*** Add File: new name.rs\r\n+*** Delete File: content.rs\r\n*** Update File: old.rs\r\n*** Move to: moved.rs\r\n@@\r\n-old\r\n+new\r\n*** Delete File: gone.rs\r\n*** End Patch\r\n",
+                vec!["new name.rs", "old.rs", "moved.rs", "gone.rs"],
+            ),
+            (
+                "*** Begin Patch\n*** Move to: orphan.rs\n*** End Patch",
+                vec![],
+            ),
+            ("*** Begin Patch\n*** Delete File: lost.rs", vec![]),
+        ] {
+            let recorder = RecordingOwner::start();
+            let cwd = recorder.project_dir().join("subdir");
+            dispatch_as(
+                Host::Codex,
+                &json!({
+                    "hook_event_name": "PostToolUse", "session_id": "root",
+                    "agent_id": "child", "cwd": cwd, "tool_name": "apply_patch",
+                    "tool_input": {"command": patch}
+                }),
+                &recorder,
+            )
+            .await;
+            let requests = recorder.requests();
+            let Request::Changed { paths, .. } = &requests[0] else {
+                panic!("changed");
+            };
+            assert_eq!(
+                *paths,
+                expected
+                    .iter()
+                    .map(|path| cwd.join(path))
+                    .collect::<Vec<_>>(),
+                "{patch}"
+            );
+            let wire = serde_json::to_value(&requests[0]).unwrap();
+            assert_eq!(wire["attributed"], true);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn real_dispatchers_deliver_only_each_agents_written_file() {
+        use mcpls_core::bridge::{
+            DiagnosticsDelivery, FloorTable, NotificationCache, ResourceSubscriptions,
+            ServerSettle, Translator,
+        };
+        use mcpls_core::config::{DiagnosticsConfig, ServerId};
+        use mcpls_core::hooks::service::{HookLocation, HookStats, StatusExtras, build_handler};
+        use mcpls_core::hooks::sweep::Sweeper;
+        use mcpls_core::hooks::{HookListener, PathFilter};
+        use mcpls_core::mcp::McplsServer;
+        for host in [Host::Claude, Host::Codex] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dunce::canonicalize(dir.path()).unwrap();
+            let identity = temp_identity(&root);
+            let cache = Arc::new(tokio::sync::Mutex::new(NotificationCache::new()));
+            let delivery = Arc::new(tokio::sync::Mutex::new(DiagnosticsDelivery::new(
+                DiagnosticsConfig::default(),
+            )));
+            delivery
+                .lock()
+                .await
+                .set_baseline(std::collections::HashMap::new());
+            let translator = Arc::new(Translator::new());
+            let roots: Arc<[PathBuf]> = Arc::from(vec![root.clone()]);
+            let server = Arc::new(McplsServer::new(
+                Arc::clone(&translator),
+                Arc::clone(&cache),
+                Arc::clone(&roots),
+                Arc::new(ResourceSubscriptions::new()),
+                false,
+                delivery,
+                Arc::new(FloorTable::new(&DiagnosticsConfig::default(), &[])),
+                DiagnosticsConfig::default(),
+                Arc::new(ServerSettle::new(
+                    Duration::from_millis(1),
+                    Duration::from_secs(1),
+                )),
+            ));
+            let sweeper = Arc::new(Sweeper::new(
+                translator,
+                PathFilter::new(
+                    roots,
+                    Arc::new(std::collections::HashMap::from([(
+                        "rs".into(),
+                        "rust".into(),
+                    )])),
+                    None,
+                ),
+                Duration::from_millis(500),
+                100,
+            ));
+            let (cancel, rx) = tokio::sync::watch::channel(false);
+            let listener = HookListener::acquire(&identity).await.unwrap().unwrap();
+            let listener_task = tokio::spawn(listener.serve(
+                build_handler(
+                    server,
+                    sweeper,
+                    HookLocation {
+                        identity: identity.clone(),
+                        root: root.clone(),
+                    },
+                    Arc::new(HookStats::default()),
+                    Arc::new(StatusExtras::default),
+                    rx.clone(),
+                ),
+                Duration::from_secs(1),
+                rx,
+            ));
+            for agent in ["a", "b"] {
+                let path = root.join(format!("{agent}.rs"));
+                std::fs::write(&path, "broken").unwrap();
+                let payload = json!({
+                    "hook_event_name": "PostToolUse",
+                    "session_id": "root", "agent_id": agent, "cwd": root,
+                    "tool_name": if matches!(host, Host::Codex) { "apply_patch" } else { "Edit" }, "tool_input": {"file_path": path, "command": format!("*** Begin Patch\n*** Update File: {agent}.rs\n@@\n-old\n+new\n*** End Patch\n")},
+                    "tool_calls": [{"tool_name": "Edit", "tool_input": {"file_path": path}}]
+                });
+                super::dispatch_payload(host, &payload.to_string(), &root, Some(&identity)).await;
+            }
+            for name in ["a", "b", "unowned"] {
+                let uri =
+                    mcpls_core::bridge::path_to_uri(&root.join(format!("{name}.rs"))).unwrap();
+                let diagnostic = serde_json::from_value(json!({
+                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+                    "severity": 1, "message": format!("{name} error")
+                })).unwrap();
+                cache.lock().await.store_diagnostics(
+                    &ServerId::from("rust"),
+                    &uri,
+                    None,
+                    vec![diagnostic],
+                );
+            }
+            for (agent, expected) in [(Some("a"), "a"), (Some("b"), "b"), (None, "unowned")] {
+                let payload = json!({"hook_event_name": "UserPromptSubmit", "session_id": "root", "agent_id": agent, "cwd": root});
+                let output =
+                    super::dispatch_payload(host, &payload.to_string(), &root, Some(&identity))
+                        .await;
+                assert!(output.contains(&format!("{expected} error")), "{output}");
+                for other in ["a", "b", "unowned"] {
+                    if other != expected {
+                        assert!(!output.contains(&format!("{other} error")), "{output}");
+                    }
+                }
+                let repeated =
+                    super::dispatch_payload(host, &payload.to_string(), &root, Some(&identity))
+                        .await;
+                assert!(!repeated.contains(" error"), "{repeated}");
+            }
+            cancel.send(true).unwrap();
+            listener_task.await.unwrap();
+        }
+    }
+
     #[test]
     fn test_the_flush_timeout_tracks_the_op_deadline_default() {
         assert_eq!(
@@ -1617,7 +1833,7 @@ mod tests {
             &json!({
                 "hook_event_name": "PostToolBatch",
                 "session_id": "s1",
-                "tool_calls": [{ "tool_input": { "file_path": file.display().to_string() } }]
+                "tool_calls": [{ "tool_name": "Edit", "tool_input": { "file_path": file.display().to_string() } }]
             }),
             &recorder,
         )
@@ -1692,11 +1908,11 @@ mod tests {
             vec!["flush".to_string(), "ack".to_string()],
             "a flush with content is acknowledged once its answer is in hand: {requests:?}"
         );
-        let Request::Flush { session } = &requests[0] else {
+        let Request::Flush { session, .. } = &requests[0] else {
             panic!("expected a flush request: {:?}", requests[0]);
         };
         assert_eq!(session.as_str(), "s1");
-        let Request::Ack { session, token } = &requests[1] else {
+        let Request::Ack { session, token, .. } = &requests[1] else {
             panic!("expected an ack request: {:?}", requests[1]);
         };
         assert_eq!(session.as_str(), "s1");
@@ -1751,6 +1967,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_only_successful_claude_write_events_claim_paths() {
+        let recorder = RecordingOwner::start();
+        for (event, tool) in [
+            ("PostToolUseFailure", "Edit"),
+            ("PostToolUse", "Read"),
+            ("PostToolUse", "Edit"),
+        ] {
+            dispatch_against(
+                &json!({
+                    "hook_event_name": event, "session_id": "s1",
+                    "tool_name": tool, "tool_input": {"file_path": "a.rs"}
+                }),
+                &recorder,
+            )
+            .await;
+        }
+        let requests = recorder.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            matches!(&requests[0], Request::Changed { attributed: true, paths, .. } if paths == &[PathBuf::from("a.rs")])
+        );
+    }
+
+    #[tokio::test]
     async fn test_post_tool_batch_sends_changed_then_flush() {
         let recorder = RecordingOwner::start();
         let file = recorder.project_dir().join("a.rs");
@@ -1759,7 +1999,11 @@ mod tests {
             &json!({
                 "hook_event_name": "PostToolBatch",
                 "session_id": "s1",
-                "tool_calls": [{ "tool_input": { "file_path": file.display().to_string() } }]
+                "tool_calls": [
+                    { "tool_name": "Read", "tool_input": { "file_path": "read.rs" } },
+                    { "tool_name": "Edit", "tool_input": { "file_path": file.display().to_string() } },
+                    { "tool_name": "Unknown", "tool_input": { "file_path": "unknown.rs" } }
+                ]
             }),
             &recorder,
         )
@@ -1776,9 +2020,11 @@ mod tests {
             "a changed, the flush, then the acknowledgement: {requests:?}"
         );
         let Request::Changed {
+            attributed,
             session: changed_session,
             paths,
             event,
+            ..
         } = &requests[0]
         else {
             panic!(
@@ -1788,10 +2034,12 @@ mod tests {
         };
         let Request::Flush {
             session: flush_session,
+            ..
         } = &requests[1]
         else {
             panic!("expected the second request to be flush: {:?}", requests[1]);
         };
+        assert!(!attributed, "batch results do not expose success status");
         assert_eq!(changed_session.as_str(), "s1");
         assert_eq!(
             *paths,
@@ -1835,7 +2083,7 @@ mod tests {
             &json!({
                 "hook_event_name": "PostToolBatch",
                 "session_id": "s1",
-                "tool_calls": [{ "tool_input": { "file_path": file.display().to_string() } }]
+                "tool_calls": [{ "tool_name": "Edit", "tool_input": { "file_path": file.display().to_string() } }]
             }),
             &recorder,
         )
@@ -3438,25 +3686,26 @@ mod tests {
             session,
             paths,
             event,
+            ..
         } = &requests[0]
         else {
             panic!("expected a changed request: {:?}", requests[0]);
         };
-        assert_eq!(session.as_str(), "s1/a1");
+        assert_eq!(session.as_str(), "s1");
         assert_eq!(
             *paths,
             vec![cwd.join("src/a.rs")],
             "apply_patch paths are relative to the session's cwd"
         );
         assert_eq!(*event, ChangeEvent::Change);
-        let Request::Flush { session } = &requests[1] else {
+        let Request::Flush { session, .. } = &requests[1] else {
             panic!("expected a flush request: {:?}", requests[1]);
         };
-        assert_eq!(session.as_str(), "s1/a1");
+        assert_eq!(session.as_str(), "s1");
     }
 
     #[tokio::test]
-    async fn test_codex_subagent_stop_ends_the_subagent_session() {
+    async fn test_codex_subagent_stop_keeps_the_subagent_session() {
         let recorder = RecordingOwner::start();
         let out = dispatch_as(
             Host::Codex,
@@ -3466,11 +3715,39 @@ mod tests {
         .await;
 
         assert_eq!(out, "");
-        let requests = recorder.requests();
-        let Request::EndSession { session } = &requests[0] else {
-            panic!("expected an end-session request: {:?}", requests[0]);
-        };
-        assert_eq!(session.as_str(), "s1/a1");
+        assert!(recorder.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_hook_agent_identity_survives_changed_flush_and_ack() {
+        for host in [Host::Claude, Host::Codex] {
+            let recorder = RecordingOwner::start_with_flush(Some(DEFAULT_FLUSH_TEXT.to_string()));
+            let payload = json!({
+                "hook_event_name": if matches!(host, Host::Claude) { "PostToolBatch" } else { "PostToolUse" },
+                "session_id": "root/one",
+                "agent_id": "child/two",
+                "cwd": recorder.project_dir(),
+                "tool_name": "apply_patch",
+                "tool_calls": [{"tool_name": "Edit", "tool_input": {"file_path": "src/a.rs"}}],
+                "tool_input": {"command": "*** Begin Patch\n*** Update File: src/a.rs\n@@\n-old\n+new\n*** End Patch\n"}
+            });
+            dispatch_as(host, &payload, &recorder).await;
+            let requests = recorder.requests();
+            assert_eq!(requests.len(), 3);
+            for request in requests {
+                let wire = serde_json::to_value(request).unwrap();
+                assert_eq!(wire["session"], "root/one");
+                assert_eq!(wire["agent_id"], "child/two");
+                assert_eq!(
+                    wire["host"],
+                    if matches!(host, Host::Claude) {
+                        "claude"
+                    } else {
+                        "codex"
+                    }
+                );
+            }
+        }
     }
 
     #[test]

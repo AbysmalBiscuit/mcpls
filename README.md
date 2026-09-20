@@ -387,6 +387,12 @@ flowchart TB
     Backend <-->|"LSP Protocol<br/>(JSON-RPC 2.0)"| Servers
 ```
 
+Diagnostics follow file writers within each root session. Agents that edit a file before its first delivered report share that report. Those writers keep receiving later diagnostics and clears until an edit starts a new ownership cycle. Pending reports retain their contents for each recipient, even when another agent edits the file or the live diagnostics change. Files with no known writer go to the root session.
+
+Codex hook `agent_id` and MCP thread metadata identify the same delivery record. Claude hooks attribute successful `Write`, `Edit`, and `MultiEdit` calls through `PostToolUse` and use `agent_id`; Claude MCP calls without an agent marker read the root record. A `PostToolBatch` payload reports no outcome for the individual calls in it, so attributing one would claim writes that may have failed; batches and filesystem watcher events refresh diagnostics without claiming authorship.
+
+Records live in backend memory. A root connection protects its agents' records, and an agent's own connection protects its record. `SessionEnd` removes records after their protecting connections close. Otherwise, `diagnostics.record_grace_ms` controls how long disconnected records survive, renewed by hook activity. Reconnection preserves history only while the same backend remains alive; record grace does not extend backend idle shutdown. The generated [configuration schema](schema/mcpls-config.json) defines the default.
+
 Each MCP session runs a small stdio frontend that relays to the checkout's one backend, so sessions in the same checkout share language servers instead of indexing twice. The first session starts the backend, and it exits shortly after the last one closes. `mcpls --no-backend` runs a session in-process instead. See [Backend Section](docs/user-guide/configuration.md#backend-section).
 
 **Key design decisions:**

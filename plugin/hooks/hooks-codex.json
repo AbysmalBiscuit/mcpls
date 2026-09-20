@@ -19,7 +19,6 @@
       }
     ],
     "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "mcpls hook --host codex" }] }],
-    "SubagentStop": [{ "hooks": [{ "type": "command", "command": "mcpls hook --host codex" }] }],
     "SessionEnd": [{ "hooks": [{ "type": "command", "command": "mcpls hook --host codex" }] }]
   }
 }

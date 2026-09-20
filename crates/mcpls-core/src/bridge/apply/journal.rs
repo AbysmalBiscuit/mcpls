@@ -156,10 +156,25 @@ pub enum Step {
 /// steps are reversed in order; the error names any file the reversal could
 /// not return to its original state and says where it actually is.
 pub fn execute(steps: &[Step]) -> Result<()> {
+    execute_observed(steps, None)
+}
+
+pub(crate) fn execute_observed(
+    steps: &[Step],
+    observer: Option<&super::WriteObserver>,
+) -> Result<()> {
     for (completed, step) in steps.iter().enumerate() {
         pause_at(step);
         if let Err(reason) = perform(step) {
             return Err(roll_back(&steps[..completed], reason));
+        }
+        if let Some(observer) = observer {
+            match step {
+                Step::Write { path, .. } | Step::Trash { path, .. } => {
+                    observer(std::slice::from_ref(path));
+                }
+                Step::Move { from, to } => observer(&[from.clone(), to.clone()]),
+            }
         }
     }
 

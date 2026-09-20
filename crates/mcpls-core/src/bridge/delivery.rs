@@ -6,9 +6,21 @@
 //! full current error list is more useful than a delta against a list that
 //! has left the context window.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
+use super::{Caller, RecordId};
+
+#[cfg(test)]
+#[path = "delivery_tests.rs"]
+mod attribution_tests;
+
+#[path = "attribution.rs"]
+mod attribution;
+
+#[path = "record_lifetime.rs"]
+mod record_lifetime;
 use crate::config::{DiagnosticsConfig, LspServerConfig, ServerId, SeverityFloor};
 
 /// Identity of one client session.
@@ -106,6 +118,8 @@ pub struct ChangedFile {
 /// What one flush found.
 #[derive(Debug, Clone, Default)]
 pub struct FlushReport {
+    /// Rendering context retained with a report instead of read from the live cache.
+    pub(crate) sources: HashMap<String, Arc<DiagnosticSnapshot>>,
     /// Files whose visible diagnostics differ from the last flush.
     pub changed: Vec<ChangedFile>,
     /// Cache keys of files that had visible diagnostics and now have none.
@@ -124,19 +138,62 @@ struct PendingFlush {
     /// `Some(hash)` records the file as delivered at that hash; `None`
     /// forgets it, for a file that cleared or was muted.
     updates: Vec<(String, Option<u64>)>,
+    snapshots: Vec<(String, u64)>,
+}
+
+#[derive(Debug, Default)]
+struct Ownership {
+    generation: u64,
+    writers: HashSet<RecordId>,
+    delivered: bool,
+}
+
+#[derive(Debug, Clone)]
+struct OwnedEntry {
+    key: String,
+    diagnostics: Vec<lsp_types::Diagnostic>,
+    floor: SeverityFloor,
+}
+
+#[derive(Debug, Clone)]
+struct RetainedFile {
+    id: u64,
+    root: SessionId,
+    generation: u64,
+    file: OwnedEntry,
+    hash: Option<u64>,
+    source: Option<Arc<DiagnosticSnapshot>>,
+}
+
+/// The source and document text used to render retained diagnostics.
+#[derive(Debug)]
+pub struct DiagnosticSnapshot {
+    /// Original diagnostic document URI.
+    pub uri: lsp_types::Uri,
+    /// Encoding negotiated with the publishing server.
+    pub encoding: super::PositionEncoding,
+    /// Document text at snapshot time.
+    pub text: Option<Arc<str>>,
 }
 
 /// Per-session records of what has already been delivered.
 #[derive(Debug)]
 pub struct DiagnosticsDelivery {
     config: DiagnosticsConfig,
-    sessions: HashMap<SessionId, HashMap<String, u64>>,
+    sessions: HashMap<RecordId, HashMap<String, u64>>,
     baseline: Option<HashMap<String, u64>>,
     /// At most one staged report per session. Never names a session
     /// `sessions` lacks: `stage` seeds the record before it stages, and
     /// `end_session` drops both.
-    pending: HashMap<SessionId, PendingFlush>,
+    pending: HashMap<RecordId, PendingFlush>,
     next_token: u64,
+    roots: HashMap<RecordId, Option<SessionId>>,
+    ownership: HashMap<(SessionId, String), Ownership>,
+    retained: HashMap<RecordId, BTreeMap<String, VecDeque<Arc<RetainedFile>>>>,
+    sources: HashMap<String, Arc<DiagnosticSnapshot>>,
+    next_snapshot: u64,
+    next_generation: u64,
+    lifetime: record_lifetime::RecordLifetime,
 }
 
 impl DiagnosticsDelivery {
@@ -154,6 +211,15 @@ impl DiagnosticsDelivery {
             baseline: None,
             pending: HashMap::new(),
             next_token: 0,
+            roots: HashMap::new(),
+            ownership: HashMap::new(),
+            retained: HashMap::new(),
+            sources: HashMap::new(),
+            next_snapshot: 0,
+            next_generation: 0,
+            lifetime: record_lifetime::RecordLifetime::new(std::time::Duration::from_millis(
+                config.record_grace_ms,
+            )),
         }
     }
 
@@ -190,14 +256,28 @@ impl DiagnosticsDelivery {
 
     /// Drop `session`'s record, so a later flush for the same id starts
     /// from the baseline again.
-    pub fn end_session(&mut self, session: &SessionId) {
+    pub fn end_session(&mut self, session: impl Into<RecordId>) {
+        let session = &session.into();
+        self.lifetime.forget(session);
         self.sessions.remove(session);
         self.pending.remove(session);
+        self.retained.remove(session);
+        self.roots.remove(session);
+        self.ownership.retain(|_, owner| {
+            owner.writers.remove(session);
+            !owner.writers.is_empty()
+        });
     }
 
     /// Move committed history into `target`, keeping its history on conflicts.
     /// Unacknowledged reports from `source` are discarded.
-    pub(crate) fn merge_session(&mut self, source: &SessionId, target: &SessionId) {
+    pub(crate) fn merge_session(
+        &mut self,
+        source: impl Into<RecordId>,
+        target: impl Into<RecordId>,
+    ) {
+        let source = &source.into();
+        let target = &target.into();
         if source == target {
             return;
         }
@@ -205,10 +285,11 @@ impl DiagnosticsDelivery {
         let Some(source) = self.sessions.remove(source) else {
             return;
         };
-        let target = self.sessions.entry(target.clone()).or_default();
+        let history = self.sessions.entry(target.clone()).or_default();
         for (key, hash) in source {
-            target.entry(key).or_insert(hash);
+            history.entry(key).or_insert(hash);
         }
+        self.discard_consumed_snapshots(target);
     }
 
     /// Hash one file's visible diagnostics.
@@ -277,18 +358,45 @@ impl DiagnosticsDelivery {
     /// forever.
     pub fn stage(
         &mut self,
-        session: &SessionId,
+        session: impl Into<RecordId>,
         entries: &[FileEntry<'_>],
     ) -> (FlushReport, Option<u64>) {
-        let (report, updates) = self.diff(session, entries);
+        let session = &session.into();
+        self.observe_for(Some(session), entries);
+        let routed = self.routed_entries(session, entries);
+        let borrowed: Vec<_> = routed
+            .iter()
+            .map(|file| FileEntry {
+                key: &file.key,
+                diagnostics: &file.diagnostics,
+                floor: file.floor,
+            })
+            .collect();
+        let (mut report, updates) = self.diff(session, &borrowed);
+        let snapshots: Vec<_> = updates
+            .iter()
+            .filter_map(|(key, _)| {
+                let snapshot = self.retained.get(session)?.get(key)?.front()?;
+                if let Some(source) = &snapshot.source {
+                    report.sources.insert(key.clone(), Arc::clone(source));
+                }
+                Some((key.clone(), snapshot.id))
+            })
+            .collect();
         if updates.is_empty() {
             self.pending.remove(session);
             return (report, None);
         }
         self.next_token += 1;
         let token = self.next_token;
-        self.pending
-            .insert(session.clone(), PendingFlush { token, updates });
+        self.pending.insert(
+            session.clone(),
+            PendingFlush {
+                token,
+                updates,
+                snapshots,
+            },
+        );
         (report, Some(token))
     }
 
@@ -298,12 +406,16 @@ impl DiagnosticsDelivery {
     /// staged report: a later stage replaced it, an immediate flush
     /// superseded it, or the session ended. The record then already
     /// reflects something a reader was sent more recently, or nothing.
-    pub fn commit(&mut self, session: &SessionId, token: u64) -> bool {
+    pub fn commit(&mut self, session: impl Into<RecordId>, token: u64) -> bool {
+        let session = &session.into();
         let staged = match self.pending.get(session) {
             Some(pending) if pending.token == token => self.pending.remove(session),
             _ => None,
         };
-        let Some(PendingFlush { updates, .. }) = staged else {
+        let Some(PendingFlush {
+            updates, snapshots, ..
+        }) = staged
+        else {
             return false;
         };
         let record = self.sessions.entry(session.clone()).or_default();
@@ -317,13 +429,19 @@ impl DiagnosticsDelivery {
                 }
             }
         }
+        self.commit_snapshots(session, &snapshots);
         true
     }
 
     /// [`Self::stage`] and [`Self::commit`] in one call, for a reader whose
     /// answer either arrives or ends the session: the MCP tool and the
     /// footer, whose transport is the session's own.
-    pub fn flush(&mut self, session: &SessionId, entries: &[FileEntry<'_>]) -> FlushReport {
+    pub fn flush(
+        &mut self,
+        session: impl Into<RecordId>,
+        entries: &[FileEntry<'_>],
+    ) -> FlushReport {
+        let session = &session.into();
         let (report, token) = self.stage(session, entries);
         if let Some(token) = token {
             self.commit(session, token);
@@ -336,7 +454,7 @@ impl DiagnosticsDelivery {
     /// gives them.
     fn diff(
         &mut self,
-        session: &SessionId,
+        session: &RecordId,
         entries: &[FileEntry<'_>],
     ) -> (FlushReport, Vec<(String, Option<u64>)>) {
         let record = &*self
@@ -489,7 +607,7 @@ mod tests {
         );
     }
 
-    fn diagnostic(line: u32, severity: DiagnosticSeverity, message: &str) -> Diagnostic {
+    pub(super) fn diagnostic(line: u32, severity: DiagnosticSeverity, message: &str) -> Diagnostic {
         Diagnostic {
             range: Range {
                 start: Position::new(line, 0),
@@ -501,7 +619,7 @@ mod tests {
         }
     }
 
-    fn entry<'a>(
+    pub(super) fn entry<'a>(
         key: &'a str,
         diagnostics: &'a [Diagnostic],
         floor: SeverityFloor,

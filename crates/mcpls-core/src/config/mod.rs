@@ -152,6 +152,10 @@ impl SeverityFloor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DiagnosticsConfig {
+    /// How long an unprotected delivery record survives without hook activity.
+    /// Zero expires it immediately once no connection protects it.
+    #[serde(default = "default_record_grace_ms")]
+    pub record_grace_ms: u64,
     /// The least severe diagnostic worth delivering, for any server that
     /// does not set its own.
     #[serde(default = "default_severity_floor")]
@@ -259,9 +263,14 @@ const fn default_footer_wait_ms() -> u64 {
     15_000
 }
 
+const fn default_record_grace_ms() -> u64 {
+    60_000
+}
+
 impl Default for DiagnosticsConfig {
     fn default() -> Self {
         Self {
+            record_grace_ms: default_record_grace_ms(),
             severity: default_severity_floor(),
             max_per_file: default_max_per_file(),
             max_total: default_max_total(),
@@ -471,6 +480,7 @@ const DEFAULT_CONFIG_TEMPLATE: &str = r#"# mcpls configuration
 # settle_quiet_ms = 1000
 # settle_deadline_ms = 300000
 # footer = true
+# record_grace_ms = 60000
 # footer_grace_ms = 250
 # footer_quiet_ms = 200
 # footer_wait_ms = 15000
@@ -1517,6 +1527,9 @@ mod tests {
     fn test_the_footer_defaults_are_what_the_spec_says() {
         let config = DiagnosticsConfig::default();
         assert!(!config.footer);
+        assert_eq!(config.record_grace_ms, 60_000);
+        let zero: DiagnosticsConfig = toml::from_str("record_grace_ms = 0").unwrap();
+        assert_eq!(zero.record_grace_ms, 0);
         assert_eq!(config.footer_grace_ms, 250);
         assert_eq!(config.footer_quiet_ms, 200);
         assert_eq!(config.footer_wait_ms, 15_000);

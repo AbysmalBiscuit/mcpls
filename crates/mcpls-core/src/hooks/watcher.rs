@@ -1268,6 +1268,17 @@ mod tests {
             .expect("backdate");
         let churned = dir.path().join("churned.rs");
         std::fs::write(&churned, "fn main() {}").expect("write");
+        // Windows dates a file from the interrupt-tick clock, which lags
+        // the precise one `SystemTime::now` reads by up to its ~15ms
+        // period, so a file written right after the sweep can carry an
+        // mtime just before the cutoff. Stamping it says what the test
+        // means on any clock.
+        std::fs::File::options()
+            .write(true)
+            .open(&churned)
+            .expect("reopen")
+            .set_modified(SystemTime::now())
+            .expect("stamp");
         let mut placement = fake_placement(None);
         rescan(&mut placement, &roots, &sweeper).await;
 

@@ -307,6 +307,7 @@ impl Endpoint {
             .template
             .for_connection(SessionId::named(request.session))
             .with_notes(notes);
+        server.attach_connection().await;
         let connection = server.connection();
         let subscriptions = Arc::clone(server.subscriptions());
         let connection_state = Arc::new(RwLock::new(false));
@@ -341,9 +342,6 @@ impl Endpoint {
         // rmcp can return while detached tool handlers are still finishing.
         *connection_state.write().await = true;
         subscriptions.remove_connection(connection).await;
-        self.template
-            .end_session(&SessionId::for_connection(connection))
-            .await;
     }
 }
 
@@ -518,6 +516,222 @@ mod tests {
         let mut line = String::new();
         BufReader::new(stream).read_line(&mut line).await.unwrap();
         serde_json::from_str(&line).unwrap()
+    }
+
+    /// An MCP connection for `session`, handshaked and initialized, plus
+    /// the task serving it.
+    async fn named_connection(
+        endpoint: &Arc<Endpoint>,
+        root: &std::path::Path,
+        cfg: &ServerConfig,
+        session: &str,
+    ) -> (
+        Box<dyn crate::hooks::listener::HookStream>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (mut client, server) = tokio::io::duplex(65_536);
+        let (handler_tx, handler_rx) = mpsc::unbounded_channel();
+        let serving = Arc::clone(endpoint);
+        let task = tokio::spawn(async move {
+            let _handler_rx = handler_rx;
+            serving.connection(Box::new(server), handler_tx).await;
+        });
+        handshake::write(
+            &mut client,
+            &Handshake::mcp(
+                root.to_path_buf(),
+                Some(session.into()),
+                ConfigStamp::of(cfg),
+            ),
+        )
+        .await
+        .unwrap();
+        let reply: HandshakeReply = handshake::read(&mut client).await.unwrap();
+        assert!(reply.refusal.is_none());
+        let mut client: Box<dyn crate::hooks::listener::HookStream> = Box::new(client);
+        initialize(&mut client).await;
+        client
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+            .await
+            .unwrap();
+        (client, task)
+    }
+
+    /// Losing a connection is not losing a session: the record waits out the
+    /// grace, so a client that comes back is not told again about errors it
+    /// was already told about. Staying away past the grace is leaving.
+    #[tokio::test(start_paused = true)]
+    async fn a_record_survives_a_reconnect_inside_grace_and_expires_after_it() {
+        use crate::bridge::{FileEntry, HookAgent, HookHost};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let mut cfg = config(600_000);
+        cfg.diagnostics.record_grace_ms = 60_000;
+        let runtime = crate::Runtime::start(&cfg, Ok(root.clone())).await.unwrap();
+        let endpoint = Endpoint::new(&runtime, &cfg, root.clone(), temp_identity(&root));
+
+        // Held open for the whole test so backend idle shutdown can never be
+        // the reason a record went away.
+        let (keeper, keeper_task) = named_connection(&endpoint, &root, &cfg, "keeper").await;
+
+        let solo = HookAgent {
+            agent_id: None,
+            host: HookHost::Codex,
+        }
+        .caller("solo");
+        let diagnostics = vec![lsp_types::Diagnostic {
+            severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+            message: "broken".into(),
+            ..Default::default()
+        }];
+        let entries = [FileEntry {
+            key: "a.rs",
+            diagnostics: &diagnostics,
+            floor: crate::config::SeverityFloor::Warning,
+        }];
+
+        let (client, task) = named_connection(&endpoint, &root, &cfg, "solo").await;
+        let token = {
+            let mut delivery = runtime.context.delivery.lock().await;
+            delivery.record_write(&solo, &["a.rs".into()]);
+            delivery.stage(&solo.record, &entries).1.unwrap()
+        };
+        assert!(
+            runtime
+                .context
+                .delivery
+                .lock()
+                .await
+                .commit(&solo.record, token)
+        );
+        drop(client);
+        task.await.unwrap();
+
+        tokio::time::advance(Duration::from_secs(30)).await;
+        let (client, task) = named_connection(&endpoint, &root, &cfg, "solo").await;
+        assert!(
+            runtime
+                .context
+                .delivery
+                .lock()
+                .await
+                .flush(&solo.record, &entries)
+                .changed
+                .is_empty(),
+            "a reconnect inside the grace was told again about a delivered error"
+        );
+        drop(client);
+        task.await.unwrap();
+
+        tokio::time::advance(Duration::from_secs(61)).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let report = runtime
+                    .context
+                    .delivery
+                    .lock()
+                    .await
+                    .flush(&solo.record, &entries);
+                if !report.changed.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the record expires once the grace runs out");
+
+        drop(keeper);
+        keeper_task.await.unwrap();
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn named_connections_protect_a_child_until_the_last_close_after_end() {
+        use crate::bridge::{FileEntry, HookAgent, HookHost};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let cfg = config(60_000);
+        let runtime = crate::Runtime::start(&cfg, Ok(root.clone())).await.unwrap();
+        let endpoint = Endpoint::new(&runtime, &cfg, root.clone(), temp_identity(&root));
+        let mut clients = Vec::new();
+        let mut tasks = Vec::new();
+        for _ in 0..2 {
+            let (mut client, server) = tokio::io::duplex(65_536);
+            let (handler_tx, _handler_rx) = mpsc::unbounded_channel();
+            tasks.push(tokio::spawn(
+                Arc::clone(&endpoint).connection(Box::new(server), handler_tx),
+            ));
+            handshake::write(
+                &mut client,
+                &Handshake::mcp(root.clone(), Some("root".into()), ConfigStamp::of(&cfg)),
+            )
+            .await
+            .unwrap();
+            let reply: HandshakeReply = handshake::read(&mut client).await.unwrap();
+            assert!(reply.refusal.is_none());
+            let mut client: Box<dyn crate::hooks::listener::HookStream> = Box::new(client);
+            initialize(&mut client).await;
+            client
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+                .await
+                .unwrap();
+            clients.push(client);
+        }
+        let child = HookAgent {
+            agent_id: Some("child".into()),
+            host: HookHost::Codex,
+        }
+        .caller("root");
+        let diagnostics = vec![lsp_types::Diagnostic {
+            severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+            message: "broken".into(),
+            ..Default::default()
+        }];
+        let entries = [FileEntry {
+            key: "a.rs",
+            diagnostics: &diagnostics,
+            floor: crate::config::SeverityFloor::Warning,
+        }];
+        let token = {
+            let mut delivery = runtime.context.delivery.lock().await;
+            delivery.touch_hook(&child, tokio::time::Instant::now());
+            delivery.record_write(&child, &["a.rs".into()]);
+            delivery.stage(&child.record, &entries).1.unwrap()
+        };
+        (endpoint.handler)(crate::hooks::Request::EndSession {
+            session: "root".into(),
+        })
+        .await;
+        drop(clients.pop());
+        tasks.pop().unwrap().await.unwrap();
+        assert!(
+            runtime
+                .context
+                .delivery
+                .lock()
+                .await
+                .commit(&child.record, token)
+        );
+        drop(clients.pop());
+        tasks.pop().unwrap().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let report = runtime
+                    .context
+                    .delivery
+                    .lock()
+                    .await
+                    .flush(&child.record, &entries);
+                if !report.changed.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("last close drops the ended child");
+        runtime.shutdown().await;
     }
 
     #[tokio::test]
@@ -972,6 +1186,16 @@ while True:
     #[tokio::test]
     async fn test_a_backend_nobody_attaches_to_exits_after_the_idle_timer() {
         let backend = start(config(100)).await;
+        crate::hooks::send(
+            &backend.identity,
+            &crate::hooks::Request::Flush {
+                agent: crate::bridge::HookAgent::default(),
+                session: "hook-only".into(),
+            },
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
         tokio::time::timeout(Duration::from_secs(5), backend.task)
             .await
             .expect("the idle backend exited")

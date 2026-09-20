@@ -122,6 +122,22 @@ impl Sweeper {
         }
     }
 
+    /// The paths that belong to a configured root, canonicalized so a
+    /// symlink alias and its target resolve to one key.
+    ///
+    /// An attributed write has to claim the key the published diagnostic
+    /// carries, and only the filesystem resolves aliases to it, so this
+    /// costs a `stat` per path on the hook connection. Resolving first is
+    /// also what makes a `..` climbing out of every root fail admission,
+    /// which holds only while the roots are canonical themselves.
+    pub fn admitted_paths(&self, paths: &[PathBuf]) -> Vec<PathBuf> {
+        paths
+            .iter()
+            .map(|path| crate::bridge::apply::normalize(path))
+            .filter(|path| self.filter.admits(path))
+            .collect()
+    }
+
     /// Queue paths a host hook reported. Returns how many survived the
     /// filters.
     pub fn enqueue(&self, paths: &[PathBuf]) -> usize {
@@ -130,24 +146,28 @@ impl Sweeper {
 
     /// Queue paths from `origin`. Returns how many survived the filters.
     ///
-    /// Answers from the path and the configured roots alone -- no
-    /// filesystem call, no lock held longer than an insert -- because this
-    /// runs on the hook connection, which has a deadline to answer within,
-    /// and on the watcher's event loop, which must not block the thread
-    /// `notify` hands its events to. What each path actually is gets
-    /// decided at sweep time, off both.
-    ///
-    /// A path already pending from a hook keeps that origin when the
-    /// watcher reports it too, which it will: the agent's own write is a
-    /// disk event like any other. Letting the watcher overwrite it would
-    /// take away the spawn the agent's edit earned.
+    /// Answers from the path and the configured roots alone, with no
+    /// filesystem call, because this runs on the watcher's event loop,
+    /// which must not block the thread `notify` hands its events to. The
+    /// walk that placed the watches gives those paths the roots' own
+    /// spelling already; a hook's arrive in whatever the host sent and go
+    /// through [`Sweeper::admitted_paths`] instead.
     pub fn enqueue_from(&self, paths: &[PathBuf], origin: Origin) -> usize {
-        let mut admitted = 0;
-        for path in paths {
-            if !self.filter.admits(path) {
-                continue;
-            }
-            admitted += 1;
+        let admitted: Vec<PathBuf> = paths
+            .iter()
+            .filter(|path| self.filter.admits(path))
+            .cloned()
+            .collect();
+        self.queue_admitted(&admitted, origin)
+    }
+
+    /// Queue what [`Sweeper::admitted_paths`] returned. Reports how many.
+    ///
+    /// Takes the admitted collection rather than raw paths so a hook's
+    /// writer claim and its queued paths cannot disagree about which
+    /// files the edit touched. Holds no lock longer than an insert.
+    pub fn queue_admitted(&self, admitted: &[PathBuf], origin: Origin) -> usize {
+        for path in admitted {
             lock_std(&self.pending)
                 .entry(path.clone())
                 .and_modify(|held| {
@@ -157,10 +177,10 @@ impl Sweeper {
                 })
                 .or_insert(origin);
         }
-        if admitted > 0 {
+        if !admitted.is_empty() {
             *lock_std(&self.last_arrival) = Some(Instant::now());
         }
-        admitted
+        admitted.len()
     }
 
     /// The filter this sweeper admits paths through, so the project
@@ -507,7 +527,14 @@ mod tests {
     struct TestSweeper {
         sweeper: Arc<Sweeper>,
         translator: Arc<Translator>,
-        dir: TempDir,
+        _dir: TempDir,
+        /// The workspace's canonical path, because that is the spelling
+        /// `resolve_workspace_roots` gives every configured root and the
+        /// one [`Sweeper::admitted_paths`] resolves a path to before
+        /// asking whether it is under one. A `TempDir` on macOS hands out
+        /// `/var/folders/...` for a directory that resolves to
+        /// `/private/var/folders/...`.
+        root: PathBuf,
         _cancel: tokio::sync::watch::Sender<bool>,
     }
 
@@ -523,7 +550,7 @@ mod tests {
     impl TestSweeper {
         /// An absolute path under the workspace. Creates nothing.
         fn path(&self, rel: &str) -> PathBuf {
-            self.dir.path().join(rel)
+            self.root.join(rel)
         }
 
         /// An absolute path under the workspace, with an empty file at it.
@@ -568,8 +595,9 @@ mod tests {
         quiet_for: Duration,
         max_documents: usize,
     ) -> TestSweeper {
+        let root = dunce::canonicalize(dir.path()).expect("canonicalize the temp workspace");
         let filter = PathFilter::new(
-            Arc::from(vec![dir.path().to_path_buf()]),
+            Arc::from(vec![root.clone()]),
             Arc::new(HashMap::from([("rs".to_string(), SERVER.to_string())])),
             None,
         );
@@ -585,7 +613,8 @@ mod tests {
         TestSweeper {
             sweeper,
             translator,
-            dir,
+            _dir: dir,
+            root,
             _cancel: cancel_tx,
         }
     }

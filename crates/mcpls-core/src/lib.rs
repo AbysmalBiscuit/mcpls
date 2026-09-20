@@ -696,6 +696,10 @@ impl Runtime {
         let delivery = Arc::new(Mutex::new(bridge::DiagnosticsDelivery::new(
             config.diagnostics,
         )));
+        tokio::spawn(bridge::DiagnosticsDelivery::run_expiry(
+            Arc::clone(&delivery),
+            cancel_rx.clone(),
+        ));
         let floors = Arc::new(bridge::FloorTable::new(&config.diagnostics, &floor_configs));
 
         let sweeper = Arc::new(hooks::Sweeper::new(
