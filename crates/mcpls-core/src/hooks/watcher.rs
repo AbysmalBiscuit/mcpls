@@ -164,6 +164,58 @@ enum Coverage {
     Exhausted,
 }
 
+/// How the paths `notify` reports are spelled, against how the roots are
+/// configured.
+///
+/// macOS `FSEvents` resolves every symlink on the way to a watched
+/// directory before it reports anything under it: a root configured as
+/// `/var/checkout` arrives as `/private/var/checkout`, because `/var` is a
+/// symlink. Everything downstream decides by prefix against the configured
+/// roots -- `PathFilter::admits`, `admits_directory`, the set of placed
+/// watches -- so an unrewritten path matches no root, is dropped as
+/// outside the project, and the doctor reports a directory count for a
+/// checkout nothing ever reaches the sweeper from.
+struct Resolved {
+    /// Resolved prefix and the configured root it stands for, for the
+    /// roots the two differ on. Empty is the common case, and the one
+    /// every platform but macOS is in.
+    aliases: Vec<(PathBuf, PathBuf)>,
+}
+
+impl Resolved {
+    /// Resolve `roots`, keeping the ones that came back spelled
+    /// differently.
+    ///
+    /// Stats every root, so it belongs on the blocking pool. A root that
+    /// cannot be resolved keeps its configured spelling, which is what an
+    /// unwatchable root would have produced anyway.
+    fn new(roots: &[PathBuf]) -> Self {
+        let aliases = roots
+            .iter()
+            .filter_map(|root| {
+                let resolved = dunce::canonicalize(root).ok()?;
+                (resolved != *root).then(|| (resolved, root.clone()))
+            })
+            .collect();
+        Self { aliases }
+    }
+
+    /// `paths` spelled the way the roots are configured.
+    fn configured(&self, paths: &[PathBuf]) -> Vec<PathBuf> {
+        paths
+            .iter()
+            .map(|path| {
+                self.aliases
+                    .iter()
+                    .find_map(|(resolved, root)| {
+                        path.strip_prefix(resolved).ok().map(|rest| root.join(rest))
+                    })
+                    .unwrap_or_else(|| path.clone())
+            })
+            .collect()
+    }
+}
+
 /// The watches this project holds, and the state a doctor reads them from.
 ///
 /// One owner of both, because every change to what is watched is also a
@@ -322,6 +374,12 @@ async fn place(
         return;
     }
 
+    let named = Arc::clone(&roots);
+    let Ok(resolved) = tokio::task::spawn_blocking(move || Resolved::new(&named)).await else {
+        watcher.unwatched(UNFINISHED.to_string());
+        return;
+    };
+
     let Some(set) = walk(&sweeper, Arc::clone(&roots)).await else {
         watcher.unwatched(UNFINISHED.to_string());
         return;
@@ -351,7 +409,7 @@ async fn place(
         }
     }
     placement.publish();
-    run(placement, rx, cancel, roots, sweeper).await;
+    run(placement, rx, cancel, roots, sweeper, resolved).await;
 }
 
 /// Walk `roots` off the worker, logging what could not be reached.
@@ -399,6 +457,7 @@ async fn run<P: Place>(
     mut cancel: watch::Receiver<bool>,
     roots: Arc<[PathBuf]>,
     sweeper: Arc<Sweeper>,
+    resolved: Resolved,
 ) {
     loop {
         tokio::select! {
@@ -416,10 +475,11 @@ async fn run<P: Place>(
                         }
                     }
                     Ok(event) => {
-                        let Some(directories) = directories_among(&event.paths).await else {
+                        let paths = resolved.configured(&event.paths);
+                        let Some(directories) = directories_among(&paths).await else {
                             break;
                         };
-                        for path in &event.paths {
+                        for path in &paths {
                             if directories.contains(path) {
                                 if adopt(&mut placement, &sweeper, path).await
                                     == Coverage::Exhausted
@@ -435,7 +495,7 @@ async fn run<P: Place>(
                                 placement.forget(path);
                             }
                         }
-                        sweeper.enqueue_from(&event.paths, Origin::Watcher);
+                        sweeper.enqueue_from(&paths, Origin::Watcher);
                     }
                     Err(error) => {
                         tracing::warn!(%error, "a filesystem watch reported an error");
@@ -712,7 +772,14 @@ mod tests {
     async fn watching() -> Watching {
         let dir = tempfile::tempdir().expect("a temp dir");
         std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
-        let roots: Arc<[PathBuf]> = Arc::from(vec![dir.path().to_path_buf()]);
+        let root = dir.path().to_path_buf();
+        watching_over(dir, root).await
+    }
+
+    /// [`watching`] over a `root` that is somewhere inside `dir` rather
+    /// than `dir` itself.
+    async fn watching_over(dir: TempDir, root: PathBuf) -> Watching {
+        let roots: Arc<[PathBuf]> = Arc::from(vec![root]);
         let sweeper = sweeper_over(&roots);
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let watcher = ProjectWatcher::start(roots, &sweeper, cancel_rx);
@@ -847,6 +914,7 @@ mod tests {
             cancel_rx,
             Arc::clone(roots),
             Arc::clone(sweeper),
+            Resolved::new(roots),
         ));
         Driven {
             events,
@@ -921,6 +989,34 @@ mod tests {
             "watchPaths took one snapshot of the top level at SessionStart and \
              was blind to everything created afterwards, which is the gap this \
              watcher exists to close"
+        );
+    }
+
+    /// macOS `FSEvents` reports every path with the symlinks on the way to
+    /// it already resolved, while the sweeper admits a path by prefix
+    /// against the root as it was configured. Without the two being
+    /// reconciled, a checkout reached through a symlink -- which on macOS
+    /// is every path under `/tmp` and `/var` -- has every one of its
+    /// events dropped as outside the project, and the doctor still counts
+    /// the directories it is watching in name only.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_a_root_reached_through_a_symlink_still_reaches_the_sweeper() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(real.join("src")).expect("mkdir");
+        let root = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &root).expect("symlink");
+        let path = root.join("src/created.rs");
+
+        let fixture = watching_over(dir, root).await;
+        std::fs::write(&path, "fn main() {}").expect("write");
+
+        assert!(
+            reaches_the_sweeper(&fixture, &path).await,
+            "a root configured through a symlink is watched like any other, \
+             so what the watcher hands the sweeper has to be spelled the way \
+             the root was configured"
         );
     }
 
