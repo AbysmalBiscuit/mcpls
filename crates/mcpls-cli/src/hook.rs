@@ -129,6 +129,15 @@ async fn attribute_claude_write(
     Ok(String::new())
 }
 
+/// Whether a Claude tool name is one that puts a file on disk.
+///
+/// `plugin/hooks/hooks.json` matches `PostToolUse` against the same set, so
+/// a tool added to one and not the other either writes unattributed or is
+/// dispatched for nothing.
+fn writes_a_file(tool_name: &str) -> bool {
+    matches!(tool_name, "Write" | "Edit" | "MultiEdit")
+}
+
 async fn run(stdin: &str, identity: Option<&SocketIdentity>) -> Result<String> {
     let payload: HookPayload = serde_json::from_str(stdin)?;
     let agent = HookAgent {
@@ -137,7 +146,7 @@ async fn run(stdin: &str, identity: Option<&SocketIdentity>) -> Result<String> {
     };
 
     match payload.hook_event_name.as_str() {
-        "PostToolUse" if matches!(payload.tool_name.as_str(), "Write" | "Edit" | "MultiEdit") => {
+        "PostToolUse" if writes_a_file(&payload.tool_name) => {
             attribute_claude_write(payload, agent, identity).await
         }
 
@@ -148,7 +157,7 @@ async fn run(stdin: &str, identity: Option<&SocketIdentity>) -> Result<String> {
             let paths = payload
                 .tool_calls
                 .into_iter()
-                .filter(|call| matches!(call.tool_name.as_str(), "Write" | "Edit" | "MultiEdit"))
+                .filter(|call| writes_a_file(&call.tool_name))
                 .filter_map(|call| call.tool_input.file_path)
                 .collect();
             let requests = [
