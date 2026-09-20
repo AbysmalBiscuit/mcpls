@@ -270,6 +270,13 @@ On Windows, run the same protocol and lifecycle tests over named pipes. If this 
 - The configuration schema agrees with the config type; final verification results name any skips or platform gaps.
 - No production service, daily-driver binary, plugin installation, or external tracker state was changed by validation.
 
+## Deviations
+
+Where the implementation differs from the tasks above, and why. The behavior itself is documented in `README.md`.
+
+- **Claude writes are attributed through `PostToolUse`, not `PostToolBatch`.** Task 3 asks for a `PostToolBatch` payload to attribute its accepted paths. A batch result carries no outcome for the individual calls inside it, so attributing one would claim writes that may have failed, against this plan's own fourth review focus. `PostToolBatch` therefore sends an unattributed change, and `plugin/hooks/hooks.json` gained a `PostToolUse` registration matching `Write|Edit|MultiEdit`, which does report per-call success.
+- **`RecordLifetime` has no `identify`.** Task 4's interface lists it beside `attach`. `attach` registers a connection's association with a record idempotently and can be called again when a connection later names a second record, which is what `identify` was for, so the two collapsed into one operation.
+
 ## Unresolved questions
 
 No product decisions remain. Execution method awaits the user's selection. Windows runtime validation requires a Windows runner; absence of one is a verification limitation, not permission to silently omit its tests.
