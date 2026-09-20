@@ -1295,7 +1295,10 @@ impl McplsServer {
         self.context.delivery.lock().await.register_caller(caller);
     }
 
-    /// Drop `session`'s delivery record.
+    /// Mark `session` and its agents ended.
+    ///
+    /// Records still held open by a connection outlive the mark and go when
+    /// the last one closes; the rest go on the next expiry pass.
     pub(crate) async fn end_session(&self, session: &SessionId) {
         self.context
             .delivery
