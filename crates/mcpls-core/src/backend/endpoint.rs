@@ -518,6 +518,134 @@ mod tests {
         serde_json::from_str(&line).unwrap()
     }
 
+    /// An MCP connection for `session`, handshaked and initialized, plus
+    /// the task serving it.
+    async fn named_connection(
+        endpoint: &Arc<Endpoint>,
+        root: &std::path::Path,
+        cfg: &ServerConfig,
+        session: &str,
+    ) -> (
+        Box<dyn crate::hooks::listener::HookStream>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (mut client, server) = tokio::io::duplex(65_536);
+        let (handler_tx, handler_rx) = mpsc::unbounded_channel();
+        let serving = Arc::clone(endpoint);
+        let task = tokio::spawn(async move {
+            let _handler_rx = handler_rx;
+            serving.connection(Box::new(server), handler_tx).await;
+        });
+        handshake::write(
+            &mut client,
+            &Handshake::mcp(
+                root.to_path_buf(),
+                Some(session.into()),
+                ConfigStamp::of(cfg),
+            ),
+        )
+        .await
+        .unwrap();
+        let reply: HandshakeReply = handshake::read(&mut client).await.unwrap();
+        assert!(reply.refusal.is_none());
+        let mut client: Box<dyn crate::hooks::listener::HookStream> = Box::new(client);
+        initialize(&mut client).await;
+        client
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+            .await
+            .unwrap();
+        (client, task)
+    }
+
+    /// Losing a connection is not losing a session: the record waits out the
+    /// grace, so a client that comes back is not told again about errors it
+    /// was already told about. Staying away past the grace is leaving.
+    #[tokio::test(start_paused = true)]
+    async fn a_record_survives_a_reconnect_inside_grace_and_expires_after_it() {
+        use crate::bridge::{FileEntry, HookAgent, HookHost};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let mut cfg = config(600_000);
+        cfg.diagnostics.record_grace_ms = 60_000;
+        let runtime = crate::Runtime::start(&cfg, Ok(root.clone())).await.unwrap();
+        let endpoint = Endpoint::new(&runtime, &cfg, root.clone(), temp_identity(&root));
+
+        // Held open for the whole test so backend idle shutdown can never be
+        // the reason a record went away.
+        let (keeper, keeper_task) = named_connection(&endpoint, &root, &cfg, "keeper").await;
+
+        let solo = HookAgent {
+            agent_id: None,
+            host: HookHost::Codex,
+        }
+        .caller("solo");
+        let diagnostics = vec![lsp_types::Diagnostic {
+            severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+            message: "broken".into(),
+            ..Default::default()
+        }];
+        let entries = [FileEntry {
+            key: "a.rs",
+            diagnostics: &diagnostics,
+            floor: crate::config::SeverityFloor::Warning,
+        }];
+
+        let (client, task) = named_connection(&endpoint, &root, &cfg, "solo").await;
+        let token = {
+            let mut delivery = runtime.context.delivery.lock().await;
+            delivery.record_write(&solo, &["a.rs".into()]);
+            delivery.stage(&solo.record, &entries).1.unwrap()
+        };
+        assert!(
+            runtime
+                .context
+                .delivery
+                .lock()
+                .await
+                .commit(&solo.record, token)
+        );
+        drop(client);
+        task.await.unwrap();
+
+        tokio::time::advance(Duration::from_secs(30)).await;
+        let (client, task) = named_connection(&endpoint, &root, &cfg, "solo").await;
+        assert!(
+            runtime
+                .context
+                .delivery
+                .lock()
+                .await
+                .flush(&solo.record, &entries)
+                .changed
+                .is_empty(),
+            "a reconnect inside the grace was told again about a delivered error"
+        );
+        drop(client);
+        task.await.unwrap();
+
+        tokio::time::advance(Duration::from_secs(61)).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let report = runtime
+                    .context
+                    .delivery
+                    .lock()
+                    .await
+                    .flush(&solo.record, &entries);
+                if !report.changed.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the record expires once the grace runs out");
+
+        drop(keeper);
+        keeper_task.await.unwrap();
+        runtime.shutdown().await;
+    }
+
     #[tokio::test]
     async fn named_connections_protect_a_child_until_the_last_close_after_end() {
         use crate::bridge::{FileEntry, HookAgent, HookHost};
