@@ -212,6 +212,86 @@ async fn codex_root_and_child_use_their_thread_records() {
     child.close().await;
 }
 
+/// A call issued by a hook rather than by the model carries `threadId` and
+/// no turn metadata, so the thread is named but its root is not. It reads
+/// what it wrote and nothing else: claiming the unowned file would hand
+/// every thread the same error again.
+#[tokio::test]
+async fn codex_thread_without_root_metadata_reads_only_what_it_wrote() {
+    let server = server_with_one_error().await;
+    let prefix = if cfg!(windows) {
+        "file:///C:/workspace/"
+    } else {
+        "file:///workspace/"
+    };
+    let owned: Uri = format!("{prefix}owned.rs").parse().unwrap();
+    server
+        .context
+        .notification_cache
+        .lock()
+        .await
+        .store_diagnostics(
+            &ServerId::from("rust"),
+            &owned,
+            Some(1),
+            vec![lsp_types::Diagnostic {
+                severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+                message: "owned".to_string(),
+                ..Default::default()
+            }],
+        );
+    server.context.delivery.lock().await.record_write(
+        &crate::bridge::Caller {
+            record: RecordId::Session(SessionId::from("solo".to_string())),
+            root: None,
+        },
+        &[owned.to_string()],
+    );
+
+    let thread_only = || Some(json!({"threadId": "solo"}));
+    let mut client = Client::connect(server.for_connection(None), "codex-mcp-client").await;
+    let result = client.diagnostics(thread_only()).await;
+    assert_eq!(changed(&result), 1, "{result}");
+    assert!(
+        result["changed"][0]["file_path"]
+            .as_str()
+            .unwrap()
+            .ends_with("owned.rs"),
+        "{result}"
+    );
+    assert_eq!(changed(&client.diagnostics(thread_only()).await), 0);
+
+    // The hook door names the root the metadata never supplied. The
+    // association must not replay what the thread has already seen.
+    let caller = crate::bridge::HookAgent {
+        agent_id: Some("solo".to_string()),
+        host: crate::bridge::HookHost::Codex,
+    }
+    .caller("root");
+    server
+        .context
+        .delivery
+        .lock()
+        .await
+        .register_caller(&caller);
+    assert_eq!(changed(&client.diagnostics(thread_only()).await), 0);
+
+    // The unowned error was never the thread's to read; it belongs to the
+    // root the hook has now identified.
+    let mut root = Client::connect(server.for_connection(None), "codex-mcp-client").await;
+    let result = root.diagnostics(metadata("root")).await;
+    assert_eq!(changed(&result), 1, "{result}");
+    assert!(
+        result["changed"][0]["file_path"]
+            .as_str()
+            .unwrap()
+            .ends_with("broken.rs"),
+        "{result}"
+    );
+    client.close().await;
+    root.close().await;
+}
+
 #[tokio::test]
 async fn mcp_diagnostics_are_limited_to_the_callers_written_files() {
     let server = server_with_one_error().await;
