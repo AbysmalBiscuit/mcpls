@@ -352,7 +352,7 @@ pub async fn doctor(
         examined,
         root,
         identity,
-        &foreign_scan_prefix(),
+        &Machine::detect(),
         local,
     )
     .await
@@ -484,20 +484,20 @@ async fn backend_answer(
     }
 }
 
-/// `doctor`'s body, parameterized on the prefix its runtime-directory scan
-/// filters Windows pipe names by.
+/// `doctor`'s body, parameterized on the machine facts it reports.
 ///
-/// Production always reaches this through `doctor`, with the real prefix.
-/// A test on Windows needs a different one: the pipe namespace is
-/// machine-global, so a scan filtered on the real prefix would enumerate
-/// an actual mcpls running on the developer's own machine, not only the
-/// one the test bound itself.
+/// Production reaches this through `doctor`, with the real ones. A test
+/// supplies its own, since both are machine-wide: a scan filtered on the
+/// real pipe prefix would enumerate an actual mcpls running on the
+/// developer's own machine rather than only the pipe the test bound, and
+/// an installed `mcpls` decides what the report says about `PATH`, which
+/// otherwise passes an assertion locally and fails it on a bare runner.
 async fn doctor_scanning(
     project_dir: &Path,
     examined: Examined,
     root: &Path,
     identity: &SocketIdentity,
-    prefix: &str,
+    machine: &Machine,
     local: Option<&mcpls_core::Resolved>,
 ) -> Report {
     let mut lines = vec![
@@ -509,7 +509,7 @@ async fn doctor_scanning(
         ),
         format!("root: {} -> {}", root.display(), identity.hash),
     ];
-    let backend = backend_answer(project_dir, identity, prefix, local).await;
+    let backend = backend_answer(project_dir, identity, &machine.pipe_prefix, local).await;
     lines.extend(backend.lines);
     let mut problems = backend.problems;
 
@@ -532,11 +532,10 @@ async fn doctor_scanning(
     lines.push(servers_line(&servers));
     problems.extend(servers.iter().filter_map(|server| server.problem.clone()));
 
-    let on_path = mcpls_on_path();
-    if on_path.is_none() {
+    if machine.mcpls.is_none() {
         problems.push("mcpls is not on PATH, so no hook can reach a backend".to_string());
     }
-    lines.push(on_path_line(on_path.as_deref()));
+    lines.push(on_path_line(machine.mcpls.as_deref()));
     lines.push(watcher_line(backend.watcher.as_deref()));
 
     Report::new(lines, problems)
@@ -551,6 +550,23 @@ fn refusal_text(refusal: Option<&mcpls_core::backend::Refusal>) -> String {
         Some(Refusal::InProcess) => "it serves one session in-process".to_string(),
         Some(other) => format!("{other:?}"),
         None => "no reason given".to_string(),
+    }
+}
+
+/// What a doctor run reads off the machine rather than off its arguments.
+struct Machine {
+    /// The prefix the runtime-directory scan filters Windows pipe names by.
+    pipe_prefix: String,
+    /// Where `mcpls` resolves on `PATH`, or `None` when it resolves nowhere.
+    mcpls: Option<PathBuf>,
+}
+
+impl Machine {
+    fn detect() -> Self {
+        Self {
+            pipe_prefix: foreign_scan_prefix(),
+            mcpls: mcpls_on_path(),
+        }
     }
 }
 
@@ -1114,9 +1130,6 @@ const BACKEND_PID_UNKNOWN: &str = "backend pid: unknown";
 /// The `mcpls on PATH` line for `found`.
 ///
 /// Split out of the doctor so both branches can be driven by a test.
-/// The doctor's own call resolves against this process's real `PATH`, so
-/// whether a suite run exercises the found branch, the missing one, or
-/// only one of them is a property of the host rather than of the tests.
 fn on_path_line(found: Option<&Path>) -> String {
     found.map_or_else(
         || "mcpls on PATH: not found".to_string(),
@@ -2440,6 +2453,18 @@ mod tests {
         );
     }
 
+    /// The machine a doctor test runs against: a pipe namespace of its
+    /// own, and an `mcpls` that resolves, so what the report says about
+    /// `PATH` is the test's to decide rather than the runner's. The test
+    /// binary stands in for the install, since the only property the
+    /// report carries is an absolute path to a real executable.
+    fn test_machine(dir: &Path) -> Machine {
+        Machine {
+            pipe_prefix: test_pipe_prefix(dir),
+            mcpls: Some(std::env::current_exe().expect("this test binary's own path")),
+        }
+    }
+
     fn test_pipe_prefix(dir: &Path) -> String {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -2494,7 +2519,7 @@ mod tests {
             Examined::ProjectDir,
             &checkout_root(project),
             &identity,
-            &test_pipe_prefix(socket_dir.path()),
+            &test_machine(socket_dir.path()),
             None,
         )
         .await
@@ -2511,7 +2536,7 @@ mod tests {
             Examined::ProjectDir,
             &checkout_root(project),
             &identity,
-            &test_pipe_prefix(socket_dir.path()),
+            &test_machine(socket_dir.path()),
             None,
         )
         .await
@@ -2537,7 +2562,7 @@ mod tests {
             Examined::ProjectDir,
             &checkout_root(project),
             &identity,
-            &test_pipe_prefix(socket_dir.path()),
+            &test_machine(socket_dir.path()),
             None,
         )
         .await
@@ -2562,7 +2587,7 @@ mod tests {
             Examined::ProjectDir,
             &checkout_root(project),
             &identity,
-            &test_pipe_prefix(socket_dir.path()),
+            &test_machine(socket_dir.path()),
             None,
         )
         .await
@@ -2612,7 +2637,7 @@ mod tests {
             Examined::ProjectDir,
             &checkout_root(project),
             &identity,
-            &test_pipe_prefix(socket_dir.path()),
+            &test_machine(socket_dir.path()),
             None,
         )
         .await
@@ -2644,7 +2669,7 @@ mod tests {
             Examined::ProjectDir,
             &checkout_root(project),
             &identity,
-            &test_pipe_prefix(socket_dir.path()),
+            &test_machine(socket_dir.path()),
             None,
         )
         .await
@@ -2663,7 +2688,7 @@ mod tests {
             Examined::ProjectDir,
             &checkout_root(project),
             &identity,
-            &test_pipe_prefix(socket_dir.path()),
+            &test_machine(socket_dir.path()),
             None,
         )
         .await
@@ -2682,7 +2707,7 @@ mod tests {
             Examined::ProjectDir,
             &checkout_root(project),
             &identity,
-            &test_pipe_prefix(socket_dir.path()),
+            &test_machine(socket_dir.path()),
             None,
         )
         .await
@@ -2704,7 +2729,7 @@ mod tests {
             Examined::ProjectDir,
             &checkout_root(project),
             &identity,
-            &test_pipe_prefix(socket_dir.path()),
+            &test_machine(socket_dir.path()),
             None,
         )
         .await
@@ -2722,7 +2747,7 @@ mod tests {
             Examined::ProjectDir,
             &checkout_root(project),
             &identity,
-            &test_pipe_prefix(socket_dir.path()),
+            &test_machine(socket_dir.path()),
             None,
         )
         .await
@@ -2741,7 +2766,7 @@ mod tests {
             Examined::ProjectDir,
             &checkout_root(project),
             &identity,
-            &test_pipe_prefix(socket_dir.path()),
+            &test_machine(socket_dir.path()),
             None,
         )
         .await
@@ -2758,7 +2783,7 @@ mod tests {
             Examined::ProjectDir,
             &checkout_root(project),
             &identity,
-            &test_pipe_prefix(socket_dir.path()),
+            &test_machine(socket_dir.path()),
             None,
         )
         .await
@@ -3079,7 +3104,7 @@ mod tests {
             Examined::ProjectDir,
             &checkout_root(project.path()),
             &identity,
-            &test_pipe_prefix(socket_dir.path()),
+            &test_machine(socket_dir.path()),
             None,
         )
         .await
@@ -3194,7 +3219,7 @@ mod tests {
             Examined::ProjectDir,
             &checkout_root(&nested),
             &identity,
-            &test_pipe_prefix(socket_dir.path()),
+            &test_machine(socket_dir.path()),
             None,
         )
         .await
@@ -3230,7 +3255,7 @@ mod tests {
             Examined::ProjectDir,
             &checkout_root(project.path()),
             &identity,
-            &test_pipe_prefix(&never_created),
+            &test_machine(&never_created),
             None,
         )
         .await
@@ -3406,7 +3431,7 @@ mod tests {
             Examined::ProjectDir,
             &checkout_root(&project),
             &identity,
-            &test_pipe_prefix(socket_dir.path()),
+            &test_machine(socket_dir.path()),
             None,
         )
         .await
@@ -3469,7 +3494,7 @@ mod tests {
             Examined::ProjectDir,
             &checkout_root(&project),
             &identity,
-            &test_pipe_prefix(socket_dir.path()),
+            &test_machine(socket_dir.path()),
             None,
         )
         .await
@@ -3589,13 +3614,13 @@ mod tests {
             .unwrap();
         let client = ClientOptions::new().open(&identity.socket).unwrap();
         server.connect().await.unwrap();
-        let prefix = test_pipe_prefix(dir.path());
+        let machine = test_machine(dir.path());
         let out = super::doctor_scanning(
             dir.path(),
             Examined::ProjectDir,
             &checkout_root(dir.path()),
             &identity,
-            &prefix,
+            &machine,
             None,
         )
         .await
@@ -3617,7 +3642,7 @@ mod tests {
             Examined::ProjectDir,
             &checkout_root(dir.path()),
             &identity,
-            &prefix,
+            &machine,
             None,
         )
         .await
@@ -3800,7 +3825,7 @@ mod tests {
             Examined::ProjectDir,
             &checkout_root(project.path()),
             &identity,
-            &test_pipe_prefix(socket_dir.path()),
+            &test_machine(socket_dir.path()),
             None,
         )
         .await
@@ -4005,7 +4030,7 @@ mod tests {
             Examined::ProjectDir,
             &checkout_root(project.path()),
             &identity,
-            &test_pipe_prefix(socket_dir.path()),
+            &test_machine(socket_dir.path()),
             None,
         )
         .await

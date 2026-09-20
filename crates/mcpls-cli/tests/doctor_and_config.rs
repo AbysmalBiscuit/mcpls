@@ -18,7 +18,17 @@ fn checkout() -> (TempDir, TempDir) {
     let root = dunce::canonicalize(dir.path()).unwrap();
     std::fs::create_dir(root.join(".git")).unwrap();
     std::fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
-    (dir, TempDir::new().unwrap())
+    (dir, short_temp_dir())
+}
+
+/// macOS's `$TMPDIR` is deep enough that a runtime directory inside it
+/// pushes the socket path past the `sun_path` limit.
+fn short_temp_dir() -> TempDir {
+    #[cfg(unix)]
+    let dir = tempfile::Builder::new().tempdir_in("/tmp");
+    #[cfg(not(unix))]
+    let dir = TempDir::new();
+    dir.unwrap()
 }
 
 fn run(cwd: &Path, runtime: &Path, args: &[&str]) -> Output {
