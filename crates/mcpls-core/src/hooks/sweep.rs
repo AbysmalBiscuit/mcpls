@@ -125,16 +125,11 @@ impl Sweeper {
     /// The paths that belong to a configured root, canonicalized so a
     /// symlink alias and its target resolve to one key.
     ///
-    /// Canonicalizing costs a `stat` per path on the hook connection,
-    /// which has a deadline to answer within. An attributed write has to
-    /// claim the same key the published diagnostic carries, and only the
-    /// filesystem resolves aliases to it. What each path actually is
-    /// still waits for sweep time, off that connection.
-    ///
-    /// Resolving first is what makes a `..` that climbs out of every root,
-    /// or a symlink pointing outside one, fail admission; it also means
-    /// the roots have to be canonical themselves, or nothing resolved is
-    /// ever under one.
+    /// An attributed write has to claim the key the published diagnostic
+    /// carries, and only the filesystem resolves aliases to it, so this
+    /// costs a `stat` per path on the hook connection. Resolving first is
+    /// also what makes a `..` climbing out of every root fail admission,
+    /// which holds only while the roots are canonical themselves.
     pub fn admitted_paths(&self, paths: &[PathBuf]) -> Vec<PathBuf> {
         paths
             .iter()
@@ -149,14 +144,21 @@ impl Sweeper {
         self.enqueue_from(paths, Origin::Hook)
     }
 
-    /// Admit `paths` and queue what survives. Returns how many.
+    /// Queue paths from `origin`. Returns how many survived the filters.
     ///
-    /// A path already pending from a hook keeps that origin when the
-    /// watcher reports it too, which it will: the agent's own write is a
-    /// disk event like any other. Letting the watcher overwrite it would
-    /// take away the spawn the agent's edit earned.
+    /// Answers from the path and the configured roots alone, with no
+    /// filesystem call, because this runs on the watcher's event loop,
+    /// which must not block the thread `notify` hands its events to. The
+    /// walk that placed the watches gives those paths the roots' own
+    /// spelling already; a hook's arrive in whatever the host sent and go
+    /// through [`Sweeper::admitted_paths`] instead.
     pub fn enqueue_from(&self, paths: &[PathBuf], origin: Origin) -> usize {
-        self.queue_admitted(&self.admitted_paths(paths), origin)
+        let admitted: Vec<PathBuf> = paths
+            .iter()
+            .filter(|path| self.filter.admits(path))
+            .cloned()
+            .collect();
+        self.queue_admitted(&admitted, origin)
     }
 
     /// Queue what [`Sweeper::admitted_paths`] returned. Reports how many.
