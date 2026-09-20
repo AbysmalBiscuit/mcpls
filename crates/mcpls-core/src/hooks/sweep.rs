@@ -130,6 +130,11 @@ impl Sweeper {
     /// claim the same key the published diagnostic carries, and only the
     /// filesystem resolves aliases to it. What each path actually is
     /// still waits for sweep time, off that connection.
+    ///
+    /// Resolving first is what makes a `..` that climbs out of every root,
+    /// or a symlink pointing outside one, fail admission; it also means
+    /// the roots have to be canonical themselves, or nothing resolved is
+    /// ever under one.
     pub fn admitted_paths(&self, paths: &[PathBuf]) -> Vec<PathBuf> {
         paths
             .iter()
@@ -520,7 +525,14 @@ mod tests {
     struct TestSweeper {
         sweeper: Arc<Sweeper>,
         translator: Arc<Translator>,
-        dir: TempDir,
+        _dir: TempDir,
+        /// The workspace's canonical path, because that is the spelling
+        /// `resolve_workspace_roots` gives every configured root and the
+        /// one [`Sweeper::admitted_paths`] resolves a path to before
+        /// asking whether it is under one. A `TempDir` on macOS hands out
+        /// `/var/folders/...` for a directory that resolves to
+        /// `/private/var/folders/...`.
+        root: PathBuf,
         _cancel: tokio::sync::watch::Sender<bool>,
     }
 
@@ -536,7 +548,7 @@ mod tests {
     impl TestSweeper {
         /// An absolute path under the workspace. Creates nothing.
         fn path(&self, rel: &str) -> PathBuf {
-            self.dir.path().join(rel)
+            self.root.join(rel)
         }
 
         /// An absolute path under the workspace, with an empty file at it.
@@ -581,8 +593,9 @@ mod tests {
         quiet_for: Duration,
         max_documents: usize,
     ) -> TestSweeper {
+        let root = dunce::canonicalize(dir.path()).expect("canonicalize the temp workspace");
         let filter = PathFilter::new(
-            Arc::from(vec![dir.path().to_path_buf()]),
+            Arc::from(vec![root.clone()]),
             Arc::new(HashMap::from([("rs".to_string(), SERVER.to_string())])),
             None,
         );
@@ -598,7 +611,8 @@ mod tests {
         TestSweeper {
             sweeper,
             translator,
-            dir,
+            _dir: dir,
+            root,
             _cancel: cancel_tx,
         }
     }

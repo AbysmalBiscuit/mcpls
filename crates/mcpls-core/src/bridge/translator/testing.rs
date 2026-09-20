@@ -469,7 +469,16 @@ impl Drop for RecordingServer {
 pub struct TranslatorHarness {
     /// The translator under test, shared so a test can call it directly.
     pub translator: Arc<Translator>,
-    dir: TempDir,
+    /// Held only so the workspace outlives the harness; every path goes
+    /// through `root`.
+    _dir: TempDir,
+    /// The workspace's canonical path, which is the spelling production roots
+    /// carry: `resolve_workspace_roots` canonicalizes every one of them,
+    /// and the hook path filter admits by prefix against what it is given.
+    /// On macOS a `TempDir` hands out `/var/folders/...` for a directory
+    /// that resolves to `/private/var/folders/...`, so a harness rooted at
+    /// the raw path stands up a workspace no configuration can produce.
+    root: PathBuf,
     servers: HashMap<String, RecordingServer>,
     /// The same registry the translator holds, so a test can register a
     /// watcher the way an inbound `client/registerCapability` would.
@@ -526,6 +535,7 @@ impl TranslatorHarness {
         respond_to_diagnostics: bool,
     ) -> impl Future<Output = Self> {
         let dir = TempDir::new().expect("temp dir");
+        let root = dunce::canonicalize(dir.path()).expect("canonicalize the temp workspace");
         let server_id = ServerId::from(language_id);
         let watch_registry = Arc::new(WatchRegistry::new());
 
@@ -540,14 +550,15 @@ impl TranslatorHarness {
                 server_id.clone(),
                 language_id.to_string(),
             )]));
-        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+        translator.set_workspace_roots(vec![root.clone()]);
 
         let (client, server) = RecordingServer::spawn(respond_to_diagnostics);
         translator.register_client(server_id, client);
 
         std::future::ready(Self {
             translator: Arc::new(translator),
-            dir,
+            _dir: dir,
+            root,
             servers: HashMap::from([(language_id.to_string(), server)]),
             watch_registry,
         })
@@ -557,13 +568,13 @@ impl TranslatorHarness {
     /// for a caller that has to configure something else against the same
     /// roots the translator was given.
     pub fn root(&self) -> &Path {
-        self.dir.path()
+        &self.root
     }
 
     /// Write `contents` to `relative` under the temp workspace and return
     /// the absolute path.
     pub fn write_file(&self, relative: &str, contents: &str) -> PathBuf {
-        let path = self.dir.path().join(relative);
+        let path = self.root.join(relative);
         std::fs::write(&path, contents).expect("write the fixture");
         path
     }
