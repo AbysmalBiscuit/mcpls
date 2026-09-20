@@ -13,7 +13,7 @@ use tokio::sync::watch;
 use crate::bridge::SessionId;
 use crate::hooks::identity::SocketIdentity;
 use crate::hooks::protocol::{Request, Response, ServerStatus};
-use crate::hooks::sweep::Sweeper;
+use crate::hooks::sweep::{Origin, Sweeper};
 use crate::mcp::McplsServer;
 
 /// What the process holding the endpoint has served, for `mcpls hook
@@ -128,7 +128,7 @@ pub fn build_handler(
                             .await;
                     }
                     Response::Changed {
-                        queued: sweeper.enqueue(&paths),
+                        queued: sweeper.queue_admitted(&paths, Origin::Hook),
                     }
                 }
                 Request::Flush { agent, session } => {

@@ -122,8 +122,14 @@ impl Sweeper {
         }
     }
 
-    /// The paths that belong to a configured root, in the spelling a
-    /// published diagnostic carries.
+    /// The paths that belong to a configured root, canonicalized so a
+    /// symlink alias and its target resolve to one key.
+    ///
+    /// Canonicalizing costs a `stat` per path on the hook connection,
+    /// which has a deadline to answer within. An attributed write has to
+    /// claim the same key the published diagnostic carries, and only the
+    /// filesystem resolves aliases to it. What each path actually is
+    /// still waits for sweep time, off that connection.
     pub fn admitted_paths(&self, paths: &[PathBuf]) -> Vec<PathBuf> {
         paths
             .iter()
@@ -138,23 +144,23 @@ impl Sweeper {
         self.enqueue_from(paths, Origin::Hook)
     }
 
-    /// Queue paths from `origin`. Returns how many survived the filters.
-    ///
-    /// Answers from the path and the configured roots alone -- no
-    /// filesystem call, no lock held longer than an insert -- because this
-    /// runs on the hook connection, which has a deadline to answer within,
-    /// and on the watcher's event loop, which must not block the thread
-    /// `notify` hands its events to. What each path actually is gets
-    /// decided at sweep time, off both.
+    /// Admit `paths` and queue what survives. Returns how many.
     ///
     /// A path already pending from a hook keeps that origin when the
     /// watcher reports it too, which it will: the agent's own write is a
     /// disk event like any other. Letting the watcher overwrite it would
     /// take away the spawn the agent's edit earned.
     pub fn enqueue_from(&self, paths: &[PathBuf], origin: Origin) -> usize {
-        let mut admitted = 0;
-        for path in self.admitted_paths(paths) {
-            admitted += 1;
+        self.queue_admitted(&self.admitted_paths(paths), origin)
+    }
+
+    /// Queue what [`Sweeper::admitted_paths`] returned. Reports how many.
+    ///
+    /// Takes the admitted collection rather than raw paths so a hook's
+    /// writer claim and its queued paths cannot disagree about which
+    /// files the edit touched. Holds no lock longer than an insert.
+    pub fn queue_admitted(&self, admitted: &[PathBuf], origin: Origin) -> usize {
+        for path in admitted {
             lock_std(&self.pending)
                 .entry(path.clone())
                 .and_modify(|held| {
@@ -164,10 +170,10 @@ impl Sweeper {
                 })
                 .or_insert(origin);
         }
-        if admitted > 0 {
+        if !admitted.is_empty() {
             *lock_std(&self.last_arrival) = Some(Instant::now());
         }
-        admitted
+        admitted.len()
     }
 
     /// The filter this sweeper admits paths through, so the project
