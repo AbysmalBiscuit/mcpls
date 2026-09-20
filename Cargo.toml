@@ -48,6 +48,10 @@ toml = "1.1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 url = "2.5"
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
