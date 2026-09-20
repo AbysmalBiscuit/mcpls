@@ -128,6 +128,20 @@ fn to_structured_tool_result<T: Serialize + JsonSchema>(
 /// but small enough to stay well under stdio transport buffer limits.
 const RESOURCE_PAGE_SIZE: usize = 100;
 
+/// The `clientInfo.name` Codex introduces itself with.
+///
+/// Codex is the only host that keys a record on a thread rather than the
+/// connection, so the identity below is read for that client alone.
+const CODEX_CLIENT: &str = "codex-mcp-client";
+
+/// The `_meta` entry Codex attaches to every tool call in a turn.
+///
+/// Carries `thread_id` for the calling thread and `session_id` for the root
+/// the thread belongs to. A bare top-level `threadId` names the thread and
+/// nothing else, so the root stays unknown until this entry or a hook
+/// supplies it.
+const CODEX_TURN_METADATA: &str = "x-codex-turn-metadata";
+
 /// Slice `paths` into the page starting at the position `cursor` resumes
 /// from, returning the page and the cursor for the next page (`None` once
 /// the last page is reached).
@@ -1579,7 +1593,7 @@ impl ServerHandler for McplsServer {
         let mut server = self.clone();
         if context
             .client_info()
-            .is_some_and(|client| client.name == "codex-mcp-client")
+            .is_some_and(|client| client.name == CODEX_CLIENT)
         {
             let thread = context
                 .meta
@@ -1589,7 +1603,7 @@ impl ServerHandler for McplsServer {
                 .or_else(|| {
                     context
                         .meta
-                        .get("x-codex-turn-metadata")?
+                        .get(CODEX_TURN_METADATA)?
                         .get("thread_id")?
                         .as_str()
                         .filter(|thread| !thread.is_empty())
@@ -1608,14 +1622,16 @@ impl ServerHandler for McplsServer {
                 drop(adopted);
                 let root = context
                     .meta
-                    .get("x-codex-turn-metadata")
+                    .get(CODEX_TURN_METADATA)
                     .and_then(|meta| meta.get("session_id"))
                     .and_then(serde_json::Value::as_str)
                     .and_then(|root| SessionId::named(Some(root.to_owned())));
-                self.context.delivery.lock().await.register_caller(&Caller {
-                    record: RecordId::from(&session),
-                    root,
-                });
+                server
+                    .register_caller(&Caller {
+                        record: RecordId::from(&session),
+                        root,
+                    })
+                    .await;
                 session
             } else {
                 anonymous
@@ -1624,7 +1640,7 @@ impl ServerHandler for McplsServer {
         if server.session != SessionId::for_connection(server.connection)
             && context
                 .client_info()
-                .is_none_or(|client| client.name != "codex-mcp-client")
+                .is_none_or(|client| client.name != CODEX_CLIENT)
         {
             server
                 .register_caller(&Caller {
