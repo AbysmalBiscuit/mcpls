@@ -1,6 +1,15 @@
+//! Which caller wrote which file, and what each one is still owed.
+//!
+//! These are `DiagnosticsDelivery` methods kept in their own file and
+//! attached to `delivery` with `#[path]` rather than made a module of their
+//! own, so `super` here is `delivery`, not `bridge`.
+
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+
 use super::{
-    Arc, BTreeMap, Caller, DiagnosticSnapshot, DiagnosticsDelivery, FileEntry, HashMap, OwnedEntry,
-    RecordId, RetainedFile, SeverityFloor,
+    Caller, DiagnosticSnapshot, DiagnosticsDelivery, FileEntry, OwnedEntry, Ownership, RecordId,
+    RetainedFile, SessionId, SeverityFloor,
 };
 
 impl DiagnosticsDelivery {
@@ -14,46 +23,81 @@ impl DiagnosticsDelivery {
     }
 
     /// Associate a caller's record with its root session when known.
+    ///
+    /// Registering without a root still records the caller, with its root
+    /// left unknown. Routing reads that as an identified caller owed no
+    /// root fallback, which is what an unregistered record would get.
+    ///
+    /// A caller seen before any root owns its files under its own session,
+    /// so the first root to arrive carries that ownership over. Only the
+    /// first: a later association cannot move a record's history again.
     pub fn register_caller(&mut self, caller: &Caller) {
-        let previous = self.roots.entry(caller.record.clone()).or_default().clone();
-        if let Some(root) = &caller.root {
-            if previous.is_none()
-                && let RecordId::Session(provisional) = &caller.record
-                && provisional != root
+        let rooted = self
+            .roots
+            .entry(caller.record.clone())
+            .or_default()
+            .is_some();
+        let Some(root) = caller.root.clone() else {
+            return;
+        };
+        if let RecordId::Session(provisional) = &caller.record
+            && !rooted
+            && *provisional != root
+        {
+            self.adopt_ownership(&provisional.clone(), &root);
+        }
+        self.roots.insert(caller.record.clone(), Some(root));
+    }
+
+    /// Re-key everything `provisional` owns onto `root`.
+    fn adopt_ownership(&mut self, provisional: &SessionId, root: &SessionId) {
+        let claimed: Vec<_> = self
+            .ownership
+            .keys()
+            .filter(|(session, _)| session == provisional)
+            .cloned()
+            .collect();
+        for key in claimed {
+            let Some(owner) = self.ownership.remove(&key) else {
+                continue;
+            };
+            let destination = (root.clone(), key.1.clone());
+            let merged = match self.ownership.remove(&destination) {
+                Some(existing) => self.merge_ownership(&key.1, owner, existing),
+                None => owner,
+            };
+            self.ownership.insert(destination, merged);
+        }
+    }
+
+    /// Reconcile an adopted owner with one the root already had for `file`.
+    ///
+    /// An undelivered cycle outranks a delivered one, so a recipient still
+    /// owed its report keeps it. Two cycles at the same delivery state are
+    /// one cycle with two writers.
+    fn merge_ownership(&mut self, file: &str, owner: Ownership, existing: Ownership) -> Ownership {
+        if existing.delivered != owner.delivered {
+            return if existing.delivered { owner } else { existing };
+        }
+        let mut merged = owner;
+        merged.writers.extend(existing.writers);
+        self.restamp_retained(file, existing.generation, merged.generation);
+        merged
+    }
+
+    /// Point reports already frozen under `from` at `to`, so an
+    /// acknowledgment naming the surviving generation still finds them.
+    fn restamp_retained(&mut self, file: &str, from: u64, to: u64) {
+        for files in self.retained.values_mut() {
+            let Some(reports) = files.get_mut(file) else {
+                continue;
+            };
+            for report in reports
+                .iter_mut()
+                .filter(|report| report.generation == from)
             {
-                let keys: Vec<_> = self
-                    .ownership
-                    .keys()
-                    .filter(|(session, _)| session == provisional)
-                    .cloned()
-                    .collect();
-                for key in keys {
-                    if let Some(owner) = self.ownership.remove(&key) {
-                        let destination = (root.clone(), key.1.clone());
-                        let mut merged = owner;
-                        if let Some(existing) = self.ownership.remove(&destination) {
-                            if !existing.delivered && merged.delivered {
-                                merged = existing;
-                            } else if existing.delivered == merged.delivered {
-                                let old_generation = existing.generation;
-                                merged.writers.extend(existing.writers);
-                                for files in self.retained.values_mut() {
-                                    if let Some(reports) = files.get_mut(&key.1) {
-                                        for report in reports {
-                                            if report.generation == old_generation {
-                                                Arc::make_mut(report).generation =
-                                                    merged.generation;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        self.ownership.insert(destination, merged);
-                    }
-                }
+                Arc::make_mut(report).generation = to;
             }
-            self.roots.insert(caller.record.clone(), Some(root.clone()));
         }
     }
 
@@ -77,7 +121,7 @@ impl DiagnosticsDelivery {
                 .or_default();
             if owner.generation == 0 || owner.delivered {
                 self.next_generation += 1;
-                *owner = super::Ownership {
+                *owner = Ownership {
                     generation: self.next_generation,
                     ..Default::default()
                 };
