@@ -183,6 +183,34 @@ fn spawn_detached_with_status(
     spawn_detached_command_with_status(exe, launch.args(), &launch.root, log)
 }
 
+/// Keep this process's standard handles out of the backend.
+///
+/// Windows gives a child every inheritable handle its parent holds, whatever
+/// `STARTUPINFO` names as the child's own streams. A hook's standard output
+/// is a pipe its host reads until the end, so a backend holding a copy of it
+/// keeps that host waiting for as long as the backend runs.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn detach_standard_handles() {
+    use windows_sys::Win32::Foundation::{
+        HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+    };
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+
+    for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: both calls take a handle this process already owns and
+        // answer with a status. Nothing here dereferences, reads or closes.
+        unsafe {
+            let handle = GetStdHandle(id);
+            if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
+                let _ = SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
+}
+
 fn spawn_detached_command_with_status(
     exe: &Path,
     args: impl IntoIterator<Item = OsString>,
@@ -208,6 +236,7 @@ fn spawn_detached_command_with_status(
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        detach_standard_handles();
     }
     let mut child = command.spawn()?;
     let pid = child.id();
@@ -422,6 +451,86 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(std::fs::read_to_string(&out).unwrap().trim(), "1");
+    }
+
+    /// A host reads its hook's standard output until it ends. The backend
+    /// the hook starts outlives it by hours, so a backend holding a copy of
+    /// that stream leaves the host waiting on an end that does not come.
+    ///
+    /// Three processes, all this binary, told apart by their working
+    /// directory: the test reads the output of a stand-in hook, which starts
+    /// a detached stand-in backend that stays alive well past the read.
+    #[cfg(windows)]
+    #[test]
+    fn test_a_backend_does_not_hold_its_starters_standard_output() {
+        const MARKER: &str = "MCPLS_TEST_DETACHED_HANDLES";
+        const TEST_NAME: &str = concat!(
+            "backend::spawn::tests::",
+            "test_a_backend_does_not_hold_its_starters_standard_output"
+        );
+        const BACKEND_LIFETIME: Duration = Duration::from_secs(20);
+        const READ_BOUND: Duration = Duration::from_secs(8);
+
+        let role = std::env::current_dir()
+            .ok()
+            .and_then(|dir| dir.file_name().map(std::ffi::OsStr::to_os_string));
+        let role = role.as_deref().unwrap_or_default().to_string_lossy();
+        if std::env::var_os(MARKER).is_some() {
+            match role.as_ref() {
+                "backend" => {
+                    std::thread::sleep(BACKEND_LIFETIME);
+                    return;
+                }
+                "starter" => {
+                    let here = std::env::current_dir().unwrap();
+                    let child = spawn_detached_command_with_status(
+                        &std::env::current_exe().unwrap(),
+                        ["--exact".into(), TEST_NAME.into(), "--nocapture".into()],
+                        &here.parent().unwrap().join("backend"),
+                        &here.join("backend.log"),
+                    )
+                    .unwrap();
+                    std::fs::write(here.join("pid"), child.pid.to_string()).unwrap();
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let starter = dir.path().join("starter");
+        std::fs::create_dir(&starter).unwrap();
+        std::fs::create_dir(dir.path().join("backend")).unwrap();
+        let mut hook = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .current_dir(&starter)
+            .env(MARKER, "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let mut stdout = hook.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut sink = Vec::new();
+            let read = std::io::Read::read_to_end(&mut stdout, &mut sink);
+            let _ = tx.send(read.is_ok());
+        });
+        let ended = rx.recv_timeout(READ_BOUND).unwrap_or(false);
+
+        let _ = hook.wait();
+        if let Ok(pid) = std::fs::read_to_string(starter.join("pid")) {
+            let _ = Command::new("taskkill")
+                .args(["/PID", pid.trim(), "/F"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        assert!(
+            ended,
+            "the starter's standard output stayed open while its backend ran"
+        );
     }
 
     #[tokio::test]
