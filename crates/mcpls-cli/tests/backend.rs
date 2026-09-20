@@ -117,7 +117,7 @@ impl Project {
         }
     }
 
-    /// `mcpls hook doctor`'s report for this project.
+    /// `mcpls doctor`'s report for this project.
     fn doctor(&self) -> String {
         Self::doctor_for(&self.root(), self.runtime.path(), &self.user)
     }

@@ -27,7 +27,7 @@ pub struct HookStats {
 
 impl HookStats {
     /// Record one `Changed`, `Flush`, or `EndSession` request this process
-    /// just answered. Not called for `Status`, which is `mcpls hook doctor`
+    /// just answered. Not called for `Status`, which is `mcpls doctor`
     /// probing rather than a hook firing, nor for `Ack`, which is the
     /// second half of a `Flush` already counted.
     pub(crate) fn record_hook_request(&self) {
@@ -837,7 +837,7 @@ mod tests {
         );
     }
 
-    /// `mcpls hook doctor` reads `hooks_seen` to tell a server nothing has
+    /// `mcpls doctor` reads `hooks_seen` to tell a server nothing has
     /// ever sent a hook to apart from one a host is really driving, so an
     /// acknowledgement counted alongside its own flush would make every
     /// install look twice as busy as it is.
@@ -1105,7 +1105,7 @@ mod tests {
         assert!(text.contains("broken.rs"));
     }
 
-    /// `mcpls hook doctor` compares this against the hook's own hash of
+    /// `mcpls doctor` compares this against the hook's own hash of
     /// `CLAUDE_PROJECT_DIR`, so a `Status` answer must report the exact
     /// directory the owner actually started in, not an empty or
     /// uncanonicalized stand-in.
@@ -1119,7 +1119,7 @@ mod tests {
         assert_eq!(root, harness.root);
     }
 
-    /// `mcpls hook doctor` tells "a server that has never been sent a hook"
+    /// `mcpls doctor` tells "a server that has never been sent a hook"
     /// apart from "one that has been serving them all along" by this
     /// count. `Status` itself, the doctor's own probe, must not inflate it,
     /// or every doctor run would make an unregistered plugin look wired up.

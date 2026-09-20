@@ -24,7 +24,7 @@ Restart the session once after installing, from a new terminal if `~/.cargo/bin`
 
 When the `mcpls` on `PATH` does not match the plugin's version, the plugin tells the agent at session start, including which version to install and where to get it. That covers an `mcpls` you installed yourself, an install that failed, and an install still running in another session. A failed install is not retried every session: run the installer from the release page, or delete `~/.local/state/mcpls/bootstrap-failed` and restart.
 
-Edits made outside the agent's own edit tools (a terminal, another agent, a `git checkout`) reach mcpls through the backend's own filesystem watcher, on every host rather than only where the host offers a file-changed hook. It places one watch per directory the project's ignore rules keep, so generated trees like `target/` and `node_modules/` cost nothing, and it picks up directories created after the session started. A checkout it cannot watch, a Windows drive under WSL2 or a network mount, is reported as unwatched by `mcpls hook doctor` rather than silently missing edits.
+Edits made outside the agent's own edit tools (a terminal, another agent, a `git checkout`) reach mcpls through the backend's own filesystem watcher, on every host rather than only where the host offers a file-changed hook. It places one watch per directory the project's ignore rules keep, so generated trees like `target/` and `node_modules/` cost nothing, and it picks up directories created after the session started. A checkout it cannot watch, a Windows drive under WSL2 or a network mount, is reported as unwatched by `mcpls doctor` rather than silently missing edits.
 
 A change the watcher reports never starts a language server that is not already running. Starting one is what an agent's own edit does, or what any tool call on a file does; a `git pull` touching a language this session never opens is not a reason to pay for its server.
 
@@ -48,30 +48,34 @@ On Windows the backend is started by the plugin's hooks rather than by the front
 Payload and socket failures exit cleanly without output, so a broken connection can look like a quiet workspace. To inspect the connection and scan, run:
 
 ```fish
-mcpls hook doctor
+mcpls doctor
 ```
+
+It examines `$CLAUDE_PROJECT_DIR`, or the working directory when that is unset, and a directory named on the command line wins over both. It exits non-zero when it finds a fault. `mcpls hook doctor` is an alias that always exits 0, which the hook registrations require.
 
 A working install prints something like:
 
 ```
 socket: /tmp/mcpls-lev/39df698ef1ac4f49.sock
-hook sees: /home/lev/project/crates/core
+hook sees: /home/lev/project/crates/core (from CLAUDE_PROJECT_DIR)
 root: /home/lev/project -> 39df698ef1ac4f49
 server sees: /home/lev/project -> 39df698ef1ac4f49
 backend pid: 2816002
 hooks seen: 3 request(s) since this owner started
 backend: mcpls 0.3.9, up 1m1s
 sessions: 2 attached (s1, connection-4)
-language servers: rust
 config: 00000000000000ff
+config file: /home/lev/.config/mcpls/mcpls.toml (the user's global config)
+language servers: rust (running), python (not installed: pyright is not on PATH), go (not applicable here)
 mcpls on PATH: /path/to/mcpls; launch not checked
 watcher: 56 directories watched
+problems: none
 ```
 
 Line by line:
 
 - **`socket:`** the socket path both the hook and the running server talk over. Informational; useful when checking permissions on the file itself.
-- **`hook sees:`** the directory the hook process reads from `CLAUDE_PROJECT_DIR`, canonicalized. Any directory inside the checkout works.
+- **`hook sees:`** the directory this report is about, canonicalized, and where its name came from: a path given on the command line, `CLAUDE_PROJECT_DIR`, or the working directory. Any directory inside the checkout works. Run by hand from a terminal inside an agent session, the doctor reports on `CLAUDE_PROJECT_DIR` rather than wherever you are standing, and this clause is what tells you so.
 - **`root:`** the checkout root that directory resolves to, and the hash the socket name comes from. The root is the nearest directory at or above the `hook sees:` directory holding a `.git` entry git would accept, stopping before the home directory, or that directory itself when none does. Every session started inside one checkout shares the root and so reaches one mcpls. A linked worktree or a submodule holds its own `.git` entry and is its own root. If the root looks wrong, look for a `.git` entry where you did not expect one, or a missing one where you did.
 - **`server sees:`** what the running mcpls, if any, reports back. A healthy line repeats the `root:` line's directory and hash, as in the example above, confirming both sides agree. When no owner answers this project's own socket, the line takes one of four shapes instead:
   - `no owner; nothing is listening on this project's socket`: nothing was found running anywhere nearby. Start mcpls for this project (open it in an MCP client that spawns it) and run the doctor again.
@@ -84,6 +88,10 @@ Line by line:
   When an owner does answer but the exchange itself fails, the line reports the specific fault instead: an owner answering with an error message, answering with something other than its own status, a socket that accepted the connection but whose reply this build could not parse, or a socket that answered nothing within the probe window. Each of those pairs with `backend pid: unknown` below. The doctor names no cause for any of them, because an accepted connection and a failed exchange are the whole of what it established; what it prints instead is the answer or the error itself, and that is the thing to act on.
 - **`backend pid:`** the process id holding the socket, `none` if nothing does, or `unknown` if an owner exists but the exchange did not get far enough to learn its pid (see the fault messages above). When it does print a pid, confirm it names a live `mcpls` process; a pid that no longer exists or belongs to something else means the socket is orphaned: delete the socket file at the path in `socket:` above (a Windows named pipe clears on its own once nothing holds it) so a new mcpls can bind it.
 - **`hooks seen:`** how many `Changed`, `Flush`, or `EndSession` requests this owner has served since it started; a `Status` probe, including the doctor's own, is never counted. Zero is not by itself a fault: `SessionStart` never touches the socket, so an owner that just started, or just took over from a previous one, looks identical to one that has never received a hook. The line's own wording says what to do about a zero.
+- **`config file:`** the configuration file this build resolved for the checkout, and the tier it won on, so a fingerprint that surprises you has somewhere to lead. `mcpls config` prints the settings themselves.
+- **`project config:`** appears only when an `mcpls.toml` sits at the checkout root and was skipped as untrusted. That file has no effect until you pass `--trust-project-config`, and this line is the only place that says so.
+- **`language servers:`** every configured server and what it is doing. A backend that answered supplies the state for the ones it has (`running`, `idle`, `starting`, `not installed`, `failed`); the rest come from the configuration and the filesystem, which is why they are still reported with nothing running. `not applicable here` means no project marker matched this checkout, so nothing would start it. `not installed: <command> is not on PATH` means it would start here and its binary is missing. `installed` means it would start and its binary is there.
+- **`problems:`** the faults worth acting on, or `none`. A built-in whose binary is missing is reported above but is not a fault: nobody installs a server for every ecosystem mcpls knows. A server your own configuration file names is, because you asked for it.
 - **`mcpls on PATH:`** the absolute path of a candidate found on `PATH`, or `not found`. The doctor does not execute it: a text file named `mcpls.exe` on Windows is still a candidate, not a verified installation. The plugin's MCP server and hooks run this same `PATH` lookup, so this is the binary they run.
 - **`watcher:`** what the backend's filesystem watcher is doing, reported by the backend rather than measured locally, so it says `unknown; no backend answered` whenever the lines above show nothing answering. A working watcher says how many directories carry a watch: one per directory the project's ignore rules keep, which excludes `target` and `node_modules`, and the version control stores `.git`, `.jj`, `.hg` and `.svn`, whether or not a `.gitignore` names them. The count moves as the project does, up when a new directory is created and down when one is deleted.
 

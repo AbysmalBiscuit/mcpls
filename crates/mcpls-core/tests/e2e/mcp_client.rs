@@ -619,7 +619,7 @@ impl McpClient {
         self.process.try_wait()
     }
 
-    /// Query the backend selected for a workspace through hook doctor.
+    /// Query the backend selected for a workspace through the doctor.
     #[allow(dead_code)]
     pub(crate) fn backend_pid(workspace: &Path) -> Result<Option<u32>> {
         let output = Command::new(binary_under_test()?)
@@ -659,7 +659,7 @@ impl McpClient {
         Ok(())
     }
 
-    /// Wait until hook doctor reports no backend for a workspace.
+    /// Wait until the doctor reports no backend for a workspace.
     #[allow(dead_code)]
     pub(crate) fn wait_for_backend_exit(workspace: &Path) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(20);

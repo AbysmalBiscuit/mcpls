@@ -56,7 +56,7 @@ use std::time::{Duration, Instant};
 use bridge::apply::Applier;
 use bridge::resources::make_uri;
 use bridge::{NotificationCache, ResourceSubscriptions, ServerLifecycle, Translator};
-pub use config::{BackendConfig, ConfigSource, ProjectConfigTrust, ServerConfig};
+pub use config::{BackendConfig, ConfigSource, ProjectConfigTrust, Resolved, ServerConfig};
 use config::{ServerId, SpawnPolicy, ToolRouter};
 pub use error::Error;
 use lsp::{LspNotification, LspServer, ServerInitConfig};

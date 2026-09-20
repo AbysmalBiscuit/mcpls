@@ -269,24 +269,91 @@ fn additional_context_output(event: &str, context: Option<String>) -> String {
 /// wait for a human sitting at a terminal.
 const MAX_FOREIGN_CANDIDATES: usize = 16;
 
+/// A doctor run: the report a reader sees, and the faults it found.
+///
+/// `mcpls hook doctor` prints the text and exits 0, which the hook path
+/// requires. `mcpls doctor` exits non-zero when `problems` is not empty.
+pub struct Report {
+    /// The report, one fact per line, without a trailing newline.
+    pub text: String,
+    /// Each fault, phrased for the line that ends the report.
+    pub problems: Vec<String>,
+}
+
+impl Report {
+    fn new(mut lines: Vec<String>, problems: Vec<String>) -> Self {
+        lines.push(if problems.is_empty() {
+            "problems: none".to_string()
+        } else {
+            format!("problems: {}", problems.join("; "))
+        });
+        Self {
+            text: lines.join("\n"),
+            problems,
+        }
+    }
+}
+
+/// Where the directory a doctor run examined was named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Examined {
+    /// A path given on the command line.
+    Argument,
+    /// `CLAUDE_PROJECT_DIR`, which is what a real hook reads.
+    ProjectDir,
+    /// This process's working directory, nothing else having named one.
+    WorkingDirectory,
+}
+
+impl Examined {
+    /// How the report names where the directory came from.
+    #[must_use]
+    pub const fn origin(self) -> &'static str {
+        match self {
+            Self::Argument => "given on the command line",
+            Self::ProjectDir => "from CLAUDE_PROJECT_DIR",
+            Self::WorkingDirectory => "the working directory; CLAUDE_PROJECT_DIR is unset",
+        }
+    }
+}
+
+/// The directory a doctor run examines, before canonicalization, and where
+/// its name came from.
+///
+/// Run by hand from a terminal inside an agent session, the doctor would
+/// otherwise report on `CLAUDE_PROJECT_DIR` while the reader stands
+/// somewhere else entirely, with nothing on the report saying so.
+pub fn examined_directory(argument: Option<&Path>) -> (PathBuf, Examined) {
+    if let Some(path) = argument {
+        return (path.to_path_buf(), Examined::Argument);
+    }
+    std::env::var_os("CLAUDE_PROJECT_DIR").map_or_else(
+        || (PathBuf::from("."), Examined::WorkingDirectory),
+        |named| (PathBuf::from(named), Examined::ProjectDir),
+    )
+}
+
 /// Probe this project's hook socket and describe what it finds: the
 /// socket path, the directory hash each side computes, whether an owner
-/// answers and how many hooks it has actually seen, and whether `mcpls`
-/// resolves on `PATH`.
+/// answers and how many hooks it has actually seen, which configured
+/// language servers apply here and which of them are installed, and
+/// whether `mcpls` resolves on `PATH`.
 ///
 /// Socket failures are silent in hooks; this command reports their cause.
 pub async fn doctor(
     project_dir: &Path,
+    examined: Examined,
     root: &Path,
     identity: &SocketIdentity,
-    local_fingerprint: Option<&str>,
-) -> String {
+    local: Option<&mcpls_core::Resolved>,
+) -> Report {
     doctor_scanning(
         project_dir,
+        examined,
         root,
         identity,
         &foreign_scan_prefix(),
-        local_fingerprint,
+        local,
     )
     .await
 }
@@ -297,31 +364,26 @@ pub fn checkout_root(project_dir: &Path) -> PathBuf {
     mcpls_core::hooks::project_root(project_dir).unwrap_or_else(|_| project_dir.to_path_buf())
 }
 
-/// `doctor`'s body, parameterized on the prefix its runtime-directory scan
-/// filters Windows pipe names by.
-///
-/// Production always reaches this through `doctor`, with the real prefix.
-/// A test on Windows needs a different one: the pipe namespace is
-/// machine-global, so a scan filtered on the real prefix would enumerate
-/// an actual mcpls running on the developer's own machine, not only the
-/// one the test bound itself.
-async fn doctor_scanning(
+/// What this project's own socket says about the backend behind it.
+struct BackendAnswer {
+    lines: Vec<String>,
+    problems: Vec<String>,
+    /// The watcher's state exists only where the backend runs, so only an
+    /// owner's answer can carry it.
+    watcher: Option<Box<WatcherStatus>>,
+    servers: Vec<ServerStatus>,
+}
+
+async fn backend_answer(
     project_dir: &Path,
-    root: &Path,
     identity: &SocketIdentity,
     prefix: &str,
-    local_fingerprint: Option<&str>,
-) -> String {
-    let mut lines = vec![
-        format!("socket: {}", identity.socket.display()),
-        format!("hook sees: {}", project_dir.display()),
-        format!("root: {} -> {}", root.display(), identity.hash),
-    ];
-
-    // Filled by the one arm that gets an answer from this project's own
-    // backend, which is the only place the watcher's state exists now that
-    // the watching is the backend's rather than the host's.
+    local: Option<&mcpls_core::Resolved>,
+) -> BackendAnswer {
+    let mut lines = Vec::new();
+    let mut problems = Vec::new();
     let mut reported_watcher: Option<Box<WatcherStatus>> = None;
+    let mut reported_servers: Vec<ServerStatus> = Vec::new();
 
     match probe(identity, &Request::Status, SOCKET_TIMEOUT).await {
         // Only the socket's owner can identify this project's service.
@@ -340,6 +402,7 @@ async fn doctor_scanning(
             ..
         }) => {
             reported_watcher = Some(watcher);
+            reported_servers = servers;
             lines.push(format!("server sees: {} -> {hash}", root.display()));
             lines.push(format!("backend pid: {pid}"));
             lines.push(hooks_seen_line(hooks_seen));
@@ -348,8 +411,10 @@ async fn doctor_scanning(
                 uptime(uptime_ms)
             ));
             lines.push(sessions_line(&sessions));
-            lines.push(servers_line(&servers));
-            lines.push(config_line(&config_fingerprint, local_fingerprint));
+            lines.push(config_line(
+                &config_fingerprint,
+                local.map(|local| local.config.fingerprint()).as_deref(),
+            ));
         }
         // An owner deliberately explained itself; print that rather than
         // discarding it behind a timing guess.
@@ -358,6 +423,7 @@ async fn doctor_scanning(
                 "server sees: an owner answered with an error: {message}"
             ));
             lines.push(BACKEND_PID_UNKNOWN.to_string());
+            problems.push(format!("the backend answered with an error: {message}"));
         }
         // Some other, unexpected answer to a Status request. An owner
         // exists, evidenced by the answer itself, so this is not a
@@ -378,6 +444,7 @@ async fn doctor_scanning(
                  {error}"
             ));
             lines.push(BACKEND_PID_UNKNOWN.to_string());
+            problems.push("something holds the socket that this build cannot read".to_string());
         }
         ProbeOutcome::Refused(reply) => {
             lines.push(format!(
@@ -387,6 +454,10 @@ async fn doctor_scanning(
                 refusal_text(reply.refusal.as_ref())
             ));
             lines.push(format!("backend pid: {}", reply.pid));
+            problems.push(format!(
+                "the backend refused this build: {}",
+                refusal_text(reply.refusal.as_ref())
+            ));
         }
         // A connection was accepted but nothing came back at all: there
         // is an owner, so naming some other directory as the reason
@@ -405,10 +476,70 @@ async fn doctor_scanning(
         }
     }
 
-    lines.push(on_path_line(mcpls_on_path().as_deref()));
-    lines.push(watcher_line(reported_watcher.as_deref()));
+    BackendAnswer {
+        lines,
+        problems,
+        watcher: reported_watcher,
+        servers: reported_servers,
+    }
+}
 
-    lines.join("\n")
+/// `doctor`'s body, parameterized on the prefix its runtime-directory scan
+/// filters Windows pipe names by.
+///
+/// Production always reaches this through `doctor`, with the real prefix.
+/// A test on Windows needs a different one: the pipe namespace is
+/// machine-global, so a scan filtered on the real prefix would enumerate
+/// an actual mcpls running on the developer's own machine, not only the
+/// one the test bound itself.
+async fn doctor_scanning(
+    project_dir: &Path,
+    examined: Examined,
+    root: &Path,
+    identity: &SocketIdentity,
+    prefix: &str,
+    local: Option<&mcpls_core::Resolved>,
+) -> Report {
+    let mut lines = vec![
+        format!("socket: {}", identity.socket.display()),
+        format!(
+            "hook sees: {} ({})",
+            project_dir.display(),
+            examined.origin()
+        ),
+        format!("root: {} -> {}", root.display(), identity.hash),
+    ];
+    let backend = backend_answer(project_dir, identity, prefix, local).await;
+    lines.extend(backend.lines);
+    let mut problems = backend.problems;
+
+    if let Some(local) = local {
+        lines.push(config_file_line(local));
+        if let Some(ignored) = &local.ignored_project_config {
+            lines.push(ignored_project_config_line(ignored));
+        }
+    }
+
+    let requested = local
+        .map(crate::config::servers_the_file_names)
+        .unwrap_or_default();
+    let servers = server_reports(
+        &backend.servers,
+        local.map(|local| &local.config),
+        &requested,
+        root,
+    );
+    lines.push(servers_line(&servers));
+    problems.extend(servers.iter().filter_map(|server| server.problem.clone()));
+
+    let on_path = mcpls_on_path();
+    if on_path.is_none() {
+        problems.push("mcpls is not on PATH, so no hook can reach a backend".to_string());
+    }
+    lines.push(on_path_line(on_path.as_deref()));
+    lines.push(watcher_line(backend.watcher.as_deref()));
+
+    Report::new(lines, problems)
 }
 
 /// A refusal as the doctor prints it.
@@ -480,7 +611,81 @@ fn sessions_line(sessions: &[String]) -> String {
     }
 }
 
-fn servers_line(servers: &[ServerStatus]) -> String {
+/// What the doctor says about one language server.
+struct ServerReport {
+    id: String,
+    state: String,
+    /// The fault this server contributes to the report's last line, for a
+    /// server that would serve this checkout and cannot.
+    problem: Option<String>,
+}
+
+/// What each configured language server is doing, or why it is doing
+/// nothing.
+///
+/// A backend reports only the servers that apply to its checkout, so the
+/// ones it leaves out are the pair a reader cannot otherwise tell apart:
+/// a server no project marker here matches, and one that matches and
+/// whose binary is not installed. Both come from the configuration and
+/// the filesystem, so they survive with no backend running at all. Only a
+/// server in `requested`, which the user's own file names, counts its
+/// missing binary as a fault.
+fn server_reports(
+    reported: &[ServerStatus],
+    config: Option<&mcpls_core::ServerConfig>,
+    requested: &std::collections::BTreeSet<String>,
+    root: &Path,
+) -> Vec<ServerReport> {
+    let mut reports: Vec<ServerReport> = reported
+        .iter()
+        .map(|server| ServerReport {
+            id: server.id.clone(),
+            state: server.state.to_string(),
+            problem: None,
+        })
+        .collect();
+
+    let Some(config) = config else {
+        return reports;
+    };
+    let max_depth = Some(config.workspace.heuristics_max_depth);
+
+    for server in &config.lsp_servers {
+        let id = server.id().to_string();
+        if reports.iter().any(|report| report.id == id) {
+            continue;
+        }
+        if !server.should_spawn(root, max_depth) {
+            reports.push(ServerReport {
+                id,
+                state: "not applicable here".to_string(),
+                problem: None,
+            });
+        } else if resolve_program(&server.command).is_some() {
+            reports.push(ServerReport {
+                id,
+                state: "installed".to_string(),
+                problem: None,
+            });
+        } else {
+            let problem = requested.contains(&id).then(|| {
+                format!(
+                    "your configuration asks for {id} and {} is not installed",
+                    server.command
+                )
+            });
+            reports.push(ServerReport {
+                state: format!("not installed: {} is not on PATH", server.command),
+                id,
+                problem,
+            });
+        }
+    }
+
+    reports
+}
+
+fn servers_line(servers: &[ServerReport]) -> String {
     if servers.is_empty() {
         "language servers: none".to_string()
     } else {
@@ -490,6 +695,35 @@ fn servers_line(servers: &[ServerStatus]) -> String {
             .collect();
         format!("language servers: {}", rendered.join(", "))
     }
+}
+
+/// The `config file:` line: the file this build resolved for the checkout
+/// and the tier it won on, so a fingerprint that surprises a reader has
+/// somewhere to lead.
+fn config_file_line(local: &mcpls_core::Resolved) -> String {
+    use mcpls_core::ConfigSource;
+    let tier = match local.config.source {
+        ConfigSource::Explicit => "named with --config or MCPLS_CONFIG",
+        ConfigSource::Project => "this checkout's own, trusted",
+        ConfigSource::Global => "the user's global config",
+        ConfigSource::Defaults => "built-in defaults",
+    };
+    local.path.as_ref().map_or_else(
+        || format!("config file: none ({tier})"),
+        |path| format!("config file: {} ({tier})", path.display()),
+    )
+}
+
+/// The line for an `mcpls.toml` discovery found at the checkout root and
+/// skipped, which is the single most confusing state the configuration can
+/// be in: the file a reader just edited has no effect and nothing else on
+/// the report says why.
+fn ignored_project_config_line(path: &Path) -> String {
+    format!(
+        "project config: {} was found and ignored; pass --trust-project-config \
+         (or set MCPLS_TRUST_PROJECT_CONFIG=true) to load it",
+        path.display()
+    )
 }
 
 /// The `config:` line: the backend's fingerprint, and whether the one this
@@ -846,10 +1080,18 @@ const PIPE_LISTINGS: usize = 3;
 /// exists and nothing answers it; this means no socket could ever exist
 /// here at all, on either side, which a user needs to be able to tell
 /// apart from a server that simply is not running right now.
-pub fn doctor_without_identity(project_dir: &Path, error: &mcpls_core::Error) -> String {
-    let lines = [
+pub fn doctor_without_identity(
+    project_dir: &Path,
+    examined: Examined,
+    error: &mcpls_core::Error,
+) -> Report {
+    let lines = vec![
         format!("socket: none; could not derive an identity for this directory: {error}"),
-        format!("hook sees: {} -> unknown", project_dir.display()),
+        format!(
+            "hook sees: {} ({}) -> unknown",
+            project_dir.display(),
+            examined.origin()
+        ),
         "server sees: nothing can run here; no socket exists to probe".to_string(),
         "backend pid: none".to_string(),
         on_path_line(mcpls_on_path().as_deref()),
@@ -857,7 +1099,10 @@ pub fn doctor_without_identity(project_dir: &Path, error: &mcpls_core::Error) ->
         // watcher either.
         watcher_line(None),
     ];
-    lines.join("\n")
+    Report::new(
+        lines,
+        vec![format!("no socket can exist for this directory: {error}")],
+    )
 }
 
 /// What an owner prints for its pid when it exists but did not say which
@@ -910,6 +1155,63 @@ fn resolve_on_path(path_var: &std::ffi::OsStr, exe_name: &str) -> Option<PathBuf
         .map(|candidate| std::path::absolute(&candidate).unwrap_or(candidate))
 }
 
+/// The executable a configured language server `command` names, or `None`
+/// when nothing by that name is installed.
+fn resolve_program(command: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let extensions = std::env::var_os("PATHEXT");
+    resolve_program_in(&path, extensions.as_deref(), command)
+}
+
+/// The executable `command` names: the file itself when the command spells
+/// a path, otherwise the first `PATH` entry holding it.
+///
+/// Split out of `resolve_program` so a test can supply a `PATH` of its own
+/// rather than mutating this process's real environment, which a
+/// multi-threaded test binary sharing one process cannot safely do.
+fn resolve_program_in(
+    path_var: &std::ffi::OsStr,
+    path_ext: Option<&std::ffi::OsStr>,
+    command: &str,
+) -> Option<PathBuf> {
+    let named = Path::new(command);
+    if named.components().count() > 1 {
+        return is_executable_file(named)
+            .then(|| std::path::absolute(named).unwrap_or_else(|_| named.to_path_buf()));
+    }
+    std::iter::once(command.to_string())
+        .chain(
+            executable_extensions(path_ext)
+                .into_iter()
+                .map(|extension| format!("{command}{extension}")),
+        )
+        .find_map(|name| resolve_on_path(path_var, &name))
+}
+
+/// The suffixes a bare command name may carry on this platform.
+///
+/// An npm-installed language server on Windows is a `.cmd` shim rather
+/// than an `.exe`, and a configured `command` names neither, so a bare
+/// name resolves against `PATHEXT` the way the shell itself would.
+#[cfg(windows)]
+fn executable_extensions(path_ext: Option<&std::ffi::OsStr>) -> Vec<String> {
+    const FALLBACK: &str = ".COM;.EXE;.BAT;.CMD";
+    path_ext
+        .map_or_else(
+            || FALLBACK.to_string(),
+            |value| value.to_string_lossy().into_owned(),
+        )
+        .split(';')
+        .filter(|extension| !extension.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn executable_extensions(_path_ext: Option<&std::ffi::OsStr>) -> Vec<String> {
+    Vec::new()
+}
+
 #[cfg(unix)]
 fn is_executable_file(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -925,6 +1227,7 @@ fn is_executable_file(path: &Path) -> bool {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -2188,12 +2491,14 @@ mod tests {
         let _owner = RecordingOwner::start_reporting_status(identity.clone(), project, hooks_seen);
         let out = super::doctor_scanning(
             project,
+            Examined::ProjectDir,
             &checkout_root(project),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
             None,
         )
-        .await;
+        .await
+        .text;
         (out, identity)
     }
 
@@ -2203,12 +2508,14 @@ mod tests {
         let identity = local_identity_for(project, socket_dir.path());
         let out = super::doctor_scanning(
             project,
+            Examined::ProjectDir,
             &checkout_root(project),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
             None,
         )
-        .await;
+        .await
+        .text;
         (out, identity)
     }
 
@@ -2227,12 +2534,14 @@ mod tests {
         let _owner = RecordingOwner::start_reporting_status(foreign_identity, foreign, 0);
         super::doctor_scanning(
             project,
+            Examined::ProjectDir,
             &checkout_root(project),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
             None,
         )
         .await
+        .text
     }
 
     /// Run the doctor for `project` against several real, unrelated
@@ -2250,12 +2559,14 @@ mod tests {
             .collect();
         super::doctor_scanning(
             project,
+            Examined::ProjectDir,
             &checkout_root(project),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
             None,
         )
         .await
+        .text
     }
 
     /// Run the doctor for `project` where a real owner is running for
@@ -2298,12 +2609,14 @@ mod tests {
             .collect();
         super::doctor_scanning(
             project,
+            Examined::ProjectDir,
             &checkout_root(project),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
             None,
         )
         .await
+        .text
     }
 
     /// Run the doctor for `project` where the runtime directory holds
@@ -2328,12 +2641,14 @@ mod tests {
             .collect();
         super::doctor_scanning(
             project,
+            Examined::ProjectDir,
             &checkout_root(project),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
             None,
         )
         .await
+        .text
     }
 
     /// Run the doctor for `project` where the only reachable socket
@@ -2345,12 +2660,14 @@ mod tests {
         let _owner = RecordingOwner::start_reporting_non_owner(elsewhere_identity, elsewhere);
         super::doctor_scanning(
             project,
+            Examined::ProjectDir,
             &checkout_root(project),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
             None,
         )
         .await
+        .text
     }
 
     /// Run the doctor for `project` against a real owner that accepts the
@@ -2362,12 +2679,14 @@ mod tests {
         let _owner = RecordingOwner::start_silent(identity.clone());
         super::doctor_scanning(
             project,
+            Examined::ProjectDir,
             &checkout_root(project),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
             None,
         )
         .await
+        .text
     }
 
     /// The same, with a second, real, related owner also present in the
@@ -2382,12 +2701,14 @@ mod tests {
         let _related = RecordingOwner::start_reporting_status(related_identity, related, 0);
         super::doctor_scanning(
             project,
+            Examined::ProjectDir,
             &checkout_root(project),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
             None,
         )
         .await
+        .text
     }
 
     /// Run the doctor for `project` against a real owner that answers
@@ -2398,12 +2719,14 @@ mod tests {
         let _owner = RecordingOwner::start_answering_status_with_error(identity.clone(), message);
         super::doctor_scanning(
             project,
+            Examined::ProjectDir,
             &checkout_root(project),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
             None,
         )
         .await
+        .text
     }
 
     /// Run the doctor for `project` against a real owner that answers
@@ -2415,12 +2738,14 @@ mod tests {
             RecordingOwner::start_answering_status_with_raw_line(identity.clone(), raw_line);
         super::doctor_scanning(
             project,
+            Examined::ProjectDir,
             &checkout_root(project),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
             None,
         )
         .await
+        .text
     }
 
     async fn doctor_with_raw_handshake_reply(project: &Path, raw_line: &str) -> String {
@@ -2430,12 +2755,14 @@ mod tests {
             RecordingOwner::start_answering_handshake_with_raw_line(identity.clone(), raw_line);
         super::doctor_scanning(
             project,
+            Examined::ProjectDir,
             &checkout_root(project),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
             None,
         )
         .await
+        .text
     }
 
     /// A directory count says nothing about whether the walk reached the
@@ -2485,10 +2812,16 @@ mod tests {
         let root = mcpls_core::hooks::project_root(project.path()).expect("root");
 
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 12, "expected exactly twelve lines: {out}");
+        assert_eq!(lines.len(), 13, "expected exactly thirteen lines: {out}");
         assert_eq!(lines[11], "watcher: 7 directories watched");
         assert_eq!(lines[0], format!("socket: {}", identity.socket.display()));
-        assert_eq!(lines[1], format!("hook sees: {}", project.path().display()));
+        assert_eq!(
+            lines[1],
+            format!(
+                "hook sees: {} (from CLAUDE_PROJECT_DIR)",
+                project.path().display()
+            )
+        );
         assert_eq!(lines[2], format!("root: {} -> {hash}", root.display()));
         assert_eq!(
             lines[3],
@@ -2501,9 +2834,10 @@ mod tests {
         );
         assert_eq!(lines[6], "backend: mcpls 0.3.9, up 1m1s");
         assert_eq!(lines[7], "sessions: 2 attached (s1, connection-4)");
-        assert_eq!(lines[8], "language servers: rust (running)");
-        assert_eq!(lines[9], "config: 00000000000000ff");
+        assert_eq!(lines[8], "config: 00000000000000ff");
+        assert_eq!(lines[9], "language servers: rust (running)");
         assert!(lines[10].starts_with("mcpls on PATH: "));
+        assert_eq!(lines[12], "problems: none");
     }
 
     #[test]
@@ -2514,6 +2848,165 @@ mod tests {
         assert_eq!(uptime(3_725_000), "1h2m");
     }
 
+    /// A configuration with one server that serves this checkout and one
+    /// that does not, both naming commands nothing on `PATH` provides.
+    fn config_with(markers: &[&str], command: &str) -> mcpls_core::ServerConfig {
+        let entries: Vec<String> = markers
+            .iter()
+            .enumerate()
+            .map(|(index, marker)| {
+                format!(
+                    "[[lsp_servers]]\nlanguage_id = \"lang{index}\"\ncommand = \"{command}\"\n\
+                     file_patterns = [\"**/*.lang{index}\"]\n\
+                     [lsp_servers.heuristics]\nproject_markers = [\"{marker}\"]\n"
+                )
+            })
+            .collect();
+        toml::from_str(&entries.join("\n")).expect("a configuration")
+    }
+
+    /// A configured server the backend never mentions is the pair a
+    /// reader cannot otherwise tell apart, and the whole reason the doctor
+    /// reads the configuration rather than only the backend's answer.
+    #[test]
+    fn test_a_server_that_does_not_apply_here_is_told_from_one_that_is_not_installed() {
+        let project = tempfile::tempdir().expect("a temp dir");
+        std::fs::write(project.path().join("present.marker"), "").expect("marker");
+        let config = config_with(
+            &["present.marker", "absent.marker"],
+            "mcpls-no-such-language-server",
+        );
+
+        let requested = ["lang0".to_string(), "lang1".to_string()].into();
+        let reports = server_reports(&[], Some(&config), &requested, project.path());
+        let line = servers_line(&reports);
+
+        assert!(
+            line.contains("lang0 (not installed: mcpls-no-such-language-server is not on PATH)"),
+            "{line}"
+        );
+        assert!(line.contains("lang1 (not applicable here)"), "{line}");
+
+        let problems: Vec<&str> = reports
+            .iter()
+            .filter_map(|report| report.problem.as_deref())
+            .collect();
+        assert_eq!(
+            problems,
+            vec![
+                "your configuration asks for lang0 and mcpls-no-such-language-server is not \
+                 installed"
+            ],
+            "only the server that would serve this checkout is a fault"
+        );
+    }
+
+    /// Nobody asked for the built-ins, and no developer installs a server
+    /// for every ecosystem mcpls knows, so their absence is a fact on the
+    /// report rather than something that fails the run.
+    #[test]
+    fn test_a_missing_builtin_nobody_configured_is_reported_without_being_a_fault() {
+        let project = tempfile::tempdir().expect("a temp dir");
+        std::fs::write(project.path().join("present.marker"), "").expect("marker");
+        let config = config_with(&["present.marker"], "mcpls-no-such-language-server");
+
+        let reports = server_reports(&[], Some(&config), &BTreeSet::new(), project.path());
+
+        assert!(
+            servers_line(&reports).contains("lang0 (not installed"),
+            "the state is still on the report"
+        );
+        assert!(
+            reports.iter().all(|report| report.problem.is_none()),
+            "a server no configuration file named is not a fault"
+        );
+    }
+
+    /// A server the backend already reports on keeps the backend's own
+    /// state: the backend knows whether it started, and this build does
+    /// not.
+    #[test]
+    fn test_a_running_server_keeps_the_state_the_backend_reported() {
+        let project = tempfile::tempdir().expect("a temp dir");
+        std::fs::write(project.path().join("present.marker"), "").expect("marker");
+        let config = config_with(&["present.marker"], "mcpls-no-such-language-server");
+
+        let reports = server_reports(
+            &[status("lang0", ServerLifecycle::Running)],
+            Some(&config),
+            &BTreeSet::new(),
+            project.path(),
+        );
+
+        let line = servers_line(&reports);
+        assert!(line.contains("lang0 (running)"), "{line}");
+        assert!(reports.iter().all(|report| report.problem.is_none()));
+    }
+
+    /// An installed server's command resolves to a real file, which is
+    /// what tells `installed` from `not installed`.
+    #[test]
+    fn test_a_server_whose_command_is_installed_reads_as_installed() {
+        let project = tempfile::tempdir().expect("a temp dir");
+        std::fs::write(project.path().join("present.marker"), "").expect("marker");
+        let exe = std::env::current_exe().expect("this test binary");
+        let config = config_with(
+            &["present.marker"],
+            &exe.display().to_string().replace('\\', "\\\\"),
+        );
+
+        let reports = server_reports(&[], Some(&config), &BTreeSet::new(), project.path());
+
+        let line = servers_line(&reports);
+        assert!(line.contains("lang0 (installed)"), "{line}");
+        assert!(reports.iter().all(|report| report.problem.is_none()));
+    }
+
+    /// A bare command name is resolved the way the shell would, which on
+    /// Windows means trying the `PATHEXT` suffixes an npm shim carries.
+    #[test]
+    fn test_a_bare_command_resolves_against_path_and_its_extensions() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let name = if cfg!(windows) {
+            "some-server.cmd"
+        } else {
+            "some-server"
+        };
+        let installed = dir.path().join(name);
+        std::fs::write(&installed, "").expect("the server");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&installed, std::fs::Permissions::from_mode(0o755))
+                .expect("executable");
+        }
+        let path = std::ffi::OsString::from(dir.path());
+        let path_ext = std::ffi::OsString::from(".COM;.EXE;.BAT;.CMD");
+
+        // The extension comes back spelled the way `PATHEXT` spells it,
+        // which is upper case on a default Windows install.
+        let found = resolve_program_in(&path, Some(&path_ext), "some-server")
+            .expect("the installed server");
+        assert_eq!(
+            found.display().to_string().to_lowercase(),
+            installed.display().to_string().to_lowercase()
+        );
+        assert!(resolve_program_in(&path, Some(&path_ext), "absent-server").is_none());
+    }
+
+    /// A command spelling a path is that file or nothing; `PATH` never
+    /// enters into it.
+    #[test]
+    fn test_a_command_naming_a_path_is_taken_as_that_path() {
+        let exe = std::env::current_exe().expect("this test binary");
+        let empty = std::ffi::OsString::new();
+
+        assert!(resolve_program_in(&empty, None, &exe.display().to_string()).is_some());
+        assert!(
+            resolve_program_in(&empty, None, &exe.join("nope").display().to_string()).is_none()
+        );
+    }
+
     #[test]
     fn test_the_servers_line_names_a_state_beside_each_server() {
         let servers = vec![
@@ -2522,7 +3015,12 @@ mod tests {
             status("lua", ServerLifecycle::NotInstalled),
         ];
         assert_eq!(
-            servers_line(&servers),
+            servers_line(&server_reports(
+                &servers,
+                None,
+                &BTreeSet::new(),
+                Path::new("/nowhere")
+            )),
             "language servers: rust (running), typescript (idle), lua (not installed)"
         );
     }
@@ -2533,7 +3031,12 @@ mod tests {
             .map(|state| status("language", state))
             .collect();
         assert_eq!(
-            servers_line(&servers),
+            servers_line(&server_reports(
+                &servers,
+                None,
+                &BTreeSet::new(),
+                Path::new("/nowhere")
+            )),
             "language servers: language (idle), language (starting), language (running), language (not installed), language (failed)"
         );
     }
@@ -2573,16 +3076,18 @@ mod tests {
 
         let out = super::doctor_scanning(
             project.path(),
+            Examined::ProjectDir,
             &checkout_root(project.path()),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
             None,
         )
-        .await;
+        .await
+        .text;
 
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 7, "expected exactly seven lines: {out}");
-        assert_eq!(lines[6], "watcher: unknown; no backend answered");
+        assert_eq!(lines.len(), 9, "expected exactly nine lines: {out}");
+        assert_eq!(lines[7], "watcher: unknown; no backend answered");
         assert_eq!(
             lines[3],
             format!(
@@ -2648,17 +3153,25 @@ mod tests {
         let root = mcpls_core::hooks::project_root(project.path()).expect("root");
 
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 7, "expected exactly seven lines: {out}");
-        assert_eq!(lines[6], "watcher: unknown; no backend answered");
+        assert_eq!(lines.len(), 9, "expected exactly nine lines: {out}");
+        assert_eq!(lines[7], "watcher: unknown; no backend answered");
         assert_eq!(lines[0], format!("socket: {}", identity.socket.display()));
-        assert_eq!(lines[1], format!("hook sees: {}", project.path().display()));
+        assert_eq!(
+            lines[1],
+            format!(
+                "hook sees: {} (from CLAUDE_PROJECT_DIR)",
+                project.path().display()
+            )
+        );
         assert_eq!(lines[2], format!("root: {} -> {hash}", root.display()));
         assert_eq!(
             lines[3],
             "server sees: no owner; nothing is listening on this project's socket"
         );
         assert_eq!(lines[4], "backend pid: none");
-        assert!(lines[5].starts_with("mcpls on PATH: "));
+        assert_eq!(lines[5], "language servers: none");
+        assert!(lines[6].starts_with("mcpls on PATH: "));
+        assert_eq!(lines[8], "problems: none");
     }
 
     /// Named for what it still proves. It used to assert the local watch
@@ -2678,30 +3191,34 @@ mod tests {
 
         let out = super::doctor_scanning(
             &nested,
+            Examined::ProjectDir,
             &checkout_root(&nested),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
             None,
         )
-        .await;
+        .await
+        .text;
 
         let lines: Vec<_> = out.lines().collect();
-        assert_eq!(lines[1], format!("hook sees: {}", nested.display()));
+        assert_eq!(
+            lines[1],
+            format!("hook sees: {} (from CLAUDE_PROJECT_DIR)", nested.display())
+        );
         assert_eq!(
             lines[2],
             format!("root: {} -> {}", root.display(), identity.hash)
         );
-        assert_eq!(
-            lines.last().copied(),
-            Some("watcher: unknown; no backend answered"),
-            "nothing is bound here, so no backend can have reported a watcher"
+        assert!(
+            lines.contains(&"watcher: unknown; no backend answered"),
+            "nothing is bound here, so no backend can have reported a watcher: {out}"
         );
     }
 
     /// The runtime location only exists once an owner has bound there,
     /// so its absence is the ordinary shape of a machine mcpls has never
     /// run on, not a scan failure. This is the first thing a new
-    /// install's first `mcpls hook doctor` run would see.
+    /// install's first doctor run would see.
     #[tokio::test]
     async fn test_doctor_reports_a_clean_no_owner_when_the_runtime_location_was_never_created() {
         let project = tempfile::tempdir().expect("a temp dir");
@@ -2710,12 +3227,14 @@ mod tests {
 
         let out = super::doctor_scanning(
             project.path(),
+            Examined::ProjectDir,
             &checkout_root(project.path()),
             &identity,
             &test_pipe_prefix(&never_created),
             None,
         )
-        .await;
+        .await
+        .text;
 
         assert_eq!(
             out.lines()
@@ -2884,12 +3403,14 @@ mod tests {
 
         let out = super::doctor_scanning(
             &project,
+            Examined::ProjectDir,
             &checkout_root(&project),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
             None,
         )
-        .await;
+        .await
+        .text;
 
         let server_sees = out
             .lines()
@@ -2945,12 +3466,14 @@ mod tests {
 
         let out = super::doctor_scanning(
             &project,
+            Examined::ProjectDir,
             &checkout_root(&project),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
             None,
         )
-        .await;
+        .await
+        .text;
 
         let server_sees = out
             .lines()
@@ -3069,12 +3592,14 @@ mod tests {
         let prefix = test_pipe_prefix(dir.path());
         let out = super::doctor_scanning(
             dir.path(),
+            Examined::ProjectDir,
             &checkout_root(dir.path()),
             &identity,
             &prefix,
             None,
         )
-        .await;
+        .await
+        .text;
         assert!(
             out.contains(
                 "server sees: a socket answered nothing within 50ms; an owner may be busy"
@@ -3089,12 +3614,14 @@ mod tests {
         let _owner = RecordingOwner::start_reporting_status(identity.clone(), dir.path(), 1);
         let out = super::doctor_scanning(
             dir.path(),
+            Examined::ProjectDir,
             &checkout_root(dir.path()),
             &identity,
             &prefix,
             None,
         )
-        .await;
+        .await
+        .text;
         assert!(
             out.contains(&format!("backend pid: {}", std::process::id())),
             "{out}"
@@ -3270,12 +3797,14 @@ mod tests {
 
         let out = super::doctor_scanning(
             project.path(),
+            Examined::ProjectDir,
             &checkout_root(project.path()),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
             None,
         )
-        .await;
+        .await
+        .text;
 
         assert_eq!(
             out.lines()
@@ -3473,12 +4002,14 @@ mod tests {
         let inaccessible = std::fs::read_dir(socket_dir.path()).is_err();
         let out = super::doctor_scanning(
             project.path(),
+            Examined::ProjectDir,
             &checkout_root(project.path()),
             &identity,
             &test_pipe_prefix(socket_dir.path()),
             None,
         )
-        .await;
+        .await
+        .text;
 
         // Restore access before any assertion can panic and skip this,
         // leaving this test's own TempDir unable to clean itself up.
@@ -3630,18 +4161,25 @@ mod tests {
         let missing = project.path().join("does-not-exist");
         let error = mcpls_core::hooks::identity_for(&missing).expect_err("an unreachable dir");
 
-        let out = super::doctor_without_identity(project.path(), &error);
+        let out = super::doctor_without_identity(project.path(), Examined::ProjectDir, &error).text;
 
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 6, "expected exactly six lines: {out}");
+        assert_eq!(lines.len(), 7, "expected exactly seven lines: {out}");
         assert_eq!(lines[5], "watcher: unknown; no backend answered");
+        assert!(
+            lines[6].starts_with("problems: no socket can exist"),
+            "a directory nothing can run in is a fault, not a clean bill: {out}"
+        );
         assert_eq!(
             lines[0],
             format!("socket: none; could not derive an identity for this directory: {error}")
         );
         assert_eq!(
             lines[1],
-            format!("hook sees: {} -> unknown", project.path().display())
+            format!(
+                "hook sees: {} (from CLAUDE_PROJECT_DIR) -> unknown",
+                project.path().display()
+            )
         );
         assert_eq!(
             lines[2], "server sees: nothing can run here; no socket exists to probe",

@@ -9,10 +9,12 @@ use mcpls_core::ProjectConfigTrust;
 
 mod args;
 mod completions;
+mod config;
 mod hook;
 mod logging;
 
 use args::{Args, Command, HookAction, SchemaAction};
+use hook::{Examined, Report};
 
 #[tokio::main]
 async fn main() {
@@ -62,6 +64,27 @@ async fn main() {
         std::process::exit(0);
     }
 
+    if let Some(Command::Doctor { path }) = &args.command {
+        let report = diagnose(&args, path.as_deref()).await;
+        write_report(&format!("{}\n", report.text));
+        std::process::exit(i32::from(!report.problems.is_empty()));
+    }
+
+    if let Some(Command::Config { path, origin, json }) = &args.command {
+        let (directory, examined) = examined_directory(path.as_deref());
+        let root = hook::checkout_root(&directory);
+        let rendered = resolve_config(&args, &root)
+            .and_then(|resolved| config::render(&resolved, &directory, examined, *origin, *json));
+        match rendered {
+            Ok(text) => write_report(&text),
+            Err(err) => {
+                eprintln!("{err:?}");
+                std::process::exit(1);
+            }
+        }
+        std::process::exit(0);
+    }
+
     // A hook invocation needs neither a loaded config nor a log subscriber,
     // and reading stdin and writing hook JSON is the whole command.
     if let Some(Command::Hook { host, action }) = &args.command {
@@ -103,26 +126,10 @@ async fn main() {
                     .write_all(out.as_bytes())
                     .and_then(|()| stdout.flush());
             }
+            // The alias exits 0 whatever it found, which every hook
+            // registration depends on.
             Some(HookAction::Doctor) => {
-                // `mcpls hook doctor` reports on the socket and the install.
-                // It reads the same `CLAUDE_PROJECT_DIR` the hook itself
-                // does, canonicalized the same way, so it probes exactly
-                // the socket a real hook invocation would.
-                let raw_project_dir = std::env::var_os("CLAUDE_PROJECT_DIR")
-                    .map_or_else(|| std::path::PathBuf::from("."), std::path::PathBuf::from);
-                let project_dir = dunce::canonicalize(&raw_project_dir).unwrap_or(raw_project_dir);
-                let root = hook::checkout_root(&project_dir);
-                let local_fingerprint = load_config(&args, &root)
-                    .ok()
-                    .map(|config| config.fingerprint());
-                let out = match mcpls_core::hooks::identity_for(&root) {
-                    Ok(identity) => {
-                        hook::doctor(&project_dir, &root, &identity, local_fingerprint.as_deref())
-                            .await
-                    }
-                    Err(error) => hook::doctor_without_identity(&project_dir, &error),
-                };
-                println!("{out}");
+                write_report(&format!("{}\n", diagnose(&args, None).await.text));
             }
         }
         std::process::exit(0);
@@ -244,16 +251,58 @@ async fn run(args: Args) -> Result<()> {
     Ok(())
 }
 
+/// Write a report to stdout, treating a reader that closed early
+/// (`mcpls config | head`) as done rather than a crash: `print!` panics on
+/// a broken pipe, and both reports are long enough that paging them is the
+/// norm.
+fn write_report(text: &str) {
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(text.as_bytes()).and_then(|()| out.flush());
+}
+
+/// The directory a doctor or config run examines, canonicalized, and where
+/// its name came from.
+fn examined_directory(argument: Option<&std::path::Path>) -> (std::path::PathBuf, Examined) {
+    let (named, examined) = hook::examined_directory(argument);
+    (dunce::canonicalize(&named).unwrap_or(named), examined)
+}
+
+/// Probe the backend for a directory and report what answers.
+///
+/// Reads the same `CLAUDE_PROJECT_DIR` a hook does, canonicalized the same
+/// way, so with no argument it probes exactly the socket a real hook
+/// invocation would.
+async fn diagnose(args: &Args, path: Option<&std::path::Path>) -> Report {
+    let (directory, examined) = examined_directory(path);
+    let root = hook::checkout_root(&directory);
+    let local = resolve_config(args, &root).ok();
+    match mcpls_core::hooks::identity_for(&root) {
+        Ok(identity) => hook::doctor(&directory, examined, &root, &identity, local.as_ref()).await,
+        Err(error) => hook::doctor_without_identity(&directory, examined, &error),
+    }
+}
+
 /// Load the configuration a session in `root` runs with.
 fn load_config(args: &Args, root: &std::path::Path) -> Result<mcpls_core::ServerConfig> {
+    Ok(resolve_config(args, root)?.config)
+}
+
+/// The configuration a session in `root` runs with, and where it came from.
+fn resolve_config(args: &Args, root: &std::path::Path) -> Result<mcpls_core::Resolved> {
     if let Some(config_path) = &args.config {
-        return mcpls_core::ServerConfig::load_from(config_path)
-            .with_context(|| format!("failed to load config from {}", config_path.display()));
+        let config = mcpls_core::ServerConfig::load_from(config_path)
+            .with_context(|| format!("failed to load config from {}", config_path.display()))?;
+        return Ok(mcpls_core::Resolved {
+            config,
+            path: Some(config_path.clone()),
+            ignored_project_config: None,
+        });
     }
     let trust = if args.trust_project_config {
         ProjectConfigTrust::Trusted
     } else {
         ProjectConfigTrust::Untrusted
     };
-    mcpls_core::ServerConfig::load_at(trust, root).context("failed to load configuration")
+    mcpls_core::ServerConfig::resolve_at(trust, root).context("failed to load configuration")
 }

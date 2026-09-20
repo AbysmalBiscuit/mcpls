@@ -140,6 +140,42 @@ pub enum Command {
         shell: Shell,
     },
 
+    /// Report on the backend, the language servers, and the install
+    ///
+    /// Names the socket, the directory both sides resolved, whether a
+    /// backend answers, which configured language servers apply here and
+    /// which of their binaries are installed, and whether `mcpls` resolves
+    /// on `PATH`. Exits non-zero when it finds a fault.
+    Doctor {
+        /// Directory to examine
+        ///
+        /// Defaults to `$CLAUDE_PROJECT_DIR`, then the working directory.
+        #[arg(value_name = "DIR")]
+        path: Option<PathBuf>,
+    },
+
+    /// Print the configuration resolved for a directory
+    ///
+    /// Names the tier that won, the file it came from, the fingerprint, and
+    /// the merged settings including the built-in servers folded in.
+    /// Honors `--config` and `--trust-project-config`, which change the
+    /// answer.
+    Config {
+        /// Directory to resolve the configuration for
+        ///
+        /// Defaults to `$CLAUDE_PROJECT_DIR`, then the working directory.
+        #[arg(value_name = "DIR")]
+        path: Option<PathBuf>,
+
+        /// Annotate each setting with the file it came from
+        #[arg(long)]
+        origin: bool,
+
+        /// Print JSON instead of TOML
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Print the JSON Schema for `mcpls.toml` or initialize a config file
     Schema {
         /// An action to perform instead of printing the schema
@@ -175,9 +211,10 @@ pub enum SchemaAction {
 /// What `mcpls hook` can do besides serving a hook invocation.
 #[derive(Debug, Subcommand)]
 pub enum HookAction {
-    /// Print the socket path, both directory hashes, the backend's pid,
-    /// uptime, sessions, language servers and configuration, and whether
-    /// mcpls resolves on PATH
+    /// Alias for `mcpls doctor`, kept because published troubleshooting
+    /// text spells it this way. It always exits 0, which the hook path
+    /// requires; the top-level command reports a fault in its status.
+    #[command(hide = true)]
     Doctor,
 }
 
@@ -242,6 +279,53 @@ mod tests {
     #[test]
     fn test_completions_rejects_unknown_shell() {
         assert!(Args::try_parse_from(["mcpls", "completions", "tcsh"]).is_err());
+    }
+
+    /// The doctor moved out from under `hook`, where a user had to know
+    /// it was filed under the thing they were not debugging.
+    #[test]
+    fn test_doctor_is_a_top_level_command_taking_an_optional_directory() {
+        assert!(matches!(
+            Args::parse_from(["mcpls", "doctor"]).command,
+            Some(Command::Doctor { path: None })
+        ));
+        assert!(matches!(
+            Args::parse_from(["mcpls", "doctor", "/work"]).command,
+            Some(Command::Doctor { path: Some(path) }) if path == std::path::Path::new("/work")
+        ));
+    }
+
+    /// Published troubleshooting text spells it `mcpls hook doctor`, so
+    /// the old form keeps parsing.
+    #[test]
+    fn test_hook_doctor_still_parses() {
+        assert!(matches!(
+            Args::parse_from(["mcpls", "hook", "doctor"]).command,
+            Some(Command::Hook {
+                action: Some(HookAction::Doctor),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_config_takes_an_optional_directory_and_its_two_flags() {
+        assert!(matches!(
+            Args::parse_from(["mcpls", "config"]).command,
+            Some(Command::Config {
+                path: None,
+                origin: false,
+                json: false
+            })
+        ));
+        assert!(matches!(
+            Args::parse_from(["mcpls", "config", "/work", "--origin", "--json"]).command,
+            Some(Command::Config {
+                path: Some(path),
+                origin: true,
+                json: true
+            }) if path == std::path::Path::new("/work")
+        ));
     }
 
     #[test]

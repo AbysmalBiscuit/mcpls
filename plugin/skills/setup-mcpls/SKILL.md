@@ -14,7 +14,7 @@ metadata:
 
 mcpls is one Rust binary that speaks LSP to real language servers such as rust-analyzer, pyright, gopls, and clangd, and exposes them to an agent as MCP tools. It does no language analysis itself: a language whose server is missing from `PATH` or from the config has no code intelligence, while the other languages keep working.
 
-The binary is the source of truth for its own surface. `mcpls --help` lists every flag, environment variable, and subcommand. `mcpls schema` prints the JSON Schema for `mcpls.toml`. `mcpls hook doctor` reports the running backend, its sessions, language servers, and loaded configuration.
+The binary is the source of truth for its own surface. `mcpls --help` lists every flag, environment variable, and subcommand. `mcpls schema` prints the JSON Schema for `mcpls.toml`. `mcpls doctor` reports the running backend, its sessions, and which language servers apply here and are installed. `mcpls config` prints the configuration resolved for a directory.
 
 Read the reference for the task in front of you:
 

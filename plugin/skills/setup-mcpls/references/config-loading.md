@@ -25,4 +25,4 @@ A checkout's `mcpls.toml` can set the `command` and `args` mcpls spawns, so load
 
 An ignored config is reported in two places: a warning on stderr, which a stdio client rarely shows, and a note appended to the server instructions in the MCP `initialize` response. When the server instructions mention an ignored project config, the file only needs a trust decision.
 
-`mcpls hook doctor` prints the configuration the running backend actually loaded.
+`mcpls config` prints the configuration this checkout resolves to: the tier that won, the file it came from, and the merged settings. It names an ignored project config outright, on a `# ignored:` line, rather than leaving it to be inferred from a fingerprint that does not match what was just written. `mcpls config --origin` goes further and marks each setting with the file that decided it. `mcpls doctor` prints the fingerprint the running backend actually loaded, beside the one this build resolves.

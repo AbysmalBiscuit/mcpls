@@ -64,7 +64,7 @@ pub enum Request {
         /// The Claude Code session that ended.
         session: String,
     },
-    /// Sent by `mcpls hook doctor` to check whether a socket has a live
+    /// Sent by `mcpls doctor` to check whether a socket has a live
     /// owner before falling back to a cold start.
     Status,
 }
@@ -156,7 +156,7 @@ pub enum Response {
         /// sees.
         root: PathBuf,
         /// How many `Changed`, `Flush`, or `EndSession` requests this owner
-        /// has answered since it started, so `mcpls hook doctor` can tell a
+        /// has answered since it started, so `mcpls doctor` can tell a
         /// server that is up but has never been sent a hook apart from one
         /// that is actually wired up to a host.
         hooks_seen: u64,
