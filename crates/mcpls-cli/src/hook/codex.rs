@@ -53,59 +53,47 @@ impl CodexPayload {
     }
 }
 
-/// Every file path an `apply_patch` envelope names, in order, verbatim.
+/// Every file path an `apply_patch` envelope names, in its order and
+/// spelling. An envelope that never opens or never closes names nothing.
+///
+/// Only an unprefixed line inside the envelope reads as a header, since
+/// patch content always sits behind `+`, `-` or a space. Body lines go
+/// uninspected: producers disagree on whether a blank context line keeps
+/// its leading space, and refusing an envelope over one would drop the
+/// attribution for every file it names.
 fn apply_patch_paths(envelope: &str) -> Vec<&str> {
     let mut lines = envelope.lines();
     if lines.next() != Some("*** Begin Patch") {
         return Vec::new();
     }
     let mut paths = Vec::new();
-    let mut mode = "";
-    let mut can_move = false;
-    let mut ended = false;
+    let mut after_update = false;
     for line in lines {
-        if ended {
-            if !line.is_empty() {
-                return Vec::new();
-            }
-            continue;
-        }
         if line == "*** End Patch" {
-            ended = true;
-        } else if let Some(header) = line.strip_prefix("*** ") {
-            let Some((verb, path)) = header.split_once(": ") else {
-                if line == "*** End of File" && mode == "Update File" {
-                    continue;
-                }
-                return Vec::new();
-            };
-            if path.is_empty() {
-                return Vec::new();
-            }
-            match verb {
-                "Add File" | "Update File" | "Delete File" => {
-                    mode = verb;
-                    can_move = verb == "Update File";
-                }
-                "Move to" if can_move => {
-                    can_move = false;
-                }
-                _ => return Vec::new(),
-            }
-            paths.push(path);
-        } else {
-            can_move = false;
-            let valid = match mode {
-                "Add File" => line.starts_with('+'),
-                "Update File" => line.starts_with([' ', '+', '-']) || line.starts_with("@@"),
-                _ => false,
-            };
-            if !valid {
-                return Vec::new();
+            return paths;
+        }
+        let Some((verb, path)) = line
+            .strip_prefix("*** ")
+            .and_then(|header| header.split_once(": "))
+            .filter(|(_, path)| !path.is_empty())
+        else {
+            after_update = false;
+            continue;
+        };
+        match verb {
+            "Add File" | "Delete File" => after_update = false,
+            "Update File" => after_update = true,
+            // A rename names its destination only straight after the
+            // `Update File` whose source it replaces.
+            "Move to" if after_update => after_update = false,
+            _ => {
+                after_update = false;
+                continue;
             }
         }
+        paths.push(path);
     }
-    if ended { paths } else { Vec::new() }
+    Vec::new()
 }
 
 pub(super) async fn run(
@@ -185,6 +173,44 @@ mod tests {
         assert_eq!(
             apply_patch_paths(patch),
             vec!["src/new.rs", "src/old.rs", "src/renamed.rs", "src/gone.rs"]
+        );
+    }
+
+    /// A producer that strips trailing whitespace leaves a blank context
+    /// line bare, with no leading space. The files the patch names are
+    /// still the files it wrote.
+    #[test]
+    fn test_a_bare_blank_context_line_keeps_the_patch_attributed() {
+        let patch = "*** Begin Patch\n\
+                     *** Update File: src/a.rs\n\
+                     @@\n\
+                     -old\n\
+                     \n\
+                     +new\n\
+                     *** End Patch\n";
+        assert_eq!(apply_patch_paths(patch), vec!["src/a.rs"]);
+    }
+
+    #[test]
+    fn test_crlf_and_spaces_in_paths_survive() {
+        let patch = "*** Begin Patch\r\n\
+                     *** Update File: src/old name.rs\r\n\
+                     *** Move to: src/new name.rs\r\n\
+                     @@\r\n\
+                     -a\r\n\
+                     +b\r\n\
+                     *** End Patch\r\n";
+        assert_eq!(
+            apply_patch_paths(patch),
+            vec!["src/old name.rs", "src/new name.rs"]
+        );
+    }
+
+    #[test]
+    fn test_an_unclosed_or_unopened_envelope_names_nothing() {
+        assert!(apply_patch_paths("*** Update File: outside-an-envelope.rs").is_empty());
+        assert!(
+            apply_patch_paths("*** Begin Patch\n*** Update File: src/a.rs\n@@\n+b\n").is_empty()
         );
     }
 }
