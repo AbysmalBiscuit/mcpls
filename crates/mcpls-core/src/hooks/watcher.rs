@@ -474,6 +474,7 @@ async fn run<P: Place>(
                             return;
                         }
                     }
+                    Ok(event) if is_read(event.kind) => {}
                     Ok(event) => {
                         let paths = resolved.configured(&event.paths);
                         let Some(directories) = directories_among(&paths).await else {
@@ -513,6 +514,17 @@ async fn run<P: Place>(
     // Dropping the watcher here releases every descriptor with it, so no
     // watch outlives the backend.
     drop(placement);
+}
+
+/// Whether an event says only that something read the path.
+///
+/// inotify reports opens and reads alongside writes, and mcpls reads what
+/// it sweeps, so answering them is a sweep that causes the next sweep,
+/// with nothing to stop it. A write arrives as `Modify`, `Create` or
+/// `Remove` on every platform, so dropping the reads loses no change --
+/// including the `Close(Write)` ending a save whose `Modify` already came.
+const fn is_read(kind: notify::EventKind) -> bool {
+    matches!(kind, notify::EventKind::Access(_))
 }
 
 /// Which of `paths` are directories right now.
@@ -723,6 +735,7 @@ mod tests {
     use notify::EventKind;
     #[cfg(unix)]
     use notify::event::Flag;
+    use notify::event::{AccessKind, AccessMode};
     use tempfile::TempDir;
 
     use super::*;
@@ -931,6 +944,15 @@ mod tests {
                 .expect("the run loop to still be draining");
         }
 
+        /// Report `path` the way `notify` reports something opening it
+        /// for reading.
+        fn report_read(&self, path: &Path) {
+            let kind = EventKind::Access(AccessKind::Open(AccessMode::Any));
+            self.events
+                .send(Ok(Event::new(kind).add_path(path.to_path_buf())))
+                .expect("the run loop to still be draining");
+        }
+
         /// Report the queue overflowed, which is not a list of paths.
         ///
         /// Only the watch-limit tests drive this, and the watch limit is
@@ -1099,6 +1121,33 @@ mod tests {
         driven.report(&late);
 
         wait_until(|| sweeper.pending_paths().contains(&path)).await;
+    }
+
+    /// Reads are not changes. inotify reports every open, and a sweep
+    /// opens the untracked files it finds, so a sweeper that took its own
+    /// reads for edits would keep sweeping a checkout nobody is editing
+    /// and keep telling the servers a file changed.
+    #[tokio::test]
+    async fn test_a_read_of_a_file_is_not_swept() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let roots: Arc<[PathBuf]> = Arc::from(vec![dir.path().to_path_buf()]);
+        let sweeper = sweeper_over(&roots);
+        let driven = drive(&sweeper, &roots, None);
+        let read = dir.path().join("read.rs");
+        let written = dir.path().join("written.rs");
+        std::fs::write(&read, "fn main() {}").expect("write");
+        std::fs::write(&written, "fn main() {}").expect("write");
+
+        driven.report_read(&read);
+        // The loop takes events in order, so the write landing proves the
+        // read ahead of it has already been handled.
+        driven.report(&written);
+        wait_until(|| sweeper.pending_paths().contains(&written)).await;
+
+        assert!(
+            !sweeper.pending_paths().contains(&read),
+            "a file mcpls only read must not come back as a change"
+        );
     }
 
     /// The watch limit is the same failure after startup as at it: a
