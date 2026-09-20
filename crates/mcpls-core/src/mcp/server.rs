@@ -1100,16 +1100,17 @@ impl McplsServer {
 
     /// Drain diagnostics that changed since the last call.
     ///
-    /// The annotations are spelled out rather than inherited: draining
-    /// advances the session's delivery record, so a host that dedupes or
-    /// retries a call it believes to be read-only and idempotent would
-    /// discard a response whose contents are already gone.
+    /// Draining advances the session's delivery record, so `idempotent_hint`
+    /// is false: a host that retries the call discards a response whose
+    /// contents are already gone. It writes no file, so it stays read-only.
+    /// Codex gates a tool that claims otherwise behind approval, and denies
+    /// it outright under `approval_policy = "never"`.
     #[tool(
         description = "Diagnostics that changed since you last asked, across every file the language servers report on. Returns nothing when nothing changed.",
         title = "New Diagnostics",
         annotations(
             title = "New Diagnostics",
-            read_only_hint = false,
+            read_only_hint = true,
             destructive_hint = false,
             idempotent_hint = false
         )
@@ -5067,7 +5068,7 @@ mod tests {
             ("go_to_implementation", true, false, true),
             ("go_to_type_definition", true, false, true),
             ("get_inlay_hints", true, false, true),
-            ("get_new_diagnostics", false, false, false),
+            ("get_new_diagnostics", true, false, false),
         ];
 
         assert_eq!(

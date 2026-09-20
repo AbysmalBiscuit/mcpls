@@ -435,3 +435,26 @@ fn a_new_cycle_survives_an_older_acknowledgment() {
     assert_eq!(delivery.flush(&b.record, &latest).changed.len(), 1);
     assert_eq!(delivery.flush(&a.record, &latest).changed.len(), 1);
 }
+
+#[test]
+fn a_late_baseline_merge_still_owes_a_claimed_file_to_its_writer() {
+    let mut delivery = DiagnosticsDelivery::new(DiagnosticsConfig::default());
+    delivery.set_baseline(HashMap::new());
+    let root = caller("root", "root");
+    let errors = vec![diagnostic(0, DiagnosticSeverity::ERROR, "boom")];
+    let entries = [entry("a.rs", &errors, SeverityFloor::Warning)];
+    delivery.record_write(&root, &["a.rs".into()]);
+    delivery.merge_baseline(HashMap::from([(
+        "a.rs".to_string(),
+        DiagnosticsDelivery::visible_hash(&errors, SeverityFloor::Warning).unwrap(),
+    )]));
+    assert_eq!(
+        delivery
+            .flush(&root.record, &entries)
+            .changed
+            .iter()
+            .map(|file| file.key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a.rs"]
+    );
+}

@@ -744,7 +744,7 @@
     },
     "annotations": {
       "title": "New Diagnostics",
-      "readOnlyHint": false,
+      "readOnlyHint": true,
       "destructiveHint": false,
       "idempotentHint": false
     }
