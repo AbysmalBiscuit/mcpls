@@ -1208,7 +1208,7 @@ fn executable_extensions(path_ext: Option<&std::ffi::OsStr>) -> Vec<String> {
 }
 
 #[cfg(not(windows))]
-fn executable_extensions(_path_ext: Option<&std::ffi::OsStr>) -> Vec<String> {
+const fn executable_extensions(_path_ext: Option<&std::ffi::OsStr>) -> Vec<String> {
     Vec::new()
 }
 
