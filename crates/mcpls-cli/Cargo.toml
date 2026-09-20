@@ -24,6 +24,7 @@ mcpls-core = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
+toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 
@@ -32,7 +33,6 @@ assert_cmd = { workspace = true }
 predicates = { workspace = true }
 strum = { workspace = true }
 tempfile = { workspace = true }
-toml = { workspace = true }
 
 [features]
 default = []

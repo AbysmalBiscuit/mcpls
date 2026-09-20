@@ -2,7 +2,7 @@
 //!
 //! The format is frozen. A build that cannot speak another build's protocol
 //! still reads this line and answers it, which is what lets a newer
-//! frontend ask an idle older backend to exit and lets `mcpls hook doctor`
+//! frontend ask an idle older backend to exit and lets `mcpls doctor`
 //! name the build it reached. Fields are only added, each optional or
 //! defaulted, and no reader rejects a field or a refusal it does not know.
 //!
@@ -112,7 +112,7 @@ impl Handshake {
         }
     }
 
-    /// A hook invocation or `mcpls hook doctor`.
+    /// A hook invocation or `mcpls doctor`.
     #[must_use]
     pub fn hook() -> Self {
         Self::bare(ConnectionKind::Hook)

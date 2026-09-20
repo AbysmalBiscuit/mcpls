@@ -1,6 +1,6 @@
 # Troubleshooting mcpls
 
-Start with `mcpls hook doctor`: it shows whether a backend is running, its language servers, the configuration it loaded, and whether `mcpls` resolves on `PATH`. For startup failures, rerun with `--log-level debug` (or `trace`) and read stderr.
+Start with `mcpls doctor`: it shows whether a backend is running, which configured language servers apply to this checkout and which of their binaries are installed, the configuration it loaded, and whether `mcpls` resolves on `PATH`. It ends with the faults worth acting on and exits non-zero when it found any. `mcpls config` prints the settings themselves. For startup failures, rerun with `--log-level debug` (or `trace`) and read stderr.
 
 | Symptom | Cause and fix |
 |---|---|

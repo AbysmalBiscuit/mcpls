@@ -24,7 +24,8 @@ With no subcommand, mcpls runs the MCP server. The others print and exit:
 
 - `mcpls completions <shell>` prints a shell completion script.
 - `mcpls schema` prints the `mcpls.toml` JSON Schema; `mcpls schema init` writes a default `mcpls.toml` in the current directory.
-- `mcpls hook doctor` reports the socket path, the backend's pid, uptime, sessions, language servers, configuration, and whether `mcpls` resolves on `PATH`.
+- `mcpls doctor [DIR]` reports the socket path, the backend's pid, uptime, sessions, language servers, configuration, and whether `mcpls` resolves on `PATH`. Without `DIR` it examines `$CLAUDE_PROJECT_DIR`, then the working directory; the report names which. It exits non-zero on a fault. `mcpls hook doctor` is an alias that always exits 0, which the hook registrations require.
+- `mcpls config [DIR] [--origin] [--json]` prints the configuration resolved for a directory: the tier that won, the file it came from, the fingerprint, and the merged settings with the built-in servers folded in. `--origin` annotates each setting with the file that decided it, or marks it a default. `--json` prints the configuration alone, so a script can read it back. Honors `--config` and `--trust-project-config`, which change the answer.
 - `mcpls hook` with no action serves one agent hook invocation from stdin. The plugins register it; running it by hand is rarely useful.
 
 ## Registering with an MCP client

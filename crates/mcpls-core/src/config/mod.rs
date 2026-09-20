@@ -920,6 +920,25 @@ pub enum ProjectConfigTrust {
     Trusted,
 }
 
+/// A configuration together with where it came from.
+///
+/// [`ServerConfig::load_at`] answers with the configuration alone, which
+/// leaves a reader unable to tell a global file from a trusted project one,
+/// or to see that discovery found an `mcpls.toml` and skipped it. `mcpls
+/// config` and `mcpls doctor` report exactly that, so resolution hands the
+/// provenance back alongside the settings.
+#[derive(Debug, Clone)]
+pub struct Resolved {
+    /// The configuration in effect.
+    pub config: ServerConfig,
+    /// The file it was read from, or `None` when nothing but the built-in
+    /// defaults applied.
+    pub path: Option<PathBuf>,
+    /// A checkout-root `mcpls.toml` that discovery found and skipped for
+    /// lack of trust.
+    pub ignored_project_config: Option<PathBuf>,
+}
+
 /// Maximum size, in bytes, of a config file `load_from` will read.
 ///
 /// A config file is trusted TOML on a normal setup, but nothing stops a
@@ -1068,12 +1087,29 @@ impl ServerConfig {
     /// Returns an error if `start` cannot be canonicalized or parsing an
     /// existing config fails.
     pub fn load_at(trust: ProjectConfigTrust, start: &Path) -> Result<Self> {
+        Ok(Self::resolve_at(trust, start)?.config)
+    }
+
+    /// Load configuration at the checkout root enclosing `start`, keeping
+    /// the file it came from and any project config discovery skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `start` cannot be canonicalized or parsing an
+    /// existing config fails.
+    pub fn resolve_at(trust: ProjectConfigTrust, start: &Path) -> Result<Resolved> {
         if let Ok(path) = std::env::var("MCPLS_CONFIG") {
-            return Self::load_from(Path::new(&path));
+            let path = PathBuf::from(path);
+            let config = Self::load_from(&path)?;
+            return Ok(Resolved {
+                config,
+                path: Some(path),
+                ignored_project_config: None,
+            });
         }
 
         let root = crate::hooks::project_root(start)?;
-        let mut project_config_ignored = false;
+        let mut ignored_project_config = None;
 
         let local_config = root.join("mcpls.toml");
         if local_config.is_file() {
@@ -1081,10 +1117,14 @@ impl ServerConfig {
                 ProjectConfigTrust::Trusted => {
                     let mut config = Self::load_from(&local_config)?;
                     config.source = ConfigSource::Project;
-                    return Ok(config);
+                    return Ok(Resolved {
+                        config,
+                        path: Some(local_config),
+                        ignored_project_config: None,
+                    });
                 }
                 ProjectConfigTrust::Untrusted => {
-                    project_config_ignored = true;
+                    ignored_project_config = Some(local_config.clone());
                     tracing::warn!(
                         "ignoring untrusted project-local config at {}; pass \
                          --trust-project-config (or set MCPLS_TRUST_PROJECT_CONFIG=true) to \
@@ -1095,6 +1135,8 @@ impl ServerConfig {
             }
         }
 
+        let project_config_ignored = ignored_project_config.is_some();
+
         if let Some(config_dir) = dirs::config_dir() {
             let user_config = config_dir.join("mcpls").join("mcpls.toml");
             if user_config.exists() {
@@ -1102,7 +1144,11 @@ impl ServerConfig {
                     Self::load_from_with_root_base(&user_config, &RelativeRootBase::Dir(root))?;
                 config.project_config_ignored = project_config_ignored;
                 config.source = ConfigSource::Global;
-                return Ok(config);
+                return Ok(Resolved {
+                    config,
+                    path: Some(user_config),
+                    ignored_project_config,
+                });
             }
 
             // No config found - create default config file
@@ -1118,10 +1164,23 @@ impl ServerConfig {
         }
 
         // Return default configuration
-        Ok(Self {
-            project_config_ignored,
-            ..Self::default()
+        Ok(Resolved {
+            config: Self {
+                project_config_ignored,
+                ..Self::default()
+            },
+            path: None,
+            ignored_project_config,
         })
+    }
+
+    /// This configuration rendered as the TOML a user would write.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a setting cannot be represented in TOML.
+    pub fn to_toml(&self) -> std::result::Result<String, toml::ser::Error> {
+        toml::to_string_pretty(self)
     }
 
     /// Load configuration from a specific path.

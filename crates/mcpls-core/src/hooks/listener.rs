@@ -579,7 +579,7 @@ fn acknowledgement_for(requests: &[Request], responses: &[Response]) -> Option<R
 ///
 /// [`send`] and [`send_many`] collapse everything short of a clean answer
 /// into one `Err`, which is right for every hook arm that only cares
-/// whether it got an answer back. `mcpls hook doctor` needs the finer
+/// whether it got an answer back. `mcpls doctor` needs the finer
 /// distinctions: a `Refused` handshake means an owner answered and rejected
 /// this connection; `NoOwner` means the transport connection could not be
 /// made, so looking for one running a different directory is the right next
@@ -775,7 +775,7 @@ impl Connection {
     /// The one place that writes the request framing and reads the
     /// response framing, for [`send_many_inner`], [`answer_one`] and
     /// [`send_and_acknowledge`] alike: if any two disagreed on either,
-    /// `mcpls hook doctor` would misread a healthy owner's answer and
+    /// `mcpls doctor` would misread a healthy owner's answer and
     /// report [`ProbeOutcome::Busy`] for it, which is exactly the
     /// misdiagnosis this module exists to prevent.
     async fn exchange(&mut self, requests: &[Request]) -> Result<Vec<Response>> {
@@ -1227,7 +1227,7 @@ mod runtime_dir_tests {
 }
 
 /// `probe`'s whole guarantee otherwise lived one crate away, exercised
-/// only indirectly through `mcpls hook doctor`'s own tests. Unix-only:
+/// only indirectly through `mcpls doctor`'s own tests. Unix-only:
 /// the Windows connect path is `probe_connect_phase`'s separate branch,
 /// covered by `classify_tests` above rather than by binding a real pipe
 /// here.

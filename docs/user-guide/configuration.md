@@ -752,7 +752,7 @@ How long a footer waits in total before reporting whatever it has, `footer_grace
 
 The `mcpls` an MCP client launches is a small stdio frontend. The first session in a checkout starts one backend for that checkout in the background, and every later session in the same checkout, from any subdirectory, attaches to it and shares its language servers. Two worktrees of one repository are two checkouts and get a backend each. On Windows the frontend cannot start the backend itself, so the next Claude Code hook invocation starts it; a session with no hooks installed reports that it is waiting for its backend.
 
-A frontend whose configuration fingerprint differs from the running backend's still attaches, and the backend's configuration stays in effect; the session's server instructions name both fingerprints. A frontend that trusts the project's `mcpls.toml` when the backend does not, or the reverse, is refused. `mcpls hook doctor` shows the backend's pid, uptime, attached sessions, language servers and configuration fingerprint.
+A frontend whose configuration fingerprint differs from the running backend's still attaches, and the backend's configuration stays in effect; the session's server instructions name both fingerprints. A frontend that trusts the project's `mcpls.toml` when the backend does not, or the reverse, is refused. `mcpls doctor` shows the backend's pid, uptime, attached sessions, language servers and configuration fingerprint, and `mcpls config` prints the configuration itself.
 
 Pass `--no-backend` (or set `MCPLS_NO_BACKEND=true`) to serve one session entirely in-process instead, for debugging or for a host where a background process cannot run.
 
