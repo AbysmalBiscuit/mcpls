@@ -615,11 +615,15 @@ impl Runtime {
 
         let applicable_configs =
             applicable_server_configs(config, &workspace_roots, max_depth, &watch_registry);
-
-        info!(
-            "Attempting to spawn {} applicable LSP server(s)...",
-            applicable_configs.len()
-        );
+        let eager_configs = partition_spawn_configs(config, &applicable_configs);
+        if !applicable_configs.is_empty() {
+            info!(
+                "{} applicable LSP server(s): {} eager, spawning now; {} lazy, idle until first use",
+                applicable_configs.len(),
+                eager_configs.len(),
+                applicable_configs.len() - eager_configs.len()
+            );
+        }
 
         // Built over the applicable (post-heuristics) configs only: this is where
         // #174's workspace-scoped routing rules (duplicate ServerId, conflicting
@@ -738,8 +742,6 @@ impl Runtime {
             notification_lifecycle::NotificationPumps::new(pump_shared.clone(), cancel_rx.clone())
         });
 
-        let eager_configs = partition_spawn_configs(config, &applicable_configs);
-
         let lsp_init_handle = if applicable_configs.is_empty() {
             warn!("No applicable LSP servers configured — starting in protocol-only mode");
             // No server will ever be spawned, so `baseline_task` never runs and
@@ -753,10 +755,6 @@ impl Runtime {
             delivery.lock().await.set_baseline(HashMap::new());
             None
         } else {
-            info!(
-                "Spawning {} LSP server(s) in the background...",
-                eager_configs.len()
-            );
             Some(spawn_lsp_servers_background(
                 eager_configs,
                 Arc::clone(&translator),
@@ -1225,7 +1223,11 @@ fn spawn_lsp_servers_background(
         for id in registered.diagnostics_flags.keys() {
             translator.set_lifecycle(id, ServerLifecycle::Running);
         }
-        info!("Proceeding with {} LSP server(s)", server_count);
+        info!(
+            "Started {} of {} eager LSP server(s)",
+            server_count,
+            applicable_configs.len()
+        );
 
         let diagnostics_owners = registered
             .diagnostics_flags
