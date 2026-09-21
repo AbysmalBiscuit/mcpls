@@ -26,8 +26,8 @@ pub fn render(config: &ServerConfig, root: &Path) -> Option<String> {
         .iter()
         .map(|server| server.language_id.clone())
         .collect();
-    // A missing binary stats every `PATH` entry, slow Windows mounts on WSL
-    // included, so each lookup runs on its own thread beside the scan.
+    // A missing binary stats every `PATH` entry, so each lookup runs on its
+    // own thread beside the scan.
     let servers: Vec<String> = std::thread::scope(|scope| {
         #[expect(
             clippy::needless_collect,
@@ -37,7 +37,7 @@ pub fn render(config: &ServerConfig, root: &Path) -> Option<String> {
             .into_iter()
             .map(|server| {
                 let installed =
-                    scope.spawn(|| crate::hook::resolve_program(&server.command).is_some());
+                    scope.spawn(|| crate::hook::resolve_program(&server.command, root).is_some());
                 (server, installed)
             })
             .collect();
