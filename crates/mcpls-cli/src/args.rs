@@ -195,6 +195,19 @@ pub enum Command {
         json: bool,
     },
 
+    /// Start, stop, restart, or list the language servers a checkout's
+    /// backend runs
+    ///
+    /// Talks to the running backend. A stopped server stays stopped until
+    /// `mcpls lsp start` or `restart`, or until the backend exits. Exits
+    /// non-zero when a server misses the state asked for, or no backend
+    /// answers.
+    Lsp {
+        /// What to do
+        #[command(subcommand)]
+        action: LspCommand,
+    },
+
     /// Print the JSON Schema for `mcpls.toml` or initialize a config file
     Schema {
         /// An action to perform instead of printing the schema
@@ -269,6 +282,62 @@ pub enum BackendAction {
         #[arg(value_name = "DIR")]
         path: Option<PathBuf>,
     },
+}
+
+/// Actions for `mcpls lsp`.
+#[derive(Debug, Subcommand)]
+pub enum LspCommand {
+    /// Print each applicable server and its state
+    Status {
+        /// Directory whose backend to ask
+        ///
+        /// Defaults to `$CLAUDE_PROJECT_DIR`, then the working directory.
+        #[arg(long, value_name = "DIR")]
+        dir: Option<PathBuf>,
+    },
+    /// Start servers that are not running
+    Start {
+        #[command(flatten)]
+        targets: LspTargets,
+        /// Return without waiting for the servers to finish starting
+        #[arg(long)]
+        no_wait: bool,
+    },
+    /// Shut servers down and keep them down
+    Stop {
+        #[command(flatten)]
+        targets: LspTargets,
+    },
+    /// Replace running servers' processes, starting any that are not running
+    Restart {
+        #[command(flatten)]
+        targets: LspTargets,
+        /// Return without waiting for the servers to finish starting
+        #[arg(long)]
+        no_wait: bool,
+    },
+}
+
+/// The servers an `mcpls lsp` action applies to.
+#[derive(Debug, clap::Args)]
+pub struct LspTargets {
+    /// Server ids, as `mcpls lsp status` prints them
+    #[arg(
+        value_name = "SERVER",
+        required_unless_present = "all",
+        conflicts_with = "all"
+    )]
+    pub servers: Vec<String>,
+
+    /// Every server that applies to the checkout
+    #[arg(long)]
+    pub all: bool,
+
+    /// Directory whose backend to ask
+    ///
+    /// Defaults to `$CLAUDE_PROJECT_DIR`, then the working directory.
+    #[arg(long, value_name = "DIR")]
+    pub dir: Option<PathBuf>,
 }
 
 /// Actions for `mcpls schema`.
@@ -633,5 +702,34 @@ mod tests {
             let expected: SocketAddr = "[::1]:4000".parse().unwrap();
             assert_eq!(args.listen, Some(expected));
         }
+    }
+
+    #[test]
+    fn test_lsp_actions_take_servers_or_all_but_not_both() {
+        assert!(matches!(
+            Args::parse_from(["mcpls", "lsp", "start", "rust", "lua"]).command,
+            Some(Command::Lsp {
+                action: LspCommand::Start { targets, no_wait: false }
+            }) if targets.servers == ["rust", "lua"] && !targets.all
+        ));
+        assert!(matches!(
+            Args::parse_from(["mcpls", "lsp", "stop", "--all", "--dir", "/work"]).command,
+            Some(Command::Lsp {
+                action: LspCommand::Stop { targets }
+            }) if targets.all && targets.dir.as_deref() == Some(std::path::Path::new("/work"))
+        ));
+        assert!(Args::try_parse_from(["mcpls", "lsp", "stop", "rust", "--all"]).is_err());
+        assert!(Args::try_parse_from(["mcpls", "lsp", "restart"]).is_err());
+    }
+
+    #[test]
+    fn test_lsp_status_takes_only_a_directory() {
+        assert!(matches!(
+            Args::parse_from(["mcpls", "lsp", "status"]).command,
+            Some(Command::Lsp {
+                action: LspCommand::Status { dir: None }
+            })
+        ));
+        assert!(Args::try_parse_from(["mcpls", "lsp", "stop", "rust", "--no-wait"]).is_err());
     }
 }
