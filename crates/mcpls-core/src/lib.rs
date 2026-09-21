@@ -1193,7 +1193,7 @@ fn spawn_lsp_servers_background(
                 translator.record_spawn_error(&failure.server_id, failure.message.clone());
                 ServerLifecycle::Failed
             };
-            translator.set_lifecycle(&failure.server_id, state);
+            translator.set_lifecycle_unless_stopped(&failure.server_id, state);
         }
 
         if result.all_failed() {
@@ -1222,7 +1222,9 @@ fn spawn_lsp_servers_background(
         let server_count = result.server_count();
         let registered = register_servers(result, &translator);
         for id in registered.diagnostics_flags.keys() {
-            translator.set_lifecycle(id, ServerLifecycle::Running);
+            if !translator.set_lifecycle_unless_stopped(id, ServerLifecycle::Running) {
+                translator.tear_down(id).await;
+            }
         }
         info!(
             "Started {} of {} eager LSP server(s)",
@@ -1233,7 +1235,9 @@ fn spawn_lsp_servers_background(
         let diagnostics_owners = registered
             .diagnostics_flags
             .iter()
-            .filter(|&(_, &is_route)| is_route)
+            .filter(|&(id, &is_route)| {
+                is_route && translator.lifecycle_of(id) != Some(ServerLifecycle::Stopped)
+            })
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
         #[cfg(all(test, unix))]

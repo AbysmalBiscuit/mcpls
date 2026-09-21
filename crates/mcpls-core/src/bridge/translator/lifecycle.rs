@@ -62,10 +62,6 @@ impl Translator {
 
     /// Return a stopped, missing, or failed `id` to `Idle` so an explicit
     /// start may claim it.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "explicit starts arrive with lsp control")
-    )]
     pub(crate) fn reset_for_explicit_start(&self, id: &ServerId) {
         let mut states = lock_std(&self.lifecycles);
         if matches!(

@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use tokio::sync::Mutex;
 
 use self::clock::{Clock, SystemClock};
+pub use self::control::LspAction;
 use self::encoding_ctx::EncodingCtx;
 pub use self::lifecycle::ServerLifecycle;
 use self::respawn::RespawnBackoff;
@@ -27,6 +28,7 @@ use crate::lsp::{LspClient, LspServer, ServerInitConfig, WatchRegistry};
 mod assist;
 mod call_hierarchy;
 mod clock;
+mod control;
 mod diagnostics;
 mod dto;
 mod edits;
@@ -218,6 +220,27 @@ pub enum OpenOutcome {
 /// single LSP server's graceful `shutdown`/`exit` handshake before giving up
 /// and letting `kill_on_drop` terminate it instead.
 const SERVER_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Shut `server` down with the LSP `shutdown`/`exit` handshake, letting
+/// `kill_on_drop` end it when that fails or outlasts
+/// [`SERVER_SHUTDOWN_TIMEOUT`]. A process that already exited is only
+/// reaped.
+pub(super) async fn shut_down_server(id: ServerId, mut server: LspServer) {
+    if matches!(server.has_exited(), Ok(true)) {
+        return;
+    }
+    match tokio::time::timeout(SERVER_SHUTDOWN_TIMEOUT, server.shutdown()).await {
+        Ok(Ok(())) => tracing::debug!(%id, "LSP server shut down gracefully"),
+        Ok(Err(e)) => tracing::warn!(
+            %id, error = %e,
+            "LSP server shutdown handshake failed, killing process instead"
+        ),
+        Err(_) => tracing::warn!(
+            %id, timeout = ?SERVER_SHUTDOWN_TIMEOUT,
+            "LSP server did not shut down in time, killing process instead"
+        ),
+    }
+}
 
 impl Translator {
     /// Create a new translator.
@@ -1038,19 +1061,7 @@ impl Translator {
 
         let mut tasks = tokio::task::JoinSet::new();
         for (id, server) in servers {
-            tasks.spawn(async move {
-                match tokio::time::timeout(SERVER_SHUTDOWN_TIMEOUT, server.shutdown()).await {
-                    Ok(Ok(())) => tracing::debug!(%id, "LSP server shut down gracefully"),
-                    Ok(Err(e)) => tracing::warn!(
-                        %id, error = %e,
-                        "LSP server shutdown handshake failed, killing process instead"
-                    ),
-                    Err(_) => tracing::warn!(
-                        %id, timeout = ?SERVER_SHUTDOWN_TIMEOUT,
-                        "LSP server did not shut down in time, killing process instead"
-                    ),
-                }
-            });
+            tasks.spawn(shut_down_server(id, server));
         }
         tasks.join_all().await;
     }
