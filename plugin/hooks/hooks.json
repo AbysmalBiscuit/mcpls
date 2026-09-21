@@ -5,15 +5,26 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" bootstrap-binaries claude",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" bootstrap-binaries claude-code",
             "timeout": 300
           }
         ]
       }
     ],
-    "PostToolUse": [{ "matcher": "Write|Edit|MultiEdit", "hooks": [{ "type": "command", "command": "mcpls hook" }] }],
-    "PostToolBatch": [{ "hooks": [{ "type": "command", "command": "mcpls hook" }] }],
-    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "mcpls hook" }] }],
-    "SessionEnd": [{ "hooks": [{ "type": "command", "command": "mcpls hook" }] }]
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [{ "type": "command", "command": "mcpls hook post-tool-use --harness claude-code" }]
+      }
+    ],
+    "PostToolBatch": [
+      { "hooks": [{ "type": "command", "command": "mcpls hook post-tool-batch --harness claude-code" }] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "mcpls hook user-prompt-submit --harness claude-code" }] }
+    ],
+    "SessionEnd": [
+      { "hooks": [{ "type": "command", "command": "mcpls hook session-end --harness claude-code" }] }
+    ]
   }
 }

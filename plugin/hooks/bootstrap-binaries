@@ -2,7 +2,7 @@
 # SessionStart hook: ensure the mcpls this plugin drives is on PATH and matches
 # the plugin's version, installing it from the matching GitHub release.
 #
-# Usage: bootstrap-binaries <claude|codex>
+# Usage: bootstrap-binaries <claude-code|codex>
 #
 # The MCP server and every other hook run `mcpls` from PATH, and a plugin
 # install cannot place it there, so this runs at session start instead.
@@ -23,7 +23,7 @@ MANIFEST="${PLUGIN_ROOT}/.claude-plugin/plugin.json"
 
 # Installs are serialised per harness, so the lock is named after it.
 case "${1:-}" in
-    claude | codex) harness="$1" ;;
+    claude-code | codex) harness="$1" ;;
     *) harness=unknown ;;
 esac
 

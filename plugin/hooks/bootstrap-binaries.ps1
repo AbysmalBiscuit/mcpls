@@ -1,7 +1,7 @@
 # SessionStart hook: ensure the mcpls this plugin drives is on PATH and matches
 # the plugin's version, installing it from the matching GitHub release.
 #
-# Usage: bootstrap-binaries.ps1 <claude|codex>
+# Usage: bootstrap-binaries.ps1 <claude-code|codex>
 #
 # PowerShell twin of `bootstrap-binaries`, for Windows hosts with no bash.
 # Both resolve the same state paths and locks, so a machine that later gains
@@ -22,7 +22,7 @@ $manifest = Join-Path $pluginRoot '.claude-plugin/plugin.json'
 
 # Installs are serialised per harness, so the lock is named after it.
 $harness = 'unknown'
-if ($args.Count -gt 0 -and $args[0] -in @('claude', 'codex')) { $harness = $args[0] }
+if ($args.Count -gt 0 -and $args[0] -in @('claude-code', 'codex')) { $harness = $args[0] }
 
 function Write-Note($message) { [Console]::Error.WriteLine("mcpls plugin: $message") }
 

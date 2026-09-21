@@ -845,7 +845,20 @@ async fn test_hook_context_outputs_name_the_triggering_event_through_cli() {
         rx,
     ));
     tokio::task::spawn_blocking(move || {
-        for event in ["UserPromptSubmit", "PostToolBatch"] {
+        // The bare `mcpls hook` is how a manifest installed before the
+        // verbs reads, and it names its event only in the payload.
+        let invocations: [(&str, &[&str]); 3] = [
+            (
+                "UserPromptSubmit",
+                &["hook", "user-prompt-submit", "--harness", "claude-code"],
+            ),
+            (
+                "PostToolBatch",
+                &["hook", "post-tool-batch", "--harness", "claude-code"],
+            ),
+            ("UserPromptSubmit", &["hook"]),
+        ];
+        for (event, args) in invocations {
             let mut cmd = Command::cargo_bin("mcpls").unwrap();
             clear_ambient_env(&mut cmd);
             let output = assert_cmd::Command::from_std(cmd)
@@ -853,7 +866,7 @@ async fn test_hook_context_outputs_name_the_triggering_event_through_cli() {
                 .env_remove("XDG_RUNTIME_DIR")
                 .env("TMPDIR", runtime.path())
                 .env("USER", "mcpls-test")
-                .arg("hook")
+                .args(args)
                 .write_stdin(
                     serde_json::json!({"hook_event_name": event, "session_id": "test"}).to_string(),
                 )
@@ -875,6 +888,24 @@ async fn test_hook_context_outputs_name_the_triggering_event_through_cli() {
     .unwrap();
     cancel.send(true).unwrap();
     owner.await.unwrap();
+}
+
+/// Exit 2 is a verdict to both harnesses: Claude Code erases a submitted
+/// prompt on it, and Codex blocks the tool call. A verb this binary does not
+/// know, from a manifest newer than it, has to fail as an error instead.
+#[test]
+fn test_an_unknown_hook_verb_exits_1_not_2() {
+    for args in [
+        &["hook", "not-a-verb"][..],
+        &["hook", "user-prompt-submit", "--harness", "emacs"],
+    ] {
+        let mut cmd = Command::cargo_bin("mcpls").unwrap();
+        clear_ambient_env(&mut cmd)
+            .args(args)
+            .assert()
+            .code(1)
+            .stderr(predicate::str::is_empty().not());
+    }
 }
 
 /// A Codex hook names its project in the payload's `cwd` rather than in
@@ -924,7 +955,18 @@ async fn test_codex_hook_reaches_the_owner_named_by_the_payload_cwd() {
         rx,
     ));
     tokio::task::spawn_blocking(move || {
-        for event in ["UserPromptSubmit", "PostToolUse"] {
+        let invocations: [(&str, &[&str]); 3] = [
+            (
+                "UserPromptSubmit",
+                &["hook", "user-prompt-submit", "--harness", "codex"],
+            ),
+            (
+                "PostToolUse",
+                &["hook", "post-tool-use", "--harness", "codex"],
+            ),
+            ("PostToolUse", &["hook", "--host", "codex"]),
+        ];
+        for (event, args) in invocations {
             let mut cmd = Command::cargo_bin("mcpls").unwrap();
             clear_ambient_env(&mut cmd);
             let output = assert_cmd::Command::from_std(cmd)
@@ -933,7 +975,7 @@ async fn test_codex_hook_reaches_the_owner_named_by_the_payload_cwd() {
                 .env_remove("XDG_RUNTIME_DIR")
                 .env("TMPDIR", runtime.path())
                 .env("USER", "mcpls-test")
-                .args(["hook", "--host", "codex"])
+                .args(args)
                 .write_stdin(
                     serde_json::json!({
                         "hook_event_name": event,

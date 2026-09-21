@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use crate::completions::Shell;
-use crate::hook::Host;
+use crate::hook::{Harness, HookEvent};
 
 /// Parses a boolean flag/env value, accepting common truthy and falsy
 /// spellings beyond the strict `"true"`/`"false"` that `str::parse::<bool>`
@@ -185,17 +185,23 @@ pub enum Command {
 
     /// Serve one agent hook invocation
     ///
-    /// With no argument, reads the hook payload from stdin and writes hook
-    /// JSON to stdout, dispatching on the payload's own `hook_event_name`.
-    /// One subcommand rather than one per event means no shell script and the
-    /// registrations work on Windows.
+    /// Reads the hook payload for EVENT from stdin and writes hook JSON to
+    /// stdout. With no EVENT, the payload's own `hook_event_name` names it,
+    /// which is how a manifest from before the verbs reads.
+    #[command(subcommand_value_name = "EVENT", subcommand_help_heading = "Events")]
     Hook {
         /// The harness that spawned this hook, which decides where the
         /// project directory comes from
-        #[arg(long, value_enum, default_value_t = Host::Claude)]
-        host: Host,
+        #[arg(
+            long,
+            alias = "host",
+            value_enum,
+            default_value_t = Harness::ClaudeCode,
+            global = true
+        )]
+        harness: Harness,
 
-        /// What to do instead of reading a hook payload from stdin
+        /// The event to answer
         #[command(subcommand)]
         action: Option<HookAction>,
     },
@@ -203,12 +209,15 @@ pub enum Command {
 
 /// Actions for `mcpls schema`.
 #[derive(Debug, Subcommand)]
+    #[command(flatten)]
+    Event(HookEvent),
+
 pub enum SchemaAction {
     /// Create a default `mcpls.toml` in the current directory
     Init,
 }
 
-/// What `mcpls hook` can do besides serving a hook invocation.
+/// Actions for `mcpls hook`.
 #[derive(Debug, Subcommand)]
 pub enum HookAction {
     /// Alias for `mcpls doctor`, kept because published troubleshooting

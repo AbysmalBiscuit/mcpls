@@ -1,11 +1,10 @@
 //! Dispatching one agent hook invocation.
 //!
-//! A hook registration spawns `mcpls hook`, writes one JSON payload to its
-//! stdin, and reads one JSON payload back from its stdout. Routing on the
-//! payload's own `hook_event_name` here, in one binary, means there is no
-//! shell script translating hook names into subcommands, and the same
-//! registrations work unmodified on Windows. Claude Code and Codex send
-//! different payload shapes, so `--host` picks which dispatcher reads it.
+//! A hook registration spawns `mcpls hook <event> --harness <name>`, writes
+//! one JSON payload to its stdin, and reads one JSON payload back from its
+//! stdout. The spelling is devkit's, so one manifest reads the same for both
+//! tools. Claude Code and Codex send different payload shapes, so
+//! `--harness` picks which dispatcher reads it.
 
 mod codex;
 
@@ -20,7 +19,7 @@ use mcpls_core::hooks::{
     ChangeEvent, ProbeOutcome, Request, Response, SocketIdentity, WatcherStatus, probe, send,
     send_and_acknowledge,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// How long a hook waits for an answer to `Changed` or `EndSession`, which
 /// carry no context back and are never worth stalling an edit for.
@@ -33,19 +32,54 @@ const FLUSH_SOCKET_TIMEOUT: Duration = Duration::from_millis(1500);
 /// The agent harness that spawned a hook, which decides where its project
 /// directory and session identity come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum Host {
+pub enum Harness {
     /// Claude Code, which names the project in `CLAUDE_PROJECT_DIR`.
-    Claude,
+    #[value(alias = "claude")]
+    ClaudeCode,
     /// Codex, which names the project in every payload's `cwd`.
     Codex,
 }
 
+/// The hook events mcpls answers, one verb per harness event.
+///
+/// The serde spelling is the harness's own `hook_event_name`, which a
+/// manifest from before the verbs leaves as the only name the event has, and
+/// which `hookEventName` in the answer has to repeat.
+///
+/// There is no `Stop`: context a `Stop` hook returns resumes the
+/// conversation, so diagnostics wait for the next prompt instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::Subcommand, Serialize, Deserialize)]
+pub enum HookEvent {
+    /// A tool call finished
+    PostToolUse,
+    /// A batch of parallel tool calls finished
+    PostToolBatch,
+    /// The user submitted a prompt
+    UserPromptSubmit,
+    /// The session ended
+    SessionEnd,
+}
+
+impl HookEvent {
+    /// The event a payload names in its `hook_event_name`, or `None` for a
+    /// payload that is not JSON or an event mcpls does not answer.
+    pub fn named_in(stdin: &str) -> Option<Self> {
+        #[derive(Deserialize)]
+        struct Named {
+            hook_event_name: HookEvent,
+        }
+        serde_json::from_str::<Named>(stdin)
+            .ok()
+            .map(|named| named.hook_event_name)
+    }
+}
+
 /// The directory a hook invocation names as its project, before
 /// canonicalization, or `.` when it names none.
-pub fn project_dir(host: Host, stdin: &str) -> PathBuf {
-    let named = match host {
-        Host::Claude => std::env::var_os("CLAUDE_PROJECT_DIR").map(PathBuf::from),
-        Host::Codex => serde_json::from_str::<serde_json::Value>(stdin)
+pub fn project_dir(harness: Harness, stdin: &str) -> PathBuf {
+    let named = match harness {
+        Harness::ClaudeCode => std::env::var_os("CLAUDE_PROJECT_DIR").map(PathBuf::from),
+        Harness::Codex => serde_json::from_str::<serde_json::Value>(stdin)
             .ok()
             .and_then(|payload| payload.get("cwd")?.as_str().map(PathBuf::from)),
     };
@@ -54,10 +88,9 @@ pub fn project_dir(host: Host, stdin: &str) -> PathBuf {
 
 /// The hook payload Claude Code writes to stdin, keeping only the fields
 /// the dispatch table below reads. Every field is optional or defaulted,
-/// since which ones are present depends on `hook_event_name`.
+/// since which ones are present depends on the event.
 #[derive(Debug, Deserialize)]
 struct HookPayload {
-    hook_event_name: String,
     #[serde(default)]
     session_id: String,
     #[serde(default)]
@@ -92,14 +125,15 @@ async fn silently<T: Default>(body: impl Future<Output = Result<T>>) -> T {
 
 /// Return hook JSON, or an empty answer on payload or socket failure.
 pub async fn dispatch_payload(
-    host: Host,
+    harness: Harness,
+    event: HookEvent,
     stdin: &str,
     project_dir: &Path,
     identity: Option<&SocketIdentity>,
 ) -> String {
-    match host {
-        Host::Claude => silently(run(stdin, identity)).await,
-        Host::Codex => silently(codex::run(stdin, project_dir, identity)).await,
+    match harness {
+        Harness::ClaudeCode => silently(run(event, stdin, identity)).await,
+        Harness::Codex => silently(codex::run(event, stdin, project_dir, identity)).await,
     }
 }
 
@@ -138,19 +172,20 @@ fn writes_a_file(tool_name: &str) -> bool {
     matches!(tool_name, "Write" | "Edit" | "MultiEdit")
 }
 
-async fn run(stdin: &str, identity: Option<&SocketIdentity>) -> Result<String> {
+async fn run(event: HookEvent, stdin: &str, identity: Option<&SocketIdentity>) -> Result<String> {
     let payload: HookPayload = serde_json::from_str(stdin)?;
     let agent = HookAgent {
         agent_id: payload.agent_id.clone(),
         host: HookHost::Claude,
     };
 
-    match payload.hook_event_name.as_str() {
-        "PostToolUse" if writes_a_file(&payload.tool_name) => {
+    match event {
+        HookEvent::PostToolUse if writes_a_file(&payload.tool_name) => {
             attribute_claude_write(payload, agent, identity).await
         }
+        HookEvent::PostToolUse => Ok(String::new()),
 
-        "PostToolBatch" => {
+        HookEvent::PostToolBatch => {
             let Some(identity) = identity else {
                 return Ok(String::new());
             };
@@ -175,10 +210,10 @@ async fn run(stdin: &str, identity: Option<&SocketIdentity>) -> Result<String> {
             ];
             let responses = send_and_acknowledge(identity, &requests, FLUSH_SOCKET_TIMEOUT).await?;
             let context = responses.into_iter().nth(1).and_then(flush_context);
-            Ok(additional_context_output("PostToolBatch", context))
+            Ok(additional_context_output(event, context))
         }
 
-        "UserPromptSubmit" => {
+        HookEvent::UserPromptSubmit => {
             let Some(identity) = identity else {
                 return Ok(String::new());
             };
@@ -192,10 +227,10 @@ async fn run(stdin: &str, identity: Option<&SocketIdentity>) -> Result<String> {
             )
             .await?;
             let context = responses.into_iter().next().and_then(flush_context);
-            Ok(additional_context_output("UserPromptSubmit", context))
+            Ok(additional_context_output(event, context))
         }
 
-        "SessionEnd" => {
+        HookEvent::SessionEnd => {
             let Some(identity) = identity else {
                 return Ok(String::new());
             };
@@ -209,9 +244,6 @@ async fn run(stdin: &str, identity: Option<&SocketIdentity>) -> Result<String> {
             .await?;
             Ok(String::new())
         }
-
-        // Stop context resumes the conversation; flush at the next prompt instead.
-        _ => Ok(String::new()),
     }
 }
 
@@ -252,7 +284,7 @@ fn watcher_line(watcher: Option<&WatcherStatus>) -> String {
 
 /// The hook JSON carrying diagnostics context, or the empty string when
 /// there is nothing to report.
-fn additional_context_output(event: &str, context: Option<String>) -> String {
+fn additional_context_output(event: HookEvent, context: Option<String>) -> String {
     context
         .filter(|text| !text.is_empty())
         .map_or_else(String::new, |text| {
@@ -1287,22 +1319,38 @@ mod tests {
     /// goes through the same path.
     async fn dispatch_raw(stdin: &str, project_dir: &Path) -> String {
         let identity = mcpls_core::hooks::identity_for(project_dir).expect("identity");
-        super::dispatch_payload(Host::Claude, stdin, project_dir, Some(&identity)).await
+        dispatch_named(Harness::ClaudeCode, stdin, project_dir, Some(&identity)).await
+    }
+
+    /// Dispatch the event the payload names, the way a bare `mcpls hook`
+    /// does, answering nothing for an event mcpls does not handle.
+    async fn dispatch_named(
+        harness: Harness,
+        stdin: &str,
+        project_dir: &Path,
+        identity: Option<&SocketIdentity>,
+    ) -> String {
+        match HookEvent::named_in(stdin) {
+            Some(event) => {
+                super::dispatch_payload(harness, event, stdin, project_dir, identity).await
+            }
+            None => String::new(),
+        }
     }
 
     /// Run the dispatcher against a listener that records the requests it
     /// gets.
     async fn dispatch_against(payload: &serde_json::Value, recorder: &RecordingOwner) -> String {
-        dispatch_as(Host::Claude, payload, recorder).await
+        dispatch_as(Harness::ClaudeCode, payload, recorder).await
     }
 
     /// The same, for a hook spawned by `host`.
     async fn dispatch_as(
-        host: Host,
+        host: Harness,
         payload: &serde_json::Value,
         recorder: &RecordingOwner,
     ) -> String {
-        super::dispatch_payload(
+        dispatch_named(
             host,
             &payload.to_string(),
             recorder.project_dir(),
@@ -1943,7 +1991,7 @@ mod tests {
             let recorder = RecordingOwner::start();
             let cwd = recorder.project_dir().join("subdir");
             dispatch_as(
-                Host::Codex,
+                Harness::Codex,
                 &json!({
                     "hook_event_name": "PostToolUse", "session_id": "root",
                     "agent_id": "child", "cwd": cwd, "tool_name": "apply_patch",
@@ -1981,7 +2029,7 @@ mod tests {
         use mcpls_core::hooks::sweep::Sweeper;
         use mcpls_core::hooks::{HookListener, PathFilter};
         use mcpls_core::mcp::McplsServer;
-        for host in [Host::Claude, Host::Codex] {
+        for host in [Harness::ClaudeCode, Harness::Codex] {
             let dir = tempfile::tempdir().unwrap();
             let root = dunce::canonicalize(dir.path()).unwrap();
             let identity = temp_identity(&root);
@@ -2045,10 +2093,10 @@ mod tests {
                 let payload = json!({
                     "hook_event_name": "PostToolUse",
                     "session_id": "root", "agent_id": agent, "cwd": root,
-                    "tool_name": if matches!(host, Host::Codex) { "apply_patch" } else { "Edit" }, "tool_input": {"file_path": path, "command": format!("*** Begin Patch\n*** Update File: {agent}.rs\n@@\n-old\n+new\n*** End Patch\n")},
+                    "tool_name": if matches!(host, Harness::Codex) { "apply_patch" } else { "Edit" }, "tool_input": {"file_path": path, "command": format!("*** Begin Patch\n*** Update File: {agent}.rs\n@@\n-old\n+new\n*** End Patch\n")},
                     "tool_calls": [{"tool_name": "Edit", "tool_input": {"file_path": path}}]
                 });
-                super::dispatch_payload(host, &payload.to_string(), &root, Some(&identity)).await;
+                dispatch_named(host, &payload.to_string(), &root, Some(&identity)).await;
             }
             for name in ["a", "b", "unowned"] {
                 let uri =
@@ -2067,8 +2115,7 @@ mod tests {
             for (agent, expected) in [(Some("a"), "a"), (Some("b"), "b"), (None, "unowned")] {
                 let payload = json!({"hook_event_name": "UserPromptSubmit", "session_id": "root", "agent_id": agent, "cwd": root});
                 let output =
-                    super::dispatch_payload(host, &payload.to_string(), &root, Some(&identity))
-                        .await;
+                    dispatch_named(host, &payload.to_string(), &root, Some(&identity)).await;
                 assert!(output.contains(&format!("{expected} error")), "{output}");
                 for other in ["a", "b", "unowned"] {
                     if other != expected {
@@ -2076,8 +2123,7 @@ mod tests {
                     }
                 }
                 let repeated =
-                    super::dispatch_payload(host, &payload.to_string(), &root, Some(&identity))
-                        .await;
+                    dispatch_named(host, &payload.to_string(), &root, Some(&identity)).await;
                 assert!(!repeated.contains(" error"), "{repeated}");
             }
             cancel.send(true).unwrap();
@@ -2106,8 +2152,8 @@ mod tests {
     #[tokio::test]
     async fn test_a_missing_identity_produces_no_output_for_socket_using_arms() {
         let dir = tempfile::tempdir().expect("a temp dir");
-        let out = super::dispatch_payload(
-            Host::Claude,
+        let out = dispatch_named(
+            Harness::ClaudeCode,
             &json!({ "hook_event_name": "UserPromptSubmit", "session_id": "s1" }).to_string(),
             dir.path(),
             None,
@@ -2130,7 +2176,10 @@ mod tests {
 
         assert_eq!(
             out,
-            additional_context_output("UserPromptSubmit", Some(DEFAULT_FLUSH_TEXT.to_string())),
+            additional_context_output(
+                HookEvent::UserPromptSubmit,
+                Some(DEFAULT_FLUSH_TEXT.to_string())
+            ),
             "an owner slower than the old 50ms bound but inside \
              FLUSH_SOCKET_TIMEOUT must still be waited out, or raising the \
              timeout had no effect at this call site"
@@ -2157,7 +2206,10 @@ mod tests {
 
         assert_eq!(
             out,
-            additional_context_output("PostToolBatch", Some(DEFAULT_FLUSH_TEXT.to_string())),
+            additional_context_output(
+                HookEvent::PostToolBatch,
+                Some(DEFAULT_FLUSH_TEXT.to_string())
+            ),
             "an owner slower than the old 50ms bound but inside \
              FLUSH_SOCKET_TIMEOUT must still be waited out, or raising the \
              timeout had no effect at this call site"
@@ -2407,7 +2459,10 @@ mod tests {
 
         assert_eq!(
             out,
-            additional_context_output("PostToolBatch", Some(DEFAULT_FLUSH_TEXT.to_string())),
+            additional_context_output(
+                HookEvent::PostToolBatch,
+                Some(DEFAULT_FLUSH_TEXT.to_string())
+            ),
             "an error answering changed must not swallow a flush answer \
              that arrived on the same connection: {out}"
         );
@@ -2447,7 +2502,10 @@ mod tests {
 
         assert_eq!(
             out,
-            additional_context_output("UserPromptSubmit", Some(DEFAULT_FLUSH_TEXT.to_string())),
+            additional_context_output(
+                HookEvent::UserPromptSubmit,
+                Some(DEFAULT_FLUSH_TEXT.to_string())
+            ),
             "the flush answer was read before the owner hung up, so it is \
              printed: {out}"
         );
@@ -4225,7 +4283,7 @@ mod tests {
         let recorder = RecordingOwner::start_with_flush(Some(DEFAULT_FLUSH_TEXT.to_string()));
         let cwd = recorder.project_dir().join("crates");
         let out = dispatch_as(
-            Host::Codex,
+            Harness::Codex,
             &json!({
                 "hook_event_name": "PostToolUse",
                 "session_id": "s1",
@@ -4242,7 +4300,7 @@ mod tests {
 
         assert_eq!(
             out,
-            additional_context_output("PostToolUse", Some(DEFAULT_FLUSH_TEXT.to_string()))
+            additional_context_output(HookEvent::PostToolUse, Some(DEFAULT_FLUSH_TEXT.to_string()))
         );
         let requests = recorder.requests();
         let Request::Changed {
@@ -4271,7 +4329,7 @@ mod tests {
     async fn test_codex_subagent_stop_keeps_the_subagent_session() {
         let recorder = RecordingOwner::start();
         let out = dispatch_as(
-            Host::Codex,
+            Harness::Codex,
             &json!({ "hook_event_name": "SubagentStop", "session_id": "s1", "agent_id": "a1" }),
             &recorder,
         )
@@ -4283,10 +4341,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_hook_agent_identity_survives_changed_flush_and_ack() {
-        for host in [Host::Claude, Host::Codex] {
+        for host in [Harness::ClaudeCode, Harness::Codex] {
             let recorder = RecordingOwner::start_with_flush(Some(DEFAULT_FLUSH_TEXT.to_string()));
             let payload = json!({
-                "hook_event_name": if matches!(host, Host::Claude) { "PostToolBatch" } else { "PostToolUse" },
+                "hook_event_name": if matches!(host, Harness::ClaudeCode) { "PostToolBatch" } else { "PostToolUse" },
                 "session_id": "root/one",
                 "agent_id": "child/two",
                 "cwd": recorder.project_dir(),
@@ -4303,7 +4361,7 @@ mod tests {
                 assert_eq!(wire["agent_id"], "child/two");
                 assert_eq!(
                     wire["host"],
-                    if matches!(host, Host::Claude) {
+                    if matches!(host, Harness::ClaudeCode) {
                         "claude"
                     } else {
                         "codex"
@@ -4317,13 +4375,13 @@ mod tests {
     fn test_codex_project_dir_is_the_payload_cwd() {
         assert_eq!(
             project_dir(
-                Host::Codex,
+                Harness::Codex,
                 r#"{"hook_event_name":"Stop","cwd":"/work/project"}"#
             ),
             PathBuf::from("/work/project")
         );
         assert_eq!(
-            project_dir(Host::Codex, "not json"),
+            project_dir(Harness::Codex, "not json"),
             PathBuf::from("."),
             "an unreadable payload falls back the way a missing CLAUDE_PROJECT_DIR does"
         );
