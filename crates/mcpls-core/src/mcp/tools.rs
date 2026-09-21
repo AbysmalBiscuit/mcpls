@@ -3,6 +3,8 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::bridge::{Position2D, Range};
+
 /// Shared position parameters (file path plus 1-based line/character) used by
 /// every tool that operates at a single point in a file.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -34,6 +36,21 @@ pub struct RangeParams {
     /// End character (1-based).
     #[schemars(description = "End character (1-based).")]
     pub end_character: u32,
+}
+
+impl From<RangeParams> for Range {
+    fn from(range: RangeParams) -> Self {
+        Self {
+            start: Position2D {
+                line: range.start_line,
+                character: range.start_character,
+            },
+            end: Position2D {
+                line: range.end_line,
+                character: range.end_character,
+            },
+        }
+    }
 }
 
 /// Parameters for the `get_references` tool.
@@ -113,6 +130,13 @@ pub struct FormatDocumentParams {
     #[schemars(description = "Whether to use spaces instead of tabs (default: true).")]
     #[serde(default = "default_insert_spaces")]
     pub insert_spaces: bool,
+    /// Format only this range instead of the whole document.
+    #[schemars(
+        description = "Format only this range instead of the whole document. Fails when the \
+                       language server does not support range formatting."
+    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<RangeParams>,
     /// Write the edits to disk instead of only describing them.
     #[schemars(
         description = "Write the edits to disk instead of only describing them. \

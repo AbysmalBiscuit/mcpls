@@ -182,7 +182,7 @@ Claude: [get_references] Found 4 matches:
 | Tool | What it does |
 |------|--------------|
 | `rename_symbol` | Workspace-wide rename with full reference tracking |
-| `format_document` | Apply language-specific formatting rules |
+| `format_document` | Apply language-specific formatting rules to a file, or to one range of it |
 | `apply_code_action` | Apply one action from a `get_code_actions` listing |
 | `prepare_call_hierarchy` | Get callable items at a position for call hierarchy |
 | `get_incoming_calls` | Find all callers of a function (who calls this?) |

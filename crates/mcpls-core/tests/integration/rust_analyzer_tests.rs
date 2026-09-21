@@ -663,6 +663,7 @@ async fn test_format_document() {
             lib_file.to_string_lossy().to_string(),
             4,     // tab_size
             true,  // insert_spaces
+            None,  // range
             false, // apply
         ),
     )

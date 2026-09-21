@@ -854,7 +854,8 @@ impl McplsServer {
     /// writing the edits.
     #[tool(
         description = "Format document with language-specific rules. Returns text edits for \
-                       indentation, spacing, and style. With apply=true, and \
+                       indentation, spacing, and style. With range, formats only that range. \
+                       With apply=true, and \
                        apply.format_document enabled in config, writes those edits to disk.",
         title = "Format Document",
         annotations(
@@ -870,6 +871,7 @@ impl McplsServer {
             file_path,
             tab_size,
             insert_spaces,
+            range,
             apply,
         }): Parameters<FormatDocumentParams>,
     ) -> Result<String, McpError> {
@@ -877,7 +879,13 @@ impl McplsServer {
         let result = match self
             .context
             .translator
-            .handle_format_document(file_path, tab_size, insert_spaces, apply)
+            .handle_format_document(
+                file_path,
+                tab_size,
+                insert_spaces,
+                range.map(Into::into),
+                apply,
+            )
             .await
         {
             Ok(result) => result,
@@ -2528,26 +2536,31 @@ mod tests {
         );
     }
 
-    /// The three tools that can write to the working tree.
+    /// The tool calls that can write to the working tree.
     ///
     /// Each of them appends the diagnostics its own edit produced on two
-    /// adjacent lines. Driving all three from one place is what keeps a fourth
+    /// adjacent lines. Driving all of them from one place is what keeps a new
     /// write tool, or a refactor of one of these, from quietly losing them.
     #[derive(Clone, Copy, Debug)]
     enum WriteTool {
         Rename,
         Format,
+        FormatRange,
         CodeAction,
     }
 
-    const WRITE_TOOLS: [WriteTool; 3] =
-        [WriteTool::Rename, WriteTool::Format, WriteTool::CodeAction];
+    const WRITE_TOOLS: [WriteTool; 4] = [
+        WriteTool::Rename,
+        WriteTool::Format,
+        WriteTool::FormatRange,
+        WriteTool::CodeAction,
+    ];
 
     impl WriteTool {
         fn mcp_name(self) -> &'static str {
             match self {
                 Self::Rename => "rename_symbol",
-                Self::Format => "format_document",
+                Self::Format | Self::FormatRange => "format_document",
                 Self::CodeAction => "apply_code_action",
             }
         }
@@ -2556,6 +2569,7 @@ mod tests {
             match self {
                 Self::Rename => "textDocument/rename",
                 Self::Format => "textDocument/formatting",
+                Self::FormatRange => "textDocument/rangeFormatting",
                 Self::CodeAction => "textDocument/codeAction",
             }
         }
@@ -2573,6 +2587,16 @@ mod tests {
                     "file_path": path,
                     "tab_size": 4,
                     "insert_spaces": true,
+                    "apply": true,
+                }),
+                Self::FormatRange => json!({
+                    "file_path": path,
+                    "range": {
+                        "start_line": 1,
+                        "start_character": 1,
+                        "end_line": 1,
+                        "end_character": 12,
+                    },
                     "apply": true,
                 }),
                 Self::CodeAction => json!({
@@ -2598,6 +2622,10 @@ mod tests {
                     document_formatting_provider: Some(lsp_types::OneOf::Left(true)),
                     ..Default::default()
                 },
+                Self::FormatRange => lsp_types::ServerCapabilities {
+                    document_range_formatting_provider: Some(lsp_types::OneOf::Left(true)),
+                    ..Default::default()
+                },
                 Self::CodeAction => lsp_types::ServerCapabilities {
                     code_action_provider: Some(lsp_types::CodeActionProviderCapability::Simple(
                         true,
@@ -2615,7 +2643,7 @@ mod tests {
                     rename: true,
                     ..ApplyConfig::default()
                 },
-                Self::Format => ApplyConfig {
+                Self::Format | Self::FormatRange => ApplyConfig {
                     format_document: true,
                     ..ApplyConfig::default()
                 },
@@ -2638,7 +2666,7 @@ mod tests {
             }]);
             match self {
                 Self::Rename => json!({ "changes": { uri.as_str(): edits } }),
-                Self::Format => edits,
+                Self::Format | Self::FormatRange => edits,
                 Self::CodeAction => json!([{
                     "title": "Rewrite it",
                     "edit": { "changes": { uri.as_str(): edits } },
@@ -2669,6 +2697,23 @@ mod tests {
                             file_path: path.to_string(),
                             tab_size: 4,
                             insert_spaces: true,
+                            range: None,
+                            apply: true,
+                        }))
+                        .await
+                }
+                Self::FormatRange => {
+                    server
+                        .format_document(Parameters(FormatDocumentParams {
+                            file_path: path.to_string(),
+                            tab_size: 4,
+                            insert_spaces: true,
+                            range: Some(RangeParams {
+                                start_line: 1,
+                                start_character: 1,
+                                end_line: 1,
+                                end_character: 12,
+                            }),
                             apply: true,
                         }))
                         .await
@@ -2818,6 +2863,86 @@ mod tests {
                  and pays a turn for it: {result}"
             );
         }
+    }
+
+    /// A `range` sends `textDocument/rangeFormatting` over that range,
+    /// converted to the server's 0-based positions, and writes only what
+    /// the server answered for it.
+    #[tokio::test]
+    async fn test_format_with_a_range_formats_only_that_range() {
+        let mut fixture = WriteFixture::new(WriteTool::FormatRange, DiagnosticsConfig::default());
+        let path = fixture.path.display().to_string();
+        let reply = WriteTool::FormatRange.reply_rewriting(&fixture.uri);
+        let server = fixture.server.clone();
+        let fake = &mut fixture.fake;
+        let (result, request) = tokio::join!(
+            server.format_document(Parameters(FormatDocumentParams {
+                file_path: path,
+                tab_size: 2,
+                insert_spaces: false,
+                range: Some(RangeParams {
+                    start_line: 1,
+                    start_character: 4,
+                    end_line: 1,
+                    end_character: 7,
+                }),
+                apply: true,
+            })),
+            async move {
+                let mut wire = tokio::io::BufReader::new(&mut fake.write_stdout);
+                let request = read_framed_reply(&mut wire).await;
+                write_response(&mut fake.read_half_stdin, &request["id"], reply).await;
+                request
+            }
+        );
+
+        assert_eq!(request["method"], "textDocument/rangeFormatting");
+        assert_eq!(
+            request["params"]["range"],
+            json!({"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 6}})
+        );
+        assert_eq!(request["params"]["options"]["tabSize"], 2);
+        assert_eq!(request["params"]["options"]["insertSpaces"], false);
+        let result: serde_json::Value =
+            serde_json::from_str(&result.expect("the range format applies")).expect("json");
+        assert_eq!(result["applied"], true, "{result}");
+        assert_eq!(
+            std::fs::read_to_string(&fixture.path).unwrap(),
+            "fn new() {}\n"
+        );
+    }
+
+    /// A server that formats whole documents but not ranges refuses a
+    /// `range` call outright rather than reformatting the whole file.
+    #[tokio::test]
+    async fn test_format_with_a_range_is_refused_by_a_server_without_range_support() {
+        let fixture = WriteFixture::new(WriteTool::Format, DiagnosticsConfig::default());
+
+        let error = fixture
+            .server
+            .format_document(Parameters(FormatDocumentParams {
+                file_path: fixture.path.display().to_string(),
+                tab_size: 4,
+                insert_spaces: true,
+                range: Some(RangeParams {
+                    start_line: 1,
+                    start_character: 1,
+                    end_line: 1,
+                    end_character: 12,
+                }),
+                apply: true,
+            }))
+            .await
+            .expect_err("the server does not advertise range formatting");
+
+        assert!(
+            error.message.contains("documentRangeFormattingProvider"),
+            "{error:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&fixture.path).unwrap(),
+            "fn old() {}\n"
+        );
     }
 
     /// A rename that moves a file claims the path it left as well as the
@@ -4122,6 +4247,7 @@ mod tests {
             file_path: "/test/file.rs".to_string(),
             tab_size: 4,
             insert_spaces: true,
+            range: None,
             apply: false,
         });
 
