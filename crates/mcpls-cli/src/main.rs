@@ -8,13 +8,14 @@ use clap::Parser;
 use mcpls_core::ProjectConfigTrust;
 
 mod args;
+mod backend;
 mod brief;
 mod completions;
 mod config;
 mod hook;
 mod logging;
 
-use args::{Args, Command, HookAction, SchemaAction};
+use args::{Args, BackendAction, Command, HookAction, SchemaAction};
 use hook::{Examined, Report};
 
 /// Parse, failing a `hook` invocation with exit 1 rather than clap's 2.
@@ -87,6 +88,16 @@ async fn main() {
         let report = diagnose(&args, path.as_deref()).await;
         write_report(&format!("{}\n", report.text));
         std::process::exit(i32::from(!report.problems.is_empty()));
+    }
+
+    if let Some(Command::Backend {
+        action: Some(action),
+        ..
+    }) = &args.command
+    {
+        let outcome = control_backend(&args, action).await;
+        write_report(&outcome.text);
+        std::process::exit(i32::from(!outcome.success));
     }
 
     if let Some(Command::Config { path, origin, json }) = &args.command {
@@ -219,7 +230,10 @@ fn emit_brief(args: &Args, additional_context: bool) -> ! {
 async fn run(args: Args) -> Result<()> {
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "starting mcpls");
 
-    if let Some(Command::Backend { root }) = &args.command {
+    if let Some(Command::Backend {
+        root: Some(root), ..
+    }) = &args.command
+    {
         let config = load_config(&args, root)?;
         mcpls_core::backend::serve_backend(config, root.clone())
             .await
@@ -243,16 +257,7 @@ async fn run(args: Args) -> Result<()> {
 
     if !in_process {
         let stamp = mcpls_core::backend::ConfigStamp::of(&config);
-        let launch = mcpls_core::backend::BackendLaunch {
-            root,
-            config: args
-                .config
-                .as_ref()
-                .map(|path| dunce::canonicalize(path).unwrap_or_else(|_| path.clone())),
-            trust_project_config: args.trust_project_config,
-            log_level: args.log_level.clone(),
-            log_json: args.log_json,
-        };
+        let launch = backend_launch(&args, root);
         mcpls_core::backend::run_frontend(mcpls_core::backend::FrontendOptions { launch, stamp })
             .await;
         return Ok(());
@@ -281,6 +286,77 @@ async fn run(args: Args) -> Result<()> {
 
     tracing::info!("mcpls shutdown complete");
     Ok(())
+}
+
+/// What a backend for `root` is started with, from this invocation's flags.
+fn backend_launch(args: &Args, root: std::path::PathBuf) -> mcpls_core::backend::BackendLaunch {
+    mcpls_core::backend::BackendLaunch {
+        root,
+        config: args
+            .config
+            .as_ref()
+            .map(|path| dunce::canonicalize(path).unwrap_or_else(|_| path.clone())),
+        trust_project_config: args.trust_project_config,
+        log_level: args.log_level.clone(),
+        log_json: args.log_json,
+    }
+}
+
+/// Start, stop, or report on the backend for the checkout `action` names.
+async fn control_backend(args: &Args, action: &BackendAction) -> backend::Outcome {
+    use mcpls_core::backend::control;
+
+    let path = match action {
+        BackendAction::Start { path }
+        | BackendAction::Stop { path, .. }
+        | BackendAction::Status { path } => path.as_deref(),
+    };
+    let (directory, _) = examined_directory(path);
+    let root = hook::checkout_root(&directory);
+    let identity = match mcpls_core::hooks::identity_for(&root) {
+        Ok(identity) => identity,
+        Err(error) => {
+            return backend::Outcome {
+                text: format!("no backend endpoint for {}: {error}\n", root.display()),
+                success: false,
+            };
+        }
+    };
+    match action {
+        BackendAction::Status { .. } => backend::status(
+            control::status(&identity).await,
+            &root,
+            &identity.log_file(),
+        ),
+        BackendAction::Stop { force, .. } => {
+            backend::stop(control::stop(&identity, *force).await, &root)
+        }
+        BackendAction::Start { .. } => {
+            // The backend would fail on the same configuration, with the
+            // reason only in its log.
+            if let Err(error) = resolve_config(args, &root) {
+                return backend::Outcome {
+                    text: format!("{error:?}\n"),
+                    success: false,
+                };
+            }
+            let exe = match std::env::current_exe() {
+                Ok(exe) => exe,
+                Err(error) => {
+                    return backend::Outcome {
+                        text: format!("failed to locate the mcpls executable: {error}\n"),
+                        success: false,
+                    };
+                }
+            };
+            let launch = backend_launch(args, root.clone());
+            backend::start(
+                control::start(&identity, &exe, &launch).await,
+                &root,
+                &identity.log_file(),
+            )
+        }
+    }
 }
 
 /// Write a report to stdout, treating a reader that closed early

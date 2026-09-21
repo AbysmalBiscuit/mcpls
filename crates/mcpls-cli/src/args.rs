@@ -107,12 +107,25 @@ pub struct Args {
 /// launches; everything here is a one-shot utility that prints and exits.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Serve a checkout's shared backend (started by the frontend)
-    #[command(hide = true)]
+    /// Start, stop, or inspect this checkout's shared backend
+    ///
+    /// Every session in a checkout attaches to one backend, which owns the
+    /// language servers. A session starts it on demand, and it exits once
+    /// no session has been attached for `backend.idle_shutdown_ms`.
+    #[command(
+        args_conflicts_with_subcommands = true,
+        arg_required_else_help = true,
+        override_usage = "mcpls backend <COMMAND>"
+    )]
     Backend {
-        /// The canonical checkout root to serve
-        #[arg(long, value_name = "DIR")]
-        root: PathBuf,
+        /// Serve the backend for this canonical checkout root, as a
+        /// frontend launches it
+        #[arg(long, value_name = "DIR", hide = true)]
+        root: Option<PathBuf>,
+
+        /// What to do with the backend
+        #[command(subcommand)]
+        action: Option<BackendAction>,
     },
 
     /// Print the note a session start hook hands an agent
@@ -210,6 +223,51 @@ pub enum Command {
         /// The event to answer
         #[command(subcommand)]
         action: Option<HookAction>,
+    },
+}
+
+/// Actions for `mcpls backend`.
+///
+/// Each examines `DIR`, else `$CLAUDE_PROJECT_DIR`, else the working
+/// directory, and acts on the backend for that directory's checkout.
+#[derive(Debug, Subcommand)]
+pub enum BackendAction {
+    /// Start the backend and keep it running
+    ///
+    /// A started backend stays up with no session attached, instead of
+    /// exiting on its idle timer, until `mcpls backend stop`. A backend
+    /// already running is kept rather than replaced. A new backend runs
+    /// with this invocation's `--config`, `--trust-project-config`,
+    /// `--log-level` and `--log-json`.
+    Start {
+        /// Directory whose checkout to serve
+        #[arg(value_name = "DIR")]
+        path: Option<PathBuf>,
+    },
+
+    /// Stop the backend
+    ///
+    /// With sessions attached, the backend is left to them: it is no
+    /// longer kept, exits once the last one leaves, and this exits
+    /// non-zero. `--force` stops it at once, and those sessions have no
+    /// mcpls tools until they restart.
+    Stop {
+        /// Directory whose checkout's backend to stop
+        #[arg(value_name = "DIR")]
+        path: Option<PathBuf>,
+
+        /// Stop the backend even with sessions attached
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Report whether the backend is running
+    ///
+    /// Exits 0 when a backend answers and 1 when none does.
+    Status {
+        /// Directory whose checkout's backend to report on
+        #[arg(value_name = "DIR")]
+        path: Option<PathBuf>,
     },
 }
 
@@ -373,9 +431,28 @@ mod tests {
         ]);
         assert!(matches!(
             args.command,
-            Some(Command::Backend { root }) if root == std::path::Path::new("/work")
+            Some(Command::Backend { root: Some(root), action: None }) if root == std::path::Path::new("/work")
         ));
         assert_eq!(args.log_level, "debug");
+    }
+
+    #[test]
+    fn test_backend_actions_take_an_optional_directory() {
+        assert!(matches!(
+            Args::parse_from(["mcpls", "backend", "stop", "--force", "/work"]).command,
+            Some(Command::Backend {
+                root: None,
+                action: Some(BackendAction::Stop { path: Some(path), force: true }),
+            }) if path == std::path::Path::new("/work")
+        ));
+        assert!(matches!(
+            Args::parse_from(["mcpls", "backend", "start"]).command,
+            Some(Command::Backend {
+                action: Some(BackendAction::Start { path: None }),
+                ..
+            })
+        ));
+        assert!(Args::try_parse_from(["mcpls", "backend", "--root", "/work", "status"]).is_err());
     }
 
     /// The arguments a frontend launches a backend with parse back into the

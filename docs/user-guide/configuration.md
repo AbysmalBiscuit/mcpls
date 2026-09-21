@@ -767,7 +767,7 @@ spawn = "lazy"
 **Type**: Integer (milliseconds)
 **Default**: `10000`
 
-How long the backend waits after its last MCP session closes before it exits and stops its language servers. Hook connections do not keep it alive. The cost of a short value is a cold reindex for a session that opens just after the timer; raise it when sessions come and go in quick succession.
+How long the backend waits after its last MCP session closes before it exits and stops its language servers. Hook connections do not keep it alive. A backend `mcpls backend start` keeps ignores it until `mcpls backend stop`. The cost of a short value is a cold reindex for a session that opens just after the timer; raise it when sessions come and go in quick succession.
 
 ### `backend.spawn`
 
@@ -1062,6 +1062,11 @@ mcpls --log-json
 
 # Serve this session in-process instead of through the shared backend
 mcpls --no-backend
+
+# Keep this checkout's backend running with no session attached, then stop it
+mcpls backend start
+mcpls backend status
+mcpls backend stop
 
 # HTTP transport (requires transport-http feature)
 mcpls --listen 127.0.0.1:3000
