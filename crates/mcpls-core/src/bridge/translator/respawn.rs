@@ -148,6 +148,23 @@ impl Translator {
         (elapsed < delay).then(|| delay.saturating_sub(elapsed))
     }
 
+    /// Remembers why `id` failed to start, for [`Self::unavailable`] to report.
+    pub(crate) fn record_spawn_error(&self, id: &ServerId, error: String) {
+        lock_std(&self.spawn_errors).insert(id.clone(), error);
+    }
+
+    /// A [`Error::ServerUnavailable`] for `id`, carrying why its last start
+    /// failed when that is known.
+    pub(crate) fn unavailable(&self, id: &ServerId, reason: &str) -> Error {
+        let reason = lock_std(&self.spawn_errors)
+            .get(id)
+            .map_or_else(|| reason.to_string(), |cause| format!("{reason}: {cause}"));
+        Error::ServerUnavailable {
+            server_id: id.clone(),
+            reason,
+        }
+    }
+
     /// Records a failed respawn attempt for `id`, extending its backoff.
     pub(crate) fn record_respawn_failure(&self, id: &ServerId) {
         let mut backoffs = lock_std(&self.respawn_backoffs);
@@ -254,10 +271,7 @@ impl Translator {
 
         self.reconcile_respawn_stability(id);
         if let Some(remaining) = self.respawn_backoff_remaining(id) {
-            return Err(Error::ServerUnavailable {
-                server_id: id.clone(),
-                reason: format!("crash-looping, retry in {remaining:?}"),
-            });
+            return Err(self.unavailable(id, &format!("crash-looping, retry in {remaining:?}")));
         }
 
         if self.begin_starting(id) {
@@ -271,10 +285,7 @@ impl Translator {
             self.reconcile_respawn_stability(id);
             if let Some(remaining) = self.respawn_backoff_remaining(id) {
                 self.set_lifecycle(id, ServerLifecycle::Failed);
-                return Err(Error::ServerUnavailable {
-                    server_id: id.clone(),
-                    reason: format!("crash-looping, retry in {remaining:?}"),
-                });
+                return Err(self.unavailable(id, &format!("crash-looping, retry in {remaining:?}")));
             }
 
             let Some(translator) = self.self_handle.get().and_then(Weak::upgrade) else {
@@ -329,6 +340,7 @@ impl Translator {
 
         match self.install_server(&id, config).await {
             Ok(()) => {
+                lock_std(&self.spawn_errors).remove(&id);
                 self.record_respawn_success(&id);
                 guard.publish(ServerLifecycle::Running);
                 self.reconcile_diagnostics_owners(Some(&id)).await;
@@ -342,6 +354,7 @@ impl Translator {
                     ServerLifecycle::Failed
                 };
                 tracing::error!("LSP server '{id}' failed to start: {err}");
+                self.record_spawn_error(&id, err.to_string());
                 guard.publish(state);
                 self.reconcile_diagnostics_owners(None).await;
             }
@@ -533,12 +546,7 @@ impl Translator {
                         reason: "command not found".to_string(),
                     });
                 }
-                ServerLifecycle::Failed => {
-                    return Err(Error::ServerUnavailable {
-                        server_id: id.clone(),
-                        reason: "failed to start".to_string(),
-                    });
-                }
+                ServerLifecycle::Failed => return Err(self.unavailable(id, "failed to start")),
                 ServerLifecycle::Idle | ServerLifecycle::Starting => {}
             }
             if tokio::time::timeout_at(deadline, states.changed())

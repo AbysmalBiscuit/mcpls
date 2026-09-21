@@ -17,8 +17,10 @@ use lsp_types::{
     InitializedParams, PositionEncodingKind, ServerCapabilities,
     StaleRequestSupportClientCapabilities, SymbolKind, WindowClientCapabilities, WorkspaceFolder,
 };
-use tokio::process::Command;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::{ChildStderr, Command};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -49,6 +51,13 @@ const ENV_PASSTHROUGH: &[&str] = &["PATH", "HOME", "USERPROFILE", "TMPDIR", "TEM
 /// its own after sending the LSP `exit` notification, before falling back to
 /// `kill_on_drop`.
 const CHILD_EXIT_GRACE: Duration = Duration::from_secs(3);
+
+/// How long a server that exited during startup is given for its stderr to
+/// reach end of file, which a grandchild holding the pipe can delay.
+const STDERR_DRAIN_GRACE: Duration = Duration::from_millis(500);
+
+/// Trailing stderr lines kept to explain a server that exits during startup.
+const STDERR_TAIL_LINES: usize = 10;
 
 /// Every symbol kind defined by LSP 3.17 and understood by mcpls.
 const SUPPORTED_SYMBOL_KINDS: [SymbolKind; 26] = [
@@ -386,6 +395,10 @@ impl LspServer {
             .stdout
             .take()
             .ok_or_else(|| Error::Transport("Failed to capture stdout".to_string()))?;
+        let stderr_tail = child
+            .stderr
+            .take()
+            .map(|stderr| tokio::spawn(read_stderr_tail(stderr, config.server_config.id())));
 
         let transport = LspTransport::new(stdin, stdout);
         let (notification_tx, notification_rx) = mpsc::channel(NOTIFICATION_CHANNEL_CAPACITY);
@@ -397,7 +410,14 @@ impl LspServer {
             config.server_config.id(),
         );
 
-        let (capabilities, position_encoding) = Self::initialize(&client, &config).await?;
+        // A dead child leaves `initialize` pending until its timeout, since
+        // nothing answers the request, so its exit has to be watched directly.
+        let (capabilities, position_encoding) = tokio::select! {
+            result = Self::initialize(&client, &config) => result?,
+            status = child.wait() => {
+                return Err(exited_during_startup(&config.server_config, status?, stderr_tail).await);
+            }
+        };
 
         info!("LSP server initialized successfully");
 
@@ -442,7 +462,7 @@ impl LspServer {
             .envs(&config.env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
 
         // The detached backend has no console to share, so without this
@@ -711,6 +731,54 @@ impl LspServer {
         }
 
         result
+    }
+}
+
+/// Drain a server's stderr for its whole life, logging each line and
+/// returning the last [`STDERR_TAIL_LINES`] once the pipe closes.
+///
+/// Draining matters as much as the tail: a server that fills an unread
+/// stderr pipe blocks on its next write.
+async fn read_stderr_tail(stderr: ChildStderr, server_id: ServerId) -> String {
+    let mut reader = BufReader::new(stderr);
+    let mut tail = std::collections::VecDeque::with_capacity(STDERR_TAIL_LINES);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                let text = String::from_utf8_lossy(&line).trim_end().to_string();
+                debug!(server = %server_id, "stderr: {text}");
+                if tail.len() == STDERR_TAIL_LINES {
+                    tail.pop_front();
+                }
+                tail.push_back(text);
+            }
+        }
+    }
+    Vec::from(tail).join("\n").trim().to_string()
+}
+
+/// The error for a server that exited before finishing `initialize`,
+/// carrying the tail of its stderr.
+async fn exited_during_startup(
+    server_config: &LspServerConfig,
+    status: std::process::ExitStatus,
+    stderr_tail: Option<JoinHandle<String>>,
+) -> Error {
+    let stderr = match stderr_tail {
+        Some(tail) => tokio::time::timeout(STDERR_DRAIN_GRACE, tail)
+            .await
+            .ok()
+            .and_then(std::result::Result::ok)
+            .unwrap_or_default(),
+        None => String::new(),
+    };
+    Error::ServerExitedDuringStartup {
+        command: server_config.command.clone(),
+        status,
+        stderr,
     }
 }
 

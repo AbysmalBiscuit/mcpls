@@ -165,6 +165,21 @@ pub enum Error {
         source: std::io::Error,
     },
 
+    /// The server process exited before it finished the `initialize`
+    /// handshake.
+    #[error(
+        "'{command}' exited during startup ({status}){}",
+        stderr_suffix(stderr)
+    )]
+    ServerExitedDuringStartup {
+        /// Command the server was started with.
+        command: String,
+        /// How the process ended.
+        status: std::process::ExitStatus,
+        /// The last lines the process wrote to stderr.
+        stderr: String,
+    },
+
     /// LSP protocol error during message parsing.
     #[error("LSP protocol error: {0}")]
     LspProtocolError(String),
@@ -347,12 +362,40 @@ impl Error {
     }
 }
 
+fn stderr_suffix(stderr: &str) -> String {
+    if stderr.is_empty() {
+        " with no stderr output".to_string()
+    } else {
+        format!(": {stderr}")
+    }
+}
+
 /// A specialized Result type for mcpls-core operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn test_error_display_server_exited_during_startup() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let exited = |stderr: &str| Error::ServerExitedDuringStartup {
+            command: "rust-analyzer".to_string(),
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stderr: stderr.to_string(),
+        };
+        assert_eq!(
+            exited("error: Unknown binary").to_string(),
+            "'rust-analyzer' exited during startup (exit status: 1): error: Unknown binary"
+        );
+        assert_eq!(
+            exited("").to_string(),
+            "'rust-analyzer' exited during startup (exit status: 1) with no stderr output"
+        );
+    }
 
     #[test]
     fn test_error_display_lsp_init_failed() {

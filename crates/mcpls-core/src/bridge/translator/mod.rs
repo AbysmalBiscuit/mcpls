@@ -97,6 +97,8 @@ pub struct Translator {
     /// `timeout_seconds` on every tool call that arrives while it is down.
     /// See `ensure_server`.
     respawn_backoffs: Arc<StdMutex<HashMap<ServerId, RespawnBackoff>>>,
+    /// Why each server's most recent start failed, cleared once one succeeds.
+    spawn_errors: Arc<StdMutex<HashMap<ServerId, String>>>,
     /// What each applicable server is doing. Membership is the applicable
     /// set: a server absent from here is not configured for this checkout.
     lifecycles: Arc<StdMutex<HashMap<ServerId, ServerLifecycle>>>,
@@ -242,6 +244,7 @@ impl Translator {
             router: Arc::new(StdMutex::new(ToolRouter::default())),
             server_configs: Arc::new(StdMutex::new(HashMap::new())),
             respawn_backoffs: Arc::new(StdMutex::new(HashMap::new())),
+            spawn_errors: Arc::new(StdMutex::new(HashMap::new())),
             lifecycles: Arc::new(StdMutex::new(HashMap::new())),
             lifecycle_senders: Arc::new(StdMutex::new(HashMap::new())),
             self_handle: OnceLock::new(),

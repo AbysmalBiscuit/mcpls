@@ -1190,6 +1190,7 @@ fn spawn_lsp_servers_background(
                 ServerLifecycle::NotInstalled
             } else {
                 translator.record_respawn_failure(&failure.server_id);
+                translator.record_spawn_error(&failure.server_id, failure.message.clone());
                 ServerLifecycle::Failed
             };
             translator.set_lifecycle(&failure.server_id, state);
