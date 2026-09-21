@@ -104,7 +104,7 @@ pub enum ToolKind {
     DocumentSymbols,
     /// `workspace/symbol`.
     WorkspaceSymbols,
-    /// `textDocument/formatting`.
+    /// `textDocument/formatting` and `textDocument/rangeFormatting`.
     FormatDocument,
     /// `textDocument/codeAction`.
     CodeActions,

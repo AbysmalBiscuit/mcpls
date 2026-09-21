@@ -1,10 +1,10 @@
 //! Rename, format-document, and code-actions handlers.
 
 use lsp_types::{
-    DocumentChanges as LspDocumentChanges, DocumentFormattingParams, FormattingOptions, OneOf,
-    OptionalVersionedTextDocumentIdentifier, PartialResultParams, RenameParams as LspRenameParams,
-    TextDocumentEdit, TextDocumentIdentifier, TextDocumentPositionParams, WorkDoneProgressParams,
-    WorkspaceEdit,
+    DocumentChanges as LspDocumentChanges, DocumentFormattingParams, DocumentRangeFormattingParams,
+    FormattingOptions, OneOf, OptionalVersionedTextDocumentIdentifier, PartialResultParams,
+    RenameParams as LspRenameParams, TextDocumentEdit, TextDocumentIdentifier,
+    TextDocumentPositionParams, WorkDoneProgressParams, WorkspaceEdit,
 };
 use tokio::sync::mpsc;
 use tracing::warn;
@@ -13,8 +13,8 @@ use super::Translator;
 use super::diagnostics::diagnostic_to_mcp;
 use super::dto::{
     ApplyCodeActionResult, CodeAction, CodeActionsResult, CommandDescription, DocumentChanges,
-    FormatDocumentResult, RenameResult, ResourceOperation, TextEdit, WorkspaceEditDescription,
-    resource_operations_from_plan,
+    FormatDocumentResult, Range, RenameResult, ResourceOperation, TextEdit,
+    WorkspaceEditDescription, resource_operations_from_plan,
 };
 use super::encoding_ctx::EncodingCtx;
 use super::routing::{MAX_POSITION_VALUE, MAX_RANGE_LINES};
@@ -30,7 +30,6 @@ use crate::util::display_path;
 /// known to need, and a server that overruns it simply waits.
 const INBOUND_EDIT_QUEUE_DEPTH: usize = 4;
 
-/// Convert LSP range to MCP range (0-based to 1-based).
 /// Validate parameters for `handle_code_actions`.
 fn validate_code_action_params(
     start_line: u32,
@@ -59,6 +58,16 @@ fn validate_code_action_params(
         )));
     }
 
+    validate_range(start_line, start_character, end_line, end_character)
+}
+
+/// Validate a 1-based range a tool call names.
+fn validate_range(
+    start_line: u32,
+    start_character: u32,
+    end_line: u32,
+    end_character: u32,
+) -> Result<()> {
     if start_line < 1 || start_character < 1 || end_line < 1 || end_character < 1 {
         return Err(Error::InvalidToolParams(
             "Line and character positions must be >= 1".to_string(),
@@ -88,6 +97,49 @@ fn validate_code_action_params(
     }
 
     Ok(())
+}
+
+/// Ask `client` to format the document at `uri`: `textDocument/rangeFormatting`
+/// over `range` when one is given, `textDocument/formatting` otherwise.
+async fn request_formatting(
+    client: &LspClient,
+    ctx: &EncodingCtx,
+    uri: lsp_types::Uri,
+    options: FormattingOptions,
+    range: Option<Range>,
+) -> Result<Vec<lsp_types::TextEdit>> {
+    let work_done_progress_params = WorkDoneProgressParams::default();
+    let response: Option<Vec<lsp_types::TextEdit>> = if let Some(range) = range {
+        let range = lsp_types::Range {
+            start: ctx
+                .to_lsp(&uri, range.start.line, range.start.character)
+                .await,
+            end: ctx.to_lsp(&uri, range.end.line, range.end.character).await,
+        };
+        let params = DocumentRangeFormattingParams {
+            text_document: TextDocumentIdentifier { uri },
+            range,
+            options,
+            work_done_progress_params,
+        };
+        client
+            .request(
+                "textDocument/rangeFormatting",
+                params,
+                client.request_timeout(),
+            )
+            .await?
+    } else {
+        let params = DocumentFormattingParams {
+            text_document: TextDocumentIdentifier { uri },
+            options,
+            work_done_progress_params,
+        };
+        client
+            .request("textDocument/formatting", params, client.request_timeout())
+            .await?
+    };
+    Ok(response.unwrap_or_default())
 }
 
 /// Maximum length, in bytes, of a `rename_symbol` `new_name` parameter.
@@ -454,14 +506,16 @@ impl Translator {
         })
     }
 
-    /// Handle format document request. With `apply` true, writes the
-    /// resulting edits to disk instead of only describing them.
+    /// Handle format document request, formatting only `range` when one is
+    /// given. With `apply` true, writes the resulting edits to disk instead
+    /// of only describing them.
     ///
     /// # Errors
     ///
     /// Returns an error if the LSP request fails, the file cannot be opened,
-    /// or the routed server does not advertise `documentFormattingProvider`
-    /// support. When `apply` is true, also returns [`Error::ApplyDisabled`]
+    /// `range` is malformed, or the routed server does not advertise
+    /// `documentFormattingProvider` (`documentRangeFormattingProvider` with a
+    /// `range`). When `apply` is true, also returns [`Error::ApplyDisabled`]
     /// if config forbids `format_document` from writing,
     /// [`Error::ApplyRefused`] if the edit is rejected before anything is
     /// written, or [`Error::ApplyPartiallyFailed`] if a write step fails
@@ -471,8 +525,17 @@ impl Translator {
         file_path: String,
         tab_size: u32,
         insert_spaces: bool,
+        range: Option<Range>,
         apply: bool,
     ) -> Result<FormatDocumentResult> {
+        if let Some(range) = &range {
+            validate_range(
+                range.start.line,
+                range.start.character,
+                range.end.line,
+                range.end.character,
+            )?;
+        }
         let write_permit = if apply {
             Some(self.applier_for(
                 ToolKind::FormatDocument,
@@ -483,37 +546,35 @@ impl Translator {
             None
         };
 
+        let ranged = range.is_some();
+        let capability = if ranged {
+            "documentRangeFormattingProvider"
+        } else {
+            "documentFormattingProvider"
+        };
         let (server_id, client, uri) = self
-            .prepare_gated_document(
-                &file_path,
-                ToolKind::FormatDocument,
-                "documentFormattingProvider",
-                |caps| {
+            .prepare_gated_document(&file_path, ToolKind::FormatDocument, capability, |caps| {
+                if ranged {
+                    matches!(
+                        caps.document_range_formatting_provider,
+                        Some(lsp_types::OneOf::Left(true) | lsp_types::OneOf::Right(_))
+                    )
+                } else {
                     matches!(
                         caps.document_formatting_provider,
                         Some(lsp_types::OneOf::Left(true) | lsp_types::OneOf::Right(_))
                     )
-                },
-            )
+                }
+            })
             .await?;
         let ctx = self.encoding_ctx(&server_id);
         let response_uri = uri.clone();
-
-        let params = DocumentFormattingParams {
-            text_document: TextDocumentIdentifier { uri },
-            options: FormattingOptions {
-                tab_size,
-                insert_spaces,
-                ..Default::default()
-            },
-            work_done_progress_params: WorkDoneProgressParams::default(),
+        let options = FormattingOptions {
+            tab_size,
+            insert_spaces,
+            ..Default::default()
         };
-
-        let response: Option<Vec<lsp_types::TextEdit>> = client
-            .request("textDocument/formatting", params, client.request_timeout())
-            .await?;
-
-        let edits = response.unwrap_or_default();
+        let edits = request_formatting(&client, &ctx, uri, options, range).await?;
 
         let mut result_edits = Vec::with_capacity(edits.len());
         for edit in &edits {
@@ -1411,7 +1472,7 @@ mod tests {
     async fn test_format_with_apply_is_refused_when_config_forbids_it() {
         let translator = Translator::new();
         let error = translator
-            .handle_format_document("/w/a.rs".to_string(), 4, true, true)
+            .handle_format_document("/w/a.rs".to_string(), 4, true, None, true)
             .await
             .expect_err("apply must be refused by a read-only translator");
         assert!(
@@ -1466,7 +1527,7 @@ mod tests {
             let translator = Arc::clone(&translator);
             tokio::spawn(async move {
                 translator
-                    .handle_format_document(indirect, 4, true, true)
+                    .handle_format_document(indirect, 4, true, None, true)
                     .await
             })
         };
@@ -1546,7 +1607,7 @@ mod tests {
             let translator = Arc::clone(&translator);
             tokio::spawn(async move {
                 translator
-                    .handle_format_document(path_str, 4, true, true)
+                    .handle_format_document(path_str, 4, true, None, true)
                     .await
             })
         };

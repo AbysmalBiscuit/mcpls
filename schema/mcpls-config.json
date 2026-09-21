@@ -431,7 +431,7 @@
         },
         {
           "const": "format_document",
-          "description": "`textDocument/formatting`.",
+          "description": "`textDocument/formatting` and `textDocument/rangeFormatting`.",
           "type": "string"
         },
         {

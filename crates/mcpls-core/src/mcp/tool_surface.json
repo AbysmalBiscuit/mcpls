@@ -77,8 +77,46 @@
   {
     "name": "format_document",
     "title": "Format Document",
-    "description": "Format document with language-specific rules. Returns text edits for indentation, spacing, and style. With apply=true, and apply.format_document enabled in config, writes those edits to disk.",
+    "description": "Format document with language-specific rules. Returns text edits for indentation, spacing, and style. With range, formats only that range. With apply=true, and apply.format_document enabled in config, writes those edits to disk.",
     "inputSchema": {
+      "$defs": {
+        "RangeParams": {
+          "description": "Shared range parameters (1-based start/end line and character) used by\nevery tool that operates over a range in a file.",
+          "properties": {
+            "end_character": {
+              "description": "End character (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "end_line": {
+              "description": "End line (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "start_character": {
+              "description": "Start character (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "start_line": {
+              "description": "Start line (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "start_line",
+            "start_character",
+            "end_line",
+            "end_character"
+          ],
+          "type": "object"
+        }
+      },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "apply": {
@@ -94,6 +132,17 @@
           "default": true,
           "description": "Whether to use spaces instead of tabs (default: true).",
           "type": "boolean"
+        },
+        "range": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RangeParams"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Format only this range instead of the whole document. Fails when the language server does not support range formatting."
         },
         "tab_size": {
           "default": 4,
