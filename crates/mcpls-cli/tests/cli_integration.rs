@@ -1008,23 +1008,11 @@ async fn test_codex_hook_reaches_the_owner_named_by_the_payload_cwd() {
     owner.await.unwrap();
 }
 
-/// A hook invocation must never panic on a closed stdout, the same
-/// guarantee `test_completions_survives_a_closed_pipe` proves for
-/// `completions`: a hook branch that wrote with `print!` would panic past
-/// the `LineWriter`'s buffer. `SessionStart` used to force that real write
-/// on its own, but it now falls through to the empty catch-all, so this
-/// answers `UserPromptSubmit` from a live owner instead, which is what
-/// gives the hook non-empty JSON to write against the closed pipe.
+/// A hook must not panic writing to a closed stdout, which `print!` does
+/// once a write gets past the `LineWriter` buffer.
 ///
-/// Two properties have to hold for that to actually exercise anything:
-/// the context text has to be bigger than any std `LineWriter` buffer, or
-/// the whole write sits in the buffer and an exit-time flush silently
-/// swallows the error a refactor back to `print!` would trigger; and the
-/// write has to be proven non-empty against a real, captured stdout
-/// first, or a socket-derivation drift that makes the hook answer empty
-/// would leave the closed-pipe run below asserting nothing at all
-/// (`write_all("")` never touches a closed fd). Both are checked here
-/// rather than assumed.
+/// The answer has to outgrow that buffer, and a captured run first proves
+/// it is non-empty: `write_all("")` never touches the closed pipe.
 #[cfg(unix)]
 #[tokio::test]
 async fn test_hook_survives_a_closed_pipe() {
@@ -1033,11 +1021,7 @@ async fn test_hook_survives_a_closed_pipe() {
 
     use mcpls_core::hooks::{HookListener, Request, Response};
 
-    // Comfortably past the ~8KiB that forced the overflow this test
-    // guards against before this rewrite (200 top-level directories'
-    // worth of `SessionStart` JSON, in the version this replaced):
-    // shrinking this back down to something "tidy" would silently stop
-    // testing the unbuffered-write path at all.
+    // Past std's 8KiB `LineWriter` buffer; any smaller never reaches the fd.
     const OVERSIZED_CONTEXT_LEN: usize = 16 * 1024;
 
     let project = TempDir::new().unwrap();
@@ -1086,10 +1070,7 @@ async fn test_hook_survives_a_closed_pipe() {
             cmd
         };
 
-        // First, against a captured stdout: proves the hook actually
-        // reached the owner and wrote its oversized answer, so the
-        // closed-pipe run below is provably exercising a real write
-        // rather than a silently empty one.
+        // A captured run proves the hook writes the oversized answer at all.
         let captured = assert_cmd::Command::from_std(new_cmd())
             .write_stdin(PAYLOAD)
             .assert()

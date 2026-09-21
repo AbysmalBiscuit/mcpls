@@ -466,10 +466,8 @@ async fn backend_answer(
             ));
             lines.push(BACKEND_PID_UNKNOWN.to_string());
         }
-        // A connection was accepted and the exchange then failed, on the
-        // write, the read, an early hang-up, or the parse. The error
-        // carries which; the line says only what all four share, that
-        // something holds the socket and this build cannot talk to it.
+        // The socket accepted and the exchange failed: something holds it
+        // that this build cannot talk to.
         ProbeOutcome::Unintelligible(error) => {
             lines.push(format!(
                 "server sees: a socket is live but this build could not read its reply: \
@@ -671,13 +669,9 @@ struct ServerReport {
 /// What each configured language server is doing, or why it is doing
 /// nothing.
 ///
-/// A backend reports only the servers that apply to its checkout, so the
-/// ones it leaves out are the pair a reader cannot otherwise tell apart:
-/// a server no project marker here matches, and one that matches and
-/// whose binary is not installed. Both come from the configuration and
-/// the filesystem, so they survive with no backend running at all. Only a
-/// server in `requested`, which the user's own file names, counts its
-/// missing binary as a fault.
+/// Adds what the backend leaves out, and works with no backend running: a
+/// server no project marker matches, and one whose binary is missing. Only
+/// a server in `requested` counts a missing binary as a fault.
 fn server_reports(
     reported: &[ServerStatus],
     config: Option<&mcpls_core::ServerConfig>,
@@ -889,15 +883,9 @@ impl ForeignOwners {
 /// The `server sees` line to print when nothing answers this project's own
 /// socket.
 ///
-/// Candidates that were live but unidentifiable are reported as their own
-/// clause rather than folded into the counts above it. They are evidence
-/// that something is running, but not evidence of whose it is, and the
-/// lines above only ever count owners that named their own root.
-///
-/// The candidate cap bounds the whole scan rather than any one of its
-/// outcomes, so the clause disclosing it is appended last, to every
-/// variant the scan ran. A count printed without it reads as a total
-/// when it is a floor.
+/// Live but unidentifiable candidates get their own clause: they show
+/// something runs, not whose. A capped scan says so last on every variant,
+/// since its counts are floors.
 fn no_owner_line(foreign: ForeignOwners) -> String {
     let unidentified = foreign.unidentified();
     let truncated = foreign.truncated();
@@ -960,27 +948,14 @@ fn no_owner_line(foreign: ForeignOwners) -> String {
     }
 }
 
-/// Look for an mcpls answering some other project's socket in the same
-/// runtime location as `identity`'s own, so a doctor run against an
-/// unreachable socket can tell "nothing is running" apart from
-/// "something is running, for a directory that explains this one's
-/// silence".
+/// Look for an mcpls answering another socket beside `identity`'s, so the
+/// doctor can tell "nothing is running" from "one runs for a related
+/// directory".
 ///
-/// Candidates are probed in sorted order, so the set the cap applies to
-/// is the same on every run against an unchanged runtime location rather
-/// than whatever that location happened to list first. Which of those
-/// candidates answer inside the probe deadline is a property of the
-/// machine at the moment of the run, so the answer itself can still move
-/// between runs even when the candidates do not.
-///
-/// Sockets are named by their own directory's hash, which is the entire
-/// reason `identity`'s own probe above can never observe a live owner
-/// whose directory hashed differently: that owner bound a different
-/// socket file, not this one. This is the only way the doctor can learn
-/// about it at all. An owner is only ever named when its root is an
-/// ancestor or descendant of `project_dir`: anything else is a different
-/// project entirely, and naming it would accuse it of a failure it has
-/// nothing to do with.
+/// A socket is named by its root's hash, so an owner of a nested or parent
+/// root is invisible to this project's own probe. Only such an owner is
+/// named; any other root is a different project. Candidates are probed in
+/// sorted order, so the cap cuts the same set each run.
 async fn find_foreign_owner(
     identity: &SocketIdentity,
     project_dir: &Path,
@@ -993,12 +968,8 @@ async fn find_foreign_owner(
     let truncated = candidates.len() > MAX_FOREIGN_CANDIDATES;
     let mut unrelated = 0usize;
     let mut unidentified = 0usize;
-    // Naming an owner does not end the scan. Stopping at the first
-    // related answer would leave the candidates after it unprobed, so the
-    // unidentified count beside the name would be a floor while every
-    // other variant's is a total, and which it was would depend on the
-    // order the runtime directory happened to list its entries in. The
-    // candidate cap is what bounds the wait.
+    // Scan past the first related owner, so the unidentified count is a
+    // total in every variant; the candidate cap bounds the wait.
     let mut related = Option::<(PathBuf, u32)>::None;
     let mut related_count = 0usize;
     for socket in candidates.into_iter().take(MAX_FOREIGN_CANDIDATES) {
@@ -1021,12 +992,8 @@ async fn find_foreign_owner(
                     unrelated += 1;
                 }
             }
-            // Accepted the connection and then either said nothing in
-            // time or said something this build could not read. That is
-            // still a process holding the socket, and an mcpls speaking
-            // an older wire shape is the likeliest way to get here, so
-            // counting it as an absence would report the one thing the
-            // scan has evidence against.
+            // Something holds the socket, likely an mcpls on an older wire
+            // shape, so it is not an absence.
             ProbeOutcome::Refused(_) | ProbeOutcome::Busy | ProbeOutcome::Unintelligible(_) => {
                 unidentified += 1;
             }
@@ -1117,17 +1084,11 @@ fn foreign_candidates(identity: &SocketIdentity, prefix: &str) -> std::io::Resul
 #[cfg(windows)]
 const PIPE_LISTINGS: usize = 3;
 
-/// The doctor's answer when this project's own socket identity cannot be
-/// derived at all: an unreachable project directory, or a runtime
-/// directory deep enough that the derived socket path exceeds this
-/// platform's length limit. A running mcpls that hit the same failure
-/// logs a warning and serves no socket rather than aborting startup, so
-/// this state is real, not hypothetical.
+/// The doctor's answer when no socket identity can be derived: an
+/// unreachable directory, or a socket path over the platform's limit.
 ///
-/// Kept distinct from "server sees: no owner": that line means a socket
-/// exists and nothing answers it; this means no socket could ever exist
-/// here at all, on either side, which a user needs to be able to tell
-/// apart from a server that simply is not running right now.
+/// Distinct from "server sees: no owner", where a socket exists and nothing
+/// answers; here no socket can exist at all.
 pub fn doctor_without_identity(
     project_dir: &Path,
     examined: Examined,
@@ -1172,14 +1133,9 @@ fn on_path_line(found: Option<&Path>) -> String {
 /// The absolute path to an executable named `mcpls` (`mcpls.exe` on
 /// Windows) on the first `PATH` entry that has one, or `None`.
 ///
-/// Hooks invoke `mcpls` by name off `PATH` rather than by an absolute
-/// path, so a hook environment missing the install directory makes every
-/// hook do nothing, invisibly. Walking `PATH` by hand rather than
-/// shelling out to `which`, which is not installed on every host mcpls
-/// runs on. `PATH` entries are not guaranteed absolute themselves (a bare
-/// `bin`, `.`, or an empty entry from `::` all parse), so the winning
-/// candidate is absolutized before it is returned: a relative path here
-/// means nothing to whatever directory a hook later runs in.
+/// Hooks run `mcpls` by name, so without it on `PATH` every hook silently
+/// does nothing. A relative `PATH` entry is made absolute, since it means
+/// nothing to the directory a hook later runs in.
 fn mcpls_on_path() -> Option<PathBuf> {
     let exe_name = if cfg!(windows) { "mcpls.exe" } else { "mcpls" };
     let path = std::env::var_os("PATH")?;
@@ -1407,17 +1363,8 @@ mod tests {
         .to_string()
     }
 
-    /// How `RecordingOwner` answers requests: the `Flush` context text, how
-    /// long to wait before answering one, and whether `Changed` answers an
-    /// error instead of queuing. The delay defaults to zero and the error
-    /// defaults to off; a test exercising either sets it explicitly, so a
-    /// regression that narrows a client's tolerance has something in the
-    /// suite that would notice.
-    ///
-    /// The flags are independent switches over one owner, not states of a
-    /// machine: a test sets whichever ones its scenario needs and leaves
-    /// the rest at their defaults, so folding them into an enum would
-    /// enumerate combinations no reader has a name for.
+    /// How `RecordingOwner` answers requests. Each flag is an independent
+    /// switch a test sets for its scenario, so they are not an enum.
     #[derive(Clone)]
     #[allow(clippy::struct_excessive_bools)]
     struct OwnerBehavior {
@@ -1534,15 +1481,9 @@ mod tests {
     /// A listener on a temporary socket that records every request it is
     /// sent, in order, and answers each plausibly.
     ///
-    /// A hand-rolled newline-delimited JSON accept loop, not
-    /// `HookListener`: the protocol's framing is pinned by
-    /// `mcpls_core::hooks::protocol`'s own tests, so nothing here depends
-    /// on `HookListener`'s specific accept/serve machinery, and speaking
-    /// the wire format directly means one socket yields the full `Request`
-    /// (paths, session ids, event kinds) and a true connection count from
-    /// its own accept counter, rather than needing a second socket in
-    /// front of a `HookListener` whose handler cannot see connection
-    /// boundaries at all.
+    /// It speaks the wire format itself rather than wrapping `HookListener`,
+    /// whose handler cannot see connection boundaries, so it can count
+    /// connections.
     struct RecordingOwner {
         dir: tempfile::TempDir,
         identity: SocketIdentity,
@@ -1628,10 +1569,8 @@ mod tests {
             let connections = Arc::new(AtomicUsize::new(0));
             let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
-            // Bound synchronously, before this function returns: a spawned
-            // task's first poll is not guaranteed to happen before the
-            // caller's next `send`/`send_many`, and a socket that does not
-            // exist yet would refuse that connection outright.
+            // Bound before returning: the spawned task may not run before
+            // the caller's first `send`, which a missing socket refuses.
             let listener = bind_owner(&identity.socket);
             tokio::spawn(accept_loop(
                 listener,
@@ -1651,16 +1590,11 @@ mod tests {
             }
         }
 
-        /// An owner bound on `identity`, answering `Status` as though its
-        /// own startup directory were `root` and it had already answered
-        /// `hooks_seen` hook requests, rather than wherever this process
-        /// actually runs and however many requests this test harness has
-        /// actually served.
+        /// An owner bound on `identity` whose `Status` claims `root` as its
+        /// startup directory and `hooks_seen` requests answered.
         ///
-        /// Uses `identity_hash` rather than `identity_for`, which also
-        /// builds and length-checks a real socket path this call never
-        /// uses: a caller on a host with a long runtime directory would
-        /// otherwise panic here before the test bound anything.
+        /// Uses `identity_hash`, since `identity_for` fails on a host whose
+        /// runtime directory makes the socket path too long.
         fn start_reporting_status(identity: SocketIdentity, root: &Path, hooks_seen: u64) -> Self {
             let hash = mcpls_core::hooks::identity_hash(root)
                 .expect("identity hash for the reported root");
@@ -1672,10 +1606,8 @@ mod tests {
                     status_hash: hash,
                     status_root: root.to_path_buf(),
                     status_hooks_seen: hooks_seen,
-                    // A backend that is actually watching, so the doctor's
-                    // watcher line is asserted against a reported state
-                    // rather than against the empty default every other
-                    // behavior carries.
+                    // A watching backend, so the watcher line is checked
+                    // against a reported state, not the empty default.
                     status_watcher: WatcherStatus {
                         watching: true,
                         directories: 7,
@@ -1804,11 +1736,8 @@ mod tests {
         use tokio::io::AsyncReadExt as _;
 
         if behavior.silent {
-            // Accepted, and then never read from or written to: a real
-            // connection with a real owner on the other end of it, who
-            // simply never gets back to the client. `stream` stays open
-            // for as long as this future is polled, which is exactly as
-            // long as the test that spawned it keeps its runtime alive.
+            // An owner that accepts and never answers; `stream` stays open
+            // while the test's runtime lives.
             std::future::pending::<()>().await;
         }
 
@@ -1852,10 +1781,8 @@ mod tests {
 
             let hang_up = behavior.hang_up_after_flush && matches!(request, Request::Flush { .. });
 
-            // A raw line bypasses `Response`'s own serialization entirely,
-            // for a test standing in for a wire shape this build's
-            // `Response` cannot represent at all (a previous version
-            // missing a field this build now requires).
+            // A raw line stands in for an older wire shape this build's
+            // `Response` cannot represent.
             let mut out = if matches!(request, Request::Status)
                 && let Some(raw) = &behavior.status_raw_line
             {
@@ -2542,15 +2469,10 @@ mod tests {
     }
 
     /// The identity `identity_for(project)` would derive, with its socket
-    /// and lock moved into `dir` in place of the real runtime directory
-    /// `identity_for` would otherwise choose.
+    /// and lock moved into `dir`.
     ///
-    /// Uses `identity_hash` rather than `identity_for`, which also builds
-    /// and length-checks a real socket path this function never uses: on
-    /// a host with a long runtime directory (the macOS/CI condition
-    /// `doctor_without_identity` exists to degrade gracefully for),
-    /// `identity_for` fails outright, and every one of these tests would
-    /// panic before binding anything.
+    /// Uses `identity_hash`, since `identity_for` fails on a host whose
+    /// runtime directory makes the socket path too long.
     fn local_identity_for(project: &Path, dir: &Path) -> SocketIdentity {
         let hash = mcpls_core::hooks::identity_hash(project).expect("identity hash");
         let socket = test_socket(dir, &format!("{hash}.sock"));
@@ -4176,17 +4098,8 @@ mod tests {
         relative
     }
 
-    /// A `PATH` entry may be relative, and a relative path means nothing
-    /// to whatever directory a hook later runs in. Deleting the
-    /// absolutizing `.map` from `resolve_on_path`
-    /// must fail this without depending on the ambient `PATH`, which is
-    /// why the entry here is built from the real current directory
-    /// instead of assumed to already be relative.
-    /// A file named `mcpls` that nobody can execute is not an mcpls a
-    /// hook can invoke, and reporting it as one sends a reader looking
-    /// for a broken hook wiring that is really a broken install. Unix
-    /// only: Windows decides executability by extension, which the
-    /// filename already carries.
+    /// A non-executable `mcpls` is a broken install, not one a hook can run.
+    /// Unix only: Windows decides executability by extension.
     #[cfg(unix)]
     #[test]
     fn test_resolve_on_path_skips_a_file_without_the_executable_bit() {
@@ -4207,6 +4120,9 @@ mod tests {
         );
     }
 
+    /// A relative `PATH` entry means nothing to the directory a hook runs
+    /// in. The entry is built relative to the real working directory so the
+    /// test holds whatever the ambient `PATH` is.
     #[test]
     fn test_resolve_on_path_absolutizes_a_relative_path_entry() {
         let cwd = std::env::current_dir().expect("cwd");

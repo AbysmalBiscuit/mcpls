@@ -134,11 +134,11 @@ async fn main() {
         0
     };
 
-    // `#[tokio::main]`'s generated wrapper blocks in `Runtime::drop` ->
-    // `BlockingPool::shutdown` after this function returns, waiting for
-    // every outstanding spawn_blocking thread -- including the one
-    // `rmcp::transport::stdio()` (== `tokio::io::stdin()`) parks in a raw,
-    // uncancellable `read()` on the real stdin fd. That read only returns on
+    // Dropping the runtime waits on the thread parked in an uncancellable
+    // stdin `read()`, which never returns while the client holds stdin open.
+    std::process::exit(exit_code);
+}
+
 /// Answer one hook invocation for `event`, or for the event the payload
 /// names when the manifest named none.
 async fn serve_hook(harness: hook::Harness, event: Option<hook::HookEvent>) {
@@ -170,15 +170,6 @@ async fn serve_hook(harness: hook::Harness, event: Option<hook::HookEvent>) {
     let _ = stdout
         .write_all(out.as_bytes())
         .and_then(|()| stdout.flush());
-}
-
-    // more input or EOF, so if the MCP client's write end of stdin is still
-    // open, the wait never completes even though `run()` above (which
-    // includes LSP server shutdown and all shutdown logging) has already
-    // finished. `process::exit` terminates immediately, bypassing that wait
-    // -- safe here because everything that matters has already completed
-    // above. See #308.
-    std::process::exit(exit_code);
 }
 
 fn emit_schema() {

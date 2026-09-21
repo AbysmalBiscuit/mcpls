@@ -7,19 +7,11 @@ use clap::{Parser, Subcommand};
 use crate::completions::Shell;
 use crate::hook::{Harness, HookEvent};
 
-/// Parses a boolean flag/env value, accepting common truthy and falsy
-/// spellings beyond the strict `"true"`/`"false"` that `str::parse::<bool>`
-/// allows.
+/// Parses a boolean flag or env value, accepting `1`/`0`, `yes`/`no`,
+/// `y`/`n` and `on`/`off` besides `true`/`false`, case-insensitively.
 ///
-/// Environment variables rarely follow Rust's `bool` literal syntax, so this
-/// parser also accepts (case-insensitively) `1`/`0`, `yes`/`no`, `y`/`n`, and
-/// `on`/`off`. Any other value is rejected with a message naming the input.
-///
-/// The input is not trimmed: a whitespace-padded value (e.g. `" true "`) or
-/// an empty string is rejected, not coerced. This matters for
-/// `Environment=MCPLS_LOG_JSON=` (systemd) or `-e MCPLS_LOG_JSON=` (Docker)
-/// with no value after the `=`, which hard-fails startup rather than being
-/// treated as unset.
+/// Padded or empty input is rejected, so `MCPLS_LOG_JSON=` with no value
+/// fails startup instead of reading as unset.
 pub fn parse_bool_flag(s: &str) -> Result<bool, String> {
     match s.to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "y" | "on" => Ok(true),
@@ -209,9 +201,6 @@ pub enum Command {
 
 /// Actions for `mcpls schema`.
 #[derive(Debug, Subcommand)]
-    #[command(flatten)]
-    Event(HookEvent),
-
 pub enum SchemaAction {
     /// Create a default `mcpls.toml` in the current directory
     Init,
@@ -220,6 +209,9 @@ pub enum SchemaAction {
 /// Actions for `mcpls hook`.
 #[derive(Debug, Subcommand)]
 pub enum HookAction {
+    #[command(flatten)]
+    Event(HookEvent),
+
     /// Alias for `mcpls doctor`, kept because published troubleshooting
     /// text spells it this way. It always exits 0, which the hook path
     /// requires; the top-level command reports a fault in its status.
