@@ -761,7 +761,9 @@ fn a_started_backend_outlives_its_idle_timer_until_stopped() {
 /// that session attached leaves the backend to exit once the session does.
 #[test]
 fn a_stop_leaves_an_attached_backend_to_exit_with_its_sessions() {
-    let project = Project::new(300);
+    // Outlasts the frontend's retry, so a hook-started backend on Windows is
+    // still up when the frontend comes to attach.
+    let project = Project::new(2_000);
     let mut frontend = project.frontend();
     project.assert_attaches(&mut frontend);
     let pid = project.backend_pid().expect("a backend");
