@@ -1150,6 +1150,79 @@ fn i1_t3_all_failed_startup_flushes_empty() -> Result<()> {
     }
 }
 
+/// A server binary that exits before answering `initialize` is reported as
+/// soon as it dies, with its own stderr, not after `timeout_seconds`.
+#[test]
+#[cfg(unix)]
+#[ignore = "Requires mcpls binary built"]
+fn test_e2e_server_exiting_during_initialize_reports_its_stderr() -> Result<()> {
+    let workspace = TempDir::new()?;
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[package]\nname = \"fixture\"\n",
+    )?;
+    let script = workspace.path().join("dead-rust-analyzer.sh");
+    fs::write(
+        &script,
+        "echo \"error: Unknown binary 'rust-analyzer' in official toolchain 'stable'\" >&2\nexit 1\n",
+    )?;
+
+    let config_path = workspace.path().join("mcpls.toml");
+    write_fixture_config(
+        &config_path,
+        "rust",
+        "sh",
+        &[script.to_string_lossy().into_owned()],
+        &[],
+        FixtureConfigOptions {
+            workspace_mapping: false,
+            spawn: SpawnPolicy::Eager,
+            handles: &[],
+        },
+    )?;
+    let file_path = workspace.path().join("src/lib.rs");
+    fs::create_dir_all(
+        file_path
+            .parent()
+            .context("fixture file must have a parent")?,
+    )?;
+    fs::write(&file_path, "fn fixture() {}\n")?;
+
+    let config_arg = config_path
+        .to_str()
+        .context("fixture config path must be valid UTF-8")?;
+    let mut client = McpClient::spawn_with_args(&["--config", config_arg])?;
+    client.initialize()?;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let message = loop {
+        match client.call_tool(
+            "get_hover",
+            &json!({
+                "file_path": file_path,
+                "line": 0,
+                "character": 0,
+            }),
+        ) {
+            Ok(response) => panic!("the dead Rust server unexpectedly answered: {response}"),
+            Err(error)
+                if error.to_string().contains("still initializing")
+                    && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => break error.to_string(),
+        }
+    };
+    assert!(
+        message.contains("LSP server 'rust' is unavailable")
+            && message.contains("exited during startup")
+            && message.contains("Unknown binary 'rust-analyzer'"),
+        "the error should name the exit and carry the server's stderr, got {message}"
+    );
+    Ok(())
+}
+
 /// Test that mcpls exits promptly on `SIGTERM` while the client's stdin
 /// write end is still open (regression test for #308).
 ///
