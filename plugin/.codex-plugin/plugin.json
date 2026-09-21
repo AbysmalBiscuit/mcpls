@@ -1,6 +1,6 @@
 {
   "name": "mcpls",
-  "version": "0.3.11",
+  "version": "0.4.0",
   "description": "Language server intelligence and push diagnostics through mcpls",
   "author": {
     "name": "Lev Velykoivanenko"
