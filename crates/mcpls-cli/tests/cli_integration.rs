@@ -79,19 +79,25 @@ fn test_help_flag() {
         .stdout(predicate::str::contains("--config"));
 }
 
+/// `mcpls backend` lists its actions and hides the `--root` a frontend
+/// launches a backend with.
 #[test]
-fn test_help_hides_the_backend_subcommand() {
+fn test_backend_help_lists_its_actions_and_hides_serving() {
     let mut cmd = Command::cargo_bin("mcpls").unwrap();
     clear_ambient_env(&mut cmd)
         .arg("--help")
         .assert()
         .success()
-        .stdout(predicate::str::contains("--no-backend"))
-        .stdout(
-            predicate::str::is_match(r"(?m)^\s+backend\s")
-                .unwrap()
-                .not(),
-        );
+        .stdout(predicate::str::is_match(r"(?m)^\s+backend\s").unwrap());
+    let mut cmd = Command::cargo_bin("mcpls").unwrap();
+    clear_ambient_env(&mut cmd)
+        .args(["backend", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_match(r"(?m)^\s+start\s").unwrap())
+        .stdout(predicate::str::is_match(r"(?m)^\s+stop\s").unwrap())
+        .stdout(predicate::str::is_match(r"(?m)^\s+status\s").unwrap())
+        .stdout(predicate::str::contains("--root").not());
 }
 
 #[test]

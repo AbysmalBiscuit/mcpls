@@ -370,9 +370,11 @@ async fn accept_hook_handshake(mut stream: Box<dyn HookStream>) -> Option<Box<dy
         Some(Refusal::InProcess)
     };
     let refused = refusal.is_some();
-    handshake::write(&mut stream, &HandshakeReply::new(0, refusal))
-        .await
-        .ok()?;
+    let reply = HandshakeReply {
+        in_process: true,
+        ..HandshakeReply::new(0, refusal)
+    };
+    handshake::write(&mut stream, &reply).await.ok()?;
     (!refused).then_some(stream)
 }
 

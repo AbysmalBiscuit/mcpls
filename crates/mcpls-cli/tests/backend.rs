@@ -108,7 +108,6 @@ impl Project {
 
     /// Assert `holds` stays true for the whole of `window`. For a start or
     /// a replacement that must not happen, where no event marks its absence.
-    #[cfg(unix)]
     fn holds_for(&self, what: &str, window: Duration, mut holds: impl FnMut(&Self) -> bool) {
         let deadline = Instant::now() + window;
         while Instant::now() < deadline {
@@ -203,6 +202,23 @@ impl Project {
             );
             std::thread::sleep(Duration::from_millis(100));
         }
+    }
+
+    /// Run `mcpls backend ARGS` for this project: whether it succeeded,
+    /// and what it printed.
+    fn backend(&self, args: &[&str]) -> (bool, String) {
+        let output = self
+            .command(&self.root())
+            .arg("--config")
+            .arg(self.config())
+            .arg("backend")
+            .args(args)
+            .output()
+            .unwrap();
+        (
+            output.status.success(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+        )
     }
 
     fn wait_for(&self, what: &str, mut ready: impl FnMut(&Self) -> bool) {
@@ -714,4 +730,75 @@ fn a_hook_starts_the_backend_a_frontend_asked_for() {
     assert!(project.backend_pid().is_some(), "{}", project.doctor());
     frontend.close(Duration::from_secs(5));
     project.wait_for("the backend to exit", |p| p.backend_pid().is_none());
+}
+
+/// `mcpls backend start` keeps a backend up with no session attached, past
+/// its idle timer, until `mcpls backend stop` ends it.
+#[test]
+fn a_started_backend_outlives_its_idle_timer_until_stopped() {
+    let project = Project::new(300);
+    let (started, text) = project.backend(&["start"]);
+    assert!(started, "{text}");
+    let pid = project.backend_pid().expect("a started backend");
+    assert!(text.contains(&pid.to_string()), "{text}");
+
+    project.holds_for("the kept backend", Duration::from_millis(1_500), |p| {
+        p.backend_pid() == Some(pid)
+    });
+    let (running, status) = project.backend(&["status"]);
+    assert!(running && status.contains("kept"), "{status}");
+
+    let (stopped, text) = project.backend(&["stop"]);
+    assert!(stopped, "{text}");
+    assert_eq!(project.backend_pid(), None, "{}", project.doctor());
+    let (running, status) = project.backend(&["status"]);
+    assert!(!running && status.contains("not running"), "{status}");
+    let (stopped, text) = project.backend(&["stop"]);
+    assert!(stopped && text.contains("not running"), "{text}");
+}
+
+/// A start keeps the backend a session already started, and a stop with
+/// that session attached leaves the backend to exit once the session does.
+#[test]
+fn a_stop_leaves_an_attached_backend_to_exit_with_its_sessions() {
+    let project = Project::new(300);
+    let mut frontend = project.frontend();
+    project.assert_attaches(&mut frontend);
+    let pid = project.backend_pid().expect("a backend");
+
+    let (started, text) = project.backend(&["start"]);
+    assert!(started, "{text}");
+    assert_eq!(
+        project.backend_pid(),
+        Some(pid),
+        "start replaced the backend"
+    );
+
+    let (stopped, text) = project.backend(&["stop"]);
+    assert!(!stopped, "{text}");
+    assert!(text.contains("1 session"), "{text}");
+    assert_eq!(project.backend_pid(), Some(pid));
+
+    frontend.close(Duration::from_secs(5));
+    project.wait_for("the backend to exit with its session", |p| {
+        p.backend_pid().is_none()
+    });
+}
+
+/// A forced stop ends the backend with a session attached, and that
+/// session's tools then fail rather than hang.
+#[test]
+fn a_forced_stop_ends_a_backend_with_a_session_attached() {
+    let project = Project::new(60_000);
+    let mut frontend = project.frontend();
+    project.assert_attaches(&mut frontend);
+
+    let (stopped, text) = project.backend(&["stop", "--force"]);
+    assert!(stopped, "{text}");
+    assert_eq!(project.backend_pid(), None, "{}", project.doctor());
+    let call = frontend.call_tool();
+    assert!(
+        call["result"]["isError"] == true || call["error"].is_object(),
+        "{call}"
+    );
 }

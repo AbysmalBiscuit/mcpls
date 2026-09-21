@@ -29,7 +29,7 @@ use crate::transport::ShutdownSignal;
 pub(crate) enum Exit {
     /// No session was attached for the whole idle timer.
     Idle,
-    /// A client asked, with no session attached.
+    /// A client asked, with no session attached or with force.
     Shutdown,
     /// The process was signalled.
     Signal,
@@ -144,6 +144,8 @@ pub(crate) struct Endpoint {
     op_deadline: Duration,
     closing: watch::Sender<bool>,
     shutdown: watch::Sender<bool>,
+    /// Set by `mcpls backend start`, cleared by any shutdown request.
+    kept: watch::Sender<bool>,
 }
 
 impl Endpoint {
@@ -177,6 +179,7 @@ impl Endpoint {
             op_deadline: Duration::from_millis(config.diagnostics.hooks.op_deadline_ms),
             closing: watch::channel(false).0,
             shutdown: watch::channel(false).0,
+            kept: watch::channel(false).0,
         })
     }
 
@@ -190,7 +193,7 @@ impl Endpoint {
     ) -> Exit {
         let mut tasks = tokio::task::JoinSet::new();
         let (handler_tx, mut handler_rx) = mpsc::unbounded_channel();
-        let idle_expired = idle_expired(self.attachments.watch(), idle);
+        let idle_expired = idle_expired(self.attachments.watch(), self.kept.subscribe(), idle);
         let mut shutdown = self.shutdown.subscribe();
         tokio::pin!(idle_expired, signal);
         let exit = loop {
@@ -241,11 +244,16 @@ impl Endpoint {
         let sessions = self.attachments.count();
         let refusal = self.refusal_for(&request, sessions);
         let refused = refusal.is_some();
-        if handshake::write(&mut stream, &HandshakeReply::new(sessions, refusal))
-            .await
-            .is_err()
-            || refused
-        {
+        if request.kind == ConnectionKind::Shutdown {
+            self.kept.send_replace(false);
+        } else if request.keep {
+            self.kept.send_replace(true);
+        }
+        let reply = HandshakeReply {
+            kept: *self.kept.borrow(),
+            ..HandshakeReply::new(sessions, refusal)
+        };
+        if handshake::write(&mut stream, &reply).await.is_err() || refused {
             return;
         }
         let mut closing = self.closing.subscribe();
@@ -265,13 +273,14 @@ impl Endpoint {
 
     fn refusal_for(&self, request: &Handshake, sessions: usize) -> Option<Refusal> {
         if request.kind == ConnectionKind::Shutdown {
-            if sessions > 0 {
+            let refused = sessions > 0 && !request.force;
+            if refused {
                 debug!(
                     sessions = ?self.attachments.sessions(),
                     "shutdown refused while sessions are attached"
                 );
             }
-            return (sessions > 0).then_some(Refusal::Attached);
+            return refused.then_some(Refusal::Attached);
         }
         if !request.same_build() {
             return Some(Refusal::Build);
@@ -355,19 +364,22 @@ fn fingerprint_note(backend: &ConfigStamp, frontend: &ConfigStamp) -> String {
     )
 }
 
-/// Resolves once nothing has been attached for `idle` without a break.
-async fn idle_expired(mut count: watch::Receiver<usize>, idle: Duration) {
+/// Resolves once nothing has been attached, and nothing asked the backend
+/// to stay, for `idle` without a break.
+async fn idle_expired(
+    mut count: watch::Receiver<usize>,
+    mut kept: watch::Receiver<bool>,
+    idle: Duration,
+) {
     loop {
-        if *count.borrow() != 0 && count.wait_for(|attached| *attached == 0).await.is_err() {
+        let held = *count.borrow_and_update() != 0 || *kept.borrow_and_update();
+        let changed = tokio::select! {
+            () = tokio::time::sleep(idle), if !held => return,
+            changed = count.changed() => changed,
+            changed = kept.changed() => changed,
+        };
+        if changed.is_err() {
             return std::future::pending().await;
-        }
-        tokio::select! {
-            () = tokio::time::sleep(idle) => return,
-            changed = count.changed() => {
-                if changed.is_err() {
-                    return std::future::pending().await;
-                }
-            }
         }
     }
 }
@@ -958,7 +970,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_idle_timer_restarts_after_a_coalesced_attach_detach() {
         let (sender, receiver) = watch::channel(1usize);
-        let timer = tokio::spawn(idle_expired(receiver, Duration::from_secs(10)));
+        let (_kept, kept) = watch::channel(false);
+        let timer = tokio::spawn(idle_expired(receiver, kept, Duration::from_secs(10)));
 
         sender.send_replace(0);
         tokio::task::yield_now().await;

@@ -170,12 +170,12 @@ fn spawn_detached_command(
     Ok(spawn_detached_command_with_status(exe, args, cwd, log)?.pid)
 }
 
-struct SpawnedChild {
+pub(crate) struct SpawnedChild {
     pid: u32,
-    exited: Arc<AtomicBool>,
+    pub(crate) exited: Arc<AtomicBool>,
 }
 
-fn spawn_detached_with_status(
+pub(crate) fn spawn_detached_with_status(
     exe: &Path,
     launch: &BackendLaunch,
     log: &Path,

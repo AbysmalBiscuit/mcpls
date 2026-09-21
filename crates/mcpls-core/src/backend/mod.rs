@@ -4,6 +4,7 @@
 //! project's endpoint, and the backend owns the language servers and every
 //! session's records.
 
+pub mod control;
 pub mod endpoint;
 pub mod frontend;
 pub mod handshake;

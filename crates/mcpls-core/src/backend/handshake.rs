@@ -42,7 +42,7 @@ pub enum ConnectionKind {
     /// Newline-delimited hook requests.
     Hook,
     /// A request that the backend exit, honoured only with no session
-    /// attached.
+    /// attached unless forced.
     Shutdown,
 }
 
@@ -98,6 +98,14 @@ pub struct Handshake {
     /// The client's configuration.
     #[serde(default)]
     pub config: Option<ConfigStamp>,
+    /// Asks the backend to stay up with no session attached until a
+    /// shutdown. A build that predates it ignores it and answers
+    /// `kept: false`.
+    #[serde(default)]
+    pub keep: bool,
+    /// Asks a shutdown to end the backend even with sessions attached.
+    #[serde(default)]
+    pub force: bool,
 }
 
 impl Handshake {
@@ -124,6 +132,24 @@ impl Handshake {
         Self::bare(ConnectionKind::Shutdown)
     }
 
+    /// `mcpls backend start` asking a backend to outlive its idle timer.
+    #[must_use]
+    pub fn keep() -> Self {
+        Self {
+            keep: true,
+            ..Self::hook()
+        }
+    }
+
+    /// `mcpls backend stop --force` ending a backend whatever is attached.
+    #[must_use]
+    pub fn forced_shutdown() -> Self {
+        Self {
+            force: true,
+            ..Self::shutdown()
+        }
+    }
+
     fn bare(kind: ConnectionKind) -> Self {
         Self {
             mcpls: PROTOCOL,
@@ -132,6 +158,8 @@ impl Handshake {
             root: None,
             session: None,
             config: None,
+            keep: false,
+            force: false,
         }
     }
 
@@ -157,6 +185,14 @@ pub struct HandshakeReply {
     /// Why the connection is refused, absent when it is accepted.
     #[serde(default)]
     pub refusal: Option<Refusal>,
+    /// Whether the server stays up with no session attached, as
+    /// `mcpls backend start` asks.
+    #[serde(default)]
+    pub kept: bool,
+    /// Whether the server is an mcpls serving one session in-process
+    /// rather than a shared backend.
+    #[serde(default)]
+    pub in_process: bool,
 }
 
 impl HandshakeReply {
@@ -169,6 +205,8 @@ impl HandshakeReply {
             pid: std::process::id(),
             sessions,
             refusal,
+            kept: false,
+            in_process: false,
         }
     }
 
