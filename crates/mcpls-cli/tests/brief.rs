@@ -23,6 +23,8 @@ fn fixture(extra: &str) -> Fixture {
     let root = dunce::canonicalize(dir.path()).unwrap();
     std::fs::create_dir(root.join(".git")).unwrap();
     std::fs::write(root.join("fake.marker"), "").unwrap();
+    std::fs::create_dir(root.join("src")).unwrap();
+    std::fs::write(root.join("src").join("main.fake"), "").unwrap();
     let command = assert_cmd::cargo::cargo_bin("mcpls");
     let config = root.join("brief.toml");
     std::fs::write(
@@ -98,6 +100,32 @@ fn a_checkout_no_installed_server_serves_gets_no_brief() {
     let output = brief(&fixture.root, None, &fixture.config, &[]);
 
     assert!(output.status.success());
+    assert_eq!(stdout(&output), "");
+}
+
+/// A marker says a server could start here, not that its language is
+/// here: a `.git` marker matches every checkout.
+#[test]
+fn a_server_whose_language_has_no_files_here_is_left_out() {
+    let fixture = fixture("");
+    std::fs::remove_file(fixture.root.join("src").join("main.fake")).unwrap();
+
+    let output = brief(&fixture.root, None, &fixture.config, &[]);
+
+    assert!(output.status.success());
+    assert_eq!(stdout(&output), "");
+}
+
+#[test]
+fn a_gitignored_file_does_not_put_its_language_in_the_brief() {
+    let fixture = fixture("");
+    std::fs::remove_file(fixture.root.join("src").join("main.fake")).unwrap();
+    std::fs::create_dir(fixture.root.join("out")).unwrap();
+    std::fs::write(fixture.root.join("out").join("built.fake"), "").unwrap();
+    std::fs::write(fixture.root.join(".gitignore"), "out/\n").unwrap();
+
+    let output = brief(&fixture.root, None, &fixture.config, &[]);
+
     assert_eq!(stdout(&output), "");
 }
 

@@ -4,6 +4,7 @@
 //! including LSP server definitions and workspace settings.
 
 mod language;
+mod presence;
 mod routing;
 mod server;
 
