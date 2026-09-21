@@ -105,14 +105,14 @@ The returned `LspServer` is shut down in a spawned task: the LSP `shutdown` and 
 
 Tests are written first and watched failing before the code lands.
 
-- **End to end through the binary**, in `crates/mcpls-cli/tests/backend.rs`, with a backend serving the `notification_generations.py` fixture. A frontend attaches and a tool call starts the server. Then:
+- **End to end through the binary**, in `crates/mcpls-cli/tests/backend.rs`, with a backend serving a small Python language server that logs each launch and each clean exit. A frontend attaches and a tool call starts the server. Then:
   1. `mcpls lsp stop fake` exits 0 and `mcpls lsp status` prints `fake  stopped`;
   2. a tool call on a `.fake` file returns the error naming `mcpls lsp start fake`, and the fixture's launch count does not move;
   3. `mcpls lsp start fake` exits 0 reporting `running`, and the launch count rises by one;
-  4. `mcpls lsp restart fake` produces a new generation, and the previous process is gone;
+  4. `mcpls lsp restart fake` produces a new generation, and the previous process exits through the LSP shutdown handshake;
   5. an unknown id exits 1 and lists the applicable ids;
   6. `mcpls lsp status` with no backend running exits 1.
-- **Stop during a spawn**, as a translator test in `bridge/translator/respawn.rs`, using the fixture's startup delay to hold the spawn open: the fresh server is retired and the state stays `stopped`.
+- **Stop during a spawn**, as a translator test in `bridge/translator/respawn.rs`, using a fixture whose `initialize` answer is delayed to hold the spawn open: the fresh server is retired and the state stays `stopped`.
 - **Wire literals** for `Request::Lsp` and `Response::Lsp` pinned in `hooks/protocol.rs` beside the existing ones. The lifecycle render test covers `stopped` through `EnumIter`.
 - **Argument parsing** in `args.rs`: `--all` conflicts with named servers, and a mutating action without either is an error.
 
