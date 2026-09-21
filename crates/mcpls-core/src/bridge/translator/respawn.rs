@@ -90,10 +90,14 @@ impl Drop for DiagnosticsReplay<'_> {
 }
 
 impl SpawnGuard {
-    fn publish_unless_stopped(&mut self, state: ServerLifecycle) -> bool {
+    fn finish(&mut self, state: ServerLifecycle) -> bool {
         self.armed = false;
-        self.translator
-            .set_lifecycle_unless_stopped(&self.id, state)
+        self.translator.finish_spawn(&self.id, state)
+    }
+
+    fn abandon(&mut self, state: ServerLifecycle) {
+        self.armed = false;
+        self.translator.abandon_spawn(&self.id, state);
     }
 }
 
@@ -108,7 +112,7 @@ impl Drop for SpawnGuard {
         );
         self.translator.record_respawn_failure(&self.id);
         self.translator
-            .set_lifecycle_unless_stopped(&self.id, ServerLifecycle::Failed);
+            .abandon_spawn(&self.id, ServerLifecycle::Failed);
     }
 }
 
@@ -293,13 +297,13 @@ impl Translator {
 
             self.reconcile_respawn_stability(id);
             if let Some(remaining) = self.respawn_backoff_remaining(id) {
-                self.set_lifecycle(id, ServerLifecycle::Failed);
+                self.abandon_spawn(id, ServerLifecycle::Failed);
                 return Err(self.unavailable(id, &format!("crash-looping, retry in {remaining:?}")));
             }
 
             let Some(translator) = self.self_handle.get().and_then(Weak::upgrade) else {
                 self.record_respawn_failure(id);
-                self.set_lifecycle(id, ServerLifecycle::Failed);
+                self.abandon_spawn(id, ServerLifecycle::Failed);
                 return Err(Error::ServerUnavailable {
                     server_id: id.clone(),
                     reason: "this translator cannot start a server".to_string(),
@@ -327,15 +331,22 @@ impl Translator {
 
     fn restore_running_if_live(&self, id: &ServerId) -> bool {
         if self.has_live_client(id) {
-            self.set_lifecycle(id, ServerLifecycle::Running);
+            self.abandon_spawn(id, ServerLifecycle::Running);
             true
         } else {
             false
         }
     }
 
-    /// Run the spawn attempt claimed by `begin_starting`.
-    pub(super) async fn run_spawn(self: Arc<Self>, id: ServerId) {
+    /// Run the spawn attempt claimed by `begin_starting`, again for as long
+    /// as an explicit start adopts one a user stopped.
+    pub(crate) async fn run_spawn(self: Arc<Self>, id: ServerId) {
+        while Arc::clone(&self).spawn_once(&id).await {}
+    }
+
+    /// One spawn attempt. Returns true when it must be repeated.
+    async fn spawn_once(self: Arc<Self>, id: &ServerId) -> bool {
+        let id = id.clone();
         let mut guard = SpawnGuard {
             translator: Arc::clone(&self),
             id: id.clone(),
@@ -344,17 +355,16 @@ impl Translator {
 
         let Some(config) = lock_std(&self.server_configs).get(&id).cloned() else {
             tracing::error!("no spawn config registered for LSP server '{id}'");
-            return;
+            return false;
         };
 
         match self.install_server(&id, config).await {
             Ok(()) => {
                 lock_std(&self.spawn_errors).remove(&id);
                 self.record_respawn_success(&id);
-                if !guard.publish_unless_stopped(ServerLifecycle::Running) {
+                if !guard.finish(ServerLifecycle::Running) {
                     tracing::info!("LSP server '{id}' was stopped while it started");
-                    self.tear_down(&id).await;
-                    return;
+                    return self.settle_stopped_spawn(&id).await;
                 }
                 self.reconcile_diagnostics_owners(Some(&id)).await;
                 tracing::info!("LSP server '{id}' is running");
@@ -368,10 +378,11 @@ impl Translator {
                 };
                 tracing::error!("LSP server '{id}' failed to start: {err}");
                 self.record_spawn_error(&id, err.to_string());
-                guard.publish_unless_stopped(state);
+                guard.abandon(state);
                 self.reconcile_diagnostics_owners(None).await;
             }
         }
+        false
     }
 
     pub(super) async fn reconcile_diagnostics_owners(&self, installed: Option<&ServerId>) {
@@ -2436,6 +2447,57 @@ while True:
 
             assert_eq!(translator.lifecycle_of(&id), Some(ServerLifecycle::Stopped));
             assert!(!translator.has_live_client(&id));
+        }
+
+        #[tokio::test]
+        async fn test_a_start_after_a_stop_mid_spawn_adopts_that_spawn() {
+            let dir = TempDir::new().unwrap();
+            let (translator, id, log) = lifecycle_translator(dir.path());
+            translator.ensure_server(&id, None).await.unwrap();
+            translator.stop_server(&id).await;
+
+            translator.start_server(&id).await;
+            wait_for_lifecycle(&translator, &id, ServerLifecycle::Running).await;
+            tokio::time::sleep(Duration::from_millis(600)).await;
+
+            assert_eq!(logged(&log, "start").len(), 1, "one spawn serves the start");
+            assert_eq!(translator.lifecycle_of(&id), Some(ServerLifecycle::Running));
+            assert!(translator.has_live_client(&id));
+            translator.shutdown_servers().await;
+        }
+
+        #[tokio::test]
+        async fn test_a_restart_shuts_the_old_process_down_before_the_new_one_starts() {
+            let dir = TempDir::new().unwrap();
+            let (translator, id, log) = lifecycle_translator(dir.path());
+            translator.ensure_server(&id, None).await.unwrap();
+            wait_for_lifecycle(&translator, &id, ServerLifecycle::Running).await;
+            let first = logged(&log, "start")[0];
+
+            translator.restart_server(&id).await;
+            wait_until("the replacement to launch", || {
+                logged(&log, "start").len() == 2
+            })
+            .await;
+            wait_for_lifecycle(&translator, &id, ServerLifecycle::Running).await;
+
+            let lines: Vec<String> = fs::read_to_string(&log)
+                .unwrap()
+                .lines()
+                .map(str::to_string)
+                .collect();
+            let exited = lines
+                .iter()
+                .position(|line| *line == format!("exit {first}"));
+            let replaced = lines
+                .iter()
+                .rposition(|line| line.starts_with("start "))
+                .unwrap();
+            assert!(
+                exited.is_some_and(|exited| exited < replaced),
+                "the old process exits before its replacement launches: {lines:?}"
+            );
+            translator.shutdown_servers().await;
         }
 
         #[tokio::test]

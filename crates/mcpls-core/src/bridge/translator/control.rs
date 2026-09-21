@@ -99,12 +99,28 @@ impl Translator {
         if !self.begin_starting(id) {
             return;
         }
-        match self.self_handle.get().and_then(Weak::upgrade) {
-            Some(translator) => {
-                tokio::spawn(translator.run_spawn(id.clone()));
+        let Some(translator) = self.self_handle.get().and_then(Weak::upgrade) else {
+            self.abandon_spawn(id, ServerLifecycle::Failed);
+            return;
+        };
+        // The old process exits before its replacement launches: two
+        // instances would double the memory a restart is meant to free, and
+        // some servers lock their workspace data against a second one.
+        let id = id.clone();
+        tokio::spawn(async move {
+            if let Some(old) = translator.retire_server(&id).await {
+                shut_down_server(id.clone(), old).await;
             }
-            None => self.set_lifecycle(id, ServerLifecycle::Failed),
-        }
+            translator.run_spawn(id).await;
+        });
+    }
+
+    /// Retire what a spawn installed after a user stopped `id` during it.
+    /// Returns true when an explicit start adopted the spawn meanwhile, and
+    /// the caller must spawn again under the claim it still holds.
+    pub(crate) async fn settle_stopped_spawn(&self, id: &ServerId) -> bool {
+        self.tear_down(id).await;
+        self.release_stopped_spawn(id)
     }
 
     /// Detach `id` from routing, drop its watches and diagnostics

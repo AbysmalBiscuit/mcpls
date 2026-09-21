@@ -107,6 +107,9 @@ pub struct Translator {
     /// Per-server broadcast of the field above, so a caller waiting on a
     /// spawn learns the outcome without polling.
     lifecycle_senders: Arc<StdMutex<lifecycle::LifecycleSenders>>,
+    /// Servers with a spawn in flight. Only touched while holding
+    /// `lifecycles`, so a claim and its outcome are one transition.
+    spawning: Arc<StdMutex<std::collections::HashSet<ServerId>>>,
     /// A weak handle used by detached server-spawn tasks.
     self_handle: OnceLock<Weak<Self>>,
     /// Diagnostics cache, shared with `serve_with`'s notification pump.
@@ -270,6 +273,7 @@ impl Translator {
             spawn_errors: Arc::new(StdMutex::new(HashMap::new())),
             lifecycles: Arc::new(StdMutex::new(HashMap::new())),
             lifecycle_senders: Arc::new(StdMutex::new(HashMap::new())),
+            spawning: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             self_handle: OnceLock::new(),
             notification_cache: None,
             apply_sink_lock: Arc::new(Mutex::new(())),

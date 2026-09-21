@@ -662,14 +662,11 @@ impl Runtime {
                 .effective_spawn(config.backend.spawn)
                 == SpawnPolicy::Eager;
             translator.register_server_config(id.clone(), init_config.clone());
-            translator.set_lifecycle(
-                &id,
-                if eager {
-                    ServerLifecycle::Starting
-                } else {
-                    ServerLifecycle::Idle
-                },
-            );
+            if eager {
+                translator.seed_starting(&id);
+            } else {
+                translator.set_lifecycle(&id, ServerLifecycle::Idle);
+            }
         }
 
         // Shared state, built BEFORE LSP initialization so the MCP server can answer
@@ -1193,7 +1190,7 @@ fn spawn_lsp_servers_background(
                 translator.record_spawn_error(&failure.server_id, failure.message.clone());
                 ServerLifecycle::Failed
             };
-            translator.set_lifecycle_unless_stopped(&failure.server_id, state);
+            translator.abandon_spawn(&failure.server_id, state);
         }
 
         if result.all_failed() {
@@ -1222,8 +1219,10 @@ fn spawn_lsp_servers_background(
         let server_count = result.server_count();
         let registered = register_servers(result, &translator);
         for id in registered.diagnostics_flags.keys() {
-            if !translator.set_lifecycle_unless_stopped(id, ServerLifecycle::Running) {
-                translator.tear_down(id).await;
+            if !translator.finish_spawn(id, ServerLifecycle::Running)
+                && translator.settle_stopped_spawn(id).await
+            {
+                tokio::spawn(Arc::clone(&translator).run_spawn(id.clone()));
             }
         }
         info!(
