@@ -244,6 +244,9 @@ impl Translator {
         id: &ServerId,
         budget: Option<Duration>,
     ) -> Result<()> {
+        if self.lifecycle_of(id) == Some(ServerLifecycle::Stopped) {
+            return Err(stopped(id));
+        }
         if self.has_live_client(id) {
             return Ok(());
         }
@@ -547,6 +550,7 @@ impl Translator {
                     });
                 }
                 ServerLifecycle::Failed => return Err(self.unavailable(id, "failed to start")),
+                ServerLifecycle::Stopped => return Err(stopped(id)),
                 ServerLifecycle::Idle | ServerLifecycle::Starting => {}
             }
             if tokio::time::timeout_at(deadline, states.changed())
@@ -561,6 +565,15 @@ impl Translator {
     }
 }
 
+/// The refusal a tool call on a stopped server gets, naming the command
+/// that brings it back.
+pub(super) fn stopped(id: &ServerId) -> Error {
+    Error::ServerUnavailable {
+        server_id: id.clone(),
+        reason: format!("stopped; run `mcpls lsp start {id}`"),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -568,6 +581,22 @@ mod tests {
     use crate::bridge::translator::ServerLifecycle;
     use crate::bridge::translator::clock::{Clock, FakeClock};
     use crate::config::ServerId;
+
+    #[tokio::test]
+    async fn test_a_stopped_server_is_refused_with_the_command_that_starts_it() {
+        let translator = Translator::new();
+        let id = ServerId::from("rust");
+        translator.set_lifecycle(&id, ServerLifecycle::Stopped);
+        let err = translator
+            .ensure_server(&id, Some(Duration::ZERO))
+            .await
+            .expect_err("a stopped server is not started on use");
+        assert_eq!(
+            err.to_string(),
+            "LSP server 'rust' is unavailable: stopped; run `mcpls lsp start rust`"
+        );
+        assert_eq!(translator.lifecycle_of(&id), Some(ServerLifecycle::Stopped));
+    }
 
     #[test]
     fn test_respawn_backoff_remaining_returns_none_once_delay_elapsed() {

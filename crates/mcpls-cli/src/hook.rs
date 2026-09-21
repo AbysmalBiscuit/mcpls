@@ -3116,7 +3116,7 @@ mod tests {
                 &BTreeSet::new(),
                 Path::new("/nowhere")
             )),
-            "language servers: language (idle), language (starting), language (running), language (not installed), language (failed)"
+            "language servers: language (idle), language (starting), language (running), language (not installed), language (failed), language (stopped)"
         );
     }
 

@@ -31,6 +31,8 @@ pub enum ServerLifecycle {
     NotInstalled,
     /// Spawned and died. Inside the respawn backoff.
     Failed,
+    /// Stopped by a user. Nothing starts it but an explicit start.
+    Stopped,
 }
 
 impl Translator {
@@ -38,17 +40,42 @@ impl Translator {
     ///
     /// The map write and broadcast share the `lifecycles` lock, so
     /// subscribers and snapshot readers observe the same transition.
+    pub fn set_lifecycle(&self, id: &ServerId, state: ServerLifecycle) {
+        let mut states = lock_std(&self.lifecycles);
+        self.publish_locked(&mut states, id, state);
+    }
+
+    /// Record `state` for `id` unless a user stopped it, returning whether
+    /// it was recorded.
     #[expect(
         clippy::significant_drop_tightening,
         reason = "state and watch updates must remain atomic"
     )]
-    pub fn set_lifecycle(&self, id: &ServerId, state: ServerLifecycle) {
+    pub fn set_lifecycle_unless_stopped(&self, id: &ServerId, state: ServerLifecycle) -> bool {
         let mut states = lock_std(&self.lifecycles);
-        states.insert(id.clone(), state);
-        lock_std(&self.lifecycle_senders)
-            .entry(id.clone())
-            .or_insert_with(|| watch::channel(state).0)
-            .send_replace(state);
+        if states.get(id) == Some(&ServerLifecycle::Stopped) {
+            return false;
+        }
+        self.publish_locked(&mut states, id, state);
+        true
+    }
+
+    /// Return a stopped, missing, or failed `id` to `Idle` so an explicit
+    /// start may claim it.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "explicit starts arrive with lsp control")
+    )]
+    pub(crate) fn reset_for_explicit_start(&self, id: &ServerId) {
+        let mut states = lock_std(&self.lifecycles);
+        if matches!(
+            states.get(id),
+            Some(
+                ServerLifecycle::Stopped | ServerLifecycle::NotInstalled | ServerLifecycle::Failed
+            )
+        ) {
+            self.publish_locked(&mut states, id, ServerLifecycle::Idle);
+        }
     }
 
     /// Claim the right to spawn `id`, moving it to `Starting`.
@@ -65,12 +92,21 @@ impl Translator {
             Some(ServerLifecycle::Idle | ServerLifecycle::Failed | ServerLifecycle::Running) => {}
             _ => return false,
         }
-        states.insert(id.clone(), ServerLifecycle::Starting);
+        self.publish_locked(&mut states, id, ServerLifecycle::Starting);
+        true
+    }
+
+    fn publish_locked(
+        &self,
+        states: &mut HashMap<ServerId, ServerLifecycle>,
+        id: &ServerId,
+        state: ServerLifecycle,
+    ) {
+        states.insert(id.clone(), state);
         lock_std(&self.lifecycle_senders)
             .entry(id.clone())
-            .or_insert_with(|| watch::channel(ServerLifecycle::Starting).0)
-            .send_replace(ServerLifecycle::Starting);
-        true
+            .or_insert_with(|| watch::channel(state).0)
+            .send_replace(state);
     }
 
     /// The state recorded for `id`, or `None` when `id` is not applicable
@@ -120,7 +156,14 @@ mod tests {
             .collect();
         assert_eq!(
             rendered,
-            vec!["idle", "starting", "running", "not installed", "failed"]
+            vec![
+                "idle",
+                "starting",
+                "running",
+                "not installed",
+                "failed",
+                "stopped"
+            ]
         );
     }
 
@@ -201,5 +244,43 @@ mod tests {
         let id = ServerId::from("rust");
         translator.set_lifecycle(&id, ServerLifecycle::Running);
         assert!(translator.begin_starting(&id));
+    }
+
+    #[test]
+    fn test_a_stopped_server_keeps_its_state_against_a_spawn_outcome() {
+        let translator = Translator::new();
+        let id = ServerId::from("rust");
+        translator.set_lifecycle(&id, ServerLifecycle::Stopped);
+        assert!(!translator.set_lifecycle_unless_stopped(&id, ServerLifecycle::Running));
+        assert_eq!(translator.lifecycle_of(&id), Some(ServerLifecycle::Stopped));
+
+        translator.set_lifecycle(&id, ServerLifecycle::Starting);
+        assert!(translator.set_lifecycle_unless_stopped(&id, ServerLifecycle::Running));
+        assert_eq!(translator.lifecycle_of(&id), Some(ServerLifecycle::Running));
+    }
+
+    #[test]
+    fn test_an_explicit_start_resets_only_states_that_block_a_spawn() {
+        let translator = Translator::new();
+        for (state, expected) in [
+            (ServerLifecycle::Stopped, ServerLifecycle::Idle),
+            (ServerLifecycle::NotInstalled, ServerLifecycle::Idle),
+            (ServerLifecycle::Failed, ServerLifecycle::Idle),
+            (ServerLifecycle::Running, ServerLifecycle::Running),
+            (ServerLifecycle::Starting, ServerLifecycle::Starting),
+        ] {
+            let id = ServerId::from(state.to_string());
+            translator.set_lifecycle(&id, state);
+            translator.reset_for_explicit_start(&id);
+            assert_eq!(translator.lifecycle_of(&id), Some(expected), "{state}");
+        }
+    }
+
+    #[test]
+    fn test_a_stopped_server_does_not_claim_a_spawn() {
+        let translator = Translator::new();
+        let id = ServerId::from("rust");
+        translator.set_lifecycle(&id, ServerLifecycle::Stopped);
+        assert!(!translator.begin_starting(&id));
     }
 }
