@@ -75,10 +75,11 @@ fn test_every_entry_runs_mcpls_from_path() {
         "an inline object would replace the shared registration"
     );
 
-    let harnesses: [(&str, &str, &str, &[&str]); 2] = [
+    let harnesses: [(&str, &str, &str, &str, &[&str]); 2] = [
         (
             "plugin/hooks/hooks.json",
             "claude-code",
+            "mcpls brief",
             "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" bootstrap-binaries claude-code",
             &[
                 "PostToolBatch",
@@ -91,6 +92,7 @@ fn test_every_entry_runs_mcpls_from_path() {
         (
             "plugin/hooks/hooks-codex.json",
             "codex",
+            "mcpls brief --additional-context",
             "\"${PLUGIN_ROOT}/hooks/run-hook.cmd\" bootstrap-binaries codex",
             &[
                 "PostToolUse",
@@ -100,7 +102,7 @@ fn test_every_entry_runs_mcpls_from_path() {
             ],
         ),
     ];
-    for (file, harness, bootstrap, events) in harnesses {
+    for (file, harness, brief, bootstrap, events) in harnesses {
         let hooks = json(file);
         let hooks = hooks["hooks"].as_object().unwrap();
         let mut names: Vec<&str> = hooks.keys().map(String::as_str).collect();
@@ -108,6 +110,7 @@ fn test_every_entry_runs_mcpls_from_path() {
         assert_eq!(names, events, "{file}");
 
         let mut bootstraps = Vec::new();
+        let mut briefs = Vec::new();
         for (event, groups) in hooks {
             let groups = groups.as_array().unwrap();
             assert!(!groups.is_empty(), "{file}: {event}");
@@ -118,6 +121,8 @@ fn test_every_entry_runs_mcpls_from_path() {
                     assert_eq!(registration["type"], "command", "{file}: {event}");
                     if registration["command"] == bootstrap {
                         bootstraps.push(event.as_str());
+                    } else if registration["command"] == brief {
+                        briefs.push(event.as_str());
                     } else {
                         assert_eq!(
                             registration["command"],
@@ -132,6 +137,11 @@ fn test_every_entry_runs_mcpls_from_path() {
             bootstraps,
             ["SessionStart"],
             "{file}: the bootstrap runs once, at session start"
+        );
+        assert_eq!(
+            briefs,
+            ["SessionStart"],
+            "{file}: the brief runs once, at session start"
         );
     }
 

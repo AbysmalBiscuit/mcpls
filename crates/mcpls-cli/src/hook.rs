@@ -703,7 +703,7 @@ fn server_reports(
                 state: "not applicable here".to_string(),
                 problem: None,
             });
-        } else if resolve_program(&server.command).is_some() {
+        } else if resolve_program(&server.command, root).is_some() {
             reports.push(ServerReport {
                 id,
                 state: "installed".to_string(),
@@ -1156,12 +1156,48 @@ fn resolve_on_path(path_var: &std::ffi::OsStr, exe_name: &str) -> Option<PathBuf
         .map(|candidate| std::path::absolute(&candidate).unwrap_or(candidate))
 }
 
-/// The executable a configured language server `command` names, or `None`
-/// when nothing by that name is installed.
-fn resolve_program(command: &str) -> Option<PathBuf> {
+/// The executable a configured language server `command` names for a
+/// checkout at `root`, or `None` when nothing by that name is installed.
+pub fn resolve_program(command: &str, root: &Path) -> Option<PathBuf> {
     let path = std::env::var_os("PATH").unwrap_or_default();
+    let path = searched_path(&path, on_wsl(), root);
     let extensions = std::env::var_os("PATHEXT");
     resolve_program_in(&path, extensions.as_deref(), command)
+}
+
+/// The `PATH` worth searching for a language server serving `root`.
+///
+/// On WSL a Windows binary cannot open the Linux paths a checkout outside
+/// the Windows drives hands it, so those drives are dropped; stat'ing them
+/// is also slow.
+fn searched_path(path_var: &std::ffi::OsStr, wsl: bool, root: &Path) -> std::ffi::OsString {
+    if !wsl || on_windows_drive(root) {
+        return path_var.to_os_string();
+    }
+    std::env::join_paths(std::env::split_paths(path_var).filter(|dir| !on_windows_drive(dir)))
+        .unwrap_or_else(|_| path_var.to_os_string())
+}
+
+/// Whether `path` lies on a Windows drive WSL mounts, `/mnt/<letter>`.
+fn on_windows_drive(path: &Path) -> bool {
+    use std::path::Component;
+    let mut components = path.components();
+    matches!(
+        (components.next(), components.next(), components.next()),
+        (Some(Component::RootDir), Some(Component::Normal(mnt)), Some(Component::Normal(drive)))
+            if mnt == "mnt"
+                && drive.len() == 1
+                && drive.to_str().is_some_and(|d| d.chars().all(|c| c.is_ascii_alphabetic()))
+    )
+}
+
+/// Whether this process runs under WSL, whose kernel names itself.
+fn on_wsl() -> bool {
+    static WSL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WSL.get_or_init(|| {
+        std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .is_ok_and(|release| release.to_ascii_lowercase().contains("microsoft"))
+    })
 }
 
 /// The executable `command` names: the file itself when the command spells
@@ -3009,6 +3045,44 @@ mod tests {
         assert!(resolve_program_in(&empty, None, &exe.display().to_string()).is_some());
         assert!(
             resolve_program_in(&empty, None, &exe.join("nope").display().to_string()).is_none()
+        );
+    }
+
+    /// A Windows binary cannot open the Linux paths a WSL checkout hands
+    /// it, so the drives WSL mounts are not searched for one. `/mnt/wsl`
+    /// is WSL's own Linux-side mount and stays.
+    #[test]
+    fn test_wsl_searches_no_windows_drive_for_a_linux_checkout() {
+        let path = std::env::join_paths([
+            "/home/me/.cargo/bin",
+            "/mnt/c/Program Files/nodejs",
+            "/mnt/wsl/tools",
+            "/usr/bin",
+            "/mnt/d/bin",
+        ])
+        .expect("a PATH");
+
+        let searched = searched_path(&path, true, Path::new("/home/me/project"));
+
+        assert_eq!(
+            std::env::split_paths(&searched).collect::<Vec<_>>(),
+            ["/home/me/.cargo/bin", "/mnt/wsl/tools", "/usr/bin"].map(PathBuf::from)
+        );
+    }
+
+    /// A checkout on a Windows drive, or any checkout off WSL, keeps the
+    /// whole `PATH`.
+    #[test]
+    fn test_the_whole_path_is_searched_off_wsl_or_from_a_windows_drive() {
+        let path = std::env::join_paths(["/usr/bin", "/mnt/c/Windows"]).expect("a PATH");
+
+        assert_eq!(
+            searched_path(&path, true, Path::new("/mnt/c/Users/me/project")),
+            path
+        );
+        assert_eq!(
+            searched_path(&path, false, Path::new("/home/me/project")),
+            path
         );
     }
 

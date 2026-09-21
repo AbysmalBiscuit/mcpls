@@ -2047,6 +2047,11 @@ fn ra_e2e_suite() {
     // Wait for rust-analyzer to index.
     let lib_rs = workspace.join("src/lib.rs");
     wait_until_ready(&mut client, &lib_rs, "add");
+    // Hover answers before rust-analyzer finishes loading the cargo workspace.
+    // A request that lands during the reload comes back empty or as "content
+    // modified", so also wait out its `$/progress` work.
+    wait_for_settled_diagnostics_baseline(&mut client)
+        .expect("[ra_e2e] rust-analyzer did not settle after indexing");
 
     // Sub-case registry.
     let sub_cases: &[SubCase] = &[

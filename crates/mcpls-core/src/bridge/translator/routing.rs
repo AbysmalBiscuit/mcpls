@@ -861,6 +861,7 @@ mod tests {
                 ..crate::config::DiagnosticsConfig::default()
             },
             backend: crate::config::BackendConfig::default(),
+            brief: crate::config::BriefConfig::default(),
             source: crate::config::ConfigSource::default(),
             project_config_ignored: false,
         };

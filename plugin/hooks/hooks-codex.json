@@ -8,7 +8,8 @@
             "command": "\"${PLUGIN_ROOT}/hooks/run-hook.cmd\" bootstrap-binaries codex",
             "commandWindows": "& \"${PLUGIN_ROOT}/hooks/run-hook.cmd\" bootstrap-binaries codex",
             "timeout": 300
-          }
+          },
+          { "type": "command", "command": "mcpls brief --additional-context", "timeout": 5 }
         ]
       }
     ],

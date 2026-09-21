@@ -46,6 +46,18 @@
       },
       "type": "object"
     },
+    "BriefConfig": {
+      "additionalProperties": false,
+      "description": "The note `mcpls brief` hands an agent session when it starts.",
+      "properties": {
+        "enabled": {
+          "default": true,
+          "description": "Whether a session starts with a note naming the language servers\nthat serve its checkout and pointing it at the mcpls tools.\n\nDefaults on, because reaching this configuration means installing\nthe plugin and installing the plugin is the opt-in. With it off, an\nagent learns mcpls exists only from its tool list, or from\ninstructions the user writes.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "DiagnosticsConfig": {
       "additionalProperties": false,
       "description": "How much of what the language servers report reaches the agent.",
@@ -710,6 +722,10 @@
     "backend": {
       "$ref": "#/$defs/BackendConfig",
       "description": "How a shared backend manages its own lifetime."
+    },
+    "brief": {
+      "$ref": "#/$defs/BriefConfig",
+      "description": "What an agent session is told about mcpls when it starts."
     },
     "diagnostics": {
       "$ref": "#/$defs/DiagnosticsConfig",
