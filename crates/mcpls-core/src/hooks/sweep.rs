@@ -122,6 +122,11 @@ impl Sweeper {
         }
     }
 
+    /// The translator this sweeper drives.
+    pub(crate) const fn translator(&self) -> &Arc<Translator> {
+        &self.translator
+    }
+
     /// The paths that belong to a configured root, canonicalized so a
     /// symlink alias and its target resolve to one key.
     ///

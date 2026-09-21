@@ -104,7 +104,10 @@ impl Translator {
 
             match self.lifecycle_of(&id) {
                 Some(
-                    ServerLifecycle::Idle | ServerLifecycle::Starting | ServerLifecycle::Failed,
+                    ServerLifecycle::Idle
+                    | ServerLifecycle::Starting
+                    | ServerLifecycle::Failed
+                    | ServerLifecycle::Stopped,
                 ) => return Ok((id, None)),
                 Some(ServerLifecycle::NotInstalled) => {
                     let catch_all =
@@ -494,6 +497,24 @@ mod tests {
         let (id, client) = translator
             .get_client_for_file(Path::new("/work/src/main.rs"), ToolKind::Hover)
             .expect("a server expected back keeps its own route");
+
+        assert_eq!(id, narrow_id);
+        assert!(client.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_a_stopped_narrow_server_does_not_fall_through() {
+        let translator = translator_with_rust_route(router_with_narrow_rust_claim());
+        let narrow_id = ServerId::from("rust-narrow");
+        let catch_all_id = ServerId::from("rust");
+        translator.set_lifecycle(&narrow_id, ServerLifecycle::Stopped);
+        translator.set_lifecycle(&catch_all_id, ServerLifecycle::Running);
+        let (client, _server) = fake_lsp_client();
+        translator.register_client(catch_all_id, client);
+
+        let (id, client) = translator
+            .get_client_for_file(Path::new("/work/src/main.rs"), ToolKind::Hover)
+            .expect("a stopped server keeps its own route");
 
         assert_eq!(id, narrow_id);
         assert!(client.is_none());

@@ -90,9 +90,14 @@ impl Drop for DiagnosticsReplay<'_> {
 }
 
 impl SpawnGuard {
-    fn publish(&mut self, state: ServerLifecycle) {
+    fn finish(&mut self, state: ServerLifecycle) -> bool {
         self.armed = false;
-        self.translator.set_lifecycle(&self.id, state);
+        self.translator.finish_spawn(&self.id, state)
+    }
+
+    fn abandon(&mut self, state: ServerLifecycle) {
+        self.armed = false;
+        self.translator.abandon_spawn(&self.id, state);
     }
 }
 
@@ -107,7 +112,7 @@ impl Drop for SpawnGuard {
         );
         self.translator.record_respawn_failure(&self.id);
         self.translator
-            .set_lifecycle(&self.id, ServerLifecycle::Failed);
+            .abandon_spawn(&self.id, ServerLifecycle::Failed);
     }
 }
 
@@ -189,6 +194,11 @@ impl Translator {
     /// stays alive for a while or is found dead again -- see
     /// [`Self::reconcile_respawn_stability`], which is what acts on this
     /// entry.
+    pub(super) fn clear_respawn_backoff(&self, id: &ServerId) {
+        lock_std(&self.respawn_backoffs).remove(id);
+        lock_std(&self.spawn_errors).remove(id);
+    }
+
     fn record_respawn_success(&self, id: &ServerId) {
         let mut backoffs = lock_std(&self.respawn_backoffs);
         let entry = backoffs
@@ -244,6 +254,9 @@ impl Translator {
         id: &ServerId,
         budget: Option<Duration>,
     ) -> Result<()> {
+        if self.lifecycle_of(id) == Some(ServerLifecycle::Stopped) {
+            return Err(stopped(id));
+        }
         if self.has_live_client(id) {
             return Ok(());
         }
@@ -284,13 +297,13 @@ impl Translator {
 
             self.reconcile_respawn_stability(id);
             if let Some(remaining) = self.respawn_backoff_remaining(id) {
-                self.set_lifecycle(id, ServerLifecycle::Failed);
+                self.abandon_spawn(id, ServerLifecycle::Failed);
                 return Err(self.unavailable(id, &format!("crash-looping, retry in {remaining:?}")));
             }
 
             let Some(translator) = self.self_handle.get().and_then(Weak::upgrade) else {
                 self.record_respawn_failure(id);
-                self.set_lifecycle(id, ServerLifecycle::Failed);
+                self.abandon_spawn(id, ServerLifecycle::Failed);
                 return Err(Error::ServerUnavailable {
                     server_id: id.clone(),
                     reason: "this translator cannot start a server".to_string(),
@@ -306,7 +319,7 @@ impl Translator {
         self.await_terminal_state(id, &mut states, budget).await
     }
 
-    fn has_live_client(&self, id: &ServerId) -> bool {
+    pub(super) fn has_live_client(&self, id: &ServerId) -> bool {
         if !lock_std(&self.lsp_clients).contains_key(id) {
             return false;
         }
@@ -318,15 +331,22 @@ impl Translator {
 
     fn restore_running_if_live(&self, id: &ServerId) -> bool {
         if self.has_live_client(id) {
-            self.set_lifecycle(id, ServerLifecycle::Running);
+            self.abandon_spawn(id, ServerLifecycle::Running);
             true
         } else {
             false
         }
     }
 
-    /// Run the spawn attempt claimed by `begin_starting`.
-    async fn run_spawn(self: Arc<Self>, id: ServerId) {
+    /// Run the spawn attempt claimed by `begin_starting`, again for as long
+    /// as an explicit start adopts one a user stopped.
+    pub(crate) async fn run_spawn(self: Arc<Self>, id: ServerId) {
+        while Arc::clone(&self).spawn_once(&id).await {}
+    }
+
+    /// One spawn attempt. Returns true when it must be repeated.
+    async fn spawn_once(self: Arc<Self>, id: &ServerId) -> bool {
+        let id = id.clone();
         let mut guard = SpawnGuard {
             translator: Arc::clone(&self),
             id: id.clone(),
@@ -335,14 +355,17 @@ impl Translator {
 
         let Some(config) = lock_std(&self.server_configs).get(&id).cloned() else {
             tracing::error!("no spawn config registered for LSP server '{id}'");
-            return;
+            return false;
         };
 
         match self.install_server(&id, config).await {
             Ok(()) => {
                 lock_std(&self.spawn_errors).remove(&id);
                 self.record_respawn_success(&id);
-                guard.publish(ServerLifecycle::Running);
+                if !guard.finish(ServerLifecycle::Running) {
+                    tracing::info!("LSP server '{id}' was stopped while it started");
+                    return self.settle_stopped_spawn(&id).await;
+                }
                 self.reconcile_diagnostics_owners(Some(&id)).await;
                 tracing::info!("LSP server '{id}' is running");
             }
@@ -355,13 +378,14 @@ impl Translator {
                 };
                 tracing::error!("LSP server '{id}' failed to start: {err}");
                 self.record_spawn_error(&id, err.to_string());
-                guard.publish(state);
+                guard.abandon(state);
                 self.reconcile_diagnostics_owners(None).await;
             }
         }
+        false
     }
 
-    async fn reconcile_diagnostics_owners(&self, installed: Option<&ServerId>) {
+    pub(super) async fn reconcile_diagnostics_owners(&self, installed: Option<&ServerId>) {
         let Some(pumps) = self.notification_pumps.get() else {
             return;
         };
@@ -495,18 +519,7 @@ impl Translator {
         };
         let new_client = new_server.client().clone();
         let notification_rx = new_server.take_notification_rx();
-        let old_client = lock_std(&self.lsp_clients).get(id).cloned();
-        if let Some(old_client) = old_client {
-            old_client.fail_pending_requests().await;
-        }
-        if let Some(pumps) = self.notification_pumps.get() {
-            pumps.retire(id).await;
-        }
-        if caches_diagnostics && let Some(cache) = &self.notification_cache {
-            cache.lock().await.clear_server_diagnostics(id);
-        }
-
-        self.document_tracker.forget_server(id);
+        let old_server = self.retire_server(id).await;
         if let Some(pumps) = self.notification_pumps.get() {
             if caches_diagnostics {
                 pumps.register_diagnostics_owner(id);
@@ -523,10 +536,34 @@ impl Translator {
             }
             pumps.install(id.clone(), notification_rx);
         }
-        let old_server = lock_std(&self.lsp_servers).insert(id.clone(), new_server);
+        lock_std(&self.lsp_servers).insert(id.clone(), new_server);
         lock_std(&self.lsp_clients).insert(id.clone(), new_client);
-        drop(old_server);
+        if let Some(old_server) = old_server {
+            tokio::spawn(super::shut_down_server(id.clone(), old_server));
+        }
         Ok(())
+    }
+
+    /// Detach `id`'s server from routing and from every cache holding its
+    /// state, returning the process for the caller to shut down.
+    pub(super) async fn retire_server(&self, id: &ServerId) -> Option<LspServer> {
+        let old_client = lock_std(&self.lsp_clients).remove(id);
+        if let Some(old_client) = old_client {
+            old_client.fail_pending_requests().await;
+        }
+        if let Some(pumps) = self.notification_pumps.get() {
+            pumps.retire(id).await;
+        }
+        let language = lock_std(&self.server_configs)
+            .get(id)
+            .map(|config| config.server_config.language_id.clone());
+        if language.is_some_and(|language| self.is_diagnostics_route(&language, id))
+            && let Some(cache) = &self.notification_cache
+        {
+            cache.lock().await.clear_server_diagnostics(id);
+        }
+        self.document_tracker.forget_server(id);
+        lock_std(&self.lsp_servers).remove(id)
     }
 
     async fn await_terminal_state(
@@ -547,6 +584,7 @@ impl Translator {
                     });
                 }
                 ServerLifecycle::Failed => return Err(self.unavailable(id, "failed to start")),
+                ServerLifecycle::Stopped => return Err(stopped(id)),
                 ServerLifecycle::Idle | ServerLifecycle::Starting => {}
             }
             if tokio::time::timeout_at(deadline, states.changed())
@@ -561,6 +599,15 @@ impl Translator {
     }
 }
 
+/// The refusal a tool call on a stopped server gets, naming the command
+/// that brings it back.
+pub(super) fn stopped(id: &ServerId) -> Error {
+    Error::ServerUnavailable {
+        server_id: id.clone(),
+        reason: format!("stopped; run `mcpls lsp start {id}`"),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -568,6 +615,22 @@ mod tests {
     use crate::bridge::translator::ServerLifecycle;
     use crate::bridge::translator::clock::{Clock, FakeClock};
     use crate::config::ServerId;
+
+    #[tokio::test]
+    async fn test_a_stopped_server_is_refused_with_the_command_that_starts_it() {
+        let translator = Translator::new();
+        let id = ServerId::from("rust");
+        translator.set_lifecycle(&id, ServerLifecycle::Stopped);
+        let err = translator
+            .ensure_server(&id, Some(Duration::ZERO))
+            .await
+            .expect_err("a stopped server is not started on use");
+        assert_eq!(
+            err.to_string(),
+            "LSP server 'rust' is unavailable: stopped; run `mcpls lsp start rust`"
+        );
+        assert_eq!(translator.lifecycle_of(&id), Some(ServerLifecycle::Stopped));
+    }
 
     #[test]
     fn test_respawn_backoff_remaining_returns_none_once_delay_elapsed() {
@@ -696,6 +759,7 @@ mod tests {
         use tokio::time::Duration;
 
         use super::*;
+        use crate::bridge::translator::control::LspAction;
         use crate::config::{LspServerConfig, ToolKind, ToolRouter};
         use crate::lsp::ServerInitConfig;
 
@@ -2260,6 +2324,251 @@ fi
                 !translator.is_server_dead(&id),
                 "the respawned replacement should be alive"
             );
+        }
+
+        fn write_lifecycle_server(dir: &Path) -> (PathBuf, PathBuf) {
+            let script_path = dir.join("lifecycle_server.py");
+            let log_path = dir.join("lifecycle.log");
+            let body = r#"import json, os, sys, time
+
+log = open(sys.argv[1], "a", buffering=1)
+log.write(f"start {os.getpid()}\n")
+
+def receive():
+    length = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        if line in (b"\r\n", b"\n"):
+            break
+        key, value = line.decode().split(":", 1)
+        if key.lower() == "content-length":
+            length = int(value.strip())
+    return json.loads(sys.stdin.buffer.read(length))
+
+def send(message):
+    body = json.dumps({"jsonrpc": "2.0", **message}).encode()
+    sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+    sys.stdout.buffer.flush()
+
+while True:
+    message = receive()
+    if message is None:
+        break
+    method = message.get("method")
+    if method == "initialize":
+        time.sleep(0.2)
+        send({"id": message["id"], "result": {"capabilities": {"positionEncoding": "utf-16"}}})
+    elif method == "exit":
+        log.write(f"exit {os.getpid()}\n")
+        break
+    elif "id" in message:
+        send({"id": message["id"], "result": None})
+"#;
+            fs::write(&script_path, body).unwrap();
+            (script_path, log_path)
+        }
+
+        fn lifecycle_translator(dir: &Path) -> (Arc<Translator>, ServerId, PathBuf) {
+            let (script, log) = write_lifecycle_server(dir);
+            let id = ServerId::from("rust");
+            let mut config = stub_server_config("rust", &script);
+            config.server_config.command = "python3".to_string();
+            config.server_config.args = vec![
+                script.to_string_lossy().into_owned(),
+                log.to_string_lossy().into_owned(),
+            ];
+            let translator = spawnable(Translator::new(), &id);
+            translator.register_server_config(id.clone(), config);
+            (translator, id, log)
+        }
+
+        fn logged(log: &Path, kind: &str) -> Vec<u32> {
+            fs::read_to_string(log)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| line.strip_prefix(kind)?.trim().parse().ok())
+                .collect()
+        }
+
+        async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !done() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+        }
+
+        #[tokio::test]
+        async fn test_stopping_a_running_server_shuts_it_down_and_keeps_it_down() {
+            let dir = TempDir::new().unwrap();
+            let (translator, id, log) = lifecycle_translator(dir.path());
+            translator.ensure_server(&id, None).await.unwrap();
+            wait_for_lifecycle(&translator, &id, ServerLifecycle::Running).await;
+            let pid = logged(&log, "start")[0];
+
+            translator.stop_server(&id).await;
+
+            assert_eq!(translator.lifecycle_of(&id), Some(ServerLifecycle::Stopped));
+            assert!(!translator.has_live_client(&id));
+            wait_until("the stopped process to exit", || {
+                logged(&log, "exit").contains(&pid)
+            })
+            .await;
+            assert!(
+                translator
+                    .ensure_server(&id, Some(RESPAWN_WAIT))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(logged(&log, "start").len(), 1);
+        }
+
+        #[tokio::test]
+        async fn test_a_stop_during_a_spawn_retires_the_fresh_server() {
+            let dir = TempDir::new().unwrap();
+            let (translator, id, log) = lifecycle_translator(dir.path());
+            translator.ensure_server(&id, None).await.unwrap();
+            assert_eq!(
+                translator.lifecycle_of(&id),
+                Some(ServerLifecycle::Starting)
+            );
+
+            translator.stop_server(&id).await;
+            wait_until("the spawn to launch", || logged(&log, "start").len() == 1).await;
+            let pid = logged(&log, "start")[0];
+            wait_until("the fresh process to exit", || {
+                logged(&log, "exit").contains(&pid)
+            })
+            .await;
+
+            assert_eq!(translator.lifecycle_of(&id), Some(ServerLifecycle::Stopped));
+            assert!(!translator.has_live_client(&id));
+        }
+
+        #[tokio::test]
+        async fn test_a_start_after_a_stop_mid_spawn_adopts_that_spawn() {
+            let dir = TempDir::new().unwrap();
+            let (translator, id, log) = lifecycle_translator(dir.path());
+            translator.ensure_server(&id, None).await.unwrap();
+            translator.stop_server(&id).await;
+
+            translator.start_server(&id).await;
+            wait_for_lifecycle(&translator, &id, ServerLifecycle::Running).await;
+            tokio::time::sleep(Duration::from_millis(600)).await;
+
+            assert_eq!(logged(&log, "start").len(), 1, "one spawn serves the start");
+            assert_eq!(translator.lifecycle_of(&id), Some(ServerLifecycle::Running));
+            assert!(translator.has_live_client(&id));
+            translator.shutdown_servers().await;
+        }
+
+        #[tokio::test]
+        async fn test_a_restart_shuts_the_old_process_down_before_the_new_one_starts() {
+            let dir = TempDir::new().unwrap();
+            let (translator, id, log) = lifecycle_translator(dir.path());
+            translator.ensure_server(&id, None).await.unwrap();
+            wait_for_lifecycle(&translator, &id, ServerLifecycle::Running).await;
+            let first = logged(&log, "start")[0];
+
+            translator.restart_server(&id).await;
+            wait_until("the replacement to launch", || {
+                logged(&log, "start").len() == 2
+            })
+            .await;
+            wait_for_lifecycle(&translator, &id, ServerLifecycle::Running).await;
+
+            let lines: Vec<String> = fs::read_to_string(&log)
+                .unwrap()
+                .lines()
+                .map(str::to_string)
+                .collect();
+            let exited = lines
+                .iter()
+                .position(|line| *line == format!("exit {first}"));
+            let replaced = lines
+                .iter()
+                .rposition(|line| line.starts_with("start "))
+                .unwrap();
+            assert!(
+                exited.is_some_and(|exited| exited < replaced),
+                "the old process exits before its replacement launches: {lines:?}"
+            );
+            translator.shutdown_servers().await;
+        }
+
+        #[tokio::test]
+        async fn test_starting_a_stopped_server_spawns_it_again() {
+            let dir = TempDir::new().unwrap();
+            let (translator, id, log) = lifecycle_translator(dir.path());
+            translator.stop_server(&id).await;
+
+            translator.start_server(&id).await;
+            wait_for_lifecycle(&translator, &id, ServerLifecycle::Running).await;
+            assert_eq!(logged(&log, "start").len(), 1);
+            translator.shutdown_servers().await;
+        }
+
+        #[tokio::test]
+        async fn test_an_explicit_start_retries_a_server_recorded_as_not_installed() {
+            let dir = TempDir::new().unwrap();
+            let (translator, id, log) = lifecycle_translator(dir.path());
+            translator.set_lifecycle(&id, ServerLifecycle::NotInstalled);
+
+            translator.start_server(&id).await;
+            wait_for_lifecycle(&translator, &id, ServerLifecycle::Running).await;
+            assert_eq!(logged(&log, "start").len(), 1);
+            translator.shutdown_servers().await;
+        }
+
+        #[tokio::test]
+        async fn test_restarting_a_running_server_replaces_its_process() {
+            let dir = TempDir::new().unwrap();
+            let (translator, id, log) = lifecycle_translator(dir.path());
+            translator.ensure_server(&id, None).await.unwrap();
+            wait_for_lifecycle(&translator, &id, ServerLifecycle::Running).await;
+            let first = logged(&log, "start")[0];
+
+            translator.restart_server(&id).await;
+            wait_until("the replacement to launch", || {
+                logged(&log, "start").len() == 2
+            })
+            .await;
+            wait_for_lifecycle(&translator, &id, ServerLifecycle::Running).await;
+            wait_until("the replaced process to exit", || {
+                logged(&log, "exit").contains(&first)
+            })
+            .await;
+            assert!(translator.has_live_client(&id));
+            translator.shutdown_servers().await;
+        }
+
+        #[tokio::test]
+        async fn test_control_names_unknown_servers_and_applies_nothing() {
+            let dir = TempDir::new().unwrap();
+            let (translator, id, _log) = lifecycle_translator(dir.path());
+
+            let err = translator
+                .control(LspAction::Stop, &["rust".to_string(), "nope".to_string()])
+                .await
+                .expect_err("an unknown id refuses the whole request");
+            assert_eq!(
+                err,
+                "no language server named nope applies here; these do: rust"
+            );
+            assert_eq!(translator.lifecycle_of(&id), Some(ServerLifecycle::Idle));
+        }
+
+        #[tokio::test]
+        async fn test_control_with_no_names_acts_on_every_applicable_server() {
+            let dir = TempDir::new().unwrap();
+            let (translator, id, _log) = lifecycle_translator(dir.path());
+
+            let states = translator.control(LspAction::Stop, &[]).await.unwrap();
+            assert_eq!(states, vec![(id, ServerLifecycle::Stopped)]);
         }
     }
 }

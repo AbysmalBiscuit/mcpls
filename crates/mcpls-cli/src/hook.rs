@@ -1395,6 +1395,7 @@ mod tests {
             Request::Ack { .. } => "ack",
             Request::EndSession { .. } => "end_session",
             Request::Status => "status",
+            Request::Lsp { .. } => "lsp",
         }
         .to_string()
     }
@@ -1511,6 +1512,9 @@ mod tests {
                     message: message.clone(),
                 },
             ),
+            Request::Lsp { .. } => Response::Lsp {
+                servers: Vec::new(),
+            },
         }
     }
 
@@ -3116,7 +3120,7 @@ mod tests {
                 &BTreeSet::new(),
                 Path::new("/nowhere")
             )),
-            "language servers: language (idle), language (starting), language (running), language (not installed), language (failed)"
+            "language servers: language (idle), language (starting), language (running), language (not installed), language (failed), language (stopped)"
         );
     }
 

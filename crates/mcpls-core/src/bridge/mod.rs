@@ -43,7 +43,7 @@ pub(crate) use translator::testing::{
 pub use translator::{
     Completion, CompletionsResult, DefinitionResult, Diagnostic, DiagnosticSeverity,
     DiagnosticsResult, DocumentChanges, DocumentSymbolsResult, FormatDocumentResult, HoverResult,
-    Location, Position2D, Range, ReferencesResult, RenameResult, ResourceOperation,
+    Location, LspAction, Position2D, Range, ReferencesResult, RenameResult, ResourceOperation,
     ServerLifecycle, Symbol, TextEdit, Translator,
 };
 pub(crate) use translator::{OpenOutcome, validate_path_against_roots};

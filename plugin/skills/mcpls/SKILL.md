@@ -33,6 +33,7 @@ Use text search and file reads for text: comments, docs, config, string literals
 - Start from a name with `workspace_symbol_search`; its result is the position the other tools need.
 - A file in another checkout or worktree fails with `path outside workspace`. Read it directly instead.
 - The first call for a language starts its server. While it indexes, calls return empty results or a "still initializing" error. Retry shortly before concluding a symbol does not exist.
+- A call that fails with ``stopped; run `mcpls lsp start <id>` `` means the user stopped that server. If the task needs it, run the command the error names in the shell.
 - `get_document_symbols` returns the whole outline, tests included, which is thousands of lines for a large file. Prefer `workspace_symbol_search` there.
 - `rename_symbol` and `format_document` return the edits unless called with `apply: true` and the checkout allows writes; otherwise apply the returned edits yourself.
 - With the mcpls plugin installed, diagnostics from your edits arrive in context on their own. Call `get_new_diagnostics` to check before calling a change done; it returns nothing when nothing changed.

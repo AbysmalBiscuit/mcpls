@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use tokio::sync::Mutex;
 
 use self::clock::{Clock, SystemClock};
+pub use self::control::LspAction;
 use self::encoding_ctx::EncodingCtx;
 pub use self::lifecycle::ServerLifecycle;
 use self::respawn::RespawnBackoff;
@@ -27,6 +28,7 @@ use crate::lsp::{LspClient, LspServer, ServerInitConfig, WatchRegistry};
 mod assist;
 mod call_hierarchy;
 mod clock;
+mod control;
 mod diagnostics;
 mod dto;
 mod edits;
@@ -105,6 +107,9 @@ pub struct Translator {
     /// Per-server broadcast of the field above, so a caller waiting on a
     /// spawn learns the outcome without polling.
     lifecycle_senders: Arc<StdMutex<lifecycle::LifecycleSenders>>,
+    /// Servers with a spawn in flight. Only touched while holding
+    /// `lifecycles`, so a claim and its outcome are one transition.
+    spawning: Arc<StdMutex<std::collections::HashSet<ServerId>>>,
     /// A weak handle used by detached server-spawn tasks.
     self_handle: OnceLock<Weak<Self>>,
     /// Diagnostics cache, shared with `serve_with`'s notification pump.
@@ -219,6 +224,27 @@ pub enum OpenOutcome {
 /// and letting `kill_on_drop` terminate it instead.
 const SERVER_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Shut `server` down with the LSP `shutdown`/`exit` handshake, letting
+/// `kill_on_drop` end it when that fails or outlasts
+/// [`SERVER_SHUTDOWN_TIMEOUT`]. A process that already exited is only
+/// reaped.
+pub(super) async fn shut_down_server(id: ServerId, mut server: LspServer) {
+    if matches!(server.has_exited(), Ok(true)) {
+        return;
+    }
+    match tokio::time::timeout(SERVER_SHUTDOWN_TIMEOUT, server.shutdown()).await {
+        Ok(Ok(())) => tracing::debug!(%id, "LSP server shut down gracefully"),
+        Ok(Err(e)) => tracing::warn!(
+            %id, error = %e,
+            "LSP server shutdown handshake failed, killing process instead"
+        ),
+        Err(_) => tracing::warn!(
+            %id, timeout = ?SERVER_SHUTDOWN_TIMEOUT,
+            "LSP server did not shut down in time, killing process instead"
+        ),
+    }
+}
+
 impl Translator {
     /// Create a new translator.
     ///
@@ -247,6 +273,7 @@ impl Translator {
             spawn_errors: Arc::new(StdMutex::new(HashMap::new())),
             lifecycles: Arc::new(StdMutex::new(HashMap::new())),
             lifecycle_senders: Arc::new(StdMutex::new(HashMap::new())),
+            spawning: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             self_handle: OnceLock::new(),
             notification_cache: None,
             apply_sink_lock: Arc::new(Mutex::new(())),
@@ -1038,19 +1065,7 @@ impl Translator {
 
         let mut tasks = tokio::task::JoinSet::new();
         for (id, server) in servers {
-            tasks.spawn(async move {
-                match tokio::time::timeout(SERVER_SHUTDOWN_TIMEOUT, server.shutdown()).await {
-                    Ok(Ok(())) => tracing::debug!(%id, "LSP server shut down gracefully"),
-                    Ok(Err(e)) => tracing::warn!(
-                        %id, error = %e,
-                        "LSP server shutdown handshake failed, killing process instead"
-                    ),
-                    Err(_) => tracing::warn!(
-                        %id, timeout = ?SERVER_SHUTDOWN_TIMEOUT,
-                        "LSP server did not shut down in time, killing process instead"
-                    ),
-                }
-            });
+            tasks.spawn(shut_down_server(id, server));
         }
         tasks.join_all().await;
     }

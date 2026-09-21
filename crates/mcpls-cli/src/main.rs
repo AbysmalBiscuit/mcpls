@@ -14,9 +14,11 @@ mod completions;
 mod config;
 mod hook;
 mod logging;
+mod lsp;
 
-use args::{Args, BackendAction, Command, HookAction, SchemaAction};
+use args::{Args, BackendAction, Command, HookAction, LspCommand, SchemaAction};
 use hook::{Examined, Report};
+use mcpls_core::bridge::LspAction;
 
 /// Parse, failing a `hook` invocation with exit 1 rather than clap's 2.
 ///
@@ -96,6 +98,12 @@ async fn main() {
     }) = &args.command
     {
         let outcome = control_backend(&args, action).await;
+        write_report(&outcome.text);
+        std::process::exit(i32::from(!outcome.success));
+    }
+
+    if let Some(Command::Lsp { action }) = &args.command {
+        let outcome = run_lsp(&args, action).await;
         write_report(&outcome.text);
         std::process::exit(i32::from(!outcome.success));
     }
@@ -389,6 +397,64 @@ async fn diagnose(args: &Args, path: Option<&std::path::Path>) -> Report {
         Ok(identity) => hook::doctor(&directory, examined, &root, &identity, local.as_ref()).await,
         Err(error) => hook::doctor_without_identity(&directory, examined, &error),
     }
+}
+
+/// Run one `mcpls lsp` action against the backend for its directory.
+async fn run_lsp(args: &Args, action: &LspCommand) -> lsp::Outcome {
+    let (dir, change) = match action {
+        LspCommand::Status { dir } => (dir.as_deref(), None),
+        LspCommand::Start { targets, no_wait } => (
+            targets.dir.as_deref(),
+            Some((targets, LspAction::Start, !no_wait)),
+        ),
+        LspCommand::Restart { targets, no_wait } => (
+            targets.dir.as_deref(),
+            Some((targets, LspAction::Restart, !no_wait)),
+        ),
+        LspCommand::Stop { targets } => (
+            targets.dir.as_deref(),
+            Some((targets, LspAction::Stop, false)),
+        ),
+    };
+    let (directory, _) = examined_directory(dir);
+    let root = hook::checkout_root(&directory);
+    let identity = match mcpls_core::hooks::identity_for(&root) {
+        Ok(identity) => identity,
+        Err(error) => {
+            return lsp::Outcome {
+                text: format!(
+                    "cannot locate the backend for {}: {error}\n",
+                    root.display()
+                ),
+                success: false,
+            };
+        }
+    };
+    let Some((targets, lsp_action, wait)) = change else {
+        return lsp::status(&identity, &root).await;
+    };
+    let servers = if targets.all {
+        Vec::new()
+    } else {
+        targets.servers.clone()
+    };
+    let ceiling = wait.then(|| wait_ceiling(resolve_config(args, &root).ok().as_ref()));
+    lsp::control(&identity, &root, lsp_action, servers, ceiling).await
+}
+
+/// The longest any configured server may take to finish `initialize`.
+fn wait_ceiling(resolved: Option<&mcpls_core::Resolved>) -> std::time::Duration {
+    let seconds = resolved
+        .and_then(|resolved| {
+            resolved
+                .config
+                .lsp_servers
+                .iter()
+                .map(|server| server.timeout_seconds)
+                .max()
+        })
+        .unwrap_or(30);
+    std::time::Duration::from_secs(seconds)
 }
 
 /// Load the configuration a session in `root` runs with.

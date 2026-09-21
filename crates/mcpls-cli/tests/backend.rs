@@ -221,6 +221,50 @@ impl Project {
         )
     }
 
+    #[cfg(unix)]
+    fn lifecycle_log(&self) -> PathBuf {
+        self.root().join("lifecycle.log")
+    }
+
+    /// A language server that answers the handshake, logs `start <pid>`
+    /// when launched and `exit <pid>` on the LSP `exit` notification.
+    #[cfg(unix)]
+    fn with_lifecycle_server(self) -> Self {
+        std::fs::write(self.root().join("marker.fake"), "").unwrap();
+        std::fs::write(self.root().join("a.fake"), "").unwrap();
+        let script = self.root().join("lifecycle_lsp.py");
+        std::fs::write(&script, LIFECYCLE_LSP).unwrap();
+        self.write_config(
+            60_000,
+            &format!(
+                "\n[[lsp_servers]]\nlanguage_id = \"fake\"\ncommand = \"python3\"\nargs = [{:?}, {:?}]\nfile_patterns = [\"**/*.fake\"]\ntimeout_seconds = 10\n\n[lsp_servers.heuristics]\nproject_markers = [\"marker.fake\"]\n",
+                script.display().to_string(),
+                self.lifecycle_log().display().to_string(),
+            ),
+        );
+        self
+    }
+
+    #[cfg(unix)]
+    fn lifecycle_events(&self, kind: &str) -> Vec<u32> {
+        std::fs::read_to_string(self.lifecycle_log())
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.strip_prefix(kind)?.trim().parse().ok())
+            .collect()
+    }
+
+    fn lsp(&self, args: &[&str]) -> std::process::Output {
+        self.command(&self.root())
+            .env("CLAUDE_PROJECT_DIR", self.root())
+            .arg("--config")
+            .arg(self.config())
+            .arg("lsp")
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
     fn wait_for(&self, what: &str, mut ready: impl FnMut(&Self) -> bool) {
         let deadline = Instant::now() + Duration::from_secs(20);
         while !ready(self) {
@@ -232,6 +276,48 @@ impl Project {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
+}
+
+#[cfg(unix)]
+const LIFECYCLE_LSP: &str = r#"import json, os, sys
+
+log = open(sys.argv[1], "a", buffering=1)
+log.write(f"start {os.getpid()}\n")
+
+def receive():
+    length = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        if line in (b"\r\n", b"\n"):
+            break
+        key, value = line.decode().split(":", 1)
+        if key.lower() == "content-length":
+            length = int(value.strip())
+    return json.loads(sys.stdin.buffer.read(length))
+
+def send(message):
+    body = json.dumps({"jsonrpc": "2.0", **message}).encode()
+    sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+    sys.stdout.buffer.flush()
+
+while True:
+    message = receive()
+    if message is None:
+        break
+    method = message.get("method")
+    if method == "initialize":
+        send({"id": message["id"], "result": {"capabilities": {"documentSymbolProvider": True}}})
+    elif method == "exit":
+        log.write(f"exit {os.getpid()}\n")
+        break
+    elif "id" in message:
+        send({"id": message["id"], "result": None})
+"#;
+
+fn stdout(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
 /// macOS's `$TMPDIR` is deep enough that a runtime directory inside it
@@ -310,6 +396,14 @@ impl Frontend {
         let stdin = self.stdin.as_mut().unwrap();
         writeln!(stdin, "{message}").unwrap();
         stdin.flush().unwrap();
+    }
+
+    #[cfg(unix)]
+    fn symbols(&mut self, path: &Path) -> Value {
+        self.request(
+            "tools/call",
+            &json!({"name": "get_document_symbols", "arguments": {"file_path": path}}),
+        )
     }
 
     fn call_tool(&mut self) -> Value {
@@ -802,5 +896,77 @@ fn a_forced_stop_ends_a_backend_with_a_session_attached() {
     assert!(
         call["result"]["isError"] == true || call["error"].is_object(),
         "{call}"
+    );
+}
+
+/// A stopped server stays down through a tool call, and start and
+/// restart each launch one fresh process and retire the one before.
+#[cfg(unix)]
+#[test]
+fn lsp_commands_stop_start_and_restart_a_server() {
+    let project = Project::new(60_000).with_lifecycle_server();
+    let mut frontend = project.frontend();
+    project.assert_attaches(&mut frontend);
+    project.wait_for("the server to run", |p| {
+        stdout(&p.lsp(&["status"])).contains("fake  running")
+    });
+    let first = project.lifecycle_events("start")[0];
+
+    let stop = project.lsp(&["stop", "fake"]);
+    assert!(stop.status.success(), "{}", stdout(&stop));
+    assert_eq!(stdout(&stop), "fake  stopped\n");
+    project.wait_for("the stopped process to exit", |p| {
+        p.lifecycle_events("exit").contains(&first)
+    });
+
+    let call = frontend.symbols(&project.root().join("a.fake"));
+    assert!(
+        failure_text(&call).contains("stopped; run `mcpls lsp start fake`"),
+        "{call}"
+    );
+    assert_eq!(project.lifecycle_events("start").len(), 1);
+
+    let start = project.lsp(&["start", "fake"]);
+    assert!(start.status.success(), "{}", stdout(&start));
+    assert_eq!(stdout(&start), "fake  running\n");
+    assert_eq!(project.lifecycle_events("start").len(), 2);
+    let second = project.lifecycle_events("start")[1];
+
+    let restart = project.lsp(&["restart", "fake"]);
+    assert!(restart.status.success(), "{}", stdout(&restart));
+    assert_eq!(stdout(&restart), "fake  running\n");
+    assert_eq!(project.lifecycle_events("start").len(), 3);
+    project.wait_for("the replaced process to exit", |p| {
+        p.lifecycle_events("exit").contains(&second)
+    });
+    assert_tool_success(&frontend.symbols(&project.root().join("a.fake")));
+}
+
+#[cfg(unix)]
+#[test]
+fn lsp_commands_name_the_servers_that_apply_when_given_an_unknown_one() {
+    let project = Project::new(60_000).with_lifecycle_server();
+    let mut frontend = project.frontend();
+    project.assert_attaches(&mut frontend);
+
+    let start = project.lsp(&["start", "nope"]);
+    assert!(!start.status.success());
+    assert_eq!(
+        stdout(&start),
+        "no language server named nope applies here; these do: fake\n"
+    );
+}
+
+#[test]
+fn lsp_status_with_no_backend_says_where_one_comes_from() {
+    let project = Project::new(60_000);
+    let status = project.lsp(&["status"]);
+    assert!(!status.status.success());
+    assert_eq!(
+        stdout(&status),
+        format!(
+            "no backend serves {}; one starts with an agent session\n",
+            project.root().display()
+        )
     );
 }

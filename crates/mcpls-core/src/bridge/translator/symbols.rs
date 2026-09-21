@@ -230,6 +230,7 @@ impl Translator {
                 reason: "command not found".to_string(),
             },
             Some(ServerLifecycle::Failed) => self.unavailable(&server_id, "failed to start"),
+            Some(ServerLifecycle::Stopped) => super::respawn::stopped(&server_id),
             Some(ServerLifecycle::Running) | None => Error::NoServerConfigured,
         })?;
         self.require_capability(&server_id, "workspaceSymbolProvider", |caps| {

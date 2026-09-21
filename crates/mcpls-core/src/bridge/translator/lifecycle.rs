@@ -31,6 +31,8 @@ pub enum ServerLifecycle {
     NotInstalled,
     /// Spawned and died. Inside the respawn backoff.
     Failed,
+    /// Stopped by a user. Nothing starts it but an explicit start.
+    Stopped,
 }
 
 impl Translator {
@@ -38,17 +40,81 @@ impl Translator {
     ///
     /// The map write and broadcast share the `lifecycles` lock, so
     /// subscribers and snapshot readers observe the same transition.
+    pub fn set_lifecycle(&self, id: &ServerId, state: ServerLifecycle) {
+        let mut states = lock_std(&self.lifecycles);
+        self.publish_locked(&mut states, id, state);
+    }
+
+    /// End `id`'s spawn with the server it installed, publishing `state`.
+    ///
+    /// Returns false, leaving the spawn claimed, when a user stopped `id`
+    /// meanwhile: the caller retires what it installed, then calls
+    /// [`Self::release_stopped_spawn`].
     #[expect(
         clippy::significant_drop_tightening,
         reason = "state and watch updates must remain atomic"
     )]
-    pub fn set_lifecycle(&self, id: &ServerId, state: ServerLifecycle) {
+    pub(crate) fn finish_spawn(&self, id: &ServerId, state: ServerLifecycle) -> bool {
         let mut states = lock_std(&self.lifecycles);
-        states.insert(id.clone(), state);
-        lock_std(&self.lifecycle_senders)
-            .entry(id.clone())
-            .or_insert_with(|| watch::channel(state).0)
-            .send_replace(state);
+        if states.get(id) == Some(&ServerLifecycle::Stopped) {
+            return false;
+        }
+        lock_std(&self.spawning).remove(id);
+        self.publish_locked(&mut states, id, state);
+        true
+    }
+
+    /// End `id`'s spawn without an installed server, publishing `state`
+    /// unless a user stopped it meanwhile.
+    pub(crate) fn abandon_spawn(&self, id: &ServerId, state: ServerLifecycle) {
+        let mut states = lock_std(&self.lifecycles);
+        lock_std(&self.spawning).remove(id);
+        if states.get(id) != Some(&ServerLifecycle::Stopped) {
+            self.publish_locked(&mut states, id, state);
+        }
+    }
+
+    /// Give up the claim a stopped spawn kept while it retired its server.
+    /// Returns true, keeping the claim, when an explicit start adopted the
+    /// spawn meanwhile and the caller must spawn again.
+    pub(crate) fn release_stopped_spawn(&self, id: &ServerId) -> bool {
+        let states = lock_std(&self.lifecycles);
+        if states.get(id) == Some(&ServerLifecycle::Starting) {
+            return true;
+        }
+        lock_std(&self.spawning).remove(id);
+        drop(states);
+        false
+    }
+
+    /// Mark an eagerly spawned `id` as starting, with the spawn claimed by
+    /// the startup batch.
+    pub(crate) fn seed_starting(&self, id: &ServerId) {
+        let mut states = lock_std(&self.lifecycles);
+        lock_std(&self.spawning).insert(id.clone());
+        self.publish_locked(&mut states, id, ServerLifecycle::Starting);
+    }
+
+    /// Prepare `id` for an explicit start. A stopped server whose spawn is
+    /// still in flight goes back to `Starting` and keeps that spawn, so two
+    /// processes never race to install. Otherwise a stopped, missing, or
+    /// failed server returns to `Idle` for a fresh claim.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "state and watch updates must remain atomic"
+    )]
+    pub(crate) fn reset_for_explicit_start(&self, id: &ServerId) {
+        let mut states = lock_std(&self.lifecycles);
+        let next = match states.get(id) {
+            Some(ServerLifecycle::Stopped) if lock_std(&self.spawning).contains(id) => {
+                ServerLifecycle::Starting
+            }
+            Some(
+                ServerLifecycle::Stopped | ServerLifecycle::NotInstalled | ServerLifecycle::Failed,
+            ) => ServerLifecycle::Idle,
+            _ => return,
+        };
+        self.publish_locked(&mut states, id, next);
     }
 
     /// Claim the right to spawn `id`, moving it to `Starting`.
@@ -65,12 +131,24 @@ impl Translator {
             Some(ServerLifecycle::Idle | ServerLifecycle::Failed | ServerLifecycle::Running) => {}
             _ => return false,
         }
-        states.insert(id.clone(), ServerLifecycle::Starting);
+        if !lock_std(&self.spawning).insert(id.clone()) {
+            return false;
+        }
+        self.publish_locked(&mut states, id, ServerLifecycle::Starting);
+        true
+    }
+
+    fn publish_locked(
+        &self,
+        states: &mut HashMap<ServerId, ServerLifecycle>,
+        id: &ServerId,
+        state: ServerLifecycle,
+    ) {
+        states.insert(id.clone(), state);
         lock_std(&self.lifecycle_senders)
             .entry(id.clone())
-            .or_insert_with(|| watch::channel(ServerLifecycle::Starting).0)
-            .send_replace(ServerLifecycle::Starting);
-        true
+            .or_insert_with(|| watch::channel(state).0)
+            .send_replace(state);
     }
 
     /// The state recorded for `id`, or `None` when `id` is not applicable
@@ -120,7 +198,14 @@ mod tests {
             .collect();
         assert_eq!(
             rendered,
-            vec!["idle", "starting", "running", "not installed", "failed"]
+            vec![
+                "idle",
+                "starting",
+                "running",
+                "not installed",
+                "failed",
+                "stopped"
+            ]
         );
     }
 
@@ -201,5 +286,83 @@ mod tests {
         let id = ServerId::from("rust");
         translator.set_lifecycle(&id, ServerLifecycle::Running);
         assert!(translator.begin_starting(&id));
+    }
+
+    #[test]
+    fn test_a_stopped_server_keeps_its_state_against_a_spawn_outcome() {
+        let translator = Translator::new();
+        let id = ServerId::from("rust");
+        translator.set_lifecycle(&id, ServerLifecycle::Idle);
+        assert!(translator.begin_starting(&id));
+        translator.set_lifecycle(&id, ServerLifecycle::Stopped);
+        assert!(!translator.finish_spawn(&id, ServerLifecycle::Running));
+        assert_eq!(translator.lifecycle_of(&id), Some(ServerLifecycle::Stopped));
+        assert!(!translator.release_stopped_spawn(&id));
+
+        translator.set_lifecycle(&id, ServerLifecycle::Idle);
+        assert!(translator.begin_starting(&id));
+        assert!(translator.finish_spawn(&id, ServerLifecycle::Running));
+        assert_eq!(translator.lifecycle_of(&id), Some(ServerLifecycle::Running));
+    }
+
+    #[test]
+    fn test_a_start_during_a_stopped_spawn_adopts_it() {
+        let translator = Translator::new();
+        let id = ServerId::from("rust");
+        translator.set_lifecycle(&id, ServerLifecycle::Idle);
+        assert!(translator.begin_starting(&id));
+        translator.set_lifecycle(&id, ServerLifecycle::Stopped);
+
+        translator.reset_for_explicit_start(&id);
+        assert_eq!(
+            translator.lifecycle_of(&id),
+            Some(ServerLifecycle::Starting)
+        );
+        assert!(
+            !translator.begin_starting(&id),
+            "the adopted spawn is the only one"
+        );
+        assert!(translator.finish_spawn(&id, ServerLifecycle::Running));
+        assert_eq!(translator.lifecycle_of(&id), Some(ServerLifecycle::Running));
+    }
+
+    #[test]
+    fn test_an_abandoned_spawn_frees_the_claim_and_keeps_a_stop() {
+        let translator = Translator::new();
+        let id = ServerId::from("rust");
+        translator.set_lifecycle(&id, ServerLifecycle::Idle);
+        assert!(translator.begin_starting(&id));
+        translator.set_lifecycle(&id, ServerLifecycle::Stopped);
+        translator.abandon_spawn(&id, ServerLifecycle::Failed);
+        assert_eq!(translator.lifecycle_of(&id), Some(ServerLifecycle::Stopped));
+
+        translator.reset_for_explicit_start(&id);
+        assert_eq!(translator.lifecycle_of(&id), Some(ServerLifecycle::Idle));
+        assert!(translator.begin_starting(&id));
+    }
+
+    #[test]
+    fn test_an_explicit_start_resets_only_states_that_block_a_spawn() {
+        let translator = Translator::new();
+        for (state, expected) in [
+            (ServerLifecycle::Stopped, ServerLifecycle::Idle),
+            (ServerLifecycle::NotInstalled, ServerLifecycle::Idle),
+            (ServerLifecycle::Failed, ServerLifecycle::Idle),
+            (ServerLifecycle::Running, ServerLifecycle::Running),
+            (ServerLifecycle::Starting, ServerLifecycle::Starting),
+        ] {
+            let id = ServerId::from(state.to_string());
+            translator.set_lifecycle(&id, state);
+            translator.reset_for_explicit_start(&id);
+            assert_eq!(translator.lifecycle_of(&id), Some(expected), "{state}");
+        }
+    }
+
+    #[test]
+    fn test_a_stopped_server_does_not_claim_a_spawn() {
+        let translator = Translator::new();
+        let id = ServerId::from("rust");
+        translator.set_lifecycle(&id, ServerLifecycle::Stopped);
+        assert!(!translator.begin_starting(&id));
     }
 }
