@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0](https://github.com/AbysmalBiscuit/mcpls/compare/v0.3.11...v0.4.0) (2026-09-21)
+
+
+### ⚠ BREAKING CHANGES
+
+* **hooks:** `FileChanged`, the `watchPaths` reply and the `watch_paths` config key are gone from the Claude plugin. `SessionStart` stays registered, because plugin packaging gave it a second job running `bootstrap-binaries`; only its `mcpls hook` dispatch arm goes.
+
+### Features
+
+* **cli:** add backend start, stop and status ([#69](https://github.com/AbysmalBiscuit/mcpls/issues/69)) ([fcc6eff](https://github.com/AbysmalBiscuit/mcpls/commit/fcc6eff379decf17ab645834b3d5fb1d2d7570dc))
+* **cli:** add mcpls brief session hook ([#65](https://github.com/AbysmalBiscuit/mcpls/issues/65)) ([a02b838](https://github.com/AbysmalBiscuit/mcpls/commit/a02b838ac824678d518c89aa93c3379b3edff018))
+* **cli:** add mcpls doctor and mcpls config ([#60](https://github.com/AbysmalBiscuit/mcpls/issues/60)) ([5ce93db](https://github.com/AbysmalBiscuit/mcpls/commit/5ce93db5b0ed2e4627ad7d0d4300fb3354911a14))
+* **cli:** control language servers with mcpls lsp ([#70](https://github.com/AbysmalBiscuit/mcpls/issues/70)) ([b3fc8f6](https://github.com/AbysmalBiscuit/mcpls/commit/b3fc8f6d7cf35af0d8f7233c410e7a03d06dc232))
+* **diagnostics:** route reports to file writers ([#56](https://github.com/AbysmalBiscuit/mcpls/issues/56)) ([79b01f4](https://github.com/AbysmalBiscuit/mcpls/commit/79b01f4598e86175f7451401a422c46db5ebe557))
+* **hooks:** watch the project from the backend ([#53](https://github.com/AbysmalBiscuit/mcpls/issues/53)) ([b84f6f5](https://github.com/AbysmalBiscuit/mcpls/commit/b84f6f5b6c952acb4ebb34d4fd9749a5dd04b6e9))
+* **mcp:** format a range with format_document ([#68](https://github.com/AbysmalBiscuit/mcpls/issues/68)) ([f8fa22d](https://github.com/AbysmalBiscuit/mcpls/commit/f8fa22de4a6d2ec749b62183744147cee4514989))
+
+
+### Bug Fixes
+
+* **diagnostics:** keep owed files out of a late baseline ([#61](https://github.com/AbysmalBiscuit/mcpls/issues/61)) ([4f7522c](https://github.com/AbysmalBiscuit/mcpls/commit/4f7522c232169bd57c7b97b21e0367ae4641ce33))
+* **log:** stop announcing spawns lazy mode skips ([#66](https://github.com/AbysmalBiscuit/mcpls/issues/66)) ([6219b74](https://github.com/AbysmalBiscuit/mcpls/commit/6219b742a918e3ff05f27afedf3fec3bb33397f2))
+* **lsp:** report a server that dies during startup ([#67](https://github.com/AbysmalBiscuit/mcpls/issues/67)) ([03aee1b](https://github.com/AbysmalBiscuit/mcpls/commit/03aee1bfde1e32d969dc21e7d90c8c1d50afb400))
+* **mcp:** key codex records by thread ([#54](https://github.com/AbysmalBiscuit/mcpls/issues/54)) ([deb1282](https://github.com/AbysmalBiscuit/mcpls/commit/deb1282c3fd5fb59ea7cf254e0b1cad2a858246a))
+* **windows:** stop the backend holding hook stdio ([#58](https://github.com/AbysmalBiscuit/mcpls/issues/58)) ([7c6c038](https://github.com/AbysmalBiscuit/mcpls/commit/7c6c03814916f9918e9f258e0083bc01eb4a0334))
+
 ## [0.3.11](https://github.com/AbysmalBiscuit/mcpls/compare/v0.3.10...v0.3.11) (2026-09-16)
 
 
