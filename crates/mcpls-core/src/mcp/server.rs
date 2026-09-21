@@ -48,10 +48,15 @@ mod session_identity_tests;
 /// What every mcpls tells an agent about itself at `initialize`.
 #[allow(clippy::redundant_pub_crate)]
 pub(crate) const INSTRUCTIONS: &str = concat!(
-    "Universal MCP to LSP bridge. Exposes Language Server Protocol ",
-    "capabilities as MCP tools for semantic code intelligence. ",
-    "Supports hover, definition, references, diagnostics, rename, ",
-    "completions, symbols, and formatting."
+    "mcpls answers code questions from language servers, so a lookup ",
+    "returns the symbol itself: no matches in comments, strings, or ",
+    "same-named symbols in other scopes. For a question about a symbol, ",
+    "start here: workspace_symbol_search finds it by name, then ",
+    "get_definition, get_references, prepare_call_hierarchy with ",
+    "get_incoming_calls for callers, go_to_implementation, get_hover for ",
+    "its type, and rename_symbol. After an edit, get_new_diagnostics ",
+    "reports what the edit changed. Text search stays the tool for ",
+    "comments, strings, config, and languages with no language server."
 );
 
 /// MCP server that exposes LSP capabilities as tools.
