@@ -16,9 +16,27 @@ mod logging;
 use args::{Args, Command, HookAction, SchemaAction};
 use hook::{Examined, Report};
 
+/// Parse, failing a `hook` invocation with exit 1 rather than clap's 2.
+///
+/// Exit 2 is a verdict to a harness: Claude Code erases a submitted prompt
+/// on it and Codex blocks the tool call, so a verb from a manifest newer
+/// than this binary must not read as one. `use_stderr` tells a usage error
+/// from `--help`, which clap also reports as an error.
+fn parse_args() -> Args {
+    let hook = std::env::args_os().nth(1).is_some_and(|arg| arg == "hook");
+    match Args::try_parse() {
+        Ok(args) => args,
+        Err(err) if hook && err.use_stderr() => {
+            let _ = err.print();
+            std::process::exit(1);
+        }
+        Err(err) => err.exit(),
+    }
+}
+
 #[tokio::main]
 async fn main() {
-    let args = Args::parse();
+    let args = parse_args();
 
     // Completions need neither a loaded config nor a log subscriber, and
     // printing the script is the whole command, so this runs before both.
@@ -87,45 +105,10 @@ async fn main() {
 
     // A hook invocation needs neither a loaded config nor a log subscriber,
     // and reading stdin and writing hook JSON is the whole command.
-    if let Some(Command::Hook { host, action }) = &args.command {
+    if let Some(Command::Hook { harness, action }) = &args.command {
         match action {
-            None => {
-                use std::io::{Read as _, Write as _};
-                let mut stdin = String::new();
-                let _ = std::io::stdin().read_to_string(&mut stdin);
-                let raw_project_dir = hook::project_dir(*host, &stdin);
-                // A watch path is consumed by the host, which has no
-                // obligation to resolve it against this process's own
-                // working directory, so it must be absolute. Falling back
-                // to the raw path on a canonicalization failure keeps
-                // today's relative-path behaviour as the floor rather than
-                // turning it into a hard error.
-                let project_dir = dunce::canonicalize(&raw_project_dir).unwrap_or(raw_project_dir);
-                let root = hook::checkout_root(&project_dir);
-                // A failed `identity_for` (an unreachable directory, or an
-                // over-long socket path) must not suppress `SessionStart`:
-                // that arm never touches the socket, which is the entire
-                // reason it exists, so every socket-using arm degrades on
-                // its own when `identity` is `None` rather than the whole
-                // dispatch short-circuiting here.
-                let identity = mcpls_core::hooks::identity_for(&root).ok();
-                #[cfg(windows)]
-                if let (Some(identity), Ok(exe)) = (identity.as_ref(), std::env::current_exe()) {
-                    // The frontend cannot spawn a backend that outlives a
-                    // job-contained session, so it asks and a hook starts it.
-                    let _ = mcpls_core::backend::start_requested(identity, &exe).await;
-                }
-                let out = hook::dispatch_payload(*host, &stdin, &root, identity.as_ref()).await;
-                // `print!` panics on a write failure (a closed stdout pipe
-                // reached past the `LineWriter`'s buffer), which would
-                // break the exit-0 guarantee this whole command exists to
-                // uphold. `completions::emit` already solves this the same
-                // way.
-                let mut stdout = std::io::stdout().lock();
-                let _ = stdout
-                    .write_all(out.as_bytes())
-                    .and_then(|()| stdout.flush());
-            }
+            Some(HookAction::Event(event)) => serve_hook(*harness, Some(*event)).await,
+            None => serve_hook(*harness, None).await,
             // The alias exits 0 whatever it found, which every hook
             // registration depends on.
             Some(HookAction::Doctor) => {
@@ -151,18 +134,42 @@ async fn main() {
         0
     };
 
-    // `#[tokio::main]`'s generated wrapper blocks in `Runtime::drop` ->
-    // `BlockingPool::shutdown` after this function returns, waiting for
-    // every outstanding spawn_blocking thread -- including the one
-    // `rmcp::transport::stdio()` (== `tokio::io::stdin()`) parks in a raw,
-    // uncancellable `read()` on the real stdin fd. That read only returns on
-    // more input or EOF, so if the MCP client's write end of stdin is still
-    // open, the wait never completes even though `run()` above (which
-    // includes LSP server shutdown and all shutdown logging) has already
-    // finished. `process::exit` terminates immediately, bypassing that wait
-    // -- safe here because everything that matters has already completed
-    // above. See #308.
+    // Dropping the runtime waits on the thread parked in an uncancellable
+    // stdin `read()`, which never returns while the client holds stdin open.
     std::process::exit(exit_code);
+}
+
+/// Answer one hook invocation for `event`, or for the event the payload
+/// names when the manifest named none.
+async fn serve_hook(harness: hook::Harness, event: Option<hook::HookEvent>) {
+    use std::io::{Read as _, Write as _};
+    let mut stdin = String::new();
+    let _ = std::io::stdin().read_to_string(&mut stdin);
+    let Some(event) = event.or_else(|| hook::HookEvent::named_in(&stdin)) else {
+        return;
+    };
+    let raw_project_dir = hook::project_dir(harness, &stdin);
+    // The host need not resolve a watch path against this process's working
+    // directory, so it must be absolute; a failed canonicalize keeps the raw path.
+    let project_dir = dunce::canonicalize(&raw_project_dir).unwrap_or(raw_project_dir);
+    let root = hook::checkout_root(&project_dir);
+    // A failed `identity_for` (an unreachable directory, or an over-long
+    // socket path) leaves each arm to degrade on its own.
+    let identity = mcpls_core::hooks::identity_for(&root).ok();
+    #[cfg(windows)]
+    if let (Some(identity), Ok(exe)) = (identity.as_ref(), std::env::current_exe()) {
+        // The frontend cannot spawn a backend that outlives a job-contained
+        // session, so it asks and a hook starts it.
+        let _ = mcpls_core::backend::start_requested(identity, &exe).await;
+    }
+    let out = hook::dispatch_payload(harness, event, &stdin, &root, identity.as_ref()).await;
+    // `print!` panics on a write failure (a closed stdout pipe reached past
+    // the `LineWriter`'s buffer), which would break the exit-0 guarantee
+    // every hook registration depends on.
+    let mut stdout = std::io::stdout().lock();
+    let _ = stdout
+        .write_all(out.as_bytes())
+        .and_then(|()| stdout.flush());
 }
 
 fn emit_schema() {

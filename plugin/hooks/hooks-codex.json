@@ -15,10 +15,14 @@
     "PostToolUse": [
       {
         "matcher": "apply_patch",
-        "hooks": [{ "type": "command", "command": "mcpls hook --host codex" }]
+        "hooks": [{ "type": "command", "command": "mcpls hook post-tool-use --harness codex" }]
       }
     ],
-    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "mcpls hook --host codex" }] }],
-    "SessionEnd": [{ "hooks": [{ "type": "command", "command": "mcpls hook --host codex" }] }]
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "mcpls hook user-prompt-submit --harness codex" }] }
+    ],
+    "SessionEnd": [
+      { "hooks": [{ "type": "command", "command": "mcpls hook session-end --harness codex" }] }
+    ]
   }
 }

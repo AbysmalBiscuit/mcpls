@@ -1,11 +1,10 @@
 //! Dispatching one agent hook invocation.
 //!
-//! A hook registration spawns `mcpls hook`, writes one JSON payload to its
-//! stdin, and reads one JSON payload back from its stdout. Routing on the
-//! payload's own `hook_event_name` here, in one binary, means there is no
-//! shell script translating hook names into subcommands, and the same
-//! registrations work unmodified on Windows. Claude Code and Codex send
-//! different payload shapes, so `--host` picks which dispatcher reads it.
+//! A hook registration spawns `mcpls hook <event> --harness <name>`, writes
+//! one JSON payload to its stdin, and reads one JSON payload back from its
+//! stdout. The spelling is devkit's, so one manifest reads the same for both
+//! tools. Claude Code and Codex send different payload shapes, so
+//! `--harness` picks which dispatcher reads it.
 
 mod codex;
 
@@ -20,7 +19,7 @@ use mcpls_core::hooks::{
     ChangeEvent, ProbeOutcome, Request, Response, SocketIdentity, WatcherStatus, probe, send,
     send_and_acknowledge,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// How long a hook waits for an answer to `Changed` or `EndSession`, which
 /// carry no context back and are never worth stalling an edit for.
@@ -33,19 +32,54 @@ const FLUSH_SOCKET_TIMEOUT: Duration = Duration::from_millis(1500);
 /// The agent harness that spawned a hook, which decides where its project
 /// directory and session identity come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum Host {
+pub enum Harness {
     /// Claude Code, which names the project in `CLAUDE_PROJECT_DIR`.
-    Claude,
+    #[value(alias = "claude")]
+    ClaudeCode,
     /// Codex, which names the project in every payload's `cwd`.
     Codex,
 }
 
+/// The hook events mcpls answers, one verb per harness event.
+///
+/// The serde spelling is the harness's own `hook_event_name`, which a
+/// manifest from before the verbs leaves as the only name the event has, and
+/// which `hookEventName` in the answer has to repeat.
+///
+/// There is no `Stop`: context a `Stop` hook returns resumes the
+/// conversation, so diagnostics wait for the next prompt instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::Subcommand, Serialize, Deserialize)]
+pub enum HookEvent {
+    /// A tool call finished
+    PostToolUse,
+    /// A batch of parallel tool calls finished
+    PostToolBatch,
+    /// The user submitted a prompt
+    UserPromptSubmit,
+    /// The session ended
+    SessionEnd,
+}
+
+impl HookEvent {
+    /// The event a payload names in its `hook_event_name`, or `None` for a
+    /// payload that is not JSON or an event mcpls does not answer.
+    pub fn named_in(stdin: &str) -> Option<Self> {
+        #[derive(Deserialize)]
+        struct Named {
+            hook_event_name: HookEvent,
+        }
+        serde_json::from_str::<Named>(stdin)
+            .ok()
+            .map(|named| named.hook_event_name)
+    }
+}
+
 /// The directory a hook invocation names as its project, before
 /// canonicalization, or `.` when it names none.
-pub fn project_dir(host: Host, stdin: &str) -> PathBuf {
-    let named = match host {
-        Host::Claude => std::env::var_os("CLAUDE_PROJECT_DIR").map(PathBuf::from),
-        Host::Codex => serde_json::from_str::<serde_json::Value>(stdin)
+pub fn project_dir(harness: Harness, stdin: &str) -> PathBuf {
+    let named = match harness {
+        Harness::ClaudeCode => std::env::var_os("CLAUDE_PROJECT_DIR").map(PathBuf::from),
+        Harness::Codex => serde_json::from_str::<serde_json::Value>(stdin)
             .ok()
             .and_then(|payload| payload.get("cwd")?.as_str().map(PathBuf::from)),
     };
@@ -54,10 +88,9 @@ pub fn project_dir(host: Host, stdin: &str) -> PathBuf {
 
 /// The hook payload Claude Code writes to stdin, keeping only the fields
 /// the dispatch table below reads. Every field is optional or defaulted,
-/// since which ones are present depends on `hook_event_name`.
+/// since which ones are present depends on the event.
 #[derive(Debug, Deserialize)]
 struct HookPayload {
-    hook_event_name: String,
     #[serde(default)]
     session_id: String,
     #[serde(default)]
@@ -92,14 +125,15 @@ async fn silently<T: Default>(body: impl Future<Output = Result<T>>) -> T {
 
 /// Return hook JSON, or an empty answer on payload or socket failure.
 pub async fn dispatch_payload(
-    host: Host,
+    harness: Harness,
+    event: HookEvent,
     stdin: &str,
     project_dir: &Path,
     identity: Option<&SocketIdentity>,
 ) -> String {
-    match host {
-        Host::Claude => silently(run(stdin, identity)).await,
-        Host::Codex => silently(codex::run(stdin, project_dir, identity)).await,
+    match harness {
+        Harness::ClaudeCode => silently(run(event, stdin, identity)).await,
+        Harness::Codex => silently(codex::run(event, stdin, project_dir, identity)).await,
     }
 }
 
@@ -138,19 +172,20 @@ fn writes_a_file(tool_name: &str) -> bool {
     matches!(tool_name, "Write" | "Edit" | "MultiEdit")
 }
 
-async fn run(stdin: &str, identity: Option<&SocketIdentity>) -> Result<String> {
+async fn run(event: HookEvent, stdin: &str, identity: Option<&SocketIdentity>) -> Result<String> {
     let payload: HookPayload = serde_json::from_str(stdin)?;
     let agent = HookAgent {
         agent_id: payload.agent_id.clone(),
         host: HookHost::Claude,
     };
 
-    match payload.hook_event_name.as_str() {
-        "PostToolUse" if writes_a_file(&payload.tool_name) => {
+    match event {
+        HookEvent::PostToolUse if writes_a_file(&payload.tool_name) => {
             attribute_claude_write(payload, agent, identity).await
         }
+        HookEvent::PostToolUse => Ok(String::new()),
 
-        "PostToolBatch" => {
+        HookEvent::PostToolBatch => {
             let Some(identity) = identity else {
                 return Ok(String::new());
             };
@@ -175,10 +210,10 @@ async fn run(stdin: &str, identity: Option<&SocketIdentity>) -> Result<String> {
             ];
             let responses = send_and_acknowledge(identity, &requests, FLUSH_SOCKET_TIMEOUT).await?;
             let context = responses.into_iter().nth(1).and_then(flush_context);
-            Ok(additional_context_output("PostToolBatch", context))
+            Ok(additional_context_output(event, context))
         }
 
-        "UserPromptSubmit" => {
+        HookEvent::UserPromptSubmit => {
             let Some(identity) = identity else {
                 return Ok(String::new());
             };
@@ -192,10 +227,10 @@ async fn run(stdin: &str, identity: Option<&SocketIdentity>) -> Result<String> {
             )
             .await?;
             let context = responses.into_iter().next().and_then(flush_context);
-            Ok(additional_context_output("UserPromptSubmit", context))
+            Ok(additional_context_output(event, context))
         }
 
-        "SessionEnd" => {
+        HookEvent::SessionEnd => {
             let Some(identity) = identity else {
                 return Ok(String::new());
             };
@@ -209,9 +244,6 @@ async fn run(stdin: &str, identity: Option<&SocketIdentity>) -> Result<String> {
             .await?;
             Ok(String::new())
         }
-
-        // Stop context resumes the conversation; flush at the next prompt instead.
-        _ => Ok(String::new()),
     }
 }
 
@@ -252,7 +284,7 @@ fn watcher_line(watcher: Option<&WatcherStatus>) -> String {
 
 /// The hook JSON carrying diagnostics context, or the empty string when
 /// there is nothing to report.
-fn additional_context_output(event: &str, context: Option<String>) -> String {
+fn additional_context_output(event: HookEvent, context: Option<String>) -> String {
     context
         .filter(|text| !text.is_empty())
         .map_or_else(String::new, |text| {
@@ -434,10 +466,8 @@ async fn backend_answer(
             ));
             lines.push(BACKEND_PID_UNKNOWN.to_string());
         }
-        // A connection was accepted and the exchange then failed, on the
-        // write, the read, an early hang-up, or the parse. The error
-        // carries which; the line says only what all four share, that
-        // something holds the socket and this build cannot talk to it.
+        // The socket accepted and the exchange failed: something holds it
+        // that this build cannot talk to.
         ProbeOutcome::Unintelligible(error) => {
             lines.push(format!(
                 "server sees: a socket is live but this build could not read its reply: \
@@ -639,13 +669,9 @@ struct ServerReport {
 /// What each configured language server is doing, or why it is doing
 /// nothing.
 ///
-/// A backend reports only the servers that apply to its checkout, so the
-/// ones it leaves out are the pair a reader cannot otherwise tell apart:
-/// a server no project marker here matches, and one that matches and
-/// whose binary is not installed. Both come from the configuration and
-/// the filesystem, so they survive with no backend running at all. Only a
-/// server in `requested`, which the user's own file names, counts its
-/// missing binary as a fault.
+/// Adds what the backend leaves out, and works with no backend running: a
+/// server no project marker matches, and one whose binary is missing. Only
+/// a server in `requested` counts a missing binary as a fault.
 fn server_reports(
     reported: &[ServerStatus],
     config: Option<&mcpls_core::ServerConfig>,
@@ -857,15 +883,9 @@ impl ForeignOwners {
 /// The `server sees` line to print when nothing answers this project's own
 /// socket.
 ///
-/// Candidates that were live but unidentifiable are reported as their own
-/// clause rather than folded into the counts above it. They are evidence
-/// that something is running, but not evidence of whose it is, and the
-/// lines above only ever count owners that named their own root.
-///
-/// The candidate cap bounds the whole scan rather than any one of its
-/// outcomes, so the clause disclosing it is appended last, to every
-/// variant the scan ran. A count printed without it reads as a total
-/// when it is a floor.
+/// Live but unidentifiable candidates get their own clause: they show
+/// something runs, not whose. A capped scan says so last on every variant,
+/// since its counts are floors.
 fn no_owner_line(foreign: ForeignOwners) -> String {
     let unidentified = foreign.unidentified();
     let truncated = foreign.truncated();
@@ -928,27 +948,14 @@ fn no_owner_line(foreign: ForeignOwners) -> String {
     }
 }
 
-/// Look for an mcpls answering some other project's socket in the same
-/// runtime location as `identity`'s own, so a doctor run against an
-/// unreachable socket can tell "nothing is running" apart from
-/// "something is running, for a directory that explains this one's
-/// silence".
+/// Look for an mcpls answering another socket beside `identity`'s, so the
+/// doctor can tell "nothing is running" from "one runs for a related
+/// directory".
 ///
-/// Candidates are probed in sorted order, so the set the cap applies to
-/// is the same on every run against an unchanged runtime location rather
-/// than whatever that location happened to list first. Which of those
-/// candidates answer inside the probe deadline is a property of the
-/// machine at the moment of the run, so the answer itself can still move
-/// between runs even when the candidates do not.
-///
-/// Sockets are named by their own directory's hash, which is the entire
-/// reason `identity`'s own probe above can never observe a live owner
-/// whose directory hashed differently: that owner bound a different
-/// socket file, not this one. This is the only way the doctor can learn
-/// about it at all. An owner is only ever named when its root is an
-/// ancestor or descendant of `project_dir`: anything else is a different
-/// project entirely, and naming it would accuse it of a failure it has
-/// nothing to do with.
+/// A socket is named by its root's hash, so an owner of a nested or parent
+/// root is invisible to this project's own probe. Only such an owner is
+/// named; any other root is a different project. Candidates are probed in
+/// sorted order, so the cap cuts the same set each run.
 async fn find_foreign_owner(
     identity: &SocketIdentity,
     project_dir: &Path,
@@ -961,12 +968,8 @@ async fn find_foreign_owner(
     let truncated = candidates.len() > MAX_FOREIGN_CANDIDATES;
     let mut unrelated = 0usize;
     let mut unidentified = 0usize;
-    // Naming an owner does not end the scan. Stopping at the first
-    // related answer would leave the candidates after it unprobed, so the
-    // unidentified count beside the name would be a floor while every
-    // other variant's is a total, and which it was would depend on the
-    // order the runtime directory happened to list its entries in. The
-    // candidate cap is what bounds the wait.
+    // Scan past the first related owner, so the unidentified count is a
+    // total in every variant; the candidate cap bounds the wait.
     let mut related = Option::<(PathBuf, u32)>::None;
     let mut related_count = 0usize;
     for socket in candidates.into_iter().take(MAX_FOREIGN_CANDIDATES) {
@@ -989,12 +992,8 @@ async fn find_foreign_owner(
                     unrelated += 1;
                 }
             }
-            // Accepted the connection and then either said nothing in
-            // time or said something this build could not read. That is
-            // still a process holding the socket, and an mcpls speaking
-            // an older wire shape is the likeliest way to get here, so
-            // counting it as an absence would report the one thing the
-            // scan has evidence against.
+            // Something holds the socket, likely an mcpls on an older wire
+            // shape, so it is not an absence.
             ProbeOutcome::Refused(_) | ProbeOutcome::Busy | ProbeOutcome::Unintelligible(_) => {
                 unidentified += 1;
             }
@@ -1085,17 +1084,11 @@ fn foreign_candidates(identity: &SocketIdentity, prefix: &str) -> std::io::Resul
 #[cfg(windows)]
 const PIPE_LISTINGS: usize = 3;
 
-/// The doctor's answer when this project's own socket identity cannot be
-/// derived at all: an unreachable project directory, or a runtime
-/// directory deep enough that the derived socket path exceeds this
-/// platform's length limit. A running mcpls that hit the same failure
-/// logs a warning and serves no socket rather than aborting startup, so
-/// this state is real, not hypothetical.
+/// The doctor's answer when no socket identity can be derived: an
+/// unreachable directory, or a socket path over the platform's limit.
 ///
-/// Kept distinct from "server sees: no owner": that line means a socket
-/// exists and nothing answers it; this means no socket could ever exist
-/// here at all, on either side, which a user needs to be able to tell
-/// apart from a server that simply is not running right now.
+/// Distinct from "server sees: no owner", where a socket exists and nothing
+/// answers; here no socket can exist at all.
 pub fn doctor_without_identity(
     project_dir: &Path,
     examined: Examined,
@@ -1140,14 +1133,9 @@ fn on_path_line(found: Option<&Path>) -> String {
 /// The absolute path to an executable named `mcpls` (`mcpls.exe` on
 /// Windows) on the first `PATH` entry that has one, or `None`.
 ///
-/// Hooks invoke `mcpls` by name off `PATH` rather than by an absolute
-/// path, so a hook environment missing the install directory makes every
-/// hook do nothing, invisibly. Walking `PATH` by hand rather than
-/// shelling out to `which`, which is not installed on every host mcpls
-/// runs on. `PATH` entries are not guaranteed absolute themselves (a bare
-/// `bin`, `.`, or an empty entry from `::` all parse), so the winning
-/// candidate is absolutized before it is returned: a relative path here
-/// means nothing to whatever directory a hook later runs in.
+/// Hooks run `mcpls` by name, so without it on `PATH` every hook silently
+/// does nothing. A relative `PATH` entry is made absolute, since it means
+/// nothing to the directory a hook later runs in.
 fn mcpls_on_path() -> Option<PathBuf> {
     let exe_name = if cfg!(windows) { "mcpls.exe" } else { "mcpls" };
     let path = std::env::var_os("PATH")?;
@@ -1287,22 +1275,38 @@ mod tests {
     /// goes through the same path.
     async fn dispatch_raw(stdin: &str, project_dir: &Path) -> String {
         let identity = mcpls_core::hooks::identity_for(project_dir).expect("identity");
-        super::dispatch_payload(Host::Claude, stdin, project_dir, Some(&identity)).await
+        dispatch_named(Harness::ClaudeCode, stdin, project_dir, Some(&identity)).await
+    }
+
+    /// Dispatch the event the payload names, the way a bare `mcpls hook`
+    /// does, answering nothing for an event mcpls does not handle.
+    async fn dispatch_named(
+        harness: Harness,
+        stdin: &str,
+        project_dir: &Path,
+        identity: Option<&SocketIdentity>,
+    ) -> String {
+        match HookEvent::named_in(stdin) {
+            Some(event) => {
+                super::dispatch_payload(harness, event, stdin, project_dir, identity).await
+            }
+            None => String::new(),
+        }
     }
 
     /// Run the dispatcher against a listener that records the requests it
     /// gets.
     async fn dispatch_against(payload: &serde_json::Value, recorder: &RecordingOwner) -> String {
-        dispatch_as(Host::Claude, payload, recorder).await
+        dispatch_as(Harness::ClaudeCode, payload, recorder).await
     }
 
     /// The same, for a hook spawned by `host`.
     async fn dispatch_as(
-        host: Host,
+        host: Harness,
         payload: &serde_json::Value,
         recorder: &RecordingOwner,
     ) -> String {
-        super::dispatch_payload(
+        dispatch_named(
             host,
             &payload.to_string(),
             recorder.project_dir(),
@@ -1359,17 +1363,8 @@ mod tests {
         .to_string()
     }
 
-    /// How `RecordingOwner` answers requests: the `Flush` context text, how
-    /// long to wait before answering one, and whether `Changed` answers an
-    /// error instead of queuing. The delay defaults to zero and the error
-    /// defaults to off; a test exercising either sets it explicitly, so a
-    /// regression that narrows a client's tolerance has something in the
-    /// suite that would notice.
-    ///
-    /// The flags are independent switches over one owner, not states of a
-    /// machine: a test sets whichever ones its scenario needs and leaves
-    /// the rest at their defaults, so folding them into an enum would
-    /// enumerate combinations no reader has a name for.
+    /// How `RecordingOwner` answers requests. Each flag is an independent
+    /// switch a test sets for its scenario, so they are not an enum.
     #[derive(Clone)]
     #[allow(clippy::struct_excessive_bools)]
     struct OwnerBehavior {
@@ -1486,15 +1481,9 @@ mod tests {
     /// A listener on a temporary socket that records every request it is
     /// sent, in order, and answers each plausibly.
     ///
-    /// A hand-rolled newline-delimited JSON accept loop, not
-    /// `HookListener`: the protocol's framing is pinned by
-    /// `mcpls_core::hooks::protocol`'s own tests, so nothing here depends
-    /// on `HookListener`'s specific accept/serve machinery, and speaking
-    /// the wire format directly means one socket yields the full `Request`
-    /// (paths, session ids, event kinds) and a true connection count from
-    /// its own accept counter, rather than needing a second socket in
-    /// front of a `HookListener` whose handler cannot see connection
-    /// boundaries at all.
+    /// It speaks the wire format itself rather than wrapping `HookListener`,
+    /// whose handler cannot see connection boundaries, so it can count
+    /// connections.
     struct RecordingOwner {
         dir: tempfile::TempDir,
         identity: SocketIdentity,
@@ -1580,10 +1569,8 @@ mod tests {
             let connections = Arc::new(AtomicUsize::new(0));
             let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
-            // Bound synchronously, before this function returns: a spawned
-            // task's first poll is not guaranteed to happen before the
-            // caller's next `send`/`send_many`, and a socket that does not
-            // exist yet would refuse that connection outright.
+            // Bound before returning: the spawned task may not run before
+            // the caller's first `send`, which a missing socket refuses.
             let listener = bind_owner(&identity.socket);
             tokio::spawn(accept_loop(
                 listener,
@@ -1603,16 +1590,11 @@ mod tests {
             }
         }
 
-        /// An owner bound on `identity`, answering `Status` as though its
-        /// own startup directory were `root` and it had already answered
-        /// `hooks_seen` hook requests, rather than wherever this process
-        /// actually runs and however many requests this test harness has
-        /// actually served.
+        /// An owner bound on `identity` whose `Status` claims `root` as its
+        /// startup directory and `hooks_seen` requests answered.
         ///
-        /// Uses `identity_hash` rather than `identity_for`, which also
-        /// builds and length-checks a real socket path this call never
-        /// uses: a caller on a host with a long runtime directory would
-        /// otherwise panic here before the test bound anything.
+        /// Uses `identity_hash`, since `identity_for` fails on a host whose
+        /// runtime directory makes the socket path too long.
         fn start_reporting_status(identity: SocketIdentity, root: &Path, hooks_seen: u64) -> Self {
             let hash = mcpls_core::hooks::identity_hash(root)
                 .expect("identity hash for the reported root");
@@ -1624,10 +1606,8 @@ mod tests {
                     status_hash: hash,
                     status_root: root.to_path_buf(),
                     status_hooks_seen: hooks_seen,
-                    // A backend that is actually watching, so the doctor's
-                    // watcher line is asserted against a reported state
-                    // rather than against the empty default every other
-                    // behavior carries.
+                    // A watching backend, so the watcher line is checked
+                    // against a reported state, not the empty default.
                     status_watcher: WatcherStatus {
                         watching: true,
                         directories: 7,
@@ -1756,11 +1736,8 @@ mod tests {
         use tokio::io::AsyncReadExt as _;
 
         if behavior.silent {
-            // Accepted, and then never read from or written to: a real
-            // connection with a real owner on the other end of it, who
-            // simply never gets back to the client. `stream` stays open
-            // for as long as this future is polled, which is exactly as
-            // long as the test that spawned it keeps its runtime alive.
+            // An owner that accepts and never answers; `stream` stays open
+            // while the test's runtime lives.
             std::future::pending::<()>().await;
         }
 
@@ -1804,10 +1781,8 @@ mod tests {
 
             let hang_up = behavior.hang_up_after_flush && matches!(request, Request::Flush { .. });
 
-            // A raw line bypasses `Response`'s own serialization entirely,
-            // for a test standing in for a wire shape this build's
-            // `Response` cannot represent at all (a previous version
-            // missing a field this build now requires).
+            // A raw line stands in for an older wire shape this build's
+            // `Response` cannot represent.
             let mut out = if matches!(request, Request::Status)
                 && let Some(raw) = &behavior.status_raw_line
             {
@@ -1943,7 +1918,7 @@ mod tests {
             let recorder = RecordingOwner::start();
             let cwd = recorder.project_dir().join("subdir");
             dispatch_as(
-                Host::Codex,
+                Harness::Codex,
                 &json!({
                     "hook_event_name": "PostToolUse", "session_id": "root",
                     "agent_id": "child", "cwd": cwd, "tool_name": "apply_patch",
@@ -1981,7 +1956,7 @@ mod tests {
         use mcpls_core::hooks::sweep::Sweeper;
         use mcpls_core::hooks::{HookListener, PathFilter};
         use mcpls_core::mcp::McplsServer;
-        for host in [Host::Claude, Host::Codex] {
+        for host in [Harness::ClaudeCode, Harness::Codex] {
             let dir = tempfile::tempdir().unwrap();
             let root = dunce::canonicalize(dir.path()).unwrap();
             let identity = temp_identity(&root);
@@ -2045,10 +2020,10 @@ mod tests {
                 let payload = json!({
                     "hook_event_name": "PostToolUse",
                     "session_id": "root", "agent_id": agent, "cwd": root,
-                    "tool_name": if matches!(host, Host::Codex) { "apply_patch" } else { "Edit" }, "tool_input": {"file_path": path, "command": format!("*** Begin Patch\n*** Update File: {agent}.rs\n@@\n-old\n+new\n*** End Patch\n")},
+                    "tool_name": if matches!(host, Harness::Codex) { "apply_patch" } else { "Edit" }, "tool_input": {"file_path": path, "command": format!("*** Begin Patch\n*** Update File: {agent}.rs\n@@\n-old\n+new\n*** End Patch\n")},
                     "tool_calls": [{"tool_name": "Edit", "tool_input": {"file_path": path}}]
                 });
-                super::dispatch_payload(host, &payload.to_string(), &root, Some(&identity)).await;
+                dispatch_named(host, &payload.to_string(), &root, Some(&identity)).await;
             }
             for name in ["a", "b", "unowned"] {
                 let uri =
@@ -2067,8 +2042,7 @@ mod tests {
             for (agent, expected) in [(Some("a"), "a"), (Some("b"), "b"), (None, "unowned")] {
                 let payload = json!({"hook_event_name": "UserPromptSubmit", "session_id": "root", "agent_id": agent, "cwd": root});
                 let output =
-                    super::dispatch_payload(host, &payload.to_string(), &root, Some(&identity))
-                        .await;
+                    dispatch_named(host, &payload.to_string(), &root, Some(&identity)).await;
                 assert!(output.contains(&format!("{expected} error")), "{output}");
                 for other in ["a", "b", "unowned"] {
                     if other != expected {
@@ -2076,8 +2050,7 @@ mod tests {
                     }
                 }
                 let repeated =
-                    super::dispatch_payload(host, &payload.to_string(), &root, Some(&identity))
-                        .await;
+                    dispatch_named(host, &payload.to_string(), &root, Some(&identity)).await;
                 assert!(!repeated.contains(" error"), "{repeated}");
             }
             cancel.send(true).unwrap();
@@ -2106,8 +2079,8 @@ mod tests {
     #[tokio::test]
     async fn test_a_missing_identity_produces_no_output_for_socket_using_arms() {
         let dir = tempfile::tempdir().expect("a temp dir");
-        let out = super::dispatch_payload(
-            Host::Claude,
+        let out = dispatch_named(
+            Harness::ClaudeCode,
             &json!({ "hook_event_name": "UserPromptSubmit", "session_id": "s1" }).to_string(),
             dir.path(),
             None,
@@ -2130,7 +2103,10 @@ mod tests {
 
         assert_eq!(
             out,
-            additional_context_output("UserPromptSubmit", Some(DEFAULT_FLUSH_TEXT.to_string())),
+            additional_context_output(
+                HookEvent::UserPromptSubmit,
+                Some(DEFAULT_FLUSH_TEXT.to_string())
+            ),
             "an owner slower than the old 50ms bound but inside \
              FLUSH_SOCKET_TIMEOUT must still be waited out, or raising the \
              timeout had no effect at this call site"
@@ -2157,7 +2133,10 @@ mod tests {
 
         assert_eq!(
             out,
-            additional_context_output("PostToolBatch", Some(DEFAULT_FLUSH_TEXT.to_string())),
+            additional_context_output(
+                HookEvent::PostToolBatch,
+                Some(DEFAULT_FLUSH_TEXT.to_string())
+            ),
             "an owner slower than the old 50ms bound but inside \
              FLUSH_SOCKET_TIMEOUT must still be waited out, or raising the \
              timeout had no effect at this call site"
@@ -2407,7 +2386,10 @@ mod tests {
 
         assert_eq!(
             out,
-            additional_context_output("PostToolBatch", Some(DEFAULT_FLUSH_TEXT.to_string())),
+            additional_context_output(
+                HookEvent::PostToolBatch,
+                Some(DEFAULT_FLUSH_TEXT.to_string())
+            ),
             "an error answering changed must not swallow a flush answer \
              that arrived on the same connection: {out}"
         );
@@ -2447,7 +2429,10 @@ mod tests {
 
         assert_eq!(
             out,
-            additional_context_output("UserPromptSubmit", Some(DEFAULT_FLUSH_TEXT.to_string())),
+            additional_context_output(
+                HookEvent::UserPromptSubmit,
+                Some(DEFAULT_FLUSH_TEXT.to_string())
+            ),
             "the flush answer was read before the owner hung up, so it is \
              printed: {out}"
         );
@@ -2484,15 +2469,10 @@ mod tests {
     }
 
     /// The identity `identity_for(project)` would derive, with its socket
-    /// and lock moved into `dir` in place of the real runtime directory
-    /// `identity_for` would otherwise choose.
+    /// and lock moved into `dir`.
     ///
-    /// Uses `identity_hash` rather than `identity_for`, which also builds
-    /// and length-checks a real socket path this function never uses: on
-    /// a host with a long runtime directory (the macOS/CI condition
-    /// `doctor_without_identity` exists to degrade gracefully for),
-    /// `identity_for` fails outright, and every one of these tests would
-    /// panic before binding anything.
+    /// Uses `identity_hash`, since `identity_for` fails on a host whose
+    /// runtime directory makes the socket path too long.
     fn local_identity_for(project: &Path, dir: &Path) -> SocketIdentity {
         let hash = mcpls_core::hooks::identity_hash(project).expect("identity hash");
         let socket = test_socket(dir, &format!("{hash}.sock"));
@@ -4118,17 +4098,8 @@ mod tests {
         relative
     }
 
-    /// A `PATH` entry may be relative, and a relative path means nothing
-    /// to whatever directory a hook later runs in. Deleting the
-    /// absolutizing `.map` from `resolve_on_path`
-    /// must fail this without depending on the ambient `PATH`, which is
-    /// why the entry here is built from the real current directory
-    /// instead of assumed to already be relative.
-    /// A file named `mcpls` that nobody can execute is not an mcpls a
-    /// hook can invoke, and reporting it as one sends a reader looking
-    /// for a broken hook wiring that is really a broken install. Unix
-    /// only: Windows decides executability by extension, which the
-    /// filename already carries.
+    /// A non-executable `mcpls` is a broken install, not one a hook can run.
+    /// Unix only: Windows decides executability by extension.
     #[cfg(unix)]
     #[test]
     fn test_resolve_on_path_skips_a_file_without_the_executable_bit() {
@@ -4149,6 +4120,9 @@ mod tests {
         );
     }
 
+    /// A relative `PATH` entry means nothing to the directory a hook runs
+    /// in. The entry is built relative to the real working directory so the
+    /// test holds whatever the ambient `PATH` is.
     #[test]
     fn test_resolve_on_path_absolutizes_a_relative_path_entry() {
         let cwd = std::env::current_dir().expect("cwd");
@@ -4225,7 +4199,7 @@ mod tests {
         let recorder = RecordingOwner::start_with_flush(Some(DEFAULT_FLUSH_TEXT.to_string()));
         let cwd = recorder.project_dir().join("crates");
         let out = dispatch_as(
-            Host::Codex,
+            Harness::Codex,
             &json!({
                 "hook_event_name": "PostToolUse",
                 "session_id": "s1",
@@ -4242,7 +4216,7 @@ mod tests {
 
         assert_eq!(
             out,
-            additional_context_output("PostToolUse", Some(DEFAULT_FLUSH_TEXT.to_string()))
+            additional_context_output(HookEvent::PostToolUse, Some(DEFAULT_FLUSH_TEXT.to_string()))
         );
         let requests = recorder.requests();
         let Request::Changed {
@@ -4271,7 +4245,7 @@ mod tests {
     async fn test_codex_subagent_stop_keeps_the_subagent_session() {
         let recorder = RecordingOwner::start();
         let out = dispatch_as(
-            Host::Codex,
+            Harness::Codex,
             &json!({ "hook_event_name": "SubagentStop", "session_id": "s1", "agent_id": "a1" }),
             &recorder,
         )
@@ -4283,10 +4257,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_hook_agent_identity_survives_changed_flush_and_ack() {
-        for host in [Host::Claude, Host::Codex] {
+        for host in [Harness::ClaudeCode, Harness::Codex] {
             let recorder = RecordingOwner::start_with_flush(Some(DEFAULT_FLUSH_TEXT.to_string()));
             let payload = json!({
-                "hook_event_name": if matches!(host, Host::Claude) { "PostToolBatch" } else { "PostToolUse" },
+                "hook_event_name": if matches!(host, Harness::ClaudeCode) { "PostToolBatch" } else { "PostToolUse" },
                 "session_id": "root/one",
                 "agent_id": "child/two",
                 "cwd": recorder.project_dir(),
@@ -4303,7 +4277,7 @@ mod tests {
                 assert_eq!(wire["agent_id"], "child/two");
                 assert_eq!(
                     wire["host"],
-                    if matches!(host, Host::Claude) {
+                    if matches!(host, Harness::ClaudeCode) {
                         "claude"
                     } else {
                         "codex"
@@ -4317,13 +4291,13 @@ mod tests {
     fn test_codex_project_dir_is_the_payload_cwd() {
         assert_eq!(
             project_dir(
-                Host::Codex,
+                Harness::Codex,
                 r#"{"hook_event_name":"Stop","cwd":"/work/project"}"#
             ),
             PathBuf::from("/work/project")
         );
         assert_eq!(
-            project_dir(Host::Codex, "not json"),
+            project_dir(Harness::Codex, "not json"),
             PathBuf::from("."),
             "an unreadable payload falls back the way a missing CLAUDE_PROJECT_DIR does"
         );

@@ -13,14 +13,15 @@ use mcpls_core::hooks::{ChangeEvent, Request, SocketIdentity, send, send_and_ack
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::{FLUSH_SOCKET_TIMEOUT, SOCKET_TIMEOUT, additional_context_output, flush_context};
+use super::{
+    FLUSH_SOCKET_TIMEOUT, HookEvent, SOCKET_TIMEOUT, additional_context_output, flush_context,
+};
 
 /// The Codex hook payload, keeping only the fields the dispatch below reads.
-/// Every field but the event name is defaulted, since which ones are present
-/// depends on the event.
+/// Every field is defaulted, since which ones are present depends on the
+/// event.
 #[derive(Debug, Deserialize)]
 struct CodexPayload {
-    hook_event_name: String,
     #[serde(default)]
     session_id: String,
     #[serde(default)]
@@ -97,6 +98,7 @@ fn apply_patch_paths(envelope: &str) -> Vec<&str> {
 }
 
 pub(super) async fn run(
+    event: HookEvent,
     stdin: &str,
     project_dir: &Path,
     identity: Option<&SocketIdentity>,
@@ -111,8 +113,8 @@ pub(super) async fn run(
         host: HookHost::Codex,
     };
 
-    match payload.hook_event_name.as_str() {
-        "PostToolUse" => {
+    match event {
+        HookEvent::PostToolUse => {
             let requests = [
                 Request::Changed {
                     attributed: true,
@@ -128,10 +130,10 @@ pub(super) async fn run(
             ];
             let responses = send_and_acknowledge(identity, &requests, FLUSH_SOCKET_TIMEOUT).await?;
             let context = responses.into_iter().nth(1).and_then(flush_context);
-            Ok(additional_context_output("PostToolUse", context))
+            Ok(additional_context_output(event, context))
         }
 
-        "UserPromptSubmit" => {
+        HookEvent::UserPromptSubmit => {
             let responses = send_and_acknowledge(
                 identity,
                 &[Request::Flush {
@@ -142,15 +144,16 @@ pub(super) async fn run(
             )
             .await?;
             let context = responses.into_iter().next().and_then(flush_context);
-            Ok(additional_context_output("UserPromptSubmit", context))
+            Ok(additional_context_output(event, context))
         }
 
-        "SessionEnd" => {
+        HookEvent::SessionEnd => {
             send(identity, &Request::EndSession { session }, SOCKET_TIMEOUT).await?;
             Ok(String::new())
         }
 
-        _ => Ok(String::new()),
+        // Codex has no batch event; a manifest wiring one gets no answer.
+        HookEvent::PostToolBatch => Ok(String::new()),
     }
 }
 

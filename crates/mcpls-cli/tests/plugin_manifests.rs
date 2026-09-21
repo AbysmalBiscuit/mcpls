@@ -78,8 +78,8 @@ fn test_every_entry_runs_mcpls_from_path() {
     let harnesses: [(&str, &str, &str, &[&str]); 2] = [
         (
             "plugin/hooks/hooks.json",
-            "mcpls hook",
-            "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" bootstrap-binaries claude",
+            "claude-code",
+            "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" bootstrap-binaries claude-code",
             &[
                 "PostToolBatch",
                 "PostToolUse",
@@ -90,7 +90,7 @@ fn test_every_entry_runs_mcpls_from_path() {
         ),
         (
             "plugin/hooks/hooks-codex.json",
-            "mcpls hook --host codex",
+            "codex",
             "\"${PLUGIN_ROOT}/hooks/run-hook.cmd\" bootstrap-binaries codex",
             &[
                 "PostToolUse",
@@ -100,7 +100,7 @@ fn test_every_entry_runs_mcpls_from_path() {
             ],
         ),
     ];
-    for (file, hook, bootstrap, events) in harnesses {
+    for (file, harness, bootstrap, events) in harnesses {
         let hooks = json(file);
         let hooks = hooks["hooks"].as_object().unwrap();
         let mut names: Vec<&str> = hooks.keys().map(String::as_str).collect();
@@ -119,7 +119,11 @@ fn test_every_entry_runs_mcpls_from_path() {
                     if registration["command"] == bootstrap {
                         bootstraps.push(event.as_str());
                     } else {
-                        assert_eq!(registration["command"], hook, "{file}: {event}");
+                        assert_eq!(
+                            registration["command"],
+                            format!("mcpls hook {} --harness {harness}", kebab(event)),
+                            "{file}: {event}"
+                        );
                     }
                 }
             }
@@ -136,4 +140,17 @@ fn test_every_entry_runs_mcpls_from_path() {
         "& \"${PLUGIN_ROOT}/hooks/run-hook.cmd\" bootstrap-binaries codex",
         "Codex runs Windows hooks through PowerShell, where a quoted path needs the call operator"
     );
+}
+
+/// The verb a harness event registers under: `PostToolUse` is
+/// `post-tool-use`, the spelling devkit's hook verbs use too.
+fn kebab(event: &str) -> String {
+    let mut verb = String::new();
+    for c in event.chars() {
+        if c.is_ascii_uppercase() && !verb.is_empty() {
+            verb.push('-');
+        }
+        verb.push(c.to_ascii_lowercase());
+    }
+    verb
 }

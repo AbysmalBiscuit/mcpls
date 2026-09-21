@@ -5,21 +5,13 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use crate::completions::Shell;
-use crate::hook::Host;
+use crate::hook::{Harness, HookEvent};
 
-/// Parses a boolean flag/env value, accepting common truthy and falsy
-/// spellings beyond the strict `"true"`/`"false"` that `str::parse::<bool>`
-/// allows.
+/// Parses a boolean flag or env value, accepting `1`/`0`, `yes`/`no`,
+/// `y`/`n` and `on`/`off` besides `true`/`false`, case-insensitively.
 ///
-/// Environment variables rarely follow Rust's `bool` literal syntax, so this
-/// parser also accepts (case-insensitively) `1`/`0`, `yes`/`no`, `y`/`n`, and
-/// `on`/`off`. Any other value is rejected with a message naming the input.
-///
-/// The input is not trimmed: a whitespace-padded value (e.g. `" true "`) or
-/// an empty string is rejected, not coerced. This matters for
-/// `Environment=MCPLS_LOG_JSON=` (systemd) or `-e MCPLS_LOG_JSON=` (Docker)
-/// with no value after the `=`, which hard-fails startup rather than being
-/// treated as unset.
+/// Padded or empty input is rejected, so `MCPLS_LOG_JSON=` with no value
+/// fails startup instead of reading as unset.
 pub fn parse_bool_flag(s: &str) -> Result<bool, String> {
     match s.to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "y" | "on" => Ok(true),
@@ -185,17 +177,23 @@ pub enum Command {
 
     /// Serve one agent hook invocation
     ///
-    /// With no argument, reads the hook payload from stdin and writes hook
-    /// JSON to stdout, dispatching on the payload's own `hook_event_name`.
-    /// One subcommand rather than one per event means no shell script and the
-    /// registrations work on Windows.
+    /// Reads the hook payload for EVENT from stdin and writes hook JSON to
+    /// stdout. With no EVENT, the payload's own `hook_event_name` names it,
+    /// which is how a manifest from before the verbs reads.
+    #[command(subcommand_value_name = "EVENT", subcommand_help_heading = "Events")]
     Hook {
         /// The harness that spawned this hook, which decides where the
         /// project directory comes from
-        #[arg(long, value_enum, default_value_t = Host::Claude)]
-        host: Host,
+        #[arg(
+            long,
+            alias = "host",
+            value_enum,
+            default_value_t = Harness::ClaudeCode,
+            global = true
+        )]
+        harness: Harness,
 
-        /// What to do instead of reading a hook payload from stdin
+        /// The event to answer
         #[command(subcommand)]
         action: Option<HookAction>,
     },
@@ -208,9 +206,12 @@ pub enum SchemaAction {
     Init,
 }
 
-/// What `mcpls hook` can do besides serving a hook invocation.
+/// Actions for `mcpls hook`.
 #[derive(Debug, Subcommand)]
 pub enum HookAction {
+    #[command(flatten)]
+    Event(HookEvent),
+
     /// Alias for `mcpls doctor`, kept because published troubleshooting
     /// text spells it this way. It always exits 0, which the hook path
     /// requires; the top-level command reports a fault in its status.
