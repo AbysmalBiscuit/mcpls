@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::bridge::{HookAgent, ServerLifecycle};
+use crate::bridge::{HookAgent, LspAction, ServerLifecycle};
 
 /// A message sent from a Claude Code hook to a running mcpls.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +67,14 @@ pub enum Request {
     /// Sent by `mcpls doctor` to check whether a socket has a live
     /// owner before falling back to a cold start.
     Status,
+    /// Sent by `mcpls lsp` to start, stop, or restart language servers.
+    Lsp {
+        /// The change to make.
+        action: LspAction,
+        /// The servers to change, every applicable one when empty.
+        #[serde(default)]
+        servers: Vec<String>,
+    },
 }
 
 /// The kind of filesystem change a host reports for a [`Request::Changed`].
@@ -181,6 +189,12 @@ pub enum Response {
         /// Boxed: it is the largest thing on the largest variant, and an
         /// unboxed one makes every `Response` the size of a status.
         watcher: Box<WatcherStatus>,
+    },
+    /// Answers a [`Request::Lsp`] with each named server's state right
+    /// after the change, before a start has settled.
+    Lsp {
+        /// The servers the request named.
+        servers: Vec<ServerStatus>,
     },
     /// Reports a failure or a response deadline exceeded while work continues.
     Error {
@@ -442,6 +456,42 @@ mod tests {
         let literal = r#"{"op":"error","message":"boom"}"#;
         let value = Response::Error {
             message: "boom".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(&value).expect("serialize"),
+            serde_json::from_str::<serde_json::Value>(literal).expect("json")
+        );
+        assert_eq!(
+            serde_json::from_str::<Response>(literal).expect("deserialize"),
+            value
+        );
+    }
+
+    #[test]
+    fn test_the_lsp_request_pins_the_wire_shape() {
+        let literal = r#"{"op":"lsp","action":"stop","servers":["rust"]}"#;
+        let value = Request::Lsp {
+            action: crate::bridge::LspAction::Stop,
+            servers: vec!["rust".to_string()],
+        };
+        assert_eq!(
+            serde_json::to_value(&value).expect("serialize"),
+            serde_json::from_str::<serde_json::Value>(literal).expect("json")
+        );
+        assert_eq!(
+            serde_json::from_str::<Request>(literal).expect("deserialize"),
+            value
+        );
+    }
+
+    #[test]
+    fn test_the_lsp_response_pins_the_wire_shape() {
+        let literal = r#"{"op":"lsp","servers":[{"id":"rust","state":"stopped"}]}"#;
+        let value = Response::Lsp {
+            servers: vec![ServerStatus {
+                id: "rust".to_string(),
+                state: ServerLifecycle::Stopped,
+            }],
         };
         assert_eq!(
             serde_json::to_value(&value).expect("serialize"),

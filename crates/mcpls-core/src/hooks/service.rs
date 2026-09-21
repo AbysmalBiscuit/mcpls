@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use futures::future::BoxFuture;
 use tokio::sync::watch;
 
-use crate::bridge::SessionId;
+use crate::bridge::{LspAction, SessionId};
 use crate::hooks::identity::SocketIdentity;
 use crate::hooks::protocol::{Request, Response, ServerStatus};
 use crate::hooks::sweep::{Origin, Sweeper};
@@ -27,9 +27,9 @@ pub struct HookStats {
 
 impl HookStats {
     /// Record one `Changed`, `Flush`, or `EndSession` request this process
-    /// just answered. Not called for `Status`, which is `mcpls doctor`
-    /// probing rather than a hook firing, nor for `Ack`, which is the
-    /// second half of a `Flush` already counted.
+    /// just answered. Not called for `Status` or `Lsp`, which are the CLI
+    /// probing or steering rather than a hook firing, nor for `Ack`, which
+    /// is the second half of a `Flush` already counted.
     pub(crate) fn record_hook_request(&self) {
         self.hooks_seen.fetch_add(1, Ordering::Relaxed);
     }
@@ -84,7 +84,9 @@ pub type StatusSource = Arc<dyn Fn() -> StatusExtras + Send + Sync>;
 /// `McplsServer::flush_for_hook`, which takes delivery then cache and drops
 /// both before it awaits the payload build, and reaches delivery alone
 /// only by way of `McplsServer::commit_for_hook` and `end_session`. No arm
-/// of this match takes either lock itself. Do not add one that does.
+/// of this match takes either lock itself. Do not add one that does. The
+/// `lsp` arm reaches the cache only through the translator, and never
+/// while holding delivery.
 pub fn build_handler(
     server: Arc<McplsServer>,
     sweeper: Arc<Sweeper>,
@@ -181,8 +183,38 @@ pub fn build_handler(
                         watcher: Box::new(extras.watcher),
                     }
                 }
+                Request::Lsp { action, servers } => {
+                    control_servers(&sweeper, action, &servers, cancelled).await
+                }
             }
         })
+    }
+}
+
+/// Apply an `mcpls lsp` action, refusing any that would start a server
+/// once shutdown has begun.
+async fn control_servers(
+    sweeper: &Sweeper,
+    action: LspAction,
+    servers: &[String],
+    cancelled: bool,
+) -> Response {
+    if cancelled && action != LspAction::Stop {
+        return Response::Error {
+            message: "mcpls is shutting down; no language server was started".to_string(),
+        };
+    }
+    match sweeper.translator().control(action, servers).await {
+        Ok(changed) => Response::Lsp {
+            servers: changed
+                .into_iter()
+                .map(|(id, state)| ServerStatus {
+                    id: id.to_string(),
+                    state,
+                })
+                .collect(),
+        },
+        Err(message) => Response::Error { message },
     }
 }
 
@@ -199,10 +231,11 @@ mod tests {
 
     use super::*;
     use crate::bridge::{
-        DiagnosticsDelivery, FloorTable, NotificationCache, ResourceLimits, ResourceSubscriptions,
-        ServerSettle, Translator, TranslatorHarness,
+        DiagnosticsDelivery, FloorTable, LspAction, NotificationCache, ResourceLimits,
+        ResourceSubscriptions, ServerLifecycle, ServerSettle, Translator, TranslatorHarness,
     };
     use crate::config::{DiagnosticsConfig, ServerId};
+    use crate::hooks::protocol::ServerStatus;
     use crate::hooks::{ChangeEvent, HookListener, PathFilter, Request, Response, SocketIdentity};
     use crate::mcp::McplsServer;
 
@@ -1603,5 +1636,89 @@ mod tests {
 
         served.abort();
         drop(dir);
+    }
+
+    #[tokio::test]
+    async fn test_an_lsp_stop_answers_each_server_s_new_state() {
+        let harness = HookHarness::owner_without_baseline().await;
+        harness
+            .sweeper
+            .translator()
+            .set_lifecycle(&ServerId::from("rust"), ServerLifecycle::Idle);
+
+        let answer = harness
+            .send(Request::Lsp {
+                action: LspAction::Stop,
+                servers: vec!["rust".to_string()],
+            })
+            .await;
+        assert_eq!(
+            answer,
+            Response::Lsp {
+                servers: vec![ServerStatus {
+                    id: "rust".to_string(),
+                    state: ServerLifecycle::Stopped,
+                }],
+            }
+        );
+
+        let Response::Status { hooks_seen, .. } = harness.send(Request::Status).await else {
+            panic!("expected a status response");
+        };
+        assert_eq!(hooks_seen, 0, "an lsp request is not a hook firing");
+    }
+
+    #[tokio::test]
+    async fn test_an_lsp_request_naming_an_unknown_server_is_an_error() {
+        let harness = HookHarness::owner_without_baseline().await;
+        harness
+            .sweeper
+            .translator()
+            .set_lifecycle(&ServerId::from("rust"), ServerLifecycle::Idle);
+
+        let answer = harness
+            .send(Request::Lsp {
+                action: LspAction::Start,
+                servers: vec!["nope".to_string()],
+            })
+            .await;
+        assert_eq!(
+            answer,
+            Response::Error {
+                message: "no language server named nope applies here; these do: rust".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_an_lsp_start_is_refused_while_shutting_down() {
+        let harness = HookHarness::owner_without_baseline().await;
+        let translator = harness.sweeper.translator();
+        translator.set_lifecycle(&ServerId::from("rust"), ServerLifecycle::Idle);
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let handler = build_handler(
+            Arc::clone(&harness.server),
+            Arc::clone(&harness.sweeper),
+            HookLocation {
+                identity: harness.identity.clone(),
+                root: harness.root.clone(),
+            },
+            Arc::clone(&harness.stats),
+            Arc::new(StatusExtras::default),
+            cancel_rx,
+        );
+        cancel_tx.send(true).expect("cancel");
+
+        let answer = handler(Request::Lsp {
+            action: LspAction::Start,
+            servers: Vec::new(),
+        })
+        .await;
+
+        assert!(matches!(answer, Response::Error { .. }), "{answer:?}");
+        assert_eq!(
+            translator.lifecycle_of(&ServerId::from("rust")),
+            Some(ServerLifecycle::Idle)
+        );
     }
 }
