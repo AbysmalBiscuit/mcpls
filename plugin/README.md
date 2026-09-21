@@ -129,6 +129,7 @@ Setting `enabled = false` disables the hook listener, so mcpls binds no socket a
 ## What's included
 
 - `hooks/bootstrap-binaries` installs the mcpls release this plugin version pins when a session starts, and tells the agent when the `mcpls` on `PATH` does not match. `hooks/run-hook.cmd` runs it through bash, or through its PowerShell twin on Windows without Git Bash.
+- `mcpls brief` runs when a session starts and tells the agent which installed language servers serve the checkout and to use the mcpls tools, so your own agent instructions don't have to. `[brief] enabled = false` in `mcpls.toml` turns it off.
 - `.mcp.json` registers the server with both harnesses, and `hooks/hooks.json` wires Claude Code's hooks.
 - `.codex-plugin/plugin.json` and `hooks/hooks-codex.json` register the plugin with Codex. There is deliberately no `plugin.json` at this directory's root: Codex would load one as an Agent Plugins manifest, start mcpls inside the plugin cache instead of the project, and load no hooks.
 - [`skills/mcpls`](skills/mcpls/) teaches the agent when and how to use the tools for coding work.

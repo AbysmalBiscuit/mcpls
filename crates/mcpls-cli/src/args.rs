@@ -115,6 +115,20 @@ pub enum Command {
         root: PathBuf,
     },
 
+    /// Print the note a session start hook hands an agent
+    ///
+    /// Names the installed language servers that serve this checkout and
+    /// points the agent at the mcpls tools. Prints nothing when `[brief]`
+    /// is switched off, or when no installed server applies here, and
+    /// always exits 0.
+    ///
+    /// Examines `$CLAUDE_PROJECT_DIR`, then the working directory.
+    Brief {
+        /// Wrap the brief in the JSON a Codex `SessionStart` hook returns
+        #[arg(long)]
+        additional_context: bool,
+    },
+
     /// Print a shell completion script to stdout
     ///
     /// Redirect it to wherever the shell reads completions from, for example:

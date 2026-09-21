@@ -777,6 +777,22 @@ How long the backend waits after its last MCP session closes before it exits and
 
 When language servers start. `"eager"` starts every applicable server with the backend. `"lazy"` holds a server back until a session touches its language. A `[[lsp_servers]]` entry can set `spawn` to override this backend default for that server.
 
+## Brief Section
+
+When an agent session starts, the plugin runs `mcpls brief`, which hands the agent a short note naming the languages whose installed language servers serve this checkout, and telling it to start with the mcpls tools for symbols in those languages. With it, the agent knows to use mcpls without a line about it in your own `AGENTS.md` or `CLAUDE.md`. How to use each tool travels separately, in the instructions every mcpls session sends its host. A checkout that no installed server applies to gets no note. Run `mcpls brief` yourself to see what a session in the current directory would get.
+
+```toml
+[brief]
+enabled = true
+```
+
+### `brief.enabled`
+
+**Type**: Boolean
+**Default**: `true`
+
+Whether sessions get the note. It defaults on because installing the plugin is the opt-in. Set it to `false` to keep mcpls out of the session's opening context; the agent then learns about mcpls only from its tool list.
+
 ## Environment Variables
 
 ### `MCPLS_CONFIG`

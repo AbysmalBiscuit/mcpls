@@ -7,7 +7,8 @@
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" bootstrap-binaries claude-code",
             "timeout": 300
-          }
+          },
+          { "type": "command", "command": "mcpls brief", "timeout": 5 }
         ]
       }
     ],

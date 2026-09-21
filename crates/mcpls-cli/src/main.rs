@@ -8,6 +8,7 @@ use clap::Parser;
 use mcpls_core::ProjectConfigTrust;
 
 mod args;
+mod brief;
 mod completions;
 mod config;
 mod hook;
@@ -103,6 +104,10 @@ async fn main() {
         std::process::exit(0);
     }
 
+    if let Some(Command::Brief { additional_context }) = &args.command {
+        emit_brief(&args, *additional_context);
+    }
+
     // A hook invocation needs neither a loaded config nor a log subscriber,
     // and reading stdin and writing hook JSON is the whole command.
     if let Some(Command::Hook { harness, action }) = &args.command {
@@ -189,6 +194,26 @@ fn emit_schema() {
         eprintln!("failed to write config schema: {err}");
         std::process::exit(1);
     }
+}
+
+/// Print the session brief for the project a hook names, then exit 0.
+///
+/// A brief is context, never a gate: a config that fails to load gets no
+/// brief rather than a failed session start.
+fn emit_brief(args: &Args, additional_context: bool) -> ! {
+    let (directory, _) = examined_directory(None);
+    let root = hook::checkout_root(&directory);
+    let text = resolve_config(args, &root)
+        .ok()
+        .and_then(|resolved| brief::render(&resolved.config, &root));
+    match text {
+        Some(text) if additional_context => {
+            write_report(&format!("{}\n", brief::session_start_output(&text)));
+        }
+        Some(text) => write_report(&text),
+        None => {}
+    }
+    std::process::exit(0);
 }
 
 async fn run(args: Args) -> Result<()> {

@@ -1158,7 +1158,7 @@ fn resolve_on_path(path_var: &std::ffi::OsStr, exe_name: &str) -> Option<PathBuf
 
 /// The executable a configured language server `command` names, or `None`
 /// when nothing by that name is installed.
-fn resolve_program(command: &str) -> Option<PathBuf> {
+pub fn resolve_program(command: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH").unwrap_or_default();
     let extensions = std::env::var_os("PATHEXT");
     resolve_program_in(&path, extensions.as_deref(), command)

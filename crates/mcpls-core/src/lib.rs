@@ -2448,6 +2448,7 @@ mod tests {
                 apply: crate::config::ApplyConfig::default(),
                 diagnostics: hookless_diagnostics(),
                 backend: crate::config::BackendConfig::default(),
+                brief: crate::config::BriefConfig::default(),
                 source: crate::config::ConfigSource::default(),
                 project_config_ignored: false,
             };
@@ -2493,6 +2494,7 @@ mod tests {
                 apply: crate::config::ApplyConfig::default(),
                 diagnostics: hookless_diagnostics(),
                 backend: crate::config::BackendConfig::default(),
+                brief: crate::config::BriefConfig::default(),
                 source: crate::config::ConfigSource::default(),
                 project_config_ignored: false,
             };
@@ -2575,6 +2577,7 @@ mod tests {
                 apply: crate::config::ApplyConfig::default(),
                 diagnostics: crate::config::DiagnosticsConfig::default(),
                 backend: crate::config::BackendConfig::default(),
+                brief: crate::config::BriefConfig::default(),
                 source: crate::config::ConfigSource::default(),
                 project_config_ignored: false,
             };
@@ -2643,6 +2646,7 @@ mod tests {
                 apply: crate::config::ApplyConfig::default(),
                 diagnostics: crate::config::DiagnosticsConfig::default(),
                 backend: crate::config::BackendConfig::default(),
+                brief: crate::config::BriefConfig::default(),
                 source: crate::config::ConfigSource::default(),
                 project_config_ignored: false,
             };

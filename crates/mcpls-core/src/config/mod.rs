@@ -374,6 +374,33 @@ impl Default for BackendConfig {
     }
 }
 
+/// The note `mcpls brief` hands an agent session when it starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BriefConfig {
+    /// Whether a session starts with a note naming the language servers
+    /// that serve its checkout and pointing it at the mcpls tools.
+    ///
+    /// Defaults on, because reaching this configuration means installing
+    /// the plugin and installing the plugin is the opt-in. With it off, an
+    /// agent learns mcpls exists only from its tool list, or from
+    /// instructions the user writes.
+    #[serde(default = "default_brief_enabled")]
+    pub enabled: bool,
+}
+
+const fn default_brief_enabled() -> bool {
+    true
+}
+
+impl Default for BriefConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_brief_enabled(),
+        }
+    }
+}
+
 /// Where a loaded configuration came from.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -420,6 +447,10 @@ pub struct ServerConfig {
     /// How a shared backend manages its own lifetime.
     #[serde(default)]
     pub backend: BackendConfig,
+
+    /// What an agent session is told about mcpls when it starts.
+    #[serde(default)]
+    pub brief: BriefConfig,
 
     /// Where this configuration was loaded from. Load-time metadata, never
     /// read from or written to a file.
@@ -1456,6 +1487,7 @@ impl Default for ServerConfig {
             apply: ApplyConfig::default(),
             diagnostics: DiagnosticsConfig::default(),
             backend: BackendConfig::default(),
+            brief: BriefConfig::default(),
             source: ConfigSource::default(),
             project_config_ignored: false,
         }
@@ -2426,6 +2458,7 @@ mod tests {
             apply: ApplyConfig::default(),
             diagnostics: DiagnosticsConfig::default(),
             backend: BackendConfig::default(),
+            brief: BriefConfig::default(),
             source: ConfigSource::default(),
             project_config_ignored: false,
         };
@@ -2457,6 +2490,7 @@ mod tests {
             apply: ApplyConfig::default(),
             diagnostics: DiagnosticsConfig::default(),
             backend: BackendConfig::default(),
+            brief: BriefConfig::default(),
             source: ConfigSource::default(),
             project_config_ignored: false,
         };
@@ -2488,6 +2522,7 @@ mod tests {
             apply: ApplyConfig::default(),
             diagnostics: DiagnosticsConfig::default(),
             backend: BackendConfig::default(),
+            brief: BriefConfig::default(),
             source: ConfigSource::default(),
             project_config_ignored: false,
         };
@@ -2519,6 +2554,7 @@ mod tests {
             apply: ApplyConfig::default(),
             diagnostics: DiagnosticsConfig::default(),
             backend: BackendConfig::default(),
+            brief: BriefConfig::default(),
             source: ConfigSource::default(),
             project_config_ignored: false,
         };
