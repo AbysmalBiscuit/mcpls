@@ -851,6 +851,29 @@ fn a_started_backend_outlives_its_idle_timer_until_stopped() {
     assert!(stopped && text.contains("not running"), "{text}");
 }
 
+/// `mcpls backend auto` hands a kept backend back to its idle timer, so with
+/// no session attached it exits on its own.
+#[test]
+fn an_auto_backend_exits_on_its_idle_timer() {
+    let project = Project::new(300);
+    let (started, text) = project.backend(&["start"]);
+    assert!(started, "{text}");
+    let pid = project.backend_pid().expect("a started backend");
+    project.holds_for("the kept backend", Duration::from_millis(1_000), |p| {
+        p.backend_pid() == Some(pid)
+    });
+
+    let (released, text) = project.backend(&["auto"]);
+    assert!(released, "{text}");
+    assert!(text.contains(&pid.to_string()), "{text}");
+    project.wait_for("the released backend to exit", |p| {
+        p.backend_pid().is_none()
+    });
+
+    let (released, text) = project.backend(&["auto"]);
+    assert!(released && text.contains("not running"), "{text}");
+}
+
 /// A start keeps the backend a session already started, and a stop with
 /// that session attached leaves the backend to exit once the session does.
 #[test]

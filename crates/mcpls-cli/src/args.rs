@@ -248,10 +248,10 @@ pub enum BackendAction {
     /// Start the backend and keep it running
     ///
     /// A started backend stays up with no session attached, instead of
-    /// exiting on its idle timer, until `mcpls backend stop`. A backend
-    /// already running is kept rather than replaced. A new backend runs
-    /// with this invocation's `--config`, `--trust-project-config`,
-    /// `--log-level` and `--log-json`.
+    /// exiting on its idle timer, until `mcpls backend stop` or `mcpls
+    /// backend auto`. A backend already running is kept rather than
+    /// replaced. A new backend runs with this invocation's `--config`,
+    /// `--trust-project-config`, `--log-level` and `--log-json`.
     Start {
         /// Directory whose checkout to serve
         #[arg(value_name = "DIR")]
@@ -272,6 +272,18 @@ pub enum BackendAction {
         /// Stop the backend even with sessions attached
         #[arg(long)]
         force: bool,
+    },
+
+    /// Stop keeping the backend running, and leave it to its sessions
+    ///
+    /// Undoes `mcpls backend start` without stopping anything: attached
+    /// sessions keep their tools, the backend exits on its idle timer once
+    /// none is attached, and the next session starts a new one. Exits 0
+    /// when no backend is running.
+    Auto {
+        /// Directory whose checkout's backend to release
+        #[arg(value_name = "DIR")]
+        path: Option<PathBuf>,
     },
 
     /// Report whether the backend is running

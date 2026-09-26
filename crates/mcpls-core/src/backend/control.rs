@@ -1,8 +1,8 @@
 //! Starting, stopping and inspecting a checkout's backend from the command
-//! line, as `mcpls backend start`, `stop` and `status` do.
+//! line, as `mcpls backend start`, `stop`, `auto` and `status` do.
 //!
 //! A started backend is kept: it stays up with no session attached until a
-//! stop, instead of exiting on its idle timer.
+//! stop or a release, instead of exiting on its idle timer.
 
 use std::io;
 use std::path::Path;
@@ -64,6 +64,12 @@ pub enum StartError {
 /// Whether the endpoint's owner answers, and what it says.
 pub async fn status(identity: &SocketIdentity) -> Found {
     ask(identity, &Handshake::hook()).await
+}
+
+/// Stop keeping the backend, so it exits on its idle timer once no session
+/// is attached.
+pub async fn release(identity: &SocketIdentity) -> Found {
+    ask(identity, &Handshake::release()).await
 }
 
 /// Start a kept backend for `launch` with `exe`, or keep the one already

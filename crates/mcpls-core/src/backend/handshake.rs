@@ -103,6 +103,11 @@ pub struct Handshake {
     /// `kept: false`.
     #[serde(default)]
     pub keep: bool,
+    /// Asks the backend to stop being kept, so it exits on its idle timer
+    /// once no session is attached. A build that predates it ignores it
+    /// and still answers `kept: true`.
+    #[serde(default)]
+    pub release: bool,
     /// Asks a shutdown to end the backend even with sessions attached.
     #[serde(default)]
     pub force: bool,
@@ -141,6 +146,15 @@ impl Handshake {
         }
     }
 
+    /// `mcpls backend auto` handing a kept backend back to its idle timer.
+    #[must_use]
+    pub fn release() -> Self {
+        Self {
+            release: true,
+            ..Self::hook()
+        }
+    }
+
     /// `mcpls backend stop --force` ending a backend whatever is attached.
     #[must_use]
     pub fn forced_shutdown() -> Self {
@@ -159,6 +173,7 @@ impl Handshake {
             session: None,
             config: None,
             keep: false,
+            release: false,
             force: false,
         }
     }

@@ -244,7 +244,7 @@ impl Endpoint {
         let sessions = self.attachments.count();
         let refusal = self.refusal_for(&request, sessions);
         let refused = refusal.is_some();
-        if request.kind == ConnectionKind::Shutdown {
+        if request.kind == ConnectionKind::Shutdown || request.release {
             self.kept.send_replace(false);
         } else if request.keep {
             self.kept.send_replace(true);
@@ -1242,6 +1242,21 @@ while True:
         let (_, refused) = open(&backend.identity, &Handshake::shutdown()).await;
         assert_eq!(refused.refusal, Some(Refusal::Attached));
         assert_eq!(refused.sessions, 1);
+        backend.task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_only_a_release_or_shutdown_drops_the_keep() {
+        let backend = start(config(60_000)).await;
+        let (_, kept) = open(&backend.identity, &Handshake::keep()).await;
+        assert!(kept.kept);
+        let (_, hook) = open(&backend.identity, &Handshake::hook()).await;
+        assert!(hook.kept, "a plain hook handshake dropped the keep");
+
+        let (_, released) = open(&backend.identity, &Handshake::release()).await;
+        assert_eq!(released.refusal, None);
+        assert!(!released.kept);
+        assert!(!backend.task.is_finished(), "a release ended the backend");
         backend.task.abort();
     }
 

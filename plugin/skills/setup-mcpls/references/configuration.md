@@ -61,7 +61,7 @@ One backend serves every session in a checkout.
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `spawn` | `"lazy"` \| `"eager"` | `"lazy"` | When language servers start. `lazy` starts a server the first time a session touches its language, keeping unused languages out of memory. `eager` starts every applicable server with the backend. A server's own `spawn` overrides this. |
-| `idle_shutdown_ms` | integer (ms) | `10000` | How long the backend waits after its last session closes before exiting. Hook connections do not keep it alive. A backend `mcpls backend start` keeps ignores it until `mcpls backend stop`. Raise it when sessions come and go quickly, since each restart reindexes cold. |
+| `idle_shutdown_ms` | integer (ms) | `10000` | How long the backend waits after its last session closes before exiting. Hook connections do not keep it alive. A backend `mcpls backend start` keeps ignores it until `mcpls backend stop` or `mcpls backend auto`. Raise it when sessions come and go quickly, since each restart reindexes cold. |
 
 ## `[brief]` fields
 
