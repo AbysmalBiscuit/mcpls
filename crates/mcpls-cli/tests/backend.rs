@@ -330,6 +330,16 @@ fn short_temp_dir() -> TempDir {
     dir.unwrap()
 }
 
+/// Runs its closure when dropped, including while a failed assertion
+/// unwinds.
+struct OnDrop<F: FnMut()>(F);
+
+impl<F: FnMut()> Drop for OnDrop<F> {
+    fn drop(&mut self) {
+        (self.0)();
+    }
+}
+
 fn next() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -937,6 +947,17 @@ fn status_lists_this_checkouts_backend_or_every_one_with_all() {
             .output()
             .unwrap()
     };
+    // A kept backend never exits on its own, so a failed assertion must not
+    // skip the stop.
+    let _stop = OnDrop(|| {
+        for project in [&one, &two] {
+            let _ = Project::command_with_identity(&project.root(), one.runtime.path(), &one.user)
+                .arg("--config")
+                .arg(project.config())
+                .args(["backend", "stop", "--force"])
+                .output();
+        }
+    });
     let status = |args: &[&str]| {
         Project::command_with_identity(&one.root(), one.runtime.path(), &one.user)
             .env("CLAUDE_PROJECT_DIR", one.root())
