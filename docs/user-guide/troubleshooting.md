@@ -683,7 +683,7 @@ mcpls --config test-mcpls.toml --log-level debug
 
 3. **Documentation**:
    - [Getting Started](getting-started.md)
-   - [Configuration Reference](configuration.md)
+   - [Configuration Reference](config-reference.md)
    - [Tools Reference](tools-reference.md)
 
 ### Reporting bugs
@@ -869,5 +869,5 @@ mcpls --log-json 2>&1 | jq
 ## Next Steps
 
 - [Getting Started](getting-started.md) - Quick start guide
-- [Configuration](configuration.md) - Detailed configuration
+- [Configuration](config-reference.md) - Detailed configuration
 - [Tools Reference](tools-reference.md) - MCP tools documentation

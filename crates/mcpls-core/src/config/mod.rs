@@ -8,6 +8,7 @@ mod presence;
 mod routing;
 mod server;
 
+pub mod reference;
 pub mod schema;
 
 use std::collections::{HashMap, HashSet};
@@ -49,9 +50,9 @@ pub fn init_config_file(path: &Path) -> std::io::Result<()> {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LanguageExtensionMapping {
-    /// Array of extensions and their corresponding language ID.
+    /// File extensions, without the dot.
     pub extensions: Vec<String>,
-    /// Language ID to report to the LSP server.
+    /// The language ID reported to the server for these extensions.
     pub language_id: String,
 }
 
@@ -63,24 +64,30 @@ pub struct LanguageExtensionMapping {
 #[serde(deny_unknown_fields)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct ApplyConfig {
-    /// `rename_symbol` may apply its `WorkspaceEdit`.
+    /// Lets `rename_symbol` write its edit when called with `apply: true`.
+    /// A rename usually rewrites every file that references the symbol, not
+    /// only the one named.
     #[serde(default)]
     pub rename: bool,
 
-    /// `format_document` may apply its edits.
+    /// Lets `format_document` write its edits when called with
+    /// `apply: true`. The write stays inside the file named.
     #[serde(default)]
     pub format_document: bool,
 
-    /// `apply_code_action` may apply a resolved action.
+    /// Enables `apply_code_action`, which applies one action from a
+    /// `get_code_actions` listing. The widest of the three: an action can
+    /// create, move, or delete files, and can carry a command the server runs
+    /// itself, whose edits mcpls applies through the same checks. An action
+    /// the server resolves lazily shows its edit only when applied.
     #[serde(default)]
     pub code_actions: bool,
 
-    /// Operations that destroy a file's content inside an otherwise
-    /// permitted `WorkspaceEdit` are honored: an explicit delete, a create
-    /// that overwrites an existing file, and a rename onto an existing
-    /// destination, all of which leave nothing of what was there. Gates all
-    /// three for every tool above rather than any one of them, because
-    /// losing a file is not the kind of mistake a bad edit is.
+    /// Permits operations that destroy a file's content: an explicit
+    /// delete, a create that overwrites an existing file, and a rename onto
+    /// an existing destination. Gates all three for every tool above, because
+    /// losing a file is not the kind of mistake a bad edit is. Without it, an
+    /// edit containing any of them is refused whole.
     #[serde(default)]
     pub allow_file_deletion: bool,
 }
@@ -153,12 +160,14 @@ impl SeverityFloor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DiagnosticsConfig {
-    /// How long an unprotected delivery record survives without hook activity.
-    /// Zero expires it immediately once no connection protects it.
+    /// How long a delivery record survives without hook activity once no
+    /// hook connection protects it. `0` expires it at once.
     #[serde(default = "default_record_grace_ms")]
     pub record_grace_ms: u64,
-    /// The least severe diagnostic worth delivering, for any server that
-    /// does not set its own.
+    /// The least severe diagnostic worth delivering, for any applicable
+    /// server that does not set its own `diagnostics_severity`. A diagnostic
+    /// with no severity clears every floor but `"off"`, since LSP makes
+    /// severity optional.
     #[serde(default = "default_severity_floor")]
     pub severity: SeverityFloor,
     /// Most diagnostics delivered for one file in one flush. `0` means
@@ -178,47 +187,44 @@ pub struct DiagnosticsConfig {
     /// of setting it too low is a baseline taken mid-index.
     #[serde(default = "default_settle_quiet_ms")]
     pub settle_quiet_ms: u64,
-    /// How long to wait for that quiet before giving up and baselining
-    /// anyway. Bounds the damage from a server that never finishes, or from
+    /// How long to wait for the quiet `settle_quiet_ms` asks for before
+    /// giving up and baselining anyway. Bounds the damage from a server that never finishes, or from
     /// a progress notification dropped before its pump existed.
     ///
-    /// Counted from the moment the language servers are spawned, so it
-    /// covers indexing rather than the handshake that precedes it. It must
-    /// outlast a full index of the workspace: firing before that captures a
-    /// partial baseline, and every file analyzed afterwards then reads as
-    /// newly changed.
+    /// Counted from when the language servers finish starting, so the
+    /// handshake spends none of it. It must outlast a full index of the
+    /// workspace: firing before that captures a partial baseline, and every
+    /// file analyzed afterwards then reads as newly changed.
     #[serde(default = "default_settle_deadline_ms")]
     pub settle_deadline_ms: u64,
-    /// Whether the tools that write append their new diagnostics to their
-    /// own result.
+    /// Whether the tools that write append the diagnostics their own edit
+    /// caused to their result.
     #[serde(default)]
     pub footer: bool,
     /// How long a footer waits before it starts looking for quiet.
     ///
-    /// rust-analyzer's flycheck begins about 90 ms after a `didSave`, and a
-    /// footer that checks before then sees a quiet workspace and reports
-    /// the state from before the edit.
+    /// A footer that checks before the language servers react to the write
+    /// sees a quiet workspace and reports the state from before the edit;
+    /// rust-analyzer's flycheck begins about 90 ms after a save.
     #[serde(default = "default_footer_grace_ms")]
     pub footer_grace_ms: u64,
     /// How long nothing may be outstanding before a footer calls it done.
     ///
-    /// Shorter than `settle_quiet_ms`, which exists to bridge the 70 to 100
-    /// millisecond gaps between rust-analyzer's startup phases. A footer
-    /// never sees those; what it bridges is the cancel-and-restart between
-    /// two saves landing back to back.
+    /// Shorter than `settle_quiet_ms`, which bridges gaps between startup
+    /// phases a footer never sees. What a footer bridges is the
+    /// cancel-and-restart between two writes landing back to back.
     #[serde(default = "default_footer_quiet_ms")]
     pub footer_quiet_ms: u64,
-    /// How long a footer waits in total before reporting what it has.
+    /// How long a footer waits in total, `footer_grace_ms` included, before
+    /// reporting what it has. A wait that never goes quiet is sampled every
+    /// 50 ms, so it can run up to 50 ms past this.
     ///
-    /// Sized against a real build rather than against patience: a no-op
-    /// touch in this repository's largest crate costs about 4.3 seconds of
-    /// `cargo check`, measured, so a five second cap would expire on every
-    /// rename there and report the pre-edit state. The wait is gated on
-    /// progress rather than on a timer, so a fast workspace still returns
-    /// in about a second and the high cap costs it nothing.
+    /// Size it to outlast a real build of the workspace, or the footer
+    /// reports the state from before the edit. The wait ends when the servers
+    /// go quiet, so a high cap costs a fast workspace nothing.
     #[serde(default = "default_footer_wait_ms")]
     pub footer_wait_ms: u64,
-    /// How the Claude Code hooks reach this process.
+    /// How the agent's hooks reach the backend.
     #[serde(default)]
     pub hooks: HooksConfig,
 }
@@ -345,6 +351,9 @@ impl Default for HooksConfig {
 #[serde(deny_unknown_fields)]
 pub struct BackendConfig {
     /// How long a backend with no session attached waits before it exits.
+    /// Hook connections do not keep it alive. A backend kept by
+    /// `mcpls backend start` ignores this until `mcpls backend stop` or
+    /// `mcpls backend auto`.
     ///
     /// Short by default so memory returns to the machine soon after the
     /// last session closes. The cost of short is a cold reindex for a
@@ -353,11 +362,13 @@ pub struct BackendConfig {
     #[serde(default = "default_idle_shutdown_ms")]
     pub idle_shutdown_ms: u64,
 
-    /// When this backend's language servers start.
+    /// When this backend's language servers start. A server's own `spawn`
+    /// overrides it.
     ///
     /// Lazy holds a server back until the session touches its language,
-    /// which keeps a checkout's unused languages out of memory. Eager
-    /// starts every applicable server with the backend.
+    /// through a file the agent's hooks report or a tool call, which keeps a
+    /// checkout's unused languages out of memory. Eager starts every
+    /// applicable server with the backend.
     #[serde(default)]
     pub spawn: SpawnPolicy,
 }
@@ -385,7 +396,8 @@ pub struct BriefConfig {
     /// Defaults on, because reaching this configuration means installing
     /// the plugin and installing the plugin is the opt-in. With it off, an
     /// agent learns mcpls exists only from its tool list, or from
-    /// instructions the user writes.
+    /// instructions the user writes. A checkout no installed server applies
+    /// to gets no note either way.
     #[serde(default = "default_brief_enabled")]
     pub enabled: bool,
 }
@@ -421,15 +433,33 @@ pub enum ConfigSource {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
-    /// Workspace configuration.
+    /// Where the workspace is, and which files mcpls opens.
     #[serde(default)]
     pub workspace: WorkspaceConfig,
 
-    /// If omitted, the built-in servers are used. Entries identify a server
-    /// by `name`, or `language_id` when `name` is absent. The first enabled
-    /// entry for an existing server overlays it; a new identity needs
-    /// `command`. Once claimed, a later entry with `command` adds another
-    /// server, while a later `spawn`-only entry overlays the resolved server.
+    /// The language servers mcpls runs. mcpls has built-in servers for
+    /// Rust (rust-analyzer), Python (pyright), TypeScript, Go (gopls), C and
+    /// C++ (clangd), and Zig (zls), and uses them when this list is omitted.
+    ///
+    /// Entries identify a server by `name`, or `language_id` when `name` is
+    /// absent. The first enabled entry naming a built-in overlays it: a field
+    /// the entry omits is inherited, and a field it sets overrides. Setting
+    /// `command` also clears the built-in's `args`, `env`,
+    /// `initialization_options`, and `install`, since those belong to the
+    /// binary being replaced; `file_patterns` describe the language and
+    /// survive. An entry naming no built-in defines a new server, and needs
+    /// `command`.
+    ///
+    /// Entries fold top to bottom. Once an identity is claimed, a later entry
+    /// with `command` adds another server, while a later `spawn`-only entry
+    /// overlays the resolved server. Two servers with one identity must never
+    /// both apply to one workspace, so give them mutually exclusive
+    /// `heuristics.project_markers`. To run two servers for one language at
+    /// once, give each its own `name` and split the tools with `handles`.
+    ///
+    /// `enabled = false` removes whatever has the entry's identity at that
+    /// point, including an entry of your own written earlier, so put it
+    /// before any entry it should leave alone.
     #[serde(
         default = "LspServerConfig::builtins",
         deserialize_with = "deserialize_lsp_servers"
@@ -437,7 +467,26 @@ pub struct ServerConfig {
     #[schemars(with = "Vec<PartialLspServerConfig>")]
     pub lsp_servers: Vec<LspServerConfig>,
 
-    /// Which tools may write their edits to the working tree.
+    /// Which tools may write their edits to the source tree. Without this
+    /// table mcpls is read-only: every tool returns its edit for you to
+    /// read, and nothing on disk changes.
+    ///
+    /// A key hands the write to the language server, which decides which
+    /// files the edit touches and what goes in them. mcpls checks that every
+    /// path stays inside the workspace roots, applies the whole edit or none
+    /// of it, and reports what it wrote. It does not review the content, and
+    /// cannot tell a correct rename from a wrong one.
+    ///
+    /// There is no undo. mcpls rolls an edit back only while that apply is
+    /// running: when a step fails, the completed steps are reversed and the
+    /// error names any file it could not restore. Once an apply returns, the
+    /// change is on disk and mcpls keeps no record of what was there. Commit
+    /// first, and read the `files_written` list the tool returns.
+    ///
+    /// An edit is refused whole, with nothing written, when a path resolves
+    /// outside the workspace roots (following symlinks), when it would
+    /// change or destroy a file marked read-only, when a file it edits has
+    /// no readable text, or when two edits to one document overlap.
     #[serde(default)]
     pub apply: ApplyConfig,
 
@@ -445,11 +494,24 @@ pub struct ServerConfig {
     #[serde(default)]
     pub diagnostics: DiagnosticsConfig,
 
-    /// How a shared backend manages its own lifetime.
+    /// The shared backend. The first session in a checkout starts one
+    /// backend, and every later session in that checkout, from any
+    /// subdirectory, attaches to it and shares its language servers. Two
+    /// worktrees of one repository are two checkouts. `mcpls --no-backend`
+    /// serves one session in-process instead.
+    ///
+    /// A session whose configuration differs from the running backend's
+    /// still attaches, and the backend's configuration stays in effect; its
+    /// server instructions name both fingerprints. A session that trusts the
+    /// checkout's `mcpls.toml` when the backend does not, or the reverse, is
+    /// refused.
     #[serde(default)]
     pub backend: BackendConfig,
 
-    /// What an agent session is told about mcpls when it starts.
+    /// The note `mcpls brief` hands an agent session when it starts, naming
+    /// the installed language servers that serve the checkout and pointing
+    /// the agent at the mcpls tools. Run `mcpls brief` to see what a session
+    /// in the current directory gets.
     #[serde(default)]
     pub brief: BriefConfig,
 
@@ -580,48 +642,51 @@ const DEFAULT_CONFIG_TEMPLATE: &str = r#"# mcpls configuration
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceConfig {
-    /// Root directories for the workspace.
+    /// Workspace root directories. Empty means the checkout root. Each root
+    /// must exist.
+    ///
+    /// A relative root in a file named by `--config`, or in a checkout's
+    /// `mcpls.toml`, resolves against the directory holding that file, so
+    /// `roots = [".."]` in `<repo>/.agents/mcpls.toml` means the repository
+    /// root. In the user config file it resolves against the checkout root.
+    /// On Windows, `\dir` and `C:dir` are joined like any other relative
+    /// root.
     #[serde(default)]
     pub roots: Vec<PathBuf>,
 
-    /// Position encoding preference order, offered to each spawned LSP
-    /// server as `capabilities.general.positionEncodings` during the
-    /// `initialize` handshake (see [`crate::lsp::LspServer::spawn`]), in the
-    /// order configured here.
-    ///
-    /// Valid values: `"utf-8"`, `"utf-16"`, `"utf-32"`. Must be non-empty;
-    /// [`ServerConfig::validate`] rejects an empty list or an unrecognized
-    /// value.
+    /// Position encodings offered to each language server during
+    /// `initialize`, most preferred first: `"utf-8"`, `"utf-16"`, or
+    /// `"utf-32"`. Must not be empty. A server may still pick UTF-16, which
+    /// the LSP spec makes mandatory.
     #[serde(default = "default_position_encodings")]
     pub position_encodings: Vec<String>,
 
-    /// File extension to language ID mappings.
-    /// Allows users to customize which file extensions map to which language servers.
+    /// Maps file extensions to the language ID mcpls reports to a server.
+    /// Setting this key replaces the whole built-in list, so list every
+    /// language you need, not only the new one.
+    ///
+    /// A server for a language outside this list needs its files mapped,
+    /// here or through its own `file_patterns`, unless it handles only
+    /// `workspace_symbols`.
     #[serde(default = "default_language_extensions")]
     pub language_extensions: Vec<LanguageExtensionMapping>,
 
-    /// Maximum depth for recursive project marker search.
-    /// Controls how deeply nested projects can be detected.
-    /// Default: 10
+    /// How many directory levels deep mcpls searches for a server's
+    /// `heuristics.project_markers`.
     #[serde(default = "default_heuristics_max_depth")]
     pub heuristics_max_depth: usize,
 
-    /// Maximum number of documents `DocumentTracker` will keep open
-    /// simultaneously. A `textDocument/didOpen`-triggering tool call (hover,
-    /// definition, diagnostics, etc.) for a document beyond this count fails
-    /// with `DocumentLimitExceeded`. Documents stay tracked for the whole
-    /// mcpls process lifetime (there is no eviction), so once the ceiling is
-    /// reached, opening any further new path fails until either the process
-    /// is restarted or this limit is raised; already-tracked paths are
-    /// unaffected. `0` disables the limit.
-    /// Default: 100
+    /// Most documents mcpls keeps open. Documents are never evicted, so once
+    /// the limit is hit, a tool call that opens a new file fails until the
+    /// backend restarts; files already open keep working. `0` disables the
+    /// limit.
+    ///
+    /// A diagnostics sweep opens files too, and keeps one slot free for an
+    /// ordinary request. Each open document's content stays in memory.
     #[serde(default = "default_max_documents")]
     pub max_documents: usize,
 
-    /// Maximum size, in bytes, of a single file `DocumentTracker` will open.
-    /// A file larger than this fails with `FileSizeLimitExceeded`. `0`
-    /// disables the limit.
-    /// Default: 10485760 (10MB)
+    /// Largest file, in bytes, mcpls opens. `0` disables the limit.
     #[serde(default = "default_max_file_size")]
     pub max_file_size: u64,
 }

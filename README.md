@@ -250,7 +250,7 @@ Leave the table out and nothing is ever written. Turning a key on hands the writ
 > [!WARNING]
 > There is no undo. A failure partway through one apply is rolled back, and the error names any file it could not restore; once an apply returns successfully the change is on disk and mcpls has no record of what was there before. Commit before letting a tool write.
 
-See [Apply Section](docs/user-guide/configuration.md#apply-section) for what each key permits.
+See [Apply Section](docs/user-guide/config-reference.md#apply) for what each key permits.
 
 </details>
 
@@ -324,7 +324,7 @@ code_actions = false
 allow_file_deletion = false
 ```
 
-See [Configuration Reference](docs/user-guide/configuration.md) for all options.
+See [Configuration Reference](docs/user-guide/config-reference.md) for all options.
 
 </details>
 
@@ -344,7 +344,7 @@ mcpls works with any LSP 3.17 compliant server. Battle-tested with:
 | C/C++ | clangd | compile_commands.json |
 | Java | jdtls | Maven/Gradle projects |
 | Zig | zls | build.zig support |
-| And 24+ others | Any LSP 3.17 server | See [docs](docs/user-guide/configuration.md) |
+| And 24+ others | Any LSP 3.17 server | See [docs](docs/user-guide/config-reference.md) |
 
 </details>
 
@@ -393,7 +393,7 @@ Codex hook `agent_id` and MCP thread metadata identify the same delivery record.
 
 Records live in backend memory. A root connection protects its agents' records, and an agent's own connection protects its record. `SessionEnd` removes records after their protecting connections close. Otherwise, `diagnostics.record_grace_ms` controls how long disconnected records survive, renewed by hook activity. Reconnection preserves history only while the same backend remains alive; record grace does not extend backend idle shutdown. The generated [configuration schema](schema/mcpls-config.json) defines the default.
 
-Each MCP session runs a small stdio frontend that relays to the checkout's one backend, so sessions in the same checkout share language servers instead of indexing twice. The first session starts the backend, and it exits shortly after the last one closes. `mcpls --no-backend` runs a session in-process instead. See [Backend Section](docs/user-guide/configuration.md#backend-section).
+Each MCP session runs a small stdio frontend that relays to the checkout's one backend, so sessions in the same checkout share language servers instead of indexing twice. The first session starts the backend, and it exits shortly after the last one closes. `mcpls --no-backend` runs a session in-process instead. See [Backend Section](docs/user-guide/config-reference.md#backend).
 
 **Key design decisions:**
 - **Single binary** — No Node.js, Python, or other runtime dependencies
@@ -406,7 +406,7 @@ Each MCP session runs a small stdio frontend that relays to the checkout's one b
 ## Documentation
 
 - [Getting Started](docs/user-guide/getting-started.md)
-- [Configuration Reference](docs/user-guide/configuration.md)
+- [Configuration Reference](docs/user-guide/config-reference.md)
 - [Tools Reference](docs/user-guide/tools-reference.md)
 - [Troubleshooting](docs/user-guide/troubleshooting.md)
 - [Agent Skills](plugin/skills/): [`mcpls`](plugin/skills/mcpls/) teaches an AI coding agent to use the tools for coding work, and [`setup-mcpls`](plugin/skills/setup-mcpls/) to install, configure, and troubleshoot mcpls

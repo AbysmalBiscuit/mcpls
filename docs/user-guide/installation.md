@@ -280,8 +280,7 @@ mcpls searches for configuration files in the following order:
 
 1. Path specified by `--config` flag
 2. `$MCPLS_CONFIG` environment variable
-3. `./mcpls.toml` (current directory) — requires `--trust-project-config` (see
-   [Configuration Reference](configuration.md#trusting-a-project-local-config))
+3. `mcpls.toml` at the checkout root, only with `--trust-project-config`, which `mcpls help --full` explains
 4. Platform user-config directory:
    - Linux: `$XDG_CONFIG_HOME/mcpls/mcpls.toml`, else `~/.config/mcpls/mcpls.toml`
    - macOS: `~/Library/Application Support/mcpls/mcpls.toml`
@@ -519,7 +518,7 @@ xattr -d com.apple.quarantine /usr/local/bin/mcpls
 After installation:
 
 - [Getting Started Guide](getting-started.md) - Quick start with Claude Code
-- [Configuration Reference](configuration.md) - Detailed configuration options
+- [Configuration Reference](config-reference.md) - Detailed configuration options
 - [Tools Reference](tools-reference.md) - Documentation for all MCP tools
 - [Troubleshooting](troubleshooting.md) - Common issues and solutions
 

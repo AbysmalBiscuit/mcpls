@@ -21,7 +21,7 @@ When auto-detection finds no file, mcpls writes a commented template to the user
 
 ## Trust
 
-A checkout's `mcpls.toml` can set the `command` and `args` mcpls spawns, so loading one from an unfamiliar checkout would run arbitrary code. mcpls ignores it unless started with `--trust-project-config` or `MCPLS_TRUST_PROJECT_CONFIG=true`. The variable grants trust to every mcpls process that inherits it, not to one project; [cli.md](cli.md#registering-with-an-mcp-client) shows how to scope the grant to one client entry.
+A checkout's `mcpls.toml` can set the `command` and `args` mcpls spawns, so loading one from an unfamiliar checkout would run arbitrary code. mcpls ignores it unless started with `--trust-project-config` or `MCPLS_TRUST_PROJECT_CONFIG=true`. The variable grants trust to every mcpls process that inherits it, not to one project; put `--trust-project-config` in one client entry's `args` instead, as [SKILL.md](../SKILL.md#registering-with-an-mcp-client) shows.
 
 An ignored config is reported in two places: a warning on stderr, which a stdio client rarely shows, and a note appended to the server instructions in the MCP `initialize` response. When the server instructions mention an ignored project config, the file only needs a trust decision.
 

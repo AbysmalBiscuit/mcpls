@@ -4,12 +4,9 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
+use mcpls_core::config::reference;
 use mcpls_core::config::schema::document;
 use serde_json::{Value, json};
-
-fn committed_schema_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../schema/mcpls-config.json")
-}
 
 fn generated_schema() -> String {
     document().expect("generate config schema")
@@ -95,16 +92,19 @@ fn first_differing_line(committed: &str, generated: &str) -> String {
     }
 }
 
-#[test]
-fn committed_schema_matches_the_config_types() {
-    let generated = generated_schema();
-    let path = committed_schema_path();
+/// Writes `generated` to `relative` under `MCPLS_UPDATE_SCHEMA=1`, and
+/// otherwise fails when the committed file differs from it.
+fn assert_current(relative: &str, generated: &str) {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(relative);
     if std::env::var("MCPLS_UPDATE_SCHEMA").as_deref() == Ok("1") {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .unwrap_or_else(|error| panic!("create {}: {error}", parent.display()));
         }
-        std::fs::write(path, generated).expect("write generated schema");
+        std::fs::write(&path, generated)
+            .unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
         return;
     }
 
@@ -115,10 +115,23 @@ fn committed_schema_matches_the_config_types() {
     }
 
     panic!(
-        "schema/mcpls-config.json is stale; first difference:\n{}\n\
-         regenerate with `MCPLS_UPDATE_SCHEMA=1 cargo test -p mcpls-core --test config_schema` \
-         or `cargo run --bin mcpls -- schema > schema/mcpls-config.json`",
-        first_differing_line(&committed, &generated)
+        "{relative} is stale; first difference:\n{}\n\
+         regenerate with `devrun task schema`, or \
+         `MCPLS_UPDATE_SCHEMA=1 cargo test -p mcpls-core --test config_schema`",
+        first_differing_line(&committed, generated)
+    );
+}
+
+#[test]
+fn committed_schema_matches_the_config_types() {
+    assert_current("schema/mcpls-config.json", &generated_schema());
+}
+
+#[test]
+fn the_committed_config_reference_matches_the_schema() {
+    assert_current(
+        "docs/user-guide/config-reference.md",
+        &reference::document().expect("render config reference"),
     );
 }
 

@@ -16,6 +16,10 @@ pub const SCHEMA_ID: &str =
 /// Returns an error if Schemars generates an unexpected schema shape or JSON
 /// serialization fails.
 pub fn document() -> Result<String, serde_json::Error> {
+    Ok(format!("{}\n", serde_json::to_string_pretty(&value()?)?))
+}
+
+pub(super) fn value() -> Result<Value, serde_json::Error> {
     let mut schema = serde_json::to_value(schemars::schema_for!(super::ServerConfig))?;
     let object = schema
         .as_object_mut()
@@ -28,8 +32,7 @@ pub fn document() -> Result<String, serde_json::Error> {
     );
 
     remove_composite_defaults(&mut schema)?;
-
-    Ok(format!("{}\n", serde_json::to_string_pretty(&schema)?))
+    Ok(schema)
 }
 
 fn remove_composite_defaults(schema: &mut Value) -> Result<(), serde_json::Error> {

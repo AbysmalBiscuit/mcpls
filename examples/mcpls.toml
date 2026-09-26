@@ -1,8 +1,7 @@
 # Example MCPLS configuration file
 # Copy to ~/.config/mcpls/mcpls.toml or specify with --config flag.
-# If placed as ./mcpls.toml in a project directory instead, mcpls ignores it
-# unless you pass --trust-project-config (or set MCPLS_TRUST_PROJECT_CONFIG=true) —
-# see docs/user-guide/configuration.md#trusting-a-project-local-config.
+# If placed as mcpls.toml at a checkout root instead, mcpls ignores it unless
+# you pass --trust-project-config, which `mcpls help --full` explains.
 
 # Workspace settings
 [workspace]
@@ -68,9 +67,9 @@ position_encodings = ["utf-8", "utf-16"]
 # [[lsp_servers]] entry needed. An entry you write MERGES onto the built-in
 # sharing its identity (`name` if set, else `language_id`): a field you omit
 # is inherited from the built-in, a field you set overrides it. Overriding
-# `command` also drops the built-in's `args`, `env` and
-# `initialization_options`, since those belong to the binary being replaced.
-# See docs/user-guide/configuration.md for the full semantics.
+# `command` also drops the built-in's `args`, `env`, `initialization_options`
+# and `install`, since those belong to the binary being replaced.
+# See docs/user-guide/config-reference.md for the full semantics.
 
 # Rust - override the built-in's handshake timeout; command, args and
 # file_patterns are still rust-analyzer's.
