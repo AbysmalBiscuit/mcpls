@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1](https://github.com/AbysmalBiscuit/mcpls/compare/v0.4.0...v0.4.1) (2026-09-26)
+
+
+### Features
+
+* **cli:** add mcpls backend auto ([#73](https://github.com/AbysmalBiscuit/mcpls/issues/73)) ([ddfa6fc](https://github.com/AbysmalBiscuit/mcpls/commit/ddfa6fcfad104fd71ed26d9c98a52642a546f7a1))
+* **cli:** add mcpls status overview ([#76](https://github.com/AbysmalBiscuit/mcpls/issues/76)) ([0b9c1e0](https://github.com/AbysmalBiscuit/mcpls/commit/0b9c1e0840c503d55a7b51f911e8bd40f9c77e2e))
+* **cli:** install language servers with mcpls lsp install ([#77](https://github.com/AbysmalBiscuit/mcpls/issues/77)) ([812d9bb](https://github.com/AbysmalBiscuit/mcpls/commit/812d9bb5521017000d14af475796cf35406bc022))
+
 ## [0.4.0](https://github.com/AbysmalBiscuit/mcpls/compare/v0.3.11...v0.4.0) (2026-09-21)
 
 
