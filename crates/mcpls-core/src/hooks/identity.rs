@@ -174,38 +174,72 @@ pub fn windows_pipe_prefix() -> String {
 /// no hint the cause is path length, so this is checked here instead, where
 /// the path is built and the failure can name it.
 pub fn identity_for(dir: &Path) -> Result<SocketIdentity> {
-    let hash = identity_hash(dir)?;
+    let identity = identity_named(identity_hash(dir)?);
+    #[cfg(not(windows))]
+    ensure_socket_path_fits(&identity.socket)?;
+    Ok(identity)
+}
 
+/// The endpoint this user's mcpls binds for `hash`.
+fn identity_named(hash: String) -> SocketIdentity {
+    let dir = runtime_dir();
+    // The pipe namespace is machine-global, so two users at one project
+    // path would share a pipe without the user in its name.
+    #[cfg(windows)]
+    let socket = PathBuf::from(format!(r"\\.\pipe\{}{hash}", windows_pipe_prefix()));
+    #[cfg(not(windows))]
+    let socket = dir.join(format!("{hash}.sock"));
+    SocketIdentity {
+        socket,
+        lock: dir.join(format!("{hash}.lock")),
+        hash,
+    }
+}
+
+/// Every endpoint this user's mcpls has bound and not removed, in hash
+/// order. A Unix socket outlives a crashed process, so only a probe tells
+/// whether anything is behind one.
+///
+/// # Errors
+///
+/// Returns an error when the runtime directory or the pipe namespace cannot
+/// be read.
+pub fn endpoints() -> std::io::Result<Vec<SocketIdentity>> {
+    let mut hashes = std::collections::BTreeSet::new();
     #[cfg(windows)]
     {
-        // The pipe namespace is machine-global, so the project hash is not
-        // a whole identity on its own: two users with the same project
-        // path on one host would derive one pipe name and mix the second
-        // user's hooks and diagnostics with the first user's mcpls. The user
-        // goes into the name for the same reason the Unix runtime directory
-        // carries it. This keeps two users'
-        // sessions apart wherever the environment names them, and falls back
-        // to the bare hash where it names nobody; what stops one user
-        // reaching the other's pipe at all is that pipe's own access
-        // control, not its name.
         let prefix = windows_pipe_prefix();
-        Ok(SocketIdentity {
-            socket: PathBuf::from(format!(r"\\.\pipe\{prefix}{hash}")),
-            lock: runtime_dir().join(format!("{hash}.lock")),
-            hash,
-        })
+        // One listing of the pipe namespace can silently omit a live pipe
+        // while other processes create and close pipes.
+        for _ in 0..3 {
+            hashes.extend(std::fs::read_dir(r"\\.\pipe\")?.filter_map(|entry| {
+                let name = entry.ok()?.file_name().into_string().ok()?;
+                name.strip_prefix(&prefix)
+                    .filter(|hash| is_hash(hash))
+                    .map(str::to_string)
+            }));
+        }
     }
     #[cfg(not(windows))]
     {
-        let dir = runtime_dir();
-        let socket = dir.join(format!("{hash}.sock"));
-        ensure_socket_path_fits(&socket)?;
-        Ok(SocketIdentity {
-            lock: dir.join(format!("{hash}.lock")),
-            socket,
-            hash,
-        })
+        let entries = match std::fs::read_dir(runtime_dir()) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        hashes.extend(entries.filter_map(|entry| {
+            let name = entry.ok()?.file_name().into_string().ok()?;
+            name.strip_suffix(".sock")
+                .filter(|hash| is_hash(hash))
+                .map(str::to_string)
+        }));
     }
+    Ok(hashes.into_iter().map(identity_named).collect())
+}
+
+/// Whether `name` is shaped like the hash [`identity_hash`] formats.
+fn is_hash(name: &str) -> bool {
+    name.len() == 16 && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// A macOS-shaped temporary directory plus a long username already leaves

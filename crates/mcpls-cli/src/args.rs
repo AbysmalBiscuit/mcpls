@@ -208,6 +208,17 @@ pub enum Command {
         action: LspCommand,
     },
 
+    /// Show this checkout's backend, or with `--all` every one this user runs
+    ///
+    /// Prints each backend's checkout, pid, version, attached sessions,
+    /// language servers by state, and log. Examines `$CLAUDE_PROJECT_DIR`,
+    /// then the working directory. Exits 0 whether or not a backend runs.
+    Status {
+        /// Every backend this user runs, across all checkouts
+        #[arg(long)]
+        all: bool,
+    },
+
     /// Print the JSON Schema for `mcpls.toml` or initialize a config file
     Schema {
         /// An action to perform instead of printing the schema

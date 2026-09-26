@@ -15,6 +15,7 @@ mod config;
 mod hook;
 mod logging;
 mod lsp;
+mod status;
 
 use args::{Args, BackendAction, Command, HookAction, LspCommand, SchemaAction};
 use hook::{Examined, Report};
@@ -123,8 +124,10 @@ async fn main() {
         std::process::exit(0);
     }
 
-    if let Some(Command::Brief { additional_context }) = &args.command {
-        emit_brief(&args, *additional_context);
+    match &args.command {
+        Some(Command::Brief { additional_context }) => emit_brief(&args, *additional_context),
+        Some(Command::Status { all }) => emit_status(*all).await,
+        _ => {}
     }
 
     // A hook invocation needs neither a loaded config nor a log subscriber,
@@ -231,6 +234,25 @@ fn emit_brief(args: &Args, additional_context: bool) -> ! {
         }
         Some(text) => write_report(&text),
         None => {}
+    }
+    std::process::exit(0);
+}
+
+/// Print this checkout's backend, or with `all` every backend this user
+/// runs, then exit.
+async fn emit_status(all: bool) -> ! {
+    let report = if all {
+        status::all().await
+    } else {
+        let (directory, _) = examined_directory(None);
+        status::checkout(&hook::checkout_root(&directory)).await
+    };
+    match report {
+        Ok(text) => write_report(&text),
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
     }
     std::process::exit(0);
 }

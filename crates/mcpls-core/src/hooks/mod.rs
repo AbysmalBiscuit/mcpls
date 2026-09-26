@@ -15,7 +15,7 @@ pub mod watcher;
 pub use filters::{PathFilter, WatchSet, watch_set};
 #[cfg(windows)]
 pub use identity::windows_pipe_prefix;
-pub use identity::{SocketIdentity, identity_for, identity_hash, project_root};
+pub use identity::{SocketIdentity, endpoints, identity_for, identity_hash, project_root};
 pub use listener::{
     HookListener, ProbeOutcome, ServeExit, probe, send, send_and_acknowledge, send_many,
 };
