@@ -128,12 +128,12 @@ pub fn plan(config: &ServerConfig, root: &Path, named: &[String]) -> Result<Vec<
 /// Install each target in turn, in `root`, skipping those whose program
 /// `installed` already finds. With `dry_run`, name each command and run
 /// nothing.
-pub async fn install(
-    targets: &[Target],
+pub async fn install<'a>(
+    targets: &'a [Target],
     root: &Path,
     dry_run: bool,
     installed: impl Fn(&str) -> bool + Sync,
-) -> Vec<(String, Status)> {
+) -> Vec<(&'a Target, Status)> {
     let mut results = Vec::with_capacity(targets.len());
     for target in targets {
         let status = if installed(&target.program) {
@@ -148,7 +148,7 @@ pub async fn install(
         } else {
             Status::NoCommand
         };
-        results.push((target.id.clone(), status));
+        results.push((target, status));
     }
     results
 }
@@ -171,14 +171,14 @@ pub async fn nudge(root: &Path, installed: Vec<String>) {
 }
 
 /// One line per target, id then outcome.
-pub fn render(results: &[(String, Status)]) -> String {
+pub fn render(results: &[(&Target, Status)]) -> String {
     if results.is_empty() {
         return "no language servers apply here\n".to_string();
     }
     results
         .iter()
-        .fold(String::new(), |mut text, (id, status)| {
-            let _ = writeln!(text, "{id}  {status}");
+        .fold(String::new(), |mut text, (target, status)| {
+            let _ = writeln!(text, "{}  {status}", target.id);
             text
         })
 }

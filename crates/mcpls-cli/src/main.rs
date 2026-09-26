@@ -495,13 +495,12 @@ async fn run_install(args: &Args, targets: &LspTargets, dry_run: bool) -> lsp::O
     let installed = results
         .iter()
         .filter(|(_, status)| *status == install::Status::Installed)
-        .map(|(id, _)| id.clone())
+        .map(|(target, _)| target.id.clone())
         .collect();
     install::nudge(&root, installed).await;
-    let success = planned
+    let success = results
         .iter()
-        .zip(&results)
-        .all(|(target, (_, status))| !status.fails(target.named));
+        .all(|(target, status)| !status.fails(target.named));
     let ignored = resolved
         .ignored_project_config
         .as_deref()
