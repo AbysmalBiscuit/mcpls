@@ -346,7 +346,8 @@ pub enum LspCommand {
     /// Runs each server's `install` command, one at a time, in the
     /// checkout root, skipping servers already installed. Exits non-zero
     /// when a command fails, a binary still does not resolve afterwards,
-    /// or a server named here has no install command.
+    /// a server named here has no install command, or a name does not
+    /// apply to the checkout.
     Install {
         #[command(flatten)]
         targets: LspTargets,
