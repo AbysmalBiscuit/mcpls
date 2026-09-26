@@ -51,7 +51,7 @@ pub enum SpawnPolicy {
 /// `mcpls lsp install`.
 ///
 /// Unix runs it with `sh -c`; Windows runs it with Windows `PowerShell`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(untagged)]
 pub enum InstallCommand {
     /// One shell command for every OS.
@@ -71,6 +71,41 @@ pub struct PerOsInstall {
     /// the next command even after a failure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub windows: Option<String>,
+}
+
+/// Written by hand rather than derived as untagged, which would report a
+/// typo such as `macos` only as matching no variant.
+impl<'de> Deserialize<'de> for InstallCommand {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = InstallCommand;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a command string, or a table with `unix` and `windows` keys")
+            }
+
+            fn visit_str<E: serde::de::Error>(
+                self,
+                command: &str,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(InstallCommand::Any(command.to_string()))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                PerOsInstall::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                    .map(InstallCommand::PerOs)
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
 }
 
 impl InstallCommand {
@@ -1343,7 +1378,29 @@ mod tests {
             [lsp_servers.install]
             macos = "brew install zls"
         "#;
-        assert!(toml::from_str::<ServerConfig>(toml).is_err());
+        let error = toml::from_str::<ServerConfig>(toml)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("unknown field `macos`, expected `unix` or `windows`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_install_of_the_wrong_type_names_both_forms() {
+        let toml = r#"
+            [[lsp_servers]]
+            language_id = "zig"
+            install = 3
+        "#;
+        let error = toml::from_str::<ServerConfig>(toml)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("a command string, or a table with `unix` and `windows` keys"),
+            "{error}"
+        );
     }
 
     #[test]
