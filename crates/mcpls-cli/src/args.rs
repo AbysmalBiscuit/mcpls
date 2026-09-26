@@ -29,7 +29,7 @@ pub fn parse_bool_flag(s: &str) -> Result<bool, String> {
 #[derive(Debug, Parser)]
 #[command(name = "mcpls")]
 #[command(version, about, long_about = None)]
-#[command(propagate_version = true)]
+#[command(propagate_version = true, disable_help_subcommand = true)]
 pub struct Args {
     /// Subcommand to run instead of the MCP server
     #[command(subcommand)]
@@ -218,6 +218,21 @@ pub enum Command {
         /// Every backend this user runs, across all checkouts
         #[arg(long)]
         all: bool,
+    },
+
+    /// Print the help of a command, or with `--full` of every command
+    ///
+    /// `mcpls help --full` prints the long help of every command and
+    /// subcommand in one run, each under a `# mcpls <command>` heading, so
+    /// the whole CLI reads without walking it.
+    Help {
+        /// Print the help of the named command and every command beneath it
+        #[arg(long)]
+        full: bool,
+
+        /// The command to print help for, such as `lsp install`
+        #[arg(value_name = "COMMAND")]
+        command: Vec<String>,
     },
 
     /// Print the JSON Schema for `mcpls.toml` or initialize a config file

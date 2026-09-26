@@ -12,6 +12,7 @@ mod backend;
 mod brief;
 mod completions;
 mod config;
+mod help;
 mod hook;
 mod install;
 mod logging;
@@ -47,12 +48,7 @@ async fn main() {
     // Completions need neither a loaded config nor a log subscriber, and
     // printing the script is the whole command, so this runs before both.
     if let Some(Command::Completions { shell }) = &args.command {
-        let mut out = std::io::stdout().lock();
-        if let Err(err) = completions::emit(*shell, &mut out) {
-            eprintln!("failed to write completion script: {err}");
-            std::process::exit(1);
-        }
-        std::process::exit(0);
+        emit_completions(*shell);
     }
 
     if let Some(Command::Schema { action }) = &args.command {
@@ -127,6 +123,7 @@ async fn main() {
 
     match &args.command {
         Some(Command::Brief { additional_context }) => emit_brief(&args, *additional_context),
+        Some(Command::Help { full, command }) => emit_help(command, *full),
         Some(Command::Status { all }) => emit_status(*all).await,
         _ => {}
     }
@@ -241,6 +238,26 @@ fn emit_brief(args: &Args, additional_context: bool) -> ! {
 
 /// Print this checkout's backend, or with `all` every backend this user
 /// runs, then exit.
+fn emit_completions(shell: completions::Shell) -> ! {
+    let mut out = std::io::stdout().lock();
+    if let Err(err) = completions::emit(shell, &mut out) {
+        eprintln!("failed to write completion script: {err}");
+        std::process::exit(1);
+    }
+    std::process::exit(0);
+}
+
+fn emit_help(command: &[String], full: bool) -> ! {
+    match help::render(command, full) {
+        Ok(text) => write_report(&text),
+        Err(err) => {
+            eprintln!("error: {err}\n\nFor a list of commands, try 'mcpls --help'.");
+            std::process::exit(2);
+        }
+    }
+    std::process::exit(0);
+}
+
 async fn emit_status(all: bool) -> ! {
     let report = if all {
         status::all().await

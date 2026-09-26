@@ -100,6 +100,50 @@ fn test_backend_help_lists_its_actions_and_hides_serving() {
         .stdout(predicate::str::contains("--root").not());
 }
 
+/// One run prints the long help of every command a user can run, so an
+/// agent reads the whole CLI without walking it.
+#[test]
+fn help_full_prints_every_commands_long_help() {
+    let mut cmd = Command::cargo_bin("mcpls").unwrap();
+    let output = clear_ambient_env(&mut cmd)
+        .args(["help", "--full"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let text = String::from_utf8(output.stdout).unwrap();
+
+    for heading in [
+        "# mcpls\n",
+        "# mcpls backend stop\n",
+        "# mcpls lsp install\n",
+        "# mcpls schema init\n",
+    ] {
+        assert!(text.contains(heading), "missing {heading:?} in:\n{text}");
+    }
+    assert!(text.contains("see a summary with '-h'"), "{text}");
+    assert!(!text.contains("see more with '--help'"), "{text}");
+    assert!(!text.contains("# mcpls hook doctor"), "{text}");
+    assert!(!text.contains("# mcpls lsp help"), "{text}");
+}
+
+#[test]
+fn help_prints_the_long_help_of_the_command_it_names() {
+    let mut cmd = Command::cargo_bin("mcpls").unwrap();
+    clear_ambient_env(&mut cmd)
+        .args(["help", "lsp", "install"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Usage: mcpls lsp install"))
+        .stdout(predicate::str::contains("--dry-run"));
+
+    let mut cmd = Command::cargo_bin("mcpls").unwrap();
+    clear_ambient_env(&mut cmd)
+        .args(["help", "nonsense"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("nonsense"));
+}
+
 #[test]
 fn test_version_flag() {
     let mut cmd = Command::cargo_bin("mcpls").unwrap();
