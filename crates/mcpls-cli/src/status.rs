@@ -1,5 +1,5 @@
-//! `mcpls status`: every backend this user runs, as one table for a person
-//! to read.
+//! `mcpls status`: every backend this user runs, one block each for a
+//! person to read.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -14,10 +14,11 @@ use mcpls_core::hooks::{ProbeOutcome, Request, Response, SocketIdentity, probe};
 use crate::hook::refusal_text;
 
 /// Longer than the backend's default hook `op_deadline_ms`, so a slow
-/// backend still gets its row.
+/// backend still gets its block.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(3);
 
-const HEADER: [&str; 4] = ["ROOT", "PID", "VERSION", "SESSIONS"];
+/// Wide enough for the longest label, the `not installed` state.
+const LABEL_WIDTH: usize = 13;
 
 /// What one endpoint's owner said about itself.
 enum Answer {
@@ -39,22 +40,31 @@ struct Backend {
     log: PathBuf,
 }
 
-/// The table of every backend this user runs.
+/// Every backend this user runs, ordered by checkout.
 ///
 /// # Errors
 ///
-/// Returns an error when this user's endpoints cannot be listed.
-pub async fn overview() -> std::io::Result<String> {
+/// Returns why this user's endpoints cannot be listed.
+pub async fn all() -> Result<String, String> {
+    let endpoints = mcpls_core::hooks::endpoints()
+        .map_err(|error| format!("could not list this user's mcpls endpoints: {error}"))?;
     let mut probes = tokio::task::JoinSet::new();
-    for identity in mcpls_core::hooks::endpoints()? {
+    for identity in endpoints {
         probes.spawn(survey(identity));
     }
     let mut backends: Vec<Backend> = probes.join_all().await.into_iter().flatten().collect();
+    if backends.is_empty() {
+        return Ok("no mcpls backend is running\n".to_string());
+    }
     backends.sort_by_cached_key(|backend| match &backend.answer {
         Answer::Serving { root, .. } => (false, root.clone()),
         _ => (true, backend.log.clone()),
     });
-    Ok(render(&backends))
+    Ok(backends
+        .iter()
+        .map(Backend::block)
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
 
 /// Ask the owner of `identity` for its status, or `None` when nothing owns
@@ -93,60 +103,70 @@ async fn survey(identity: SocketIdentity) -> Option<Backend> {
 }
 
 impl Backend {
-    fn cells(&self) -> [String; 4] {
+    /// The checkout on its own line, then one labelled line per fact.
+    fn block(&self) -> String {
+        let mut text = String::new();
         match &self.answer {
             Answer::Serving {
                 root,
                 pid,
                 version,
                 sessions,
-                ..
-            } => [
-                root.display().to_string(),
-                pid.to_string(),
-                version.clone(),
-                sessions.to_string(),
-            ],
-            Answer::Refused(reply) => [
-                format!("unknown: {}", refusal_text(reply.refusal.as_ref())),
-                reply.pid.to_string(),
-                reply.version.clone(),
-                reply.sessions.to_string(),
-            ],
-            Answer::Unreadable(why) => [
-                format!("unknown: {why}"),
-                "-".to_string(),
-                "-".to_string(),
-                "-".to_string(),
-            ],
-        }
-    }
-
-    fn servers(&self) -> String {
-        match &self.answer {
-            Answer::Serving { servers, .. } if servers.is_empty() => "none apply".to_string(),
-            Answer::Serving { servers, .. } => {
-                let mut groups = BTreeMap::<u8, (ServerLifecycle, Vec<&str>)>::new();
-                for server in servers {
-                    groups
-                        .entry(rank(server.state))
-                        .or_insert_with(|| (server.state, Vec::new()))
-                        .1
-                        .push(&server.id);
+                servers,
+            } => {
+                let _ = writeln!(text, "{}", root.display());
+                field(&mut text, "backend", &process(*pid, version, *sessions));
+                if servers.is_empty() {
+                    field(&mut text, "servers", "none apply");
                 }
-                groups
-                    .values()
-                    .map(|(state, ids)| format!("{state}: {}", ids.join(", ")))
-                    .collect::<Vec<_>>()
-                    .join("; ")
+                for (state, ids) in by_state(servers) {
+                    field(&mut text, &state.to_string(), &ids.join(", "));
+                }
             }
-            Answer::Refused(_) | Answer::Unreadable(_) => "unknown".to_string(),
+            Answer::Refused(reply) => {
+                let _ = writeln!(
+                    text,
+                    "unknown checkout: {}",
+                    refusal_text(reply.refusal.as_ref())
+                );
+                field(
+                    &mut text,
+                    "backend",
+                    &process(reply.pid, &reply.version, reply.sessions),
+                );
+            }
+            Answer::Unreadable(why) => {
+                let _ = writeln!(text, "unknown checkout: {why}");
+            }
         }
+        field(&mut text, "log", &self.log.display().to_string());
+        text
     }
 }
 
-/// Where a state's servers sit on the line: the ones doing something
-/// first, the idle majority last.
+fn field(text: &mut String, label: &str, value: &str) {
+    let _ = writeln!(text, "  {label:<LABEL_WIDTH$}  {value}");
+}
+
+fn process(pid: u32, version: &str, sessions: usize) -> String {
+    let plural = if sessions == 1 { "" } else { "s" };
+    format!("pid {pid}, mcpls {version}, {sessions} session{plural}")
+}
+
+/// `servers` grouped by state, the ones doing something first and the
+/// idle majority last.
+fn by_state(servers: &[ServerStatus]) -> impl Iterator<Item = (ServerLifecycle, Vec<&str>)> {
+    let mut groups = BTreeMap::<u8, (ServerLifecycle, Vec<&str>)>::new();
+    for server in servers {
+        groups
+            .entry(rank(server.state))
+            .or_insert_with(|| (server.state, Vec::new()))
+            .1
+            .push(&server.id);
+    }
+    groups.into_values()
+}
+
 const fn rank(state: ServerLifecycle) -> u8 {
     match state {
         ServerLifecycle::Running => 0,
@@ -158,38 +178,6 @@ const fn rank(state: ServerLifecycle) -> u8 {
     }
 }
 
-fn render(backends: &[Backend]) -> String {
-    if backends.is_empty() {
-        return "no mcpls backend is running\n".to_string();
-    }
-    let header = HEADER.map(str::to_string);
-    let rows: Vec<[String; 4]> = backends.iter().map(Backend::cells).collect();
-    let widths: [usize; 4] = std::array::from_fn(|column| {
-        std::iter::once(&header)
-            .chain(&rows)
-            .map(|row| row[column].chars().count())
-            .max()
-            .unwrap_or(0)
-    });
-    let mut text = row_line(&header, &widths);
-    for (backend, row) in backends.iter().zip(&rows) {
-        text.push_str(&row_line(row, &widths));
-        let _ = writeln!(text, "  servers  {}", backend.servers());
-        let _ = writeln!(text, "  log      {}", backend.log.display());
-    }
-    text
-}
-
-fn row_line(cells: &[String; 4], widths: &[usize; 4]) -> String {
-    let line = cells
-        .iter()
-        .zip(widths)
-        .map(|(cell, &width)| format!("{cell:<width$}"))
-        .collect::<Vec<_>>()
-        .join("  ");
-    format!("{}\n", line.trim_end())
-}
-
 #[cfg(test)]
 mod tests {
     use mcpls_core::backend::Refusal;
@@ -197,8 +185,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_backends_render_as_an_aligned_table_with_their_servers_and_log() {
-        let serving = Backend {
+    fn test_a_serving_backend_lists_its_servers_by_state() {
+        let backend = Backend {
             answer: Answer::Serving {
                 root: PathBuf::from("/work/app"),
                 pid: 4242,
@@ -208,7 +196,7 @@ mod tests {
                     ("css", ServerLifecycle::Idle),
                     ("rust", ServerLifecycle::Running),
                     ("json", ServerLifecycle::Idle),
-                    ("toml", ServerLifecycle::Stopped),
+                    ("markdown", ServerLifecycle::NotInstalled),
                 ]
                 .map(|(id, state)| ServerStatus {
                     id: id.to_string(),
@@ -218,7 +206,23 @@ mod tests {
             },
             log: PathBuf::from("/run/mcpls/aaaa.log"),
         };
-        let refused = Backend {
+
+        assert_eq!(
+            backend.block(),
+            "\
+/work/app
+  backend        pid 4242, mcpls 0.4.0, 2 sessions
+  running        rust
+  not installed  markdown
+  idle           css, json
+  log            /run/mcpls/aaaa.log
+"
+        );
+    }
+
+    #[test]
+    fn test_a_refusing_backend_names_why_its_checkout_is_unknown() {
+        let backend = Backend {
             answer: Answer::Refused(HandshakeReply {
                 version: "0.3.0".to_string(),
                 pid: 7,
@@ -230,15 +234,11 @@ mod tests {
         };
 
         assert_eq!(
-            render(&[serving, refused]),
+            backend.block(),
             "\
-ROOT                            PID   VERSION  SESSIONS
-/work/app                       4242  0.4.0    2
-  servers  running: rust; stopped: toml; idle: css, json
-  log      /run/mcpls/aaaa.log
-unknown: the two builds differ  7     0.3.0    1
-  servers  unknown
-  log      /run/mcpls/bbbb.log
+unknown checkout: the two builds differ
+  backend        pid 7, mcpls 0.3.0, 1 session
+  log            /run/mcpls/bbbb.log
 "
         );
     }

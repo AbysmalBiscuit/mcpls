@@ -240,10 +240,10 @@ fn emit_brief(args: &Args, additional_context: bool) -> ! {
 
 /// Print every backend this user runs, then exit.
 async fn emit_status() -> ! {
-    match status::overview().await {
+    match status::all().await {
         Ok(text) => write_report(&text),
         Err(error) => {
-            eprintln!("could not list this user's mcpls endpoints: {error}");
+            eprintln!("{error}");
             std::process::exit(1);
         }
     }

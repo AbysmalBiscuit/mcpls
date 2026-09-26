@@ -966,12 +966,12 @@ fn status_lists_every_backend_this_user_runs() {
     for (project, log) in [&one, &two].into_iter().zip(&logs) {
         let pid = Project::backend_pid_for(&project.root(), one.runtime.path(), &one.user)
             .expect("a started backend");
-        let row = text
-            .lines()
-            .find(|line| line.starts_with(&project.root().display().to_string()))
-            .unwrap_or_else(|| panic!("no row for {}: {text}", project.root().display()));
-        assert!(row.contains(&pid.to_string()), "{text}");
-        assert!(text.contains(log.as_str()), "{text}");
+        let block = text
+            .split("\n\n")
+            .find(|block| block.starts_with(&format!("{}\n", project.root().display())))
+            .unwrap_or_else(|| panic!("no block for {}: {text}", project.root().display()));
+        assert!(block.contains(&format!("pid {pid},")), "{text}");
+        assert!(block.contains(log.as_str()), "{text}");
     }
 
     for project in [&one, &two] {
