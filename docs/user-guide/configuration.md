@@ -1071,8 +1071,9 @@ mcpls backend stop
 # Stop keeping it, and let it exit on its idle timer once sessions leave
 mcpls backend auto
 
-# List every backend running on this machine for this user
+# Show this checkout's backend, or every one this user runs
 mcpls status
+mcpls status --all
 
 # HTTP transport (requires transport-http feature)
 mcpls --listen 127.0.0.1:3000

@@ -1,9 +1,9 @@
-//! `mcpls status`: every backend this user runs, one block each for a
-//! person to read.
+//! `mcpls status`: the backend for this checkout, or with `--all` every
+//! backend this user runs, one block each for a person to read.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use mcpls_core::backend::HandshakeReply;
@@ -38,6 +38,20 @@ enum Answer {
 struct Backend {
     answer: Answer,
     log: PathBuf,
+}
+
+/// The backend serving `root`.
+///
+/// # Errors
+///
+/// Returns why no endpoint can exist for `root`.
+pub async fn checkout(root: &Path) -> Result<String, String> {
+    let identity = mcpls_core::hooks::identity_for(root)
+        .map_err(|error| format!("no backend endpoint for {}: {error}", root.display()))?;
+    Ok(survey(identity).await.map_or_else(
+        || format!("no mcpls backend is running for {}\n", root.display()),
+        |backend| backend.block(),
+    ))
 }
 
 /// Every backend this user runs, ordered by checkout.

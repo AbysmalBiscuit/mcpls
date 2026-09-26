@@ -37,7 +37,7 @@ set -gx PATH /path/to/mcpls/target/debug $PATH
 
 ## One backend per checkout
 
-The `mcpls` the MCP entry launches is a small frontend. The first session in a checkout starts a backend in the background, and every later session in that checkout, from any subdirectory, attaches to it and shares its language servers. The backend exits `idle_shutdown_ms` after the last session closes (10 seconds by default; set it under `[backend]`). `mcpls backend start` keeps one running with no session attached until `mcpls backend stop` ends it or `mcpls backend auto` hands it back to its sessions, and `mcpls backend status` reports on it. `mcpls status` lists every backend running across all checkouts.
+The `mcpls` the MCP entry launches is a small frontend. The first session in a checkout starts a backend in the background, and every later session in that checkout, from any subdirectory, attaches to it and shares its language servers. The backend exits `idle_shutdown_ms` after the last session closes (10 seconds by default; set it under `[backend]`). `mcpls backend start` keeps one running with no session attached until `mcpls backend stop` ends it or `mcpls backend auto` hands it back to its sessions, and `mcpls backend status` reports on it. `mcpls status --all` lists every backend running across all checkouts.
 
 On Windows the backend is started by the plugin's hooks rather than by the frontend, so the hooks are required there. A session with no hooks installed reports that it is waiting for its backend.
 
