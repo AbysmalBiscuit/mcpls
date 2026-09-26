@@ -1577,6 +1577,7 @@ mod tests {
             name: None,
             handles: None,
             diagnostics_severity: None,
+            install: None,
         }];
         config.diagnostics.hooks = HooksConfig {
             sweep_quiet_ms: 50,

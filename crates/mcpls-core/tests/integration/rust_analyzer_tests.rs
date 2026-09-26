@@ -61,6 +61,7 @@ async fn setup_rust_analyzer() -> Arc<Mutex<Translator>> {
         name: None,
         handles: None,
         diagnostics_severity: None,
+        install: None,
     };
 
     let server_init_config = ServerInitConfig {

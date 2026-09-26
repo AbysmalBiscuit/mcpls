@@ -1093,6 +1093,7 @@ while True:
             name: None,
             handles: None,
             diagnostics_severity: None,
+            install: None,
         }];
 
         let identity = temp_identity(&root);

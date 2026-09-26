@@ -312,6 +312,7 @@ mod tests {
             name: Some(name.to_string()),
             handles: Some(vec![ToolKind::WorkspaceSymbols]),
             diagnostics_severity: None,
+            install: None,
         }
     }
 
@@ -358,6 +359,7 @@ mod tests {
             name: Some("pyright".to_string()),
             handles: Some(vec![ToolKind::Hover]),
             diagnostics_severity: None,
+            install: None,
         }];
         let router = ToolRouter::from_configs(&configs).unwrap();
         let translator = Translator::new().with_router(router);

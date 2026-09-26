@@ -429,6 +429,7 @@ mod tests {
             name: name.map(str::to_string),
             handles,
             diagnostics_severity: None,
+            install: None,
         }
     }
 
@@ -521,6 +522,7 @@ mod tests {
                 name: None,
                 handles: None,
                 diagnostics_severity: None,
+                install: None,
             },
             LspServerConfig {
                 language_id: "rust".to_string(),
@@ -536,6 +538,7 @@ mod tests {
                 name: None,
                 handles: None,
                 diagnostics_severity: None,
+                install: None,
             },
         ];
         let err = ToolRouter::from_configs(&configs).unwrap_err();

@@ -47,6 +47,46 @@ pub enum SpawnPolicy {
     Eager,
 }
 
+/// The shell command that installs a server's binary, run by
+/// `mcpls lsp install`.
+///
+/// Unix runs it with `sh -c`; Windows runs it with Windows `PowerShell`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum InstallCommand {
+    /// One shell command for every OS.
+    Any(String),
+    /// A shell command per OS family; a missing key means no command there.
+    PerOs(PerOsInstall),
+}
+
+/// Install commands that differ between Unix and Windows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PerOsInstall {
+    /// Run with `sh -c` on Linux and macOS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unix: Option<String>,
+    /// Run with Windows `PowerShell` 5.1, which chains commands with `;`
+    /// rather than `&&`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows: Option<String>,
+}
+
+impl InstallCommand {
+    /// The command for the running OS, or `None` when there is none or it
+    /// is blank.
+    #[must_use]
+    pub fn for_this_os(&self) -> Option<&str> {
+        let command = match self {
+            Self::Any(command) => Some(command),
+            Self::PerOs(per_os) if cfg!(windows) => per_os.windows.as_ref(),
+            Self::PerOs(per_os) => per_os.unix.as_ref(),
+        }?;
+        (!command.trim().is_empty()).then_some(command.as_str())
+    }
+}
+
 /// Heuristics for determining if an LSP server should be spawned.
 ///
 /// Used to prevent spawning servers in projects where they are not applicable
@@ -237,6 +277,11 @@ pub struct LspServerConfig {
     /// `None` defers to [`crate::config::DiagnosticsConfig::severity`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnostics_severity: Option<SeverityFloor>,
+
+    /// The shell command `mcpls lsp install` runs when `command` is not
+    /// installed. mcpls never runs it on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install: Option<InstallCommand>,
 }
 
 const fn default_timeout() -> u64 {
@@ -321,6 +366,7 @@ impl LspServerConfig {
             name: None,
             handles: None,
             diagnostics_severity: None,
+            install: None,
         }
     }
 
@@ -496,6 +542,12 @@ pub struct PartialLspServerConfig {
     /// `[diagnostics].severity`, which defaults to `"warning"`.
     #[serde(default)]
     pub diagnostics_severity: Option<SeverityFloor>,
+    /// The shell command `mcpls lsp install` runs when `command` is not
+    /// installed: one string for every OS, or a table with `unix` and
+    /// `windows` keys. An overlay inherits the built-in value unless
+    /// `command` is replaced; a new server defaults to none.
+    #[serde(default)]
+    pub install: Option<InstallCommand>,
 }
 
 impl PartialLspServerConfig {
@@ -522,6 +574,7 @@ impl PartialLspServerConfig {
             && self.handles.is_none()
             && self.enabled.is_none()
             && self.diagnostics_severity.is_none()
+            && self.install.is_none()
     }
 }
 
@@ -608,6 +661,7 @@ impl LspServerConfig {
             handles,
             enabled: _,
             diagnostics_severity,
+            install,
         } = partial;
 
         // A new binary does not want the old one's invocation.
@@ -616,6 +670,10 @@ impl LspServerConfig {
             self.args = Vec::new();
             self.env = HashMap::new();
             self.initialization_options = None;
+            self.install = None;
+        }
+        if let Some(install) = install {
+            self.install = Some(install);
         }
         if let Some(language_id) = language_id {
             self.language_id = language_id;
@@ -680,6 +738,7 @@ impl LspServerConfig {
             name: partial.name,
             handles: partial.handles,
             diagnostics_severity: partial.diagnostics_severity,
+            install: partial.install,
         })
     }
 }
@@ -810,6 +869,7 @@ mod tests {
             name: None,
             handles: None,
             diagnostics_severity: None,
+            install: None,
         };
 
         assert_eq!(config.language_id, "custom");
@@ -930,6 +990,7 @@ mod tests {
             name: None,
             handles: None,
             diagnostics_severity: None,
+            install: None,
         };
 
         let tmp = TempDir::new().unwrap();
@@ -1212,5 +1273,113 @@ mod tests {
         assert!(EXCLUDED_DIRECTORIES.contains(&".git"));
         assert!(EXCLUDED_DIRECTORIES.contains(&"__pycache__"));
         assert!(EXCLUDED_DIRECTORIES.contains(&".venv"));
+    }
+
+    #[test]
+    fn test_install_accepts_one_string_for_every_os() {
+        let toml = r#"
+            [[lsp_servers]]
+            language_id = "python"
+            command = "pyrefly"
+            install = "uv tool install pyrefly"
+        "#;
+        let parsed: ServerConfig = toml::from_str(toml).expect("parse");
+        let server = parsed
+            .lsp_servers
+            .iter()
+            .find(|server| server.command == "pyrefly")
+            .expect("the pyrefly server");
+        assert_eq!(
+            server.install,
+            Some(InstallCommand::Any("uv tool install pyrefly".into()))
+        );
+        assert_eq!(
+            server
+                .install
+                .as_ref()
+                .and_then(InstallCommand::for_this_os),
+            Some("uv tool install pyrefly")
+        );
+    }
+
+    #[test]
+    fn test_install_picks_the_variant_for_this_os() {
+        let install = InstallCommand::PerOs(PerOsInstall {
+            unix: Some("brew install zls".into()),
+            windows: Some("winget install zigtools.zls".into()),
+        });
+        let expected = if cfg!(windows) {
+            "winget install zigtools.zls"
+        } else {
+            "brew install zls"
+        };
+        assert_eq!(install.for_this_os(), Some(expected));
+
+        let other_os_only = if cfg!(windows) {
+            PerOsInstall {
+                unix: Some("x".into()),
+                windows: None,
+            }
+        } else {
+            PerOsInstall {
+                unix: None,
+                windows: Some("x".into()),
+            }
+        };
+        assert_eq!(InstallCommand::PerOs(other_os_only).for_this_os(), None);
+    }
+
+    #[test]
+    fn test_a_blank_install_command_is_no_command() {
+        assert_eq!(InstallCommand::Any("   ".into()).for_this_os(), None);
+    }
+
+    #[test]
+    fn test_install_rejects_an_unknown_os_key() {
+        let toml = r#"
+            [[lsp_servers]]
+            language_id = "zig"
+
+            [lsp_servers.install]
+            macos = "brew install zls"
+        "#;
+        assert!(toml::from_str::<ServerConfig>(toml).is_err());
+    }
+
+    #[test]
+    fn test_install_is_inherited_unless_command_is_replaced() {
+        let mut builtin = LspServerConfig::zls();
+        builtin.install = Some(InstallCommand::Any("get zls".into()));
+
+        let mut kept = builtin.clone();
+        kept.merge(PartialLspServerConfig {
+            timeout_seconds: Some(5),
+            ..Default::default()
+        });
+        assert_eq!(kept.install, builtin.install);
+
+        let mut replaced = builtin.clone();
+        replaced.merge(PartialLspServerConfig {
+            command: Some("other-zls".into()),
+            ..Default::default()
+        });
+        assert_eq!(replaced.install, None);
+
+        let mut set = builtin;
+        set.merge(PartialLspServerConfig {
+            command: Some("other-zls".into()),
+            install: Some(InstallCommand::Any("get other".into())),
+            ..Default::default()
+        });
+        assert_eq!(set.install, Some(InstallCommand::Any("get other".into())));
+    }
+
+    #[test]
+    fn test_builtins_carry_no_install_command() {
+        assert!(
+            LspServerConfig::builtins()
+                .iter()
+                .all(|server| server.install.is_none())
+        );
     }
 }
