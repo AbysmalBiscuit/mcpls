@@ -208,6 +208,13 @@ pub enum Command {
         action: LspCommand,
     },
 
+    /// List every backend this user runs, across all checkouts
+    ///
+    /// Prints each backend's checkout, pid, version, attached sessions,
+    /// language servers and log. Checkouts with no backend are left out.
+    /// Exits 0 whether or not any backend runs.
+    Status,
+
     /// Print the JSON Schema for `mcpls.toml` or initialize a config file
     Schema {
         /// An action to perform instead of printing the schema

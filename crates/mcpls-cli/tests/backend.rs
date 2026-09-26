@@ -922,6 +922,65 @@ fn a_forced_stop_ends_a_backend_with_a_session_attached() {
     );
 }
 
+/// `mcpls status` lists every backend this user runs, from whichever
+/// checkout it is asked, and says so when none runs.
+#[test]
+fn status_lists_every_backend_this_user_runs() {
+    let one = Project::new(60_000);
+    let two = Project::new(60_000);
+    let backend = |project: &Project, action: &str| {
+        Project::command_with_identity(&project.root(), one.runtime.path(), &one.user)
+            .arg("--config")
+            .arg(project.config())
+            .args(["backend", action])
+            .output()
+            .unwrap()
+    };
+    let status = || {
+        Project::command_with_identity(&one.root(), one.runtime.path(), &one.user)
+            .arg("status")
+            .output()
+            .unwrap()
+    };
+
+    let empty = status();
+    assert!(empty.status.success(), "{}", stdout(&empty));
+    assert_eq!(stdout(&empty), "no mcpls backend is running\n");
+
+    let logs: Vec<String> = [&one, &two]
+        .into_iter()
+        .map(|project| {
+            let started = backend(project, "start");
+            assert!(started.status.success(), "{}", stdout(&started));
+            stdout(&started)
+                .lines()
+                .find_map(|line| line.strip_prefix("log: "))
+                .expect("a start names its log")
+                .to_string()
+        })
+        .collect();
+
+    let listed = status();
+    let text = stdout(&listed);
+    assert!(listed.status.success(), "{text}");
+    for (project, log) in [&one, &two].into_iter().zip(&logs) {
+        let pid = Project::backend_pid_for(&project.root(), one.runtime.path(), &one.user)
+            .expect("a started backend");
+        let row = text
+            .lines()
+            .find(|line| line.starts_with(&project.root().display().to_string()))
+            .unwrap_or_else(|| panic!("no row for {}: {text}", project.root().display()));
+        assert!(row.contains(&pid.to_string()), "{text}");
+        assert!(text.contains(log.as_str()), "{text}");
+    }
+
+    for project in [&one, &two] {
+        let stopped = backend(project, "stop");
+        assert!(stopped.status.success(), "{}", stdout(&stopped));
+    }
+    assert_eq!(stdout(&status()), "no mcpls backend is running\n");
+}
+
 /// A stopped server stays down through a tool call, and start and
 /// restart each launch one fresh process and retire the one before.
 #[cfg(unix)]

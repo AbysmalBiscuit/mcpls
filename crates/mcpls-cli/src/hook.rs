@@ -572,7 +572,7 @@ async fn doctor_scanning(
 }
 
 /// A refusal as the doctor prints it.
-fn refusal_text(refusal: Option<&mcpls_core::backend::Refusal>) -> String {
+pub fn refusal_text(refusal: Option<&mcpls_core::backend::Refusal>) -> String {
     use mcpls_core::backend::Refusal;
     match refusal {
         Some(Refusal::Build) => "the two builds differ".to_string(),

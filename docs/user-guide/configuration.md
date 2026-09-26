@@ -1071,6 +1071,9 @@ mcpls backend stop
 # Stop keeping it, and let it exit on its idle timer once sessions leave
 mcpls backend auto
 
+# List every backend running on this machine for this user
+mcpls status
+
 # HTTP transport (requires transport-http feature)
 mcpls --listen 127.0.0.1:3000
 mcpls --listen 127.0.0.1:3000 --http-path /api/mcp
