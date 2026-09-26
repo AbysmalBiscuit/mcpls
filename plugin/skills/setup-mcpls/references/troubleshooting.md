@@ -10,6 +10,7 @@ Start with `mcpls doctor`: it shows whether a backend is running, which configur
 | A request times out | Raise that server's `request_timeout_seconds` (per request) or `timeout_seconds` (handshake) in `mcpls.toml`. |
 | "no LSP server configured for language: ..." | No `[[lsp_servers]]` entry covers the file's language. Add one, or map the extension in `language_extensions`. See [configuration.md](configuration.md). |
 | "failed to spawn LSP server '...'" or "LSP server '...' is unavailable" | The server's `command` is not on `PATH`, or it crashed. Install it, or give `command` an absolute path. |
+| `mcpls doctor` reports a server "not installed ...; run `mcpls lsp install <id>`" | The configuration carries an install command for that server. Run the command the doctor names. If it then reports the binary still not on `PATH`, the installer changed `PATH` for new shells only: open a new shell and restart the agent session. |
 | "no server handles tool '...'" | No server claims that tool through `handles`, and the language has no catch-all server. See [routing.md](routing.md#rules). |
 | mcpls refuses to start, naming two `[[lsp_servers]]` entries | Two servers for one language overlap in this workspace and collide on routing. See [routing.md](routing.md#ambiguous-configs-fail-at-startup). |
 | A checkout's `mcpls.toml` has no effect | It is untrusted, or another file wins the search. See [config-loading.md](config-loading.md). |

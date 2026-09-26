@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use mcpls_core::bridge::{HookAgent, HookHost};
+use mcpls_core::config::InstallCommand;
 use mcpls_core::hooks::protocol::ServerStatus;
 use mcpls_core::hooks::{
     ChangeEvent, ProbeOutcome, Request, Response, SocketIdentity, WatcherStatus, probe, send,
@@ -716,11 +717,14 @@ fn server_reports(
                     server.command
                 )
             });
-            reports.push(ServerReport {
-                state: format!("not installed: {} is not on PATH", server.command),
-                id,
-                problem,
-            });
+            let hint = server
+                .install
+                .as_ref()
+                .and_then(InstallCommand::for_this_os)
+                .map(|_| format!("; run `mcpls lsp install {id}`"))
+                .unwrap_or_default();
+            let state = format!("not installed: {} is not on PATH{hint}", server.command);
+            reports.push(ServerReport { id, state, problem });
         }
     }
 
