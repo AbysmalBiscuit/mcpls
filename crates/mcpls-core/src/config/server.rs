@@ -67,8 +67,8 @@ pub struct PerOsInstall {
     /// Run with `sh -c` on Linux and macOS.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unix: Option<String>,
-    /// Run with Windows `PowerShell` 5.1, which chains commands with `;`
-    /// rather than `&&`.
+    /// Run with Windows `PowerShell` 5.1, which has no `&&`; its `;` runs
+    /// the next command even after a failure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub windows: Option<String>,
 }

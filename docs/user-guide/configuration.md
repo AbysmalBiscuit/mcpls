@@ -637,7 +637,7 @@ unix = "brew install zls"
 windows = "winget install zigtools.zls"
 ```
 
-Unix runs the command with `sh -c`. Windows runs it with Windows PowerShell 5.1, which has no `&&`, so chain Windows commands with `;`. The command runs in the checkout root with mcpls's own environment; the server's `env` table does not apply. An overlay inherits a built-in's `install` unless it replaces `command`.
+Unix runs the command with `sh -c`. Windows runs it with Windows PowerShell 5.1, which has no `&&`. Its `;` runs the next command even when one fails, so a failed installer followed by another step reports `installed, but ... is still not on PATH` instead of the failure. Put the installer last, or stop after a failed step with `if (-not $?) { exit 1 }`. The command runs in the checkout root with mcpls's own environment; the server's `env` table does not apply. An overlay inherits a built-in's `install` unless it replaces `command`.
 
 An install command runs arbitrary code, the same as `command` does, so one in a checkout-root `mcpls.toml` counts only with `--trust-project-config`.
 

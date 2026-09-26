@@ -66,7 +66,7 @@ pub struct PerOsInstall {
 
 ## Trust
 
-Install commands come from whichever config tier wins for the directory, resolved the way `mcpls config` resolves it and honoring `--config` and `--trust-project-config`. A checkout-root `mcpls.toml` loads only with `--trust-project-config`, the gate that already guards `command`, so an untrusted checkout cannot make `mcpls lsp install` run anything.
+Install commands come from whichever config tier wins for the directory, resolved the way `mcpls config` resolves it and honoring `--config` and `--trust-project-config`. A checkout-root `mcpls.toml` loads only with `--trust-project-config`, the gate that already guards `command`, so an untrusted checkout cannot make `mcpls lsp install` run anything. When the resolution skipped a checkout-root `mcpls.toml`, the report says so with the line `mcpls doctor` prints, because a fresh checkout's own config is the likeliest home for install commands.
 
 ## CLI
 
@@ -90,7 +90,7 @@ Each command runs to completion before the next starts, because package managers
 ==> python: uv tool install pyrefly
 ```
 
-The command runs with inherited stdio, so installer output and prompts reach the terminal. Unix runs `sh -c <command>`. Windows runs `powershell -NoProfile -EncodedCommand <base64 of the UTF-16LE command>`, because Windows argument quoting mangles double quotes on their way into `-Command`. That shell is Windows PowerShell 5.1, which has no `&&`, so a Windows command chains with `;`. The working directory is the checkout root and the environment is the CLI's own. The server's `env` table does not apply, since it describes the server process.
+The command runs with inherited stdio, so installer output and prompts reach the terminal. Unix runs `sh -c <command>`. Windows runs `powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand <base64 of the UTF-16LE command>`. The command is encoded because Windows argument quoting mangles double quotes on their way into `-Command`, and the execution policy is bypassed because package managers such as npm install `.ps1` shims the default policy refuses. That shell is Windows PowerShell 5.1, which has no `&&`, and its `;` runs the next command even after a failure, so the docs tell a Windows command to put the installer last or stop with `if (-not $?) { exit 1 }`. The working directory is the checkout root and the environment is the CLI's own. The server's `env` table does not apply, since it describes the server process.
 
 After a command exits 0, the CLI resolves the binary again. When it still does not resolve, the installer most likely changed `PATH` only for new shells, as winget and rustup do. The report says so and suggests opening a new shell.
 
@@ -98,7 +98,7 @@ After a command exits 0, the CLI resolves the binary again. When it still does n
 
 ### Backend nudge
 
-When the installs finish, the CLI probes the checkout's backend. If one answers, it sends `Request::Lsp { action: Start, servers }` naming each server whose binary now resolves, and does not wait for them to settle. The backend lifecycle already allows `not installed` to `starting`. When no backend answers, the CLI skips the nudge silently.
+When the installs finish, the CLI probes the checkout's backend. If one answers, it sends `Request::Lsp { action: Start, servers }` naming each server this run installed, and does not wait for them to settle. A server reported `already installed` is left alone, so the nudge never restarts a server someone stopped with `mcpls lsp stop`. The backend lifecycle already allows `not installed` to `starting`. When no backend answers, the CLI skips the nudge silently.
 
 ### Report and exit status
 

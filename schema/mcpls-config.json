@@ -348,7 +348,7 @@
           ]
         },
         "windows": {
-          "description": "Run with Windows `PowerShell` 5.1, which chains commands with `;`\nrather than `&&`.",
+          "description": "Run with Windows `PowerShell` 5.1, which has no `&&`; its `;` runs\nthe next command even after a failure.",
           "type": [
             "string",
             "null"
