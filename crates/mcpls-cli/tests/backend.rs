@@ -245,6 +245,28 @@ impl Project {
         self
     }
 
+    /// The lifecycle server behind `bin/fake-ls`, which is missing until
+    /// the entry's install command writes it.
+    #[cfg(unix)]
+    fn with_installable_lifecycle_server(self) -> Self {
+        std::fs::write(self.root().join("marker.fake"), "").unwrap();
+        std::fs::write(self.root().join("a.fake"), "").unwrap();
+        let script = self.root().join("lifecycle_lsp.py");
+        std::fs::write(&script, LIFECYCLE_LSP).unwrap();
+        let install = "mkdir -p bin && printf '#!/bin/sh\\nexec python3 \"$@\"\\n' > bin/fake-ls \
+                       && chmod +x bin/fake-ls";
+        self.write_config(
+            60_000,
+            &format!(
+                "\n[[lsp_servers]]\nlanguage_id = \"fake\"\ncommand = {:?}\nargs = [{:?}, {:?}]\nfile_patterns = [\"**/*.fake\"]\ntimeout_seconds = 10\ninstall = {install:?}\n\n[lsp_servers.heuristics]\nproject_markers = [\"marker.fake\"]\n",
+                self.root().join("bin").join("fake-ls").display().to_string(),
+                script.display().to_string(),
+                self.lifecycle_log().display().to_string(),
+            ),
+        );
+        self
+    }
+
     #[cfg(unix)]
     fn lifecycle_events(&self, kind: &str) -> Vec<u32> {
         std::fs::read_to_string(self.lifecycle_log())
@@ -1077,6 +1099,29 @@ fn lsp_commands_name_the_servers_that_apply_when_given_an_unknown_one() {
         stdout(&start),
         "no language server named nope applies here; these do: fake\n"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn lsp_install_starts_the_installed_server_in_a_running_backend() {
+    let project = Project::new(60_000).with_installable_lifecycle_server();
+    let mut frontend = project.frontend();
+    project.assert_attaches(&mut frontend);
+    project.wait_for("the server to be recorded missing", |p| {
+        stdout(&p.lsp(&["status"])).contains("fake  not installed")
+    });
+
+    let install = project.lsp(&["install", "fake"]);
+    assert!(install.status.success(), "{}", stdout(&install));
+    assert!(
+        stdout(&install).ends_with("fake  installed\n"),
+        "{}",
+        stdout(&install)
+    );
+
+    project.wait_for("the backend to start it", |p| {
+        stdout(&p.lsp(&["status"])).contains("fake  running")
+    });
 }
 
 #[test]

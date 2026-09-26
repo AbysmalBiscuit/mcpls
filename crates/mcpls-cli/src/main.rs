@@ -492,6 +492,12 @@ async fn run_install(args: &Args, targets: &LspTargets, dry_run: bool) -> lsp::O
         hook::resolve_program(program, &root).is_some()
     })
     .await;
+    let installed = results
+        .iter()
+        .filter(|(_, status)| *status == install::Status::Installed)
+        .map(|(id, _)| id.clone())
+        .collect();
+    install::nudge(&root, installed).await;
     let success = planned
         .iter()
         .zip(&results)

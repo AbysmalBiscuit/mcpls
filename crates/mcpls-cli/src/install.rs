@@ -4,9 +4,15 @@
 use std::fmt::{self, Write as _};
 use std::io::Write as _;
 use std::path::Path;
+use std::time::Duration;
 
 use mcpls_core::ServerConfig;
+use mcpls_core::bridge::LspAction;
 use mcpls_core::config::InstallCommand;
+use mcpls_core::hooks::{Request, probe};
+
+/// As long as `mcpls lsp start` waits for the backend to answer.
+const NUDGE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// One language server `mcpls lsp install` considers.
 #[derive(Debug)]
@@ -145,6 +151,23 @@ pub async fn install(
         results.push((target.id.clone(), status));
     }
     results
+}
+
+/// Ask the backend serving `root`, if one answers, to start the servers
+/// just installed. Without a backend there is nothing to start, and the
+/// answer changes nothing the report says, so neither is printed.
+pub async fn nudge(root: &Path, installed: Vec<String>) {
+    if installed.is_empty() {
+        return;
+    }
+    let Ok(identity) = mcpls_core::hooks::identity_for(root) else {
+        return;
+    };
+    let request = Request::Lsp {
+        action: LspAction::Start,
+        servers: installed,
+    };
+    let _ = probe(&identity, &request, NUDGE_TIMEOUT).await;
 }
 
 /// One line per target, id then outcome.
