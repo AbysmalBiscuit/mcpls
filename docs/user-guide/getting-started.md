@@ -90,8 +90,7 @@ mcpls works zero-config for Rust projects (uses rust-analyzer by default). For o
 mcpls searches for configuration in:
 1. Path specified by `--config` flag
 2. `$MCPLS_CONFIG` environment variable
-3. `./mcpls.toml` (current directory) — requires `--trust-project-config` (see
-   [Configuration Reference](configuration.md#trusting-a-project-local-config))
+3. `mcpls.toml` at the checkout root, only with `--trust-project-config`, which `mcpls help --full` explains
 4. Platform user-config directory:
    - Linux: `$XDG_CONFIG_HOME/mcpls/mcpls.toml`, else `~/.config/mcpls/mcpls.toml`
    - macOS: `~/Library/Application Support/mcpls/mcpls.toml`
@@ -112,7 +111,7 @@ language_id = "rust"
 timeout_seconds = 60
 ```
 
-See [Configuration Reference](configuration.md#lsp-server-configuration) for the full merge semantics and every field.
+See [Configuration Reference](config-reference.md#lsp_servers) for the full merge semantics and every field.
 
 ## Example Usage
 
@@ -188,7 +187,7 @@ brew install llvm
 
 ## Next Steps
 
-- [Configuration Guide](configuration.md) - Detailed configuration options
+- [Configuration Guide](config-reference.md) - Detailed configuration options
 - [Tools Reference](tools-reference.md) - Documentation for each MCP tool
 - [Troubleshooting](troubleshooting.md) - Common issues and solutions
 
@@ -206,7 +205,7 @@ Yes! Configure as many language servers as needed in `mcpls.toml`. mcpls will ro
 
 Not unless you configure it to. With no `[apply]` table in `mcpls.toml`, every tool is read-only: `rename_symbol` and `format_document` return an edit for you to read, `apply_code_action` refuses, and nothing on disk changes.
 
-Enabling a key in that table lets the language server write to your working tree through the matching tool, and there is no undo. See [Apply Section](configuration.md#apply-section).
+Enabling a key in that table lets the language server write to your working tree through the matching tool, and there is no undo. See [Apply Section](config-reference.md#apply).
 
 ### Can I use mcpls with other MCP clients?
 

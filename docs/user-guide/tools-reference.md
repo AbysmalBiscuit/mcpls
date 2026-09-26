@@ -6,7 +6,7 @@ Complete reference for the MCP tools provided by mcpls.
 
 mcpls exposes semantic code intelligence from Language Server Protocol (LSP) servers as MCP tools. Each tool corresponds to one or more LSP methods and provides rich code information to AI agents.
 
-Most tools only read. Three can write to your source tree, and only when the `[apply]` table in `mcpls.toml` permits it: `rename_symbol` and `format_document` take an `apply` parameter, and `apply_code_action` exists to write. With no `[apply]` table, all three refuse the write and every other tool is unaffected. See [Apply Section](configuration.md#apply-section) for what enabling it lets a language server do, and for the fact that there is no undo.
+Most tools only read. Three can write to your source tree, and only when the `[apply]` table in `mcpls.toml` permits it: `rename_symbol` and `format_document` take an `apply` parameter, and `apply_code_action` exists to write. With no `[apply]` table, all three refuse the write and every other tool is unaffected. See [Apply Section](config-reference.md#apply) for what enabling it lets a language server do, and for the fact that there is no undo.
 
 ## Tool Index
 
@@ -735,7 +735,7 @@ Claude: [Uses get_code_actions] Available fixes:
 
 Apply one of the actions `get_code_actions` listed, writing its edits to disk.
 
-Requires `apply.code_actions = true` in `mcpls.toml`; without it the call fails naming that key and nothing is written. This is the widest of the three write paths: an action can create, move, or delete files as well as edit them, and it can carry a command the server runs itself, which may send further edits back while it runs. See [Apply Section](configuration.md#apply-section).
+Requires `apply.code_actions = true` in `mcpls.toml`; without it the call fails naming that key and nothing is written. This is the widest of the three write paths: an action can create, move, or delete files as well as edit them, and it can carry a command the server runs itself, which may send further edits back while it runs. See [Apply Section](config-reference.md#apply).
 
 ### Parameters
 
@@ -1321,5 +1321,5 @@ Common error scenarios:
 ## Next Steps
 
 - [Getting Started](getting-started.md) - Quick start guide
-- [Configuration](configuration.md) - Configure language servers
+- [Configuration](config-reference.md) - Configure language servers
 - [Troubleshooting](troubleshooting.md) - Common issues and solutions

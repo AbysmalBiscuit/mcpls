@@ -14,16 +14,41 @@ metadata:
 
 mcpls is one Rust binary that speaks LSP to real language servers such as rust-analyzer, pyright, gopls, and clangd, and exposes them to an agent as MCP tools. It does no language analysis itself: a language whose server is missing from `PATH` or from the config has no code intelligence, while the other languages keep working.
 
-The binary is the source of truth for its own surface. `mcpls --help` lists every flag, environment variable, and subcommand. `mcpls schema` prints the JSON Schema for `mcpls.toml`. `mcpls doctor` reports the running backend, its sessions, and which language servers apply here and are installed. `mcpls config` prints the configuration resolved for a directory.
+The binary documents itself. Ask it before reading anything else:
+
+| Question | Command |
+|---|---|
+| Flags, `MCPLS_*` variables, subcommands, exit codes | `mcpls help --full` |
+| Every `mcpls.toml` key: its type, default, and rules | `mcpls schema` |
+| The configuration resolved for a directory, and which file set each value | `mcpls config --origin` |
+| The running backend, its sessions, and which language servers apply and are installed | `mcpls doctor` |
+| A starter `mcpls.toml` with every setting commented out | `mcpls schema init` |
+
+## Registering with an MCP client
+
+stdio works with every build:
+
+```json
+{
+  "mcpServers": {
+    "mcpls": {
+      "command": "mcpls",
+      "args": []
+    }
+  }
+}
+```
+
+To load a trusted checkout's `mcpls.toml`, put `"--trust-project-config"` in that entry's `args` rather than exporting `MCPLS_TRUST_PROJECT_CONFIG`, which trusts every checkout the shell launches mcpls in. MCP servers start without a login shell, so when the client cannot find `mcpls`, give `command` the binary's absolute path.
+
+## References
 
 Read the reference for the task in front of you:
 
 | Task | Read |
 |---|---|
 | Installing or updating the binary, or building with `transport-http` | [references/install.md](references/install.md) |
-| Registering mcpls with an MCP client, picking flags or `MCPLS_*` variables, serving over HTTP | [references/cli.md](references/cli.md) |
 | Finding which `mcpls.toml` loads, or why a checkout's `mcpls.toml` is ignored | [references/config-loading.md](references/config-loading.md) |
-| Writing `mcpls.toml`: the starter config, server, workspace, and backend fields | [references/configuration.md](references/configuration.md) |
 | Running several servers for one language, or sending a tool to a specific server | [references/routing.md](references/routing.md) |
 | Letting rename, formatting, or code actions write to disk | [references/apply.md](references/apply.md) |
 | Tuning diagnostic severity, volume, write-tool footers, or hook timing | [references/diagnostics.md](references/diagnostics.md) |

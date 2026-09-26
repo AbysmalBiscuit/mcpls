@@ -129,9 +129,11 @@ impl InstallCommand {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ServerHeuristics {
-    /// Files or directories that make the server applicable. Any match starts
-    /// it, searched through `workspace.heuristics_max_depth` (default: `10`).
-    /// An omitted list inherits for built-ins; no markers means always applicable.
+    /// Files or directories that make the server applicable, such as
+    /// `pyproject.toml`. Any match counts, searched through
+    /// `workspace.heuristics_max_depth` levels, skipping directories such as
+    /// `node_modules`, `target`, and `.git`. An omitted list inherits for
+    /// built-ins; no markers means always applicable.
     #[serde(default)]
     pub project_markers: Vec<String>,
 }
@@ -515,13 +517,16 @@ impl LspServerConfig {
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PartialLspServerConfig {
-    /// Language identifier used to match a built-in. Required for a new entry
-    /// unless `name` identifies it; for a new named server, an omitted value
-    /// uses `name` as its language identifier.
+    /// The language this server serves, such as `rust` or `python`, and
+    /// the identity used to find a built-in when `name` is absent. Required
+    /// for a new entry unless `name` identifies it; for a new named server,
+    /// an omitted value uses `name` as its language identifier.
     #[serde(default)]
     pub language_id: Option<String>,
-    /// Command to start the LSP server. An overlay inherits the built-in
-    /// command when omitted; a new server must set it.
+    /// The executable that starts the server, found on `PATH` or given as
+    /// an absolute path. An overlay inherits the built-in command when
+    /// omitted; a new server must set it. Setting it on an overlay clears the
+    /// built-in's `args`, `env`, `initialization_options`, and `install`.
     #[serde(default)]
     pub command: Option<String>,
     /// Arguments to pass to the command. An overlay inherits these from its
@@ -529,58 +534,106 @@ pub struct PartialLspServerConfig {
     /// becomes `[]`. A new server also defaults to `[]`.
     #[serde(default)]
     pub args: Option<Vec<String>>,
-    /// Environment variables for the server process. An overlay inherits
+    /// Variables added to the server's environment. An overlay inherits
     /// these from its built-in unless `command` is replaced, in which case an
     /// omitted value becomes `{}`. A new server also defaults to `{}`.
+    ///
+    /// The server does not inherit mcpls's environment. It gets a short
+    /// allowlist, `PATH`, `HOME`, `USERPROFILE`, the temp directory variables,
+    /// and the Windows variables its loader needs, and these entries go on
+    /// top. Setting `PATH` replaces the passed-through value, and on Unix a
+    /// bare `command` must then be found on your `PATH`, so prefer an
+    /// absolute `command` to adding a directory.
     #[serde(default)]
     pub env: Option<HashMap<String, String>>,
-    /// File patterns this server handles. An overlay inherits the built-in
-    /// patterns; a new server defaults to `[]`.
+    /// Globs for the files this server handles, such as `**/*.rs`. An
+    /// overlay inherits the built-in patterns; a new server defaults to `[]`,
+    /// which is valid when `workspace.language_extensions` maps its language
+    /// or it handles only `workspace_symbols`.
     #[serde(default)]
     pub file_patterns: Option<Vec<String>>,
-    /// Server-specific initialization options. Replaces the built-in's
+    /// Server-specific options sent in the LSP `initialize` request, such
+    /// as `cargo.features = "all"` for rust-analyzer. Replaces the built-in's
     /// value rather than merging into it. An overlay inherits the built-in
     /// value unless `command` is replaced; a new server defaults to no
     /// initialization options.
     #[serde(default)]
     pub initialization_options: Option<serde_json::Value>,
-    /// Handshake timeout in seconds. An overlay inherits the built-in value;
-    /// a new server defaults to `30` seconds.
+    /// Timeout for the `initialize` handshake alone, in seconds. Raise it
+    /// for a server that loads a large project before answering. Rejects
+    /// `0`. An overlay inherits the built-in value; a new server defaults to
+    /// `30` seconds.
     #[serde(default)]
     pub timeout_seconds: Option<u64>,
     /// When this server starts, overriding `[backend] spawn`. When omitted,
-    /// it follows `[backend] spawn`, which defaults to `"lazy"`.
+    /// it follows `[backend] spawn`, which defaults to `"lazy"`. Eager suits
+    /// a server whose index is slow enough that the first request should not
+    /// wait on it.
     #[serde(default)]
     pub spawn: Option<SpawnPolicy>,
-    /// Per-request timeout in seconds. An overlay inherits the built-in
-    /// value; a new server defaults to `30` seconds.
+    /// Timeout for each LSP request after initialization, in seconds,
+    /// independent of `timeout_seconds`. Rejects `0`. An overlay inherits the
+    /// built-in value; a new server defaults to `30` seconds.
+    ///
+    /// A request answered with content-modified (`-32802`) is retried, up to
+    /// four attempts with 3.5 seconds of backoff in all, so one tool call can
+    /// take `4 * request_timeout_seconds + 3.5s`, plus `timeout_seconds` when
+    /// the server has to restart first. Completions are capped at 10 seconds
+    /// whatever this says.
     #[serde(default)]
     pub request_timeout_seconds: Option<u64>,
-    /// Spawn heuristics. An overlay inherits the built-in markers; a new
-    /// server without markers always attempts to spawn.
+    /// Which workspaces this server applies to. An overlay inherits the
+    /// built-in markers; a new server without markers always applies.
     #[serde(default)]
     pub heuristics: Option<ServerHeuristics>,
     /// Routing identity. An overlay inherits the built-in value; when absent
     /// on a new server, `language_id` is used.
+    ///
+    /// Two servers for one `language_id` that apply at once each need their
+    /// own identity. A `name` gives an entry its own, so the built-in for that
+    /// language keeps running beside it unless an entry disables it.
     #[serde(default)]
     pub name: Option<String>,
     /// Tools this server handles. An overlay inherits the built-in value; a
-    /// new server without a list handles every unclaimed tool.
+    /// new server without a list is its language's catch-all, handling every
+    /// tool no other server claims.
+    ///
+    /// A language may have one catch-all, and a tool may be claimed by one
+    /// server per language; a config that breaks either for two servers that
+    /// both apply fails at startup, naming the entries. `rename` routes
+    /// `rename_symbol`, `workspace_symbols` routes `workspace_symbol_search`,
+    /// `call_hierarchy` routes all three call hierarchy tools, and
+    /// `diagnostics` routes both diagnostics tools. A tool whose server has no
+    /// binary moves to the catch-all. `workspace_symbols` has no document to
+    /// route by, so it goes to the first server anywhere that claims it, else
+    /// the first catch-all.
     #[serde(default)]
     pub handles: Option<Vec<ToolKind>>,
     /// Set to `false` to drop the server this entry names. Omission leaves an
-    /// existing server enabled and enables a new server by default.
+    /// existing server enabled and enables a new server by default. Entries
+    /// fold top to bottom, so it removes whatever has this identity at that
+    /// point, including an earlier entry of your own.
     #[serde(default)]
     pub enabled: Option<bool>,
-    /// The least severe diagnostic worth delivering from this server. An
-    /// overlay inherits the built-in value; a new server without one uses
+    /// The least severe diagnostic worth delivering from this server;
+    /// `"off"` mutes it without disabling it. An overlay inherits the
+    /// built-in value; a new server without one uses
     /// `[diagnostics].severity`, which defaults to `"warning"`.
     #[serde(default)]
     pub diagnostics_severity: Option<SeverityFloor>,
     /// The shell command `mcpls lsp install` runs when `command` is not
     /// installed: one string for every OS, or a table with `unix` and
     /// `windows` keys. An overlay inherits the built-in value unless
-    /// `command` is replaced; a new server defaults to none.
+    /// `command` is replaced; a new server defaults to none, and the
+    /// built-ins carry none.
+    ///
+    /// It runs in the checkout root with mcpls's own environment; the
+    /// server's `env` does not apply. Windows runs it with Windows
+    /// `PowerShell` 5.1, which has no `&&`, and whose `;` runs the next
+    /// command after a failure, so put the installer last or follow a step
+    /// with `if (-not $?) { exit 1 }`. It runs arbitrary code like `command`,
+    /// so one in a checkout's `mcpls.toml` counts only with
+    /// `--trust-project-config`.
     #[serde(default)]
     pub install: Option<InstallCommand>,
 }

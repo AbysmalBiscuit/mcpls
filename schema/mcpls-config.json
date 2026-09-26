@@ -6,22 +6,22 @@
       "properties": {
         "allow_file_deletion": {
           "default": false,
-          "description": "Operations that destroy a file's content inside an otherwise\npermitted `WorkspaceEdit` are honored: an explicit delete, a create\nthat overwrites an existing file, and a rename onto an existing\ndestination, all of which leave nothing of what was there. Gates all\nthree for every tool above rather than any one of them, because\nlosing a file is not the kind of mistake a bad edit is.",
+          "description": "Permits operations that destroy a file's content: an explicit\ndelete, a create that overwrites an existing file, and a rename onto\nan existing destination. Gates all three for every tool above, because\nlosing a file is not the kind of mistake a bad edit is. Without it, an\nedit containing any of them is refused whole.",
           "type": "boolean"
         },
         "code_actions": {
           "default": false,
-          "description": "`apply_code_action` may apply a resolved action.",
+          "description": "Enables `apply_code_action`, which applies one action from a\n`get_code_actions` listing. The widest of the three: an action can\ncreate, move, or delete files, and can carry a command the server runs\nitself, whose edits mcpls applies through the same checks. An action\nthe server resolves lazily shows its edit only when applied.",
           "type": "boolean"
         },
         "format_document": {
           "default": false,
-          "description": "`format_document` may apply its edits.",
+          "description": "Lets `format_document` write its edits when called with\n`apply: true`. The write stays inside the file named.",
           "type": "boolean"
         },
         "rename": {
           "default": false,
-          "description": "`rename_symbol` may apply its `WorkspaceEdit`.",
+          "description": "Lets `rename_symbol` write its edit when called with `apply: true`.\nA rename usually rewrites every file that references the symbol, not\nonly the one named.",
           "type": "boolean"
         }
       },
@@ -33,7 +33,7 @@
       "properties": {
         "idle_shutdown_ms": {
           "default": 10000,
-          "description": "How long a backend with no session attached waits before it exits.\n\nShort by default so memory returns to the machine soon after the\nlast session closes. The cost of short is a cold reindex for a\nsession that opens just after the timer; raise it when sessions\nalternate quickly.",
+          "description": "How long a backend with no session attached waits before it exits.\nHook connections do not keep it alive. A backend kept by\n`mcpls backend start` ignores this until `mcpls backend stop` or\n`mcpls backend auto`.\n\nShort by default so memory returns to the machine soon after the\nlast session closes. The cost of short is a cold reindex for a\nsession that opens just after the timer; raise it when sessions\nalternate quickly.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -41,7 +41,7 @@
         "spawn": {
           "$ref": "#/$defs/SpawnPolicy",
           "default": "lazy",
-          "description": "When this backend's language servers start.\n\nLazy holds a server back until the session touches its language,\nwhich keeps a checkout's unused languages out of memory. Eager\nstarts every applicable server with the backend."
+          "description": "When this backend's language servers start. A server's own `spawn`\noverrides it.\n\nLazy holds a server back until the session touches its language,\nthrough a file the agent's hooks report or a tool call, which keeps a\ncheckout's unused languages out of memory. Eager starts every\napplicable server with the backend."
         }
       },
       "type": "object"
@@ -52,7 +52,7 @@
       "properties": {
         "enabled": {
           "default": true,
-          "description": "Whether a session starts with a note naming the language servers\nthat serve its checkout and pointing it at the mcpls tools.\n\nDefaults on, because reaching this configuration means installing\nthe plugin and installing the plugin is the opt-in. With it off, an\nagent learns mcpls exists only from its tool list, or from\ninstructions the user writes.",
+          "description": "Whether a session starts with a note naming the language servers\nthat serve its checkout and pointing it at the mcpls tools.\n\nDefaults on, because reaching this configuration means installing\nthe plugin and installing the plugin is the opt-in. With it off, an\nagent learns mcpls exists only from its tool list, or from\ninstructions the user writes. A checkout no installed server applies\nto gets no note either way.",
           "type": "boolean"
         }
       },
@@ -64,33 +64,33 @@
       "properties": {
         "footer": {
           "default": false,
-          "description": "Whether the tools that write append their new diagnostics to their\nown result.",
+          "description": "Whether the tools that write append the diagnostics their own edit\ncaused to their result.",
           "type": "boolean"
         },
         "footer_grace_ms": {
           "default": 250,
-          "description": "How long a footer waits before it starts looking for quiet.\n\nrust-analyzer's flycheck begins about 90 ms after a `didSave`, and a\nfooter that checks before then sees a quiet workspace and reports\nthe state from before the edit.",
+          "description": "How long a footer waits before it starts looking for quiet.\n\nA footer that checks before the language servers react to the write\nsees a quiet workspace and reports the state from before the edit;\nrust-analyzer's flycheck begins about 90 ms after a save.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "footer_quiet_ms": {
           "default": 200,
-          "description": "How long nothing may be outstanding before a footer calls it done.\n\nShorter than `settle_quiet_ms`, which exists to bridge the 70 to 100\nmillisecond gaps between rust-analyzer's startup phases. A footer\nnever sees those; what it bridges is the cancel-and-restart between\ntwo saves landing back to back.",
+          "description": "How long nothing may be outstanding before a footer calls it done.\n\nShorter than `settle_quiet_ms`, which bridges gaps between startup\nphases a footer never sees. What a footer bridges is the\ncancel-and-restart between two writes landing back to back.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "footer_wait_ms": {
           "default": 15000,
-          "description": "How long a footer waits in total before reporting what it has.\n\nSized against a real build rather than against patience: a no-op\ntouch in this repository's largest crate costs about 4.3 seconds of\n`cargo check`, measured, so a five second cap would expire on every\nrename there and report the pre-edit state. The wait is gated on\nprogress rather than on a timer, so a fast workspace still returns\nin about a second and the high cap costs it nothing.",
+          "description": "How long a footer waits in total, `footer_grace_ms` included, before\nreporting what it has. A wait that never goes quiet is sampled every\n50 ms, so it can run up to 50 ms past this.\n\nSize it to outlast a real build of the workspace, or the footer\nreports the state from before the edit. The wait ends when the servers\ngo quiet, so a high cap costs a fast workspace nothing.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "hooks": {
           "$ref": "#/$defs/HooksConfig",
-          "description": "How the Claude Code hooks reach this process."
+          "description": "How the agent's hooks reach the backend."
         },
         "max_per_file": {
           "default": 10,
@@ -108,14 +108,14 @@
         },
         "record_grace_ms": {
           "default": 60000,
-          "description": "How long an unprotected delivery record survives without hook activity.\nZero expires it immediately once no connection protects it.",
+          "description": "How long a delivery record survives without hook activity once no\nhook connection protects it. `0` expires it at once.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "settle_deadline_ms": {
           "default": 300000,
-          "description": "How long to wait for that quiet before giving up and baselining\nanyway. Bounds the damage from a server that never finishes, or from\na progress notification dropped before its pump existed.\n\nCounted from the moment the language servers are spawned, so it\ncovers indexing rather than the handshake that precedes it. It must\noutlast a full index of the workspace: firing before that captures a\npartial baseline, and every file analyzed afterwards then reads as\nnewly changed.",
+          "description": "How long to wait for the quiet `settle_quiet_ms` asks for before\ngiving up and baselining anyway. Bounds the damage from a server that never finishes, or from\na progress notification dropped before its pump existed.\n\nCounted from when the language servers finish starting, so the\nhandshake spends none of it. It must outlast a full index of the\nworkspace: firing before that captures a partial baseline, and every\nfile analyzed afterwards then reads as newly changed.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -130,7 +130,7 @@
         "severity": {
           "$ref": "#/$defs/SeverityFloor",
           "default": "warning",
-          "description": "The least severe diagnostic worth delivering, for any server that\ndoes not set its own."
+          "description": "The least severe diagnostic worth delivering, for any applicable\nserver that does not set its own `diagnostics_severity`. A diagnostic\nwith no severity clears every floor but `\"off\"`, since LSP makes\nseverity optional."
         }
       },
       "type": "object"
@@ -179,14 +179,14 @@
       "description": "Maps file extensions to LSP language identifiers.\n\nUsed to detect the language ID for files based on their extension.\nExtensions are mapped to language IDs like \"rust\", \"python\", \"cpp\", etc.",
       "properties": {
         "extensions": {
-          "description": "Array of extensions and their corresponding language ID.",
+          "description": "File extensions, without the dot.",
           "items": {
             "type": "string"
           },
           "type": "array"
         },
         "language_id": {
-          "description": "Language ID to report to the LSP server.",
+          "description": "The language ID reported to the server for these extensions.",
           "type": "string"
         }
       },
@@ -211,7 +211,7 @@
           ]
         },
         "command": {
-          "description": "Command to start the LSP server. An overlay inherits the built-in\ncommand when omitted; a new server must set it.",
+          "description": "The executable that starts the server, found on `PATH` or given as\nan absolute path. An overlay inherits the built-in command when\nomitted; a new server must set it. Setting it on an overlay clears the\nbuilt-in's `args`, `env`, `initialization_options`, and `install`.",
           "type": [
             "string",
             "null"
@@ -226,10 +226,10 @@
               "type": "null"
             }
           ],
-          "description": "The least severe diagnostic worth delivering from this server. An\noverlay inherits the built-in value; a new server without one uses\n`[diagnostics].severity`, which defaults to `\"warning\"`."
+          "description": "The least severe diagnostic worth delivering from this server;\n`\"off\"` mutes it without disabling it. An overlay inherits the\nbuilt-in value; a new server without one uses\n`[diagnostics].severity`, which defaults to `\"warning\"`."
         },
         "enabled": {
-          "description": "Set to `false` to drop the server this entry names. Omission leaves an\nexisting server enabled and enables a new server by default.",
+          "description": "Set to `false` to drop the server this entry names. Omission leaves an\nexisting server enabled and enables a new server by default. Entries\nfold top to bottom, so it removes whatever has this identity at that\npoint, including an earlier entry of your own.",
           "type": [
             "boolean",
             "null"
@@ -239,14 +239,14 @@
           "additionalProperties": {
             "type": "string"
           },
-          "description": "Environment variables for the server process. An overlay inherits\nthese from its built-in unless `command` is replaced, in which case an\nomitted value becomes `{}`. A new server also defaults to `{}`.",
+          "description": "Variables added to the server's environment. An overlay inherits\nthese from its built-in unless `command` is replaced, in which case an\nomitted value becomes `{}`. A new server also defaults to `{}`.\n\nThe server does not inherit mcpls's environment. It gets a short\nallowlist, `PATH`, `HOME`, `USERPROFILE`, the temp directory variables,\nand the Windows variables its loader needs, and these entries go on\ntop. Setting `PATH` replaces the passed-through value, and on Unix a\nbare `command` must then be found on your `PATH`, so prefer an\nabsolute `command` to adding a directory.",
           "type": [
             "object",
             "null"
           ]
         },
         "file_patterns": {
-          "description": "File patterns this server handles. An overlay inherits the built-in\npatterns; a new server defaults to `[]`.",
+          "description": "Globs for the files this server handles, such as `**/*.rs`. An\noverlay inherits the built-in patterns; a new server defaults to `[]`,\nwhich is valid when `workspace.language_extensions` maps its language\nor it handles only `workspace_symbols`.",
           "items": {
             "type": "string"
           },
@@ -256,7 +256,7 @@
           ]
         },
         "handles": {
-          "description": "Tools this server handles. An overlay inherits the built-in value; a\nnew server without a list handles every unclaimed tool.",
+          "description": "Tools this server handles. An overlay inherits the built-in value; a\nnew server without a list is its language's catch-all, handling every\ntool no other server claims.\n\nA language may have one catch-all, and a tool may be claimed by one\nserver per language; a config that breaks either for two servers that\nboth apply fails at startup, naming the entries. `rename` routes\n`rename_symbol`, `workspace_symbols` routes `workspace_symbol_search`,\n`call_hierarchy` routes all three call hierarchy tools, and\n`diagnostics` routes both diagnostics tools. A tool whose server has no\nbinary moves to the catch-all. `workspace_symbols` has no document to\nroute by, so it goes to the first server anywhere that claims it, else\nthe first catch-all.",
           "items": {
             "$ref": "#/$defs/ToolKind"
           },
@@ -274,10 +274,10 @@
               "type": "null"
             }
           ],
-          "description": "Spawn heuristics. An overlay inherits the built-in markers; a new\nserver without markers always attempts to spawn."
+          "description": "Which workspaces this server applies to. An overlay inherits the\nbuilt-in markers; a new server without markers always applies."
         },
         "initialization_options": {
-          "description": "Server-specific initialization options. Replaces the built-in's\nvalue rather than merging into it. An overlay inherits the built-in\nvalue unless `command` is replaced; a new server defaults to no\ninitialization options."
+          "description": "Server-specific options sent in the LSP `initialize` request, such\nas `cargo.features = \"all\"` for rust-analyzer. Replaces the built-in's\nvalue rather than merging into it. An overlay inherits the built-in\nvalue unless `command` is replaced; a new server defaults to no\ninitialization options."
         },
         "install": {
           "anyOf": [
@@ -288,24 +288,24 @@
               "type": "null"
             }
           ],
-          "description": "The shell command `mcpls lsp install` runs when `command` is not\ninstalled: one string for every OS, or a table with `unix` and\n`windows` keys. An overlay inherits the built-in value unless\n`command` is replaced; a new server defaults to none."
+          "description": "The shell command `mcpls lsp install` runs when `command` is not\ninstalled: one string for every OS, or a table with `unix` and\n`windows` keys. An overlay inherits the built-in value unless\n`command` is replaced; a new server defaults to none, and the\nbuilt-ins carry none.\n\nIt runs in the checkout root with mcpls's own environment; the\nserver's `env` does not apply. Windows runs it with Windows\n`PowerShell` 5.1, which has no `&&`, and whose `;` runs the next\ncommand after a failure, so put the installer last or follow a step\nwith `if (-not $?) { exit 1 }`. It runs arbitrary code like `command`,\nso one in a checkout's `mcpls.toml` counts only with\n`--trust-project-config`."
         },
         "language_id": {
-          "description": "Language identifier used to match a built-in. Required for a new entry\nunless `name` identifies it; for a new named server, an omitted value\nuses `name` as its language identifier.",
+          "description": "The language this server serves, such as `rust` or `python`, and\nthe identity used to find a built-in when `name` is absent. Required\nfor a new entry unless `name` identifies it; for a new named server,\nan omitted value uses `name` as its language identifier.",
           "type": [
             "string",
             "null"
           ]
         },
         "name": {
-          "description": "Routing identity. An overlay inherits the built-in value; when absent\non a new server, `language_id` is used.",
+          "description": "Routing identity. An overlay inherits the built-in value; when absent\non a new server, `language_id` is used.\n\nTwo servers for one `language_id` that apply at once each need their\nown identity. A `name` gives an entry its own, so the built-in for that\nlanguage keeps running beside it unless an entry disables it.",
           "type": [
             "string",
             "null"
           ]
         },
         "request_timeout_seconds": {
-          "description": "Per-request timeout in seconds. An overlay inherits the built-in\nvalue; a new server defaults to `30` seconds.",
+          "description": "Timeout for each LSP request after initialization, in seconds,\nindependent of `timeout_seconds`. Rejects `0`. An overlay inherits the\nbuilt-in value; a new server defaults to `30` seconds.\n\nA request answered with content-modified (`-32802`) is retried, up to\nfour attempts with 3.5 seconds of backoff in all, so one tool call can\ntake `4 * request_timeout_seconds + 3.5s`, plus `timeout_seconds` when\nthe server has to restart first. Completions are capped at 10 seconds\nwhatever this says.",
           "format": "uint64",
           "minimum": 0,
           "type": [
@@ -322,10 +322,10 @@
               "type": "null"
             }
           ],
-          "description": "When this server starts, overriding `[backend] spawn`. When omitted,\nit follows `[backend] spawn`, which defaults to `\"lazy\"`."
+          "description": "When this server starts, overriding `[backend] spawn`. When omitted,\nit follows `[backend] spawn`, which defaults to `\"lazy\"`. Eager suits\na server whose index is slow enough that the first request should not\nwait on it."
         },
         "timeout_seconds": {
-          "description": "Handshake timeout in seconds. An overlay inherits the built-in value;\na new server defaults to `30` seconds.",
+          "description": "Timeout for the `initialize` handshake alone, in seconds. Raise it\nfor a server that loads a large project before answering. Rejects\n`0`. An overlay inherits the built-in value; a new server defaults to\n`30` seconds.",
           "format": "uint64",
           "minimum": 0,
           "type": [
@@ -362,7 +362,7 @@
       "description": "Heuristics for determining if an LSP server should be spawned.\n\nUsed to prevent spawning servers in projects where they are not applicable\n(e.g., rust-analyzer in a Python-only project).",
       "properties": {
         "project_markers": {
-          "description": "Files or directories that make the server applicable. Any match starts\nit, searched through `workspace.heuristics_max_depth` (default: `10`).\nAn omitted list inherits for built-ins; no markers means always applicable.",
+          "description": "Files or directories that make the server applicable, such as\n`pyproject.toml`. Any match counts, searched through\n`workspace.heuristics_max_depth` levels, skipping directories such as\n`node_modules`, `target`, and `.git`. An omitted list inherits for\nbuilt-ins; no markers means always applicable.",
           "items": {
             "type": "string"
           },
@@ -502,7 +502,7 @@
       "properties": {
         "heuristics_max_depth": {
           "default": 10,
-          "description": "Maximum depth for recursive project marker search.\nControls how deeply nested projects can be detected.\nDefault: 10",
+          "description": "How many directory levels deep mcpls searches for a server's\n`heuristics.project_markers`.",
           "format": "uint",
           "minimum": 0,
           "type": "integer"
@@ -712,7 +712,7 @@
               "language_id": "r"
             }
           ],
-          "description": "File extension to language ID mappings.\nAllows users to customize which file extensions map to which language servers.",
+          "description": "Maps file extensions to the language ID mcpls reports to a server.\nSetting this key replaces the whole built-in list, so list every\nlanguage you need, not only the new one.\n\nA server for a language outside this list needs its files mapped,\nhere or through its own `file_patterns`, unless it handles only\n`workspace_symbols`.",
           "items": {
             "$ref": "#/$defs/LanguageExtensionMapping"
           },
@@ -720,14 +720,14 @@
         },
         "max_documents": {
           "default": 100,
-          "description": "Maximum number of documents `DocumentTracker` will keep open\nsimultaneously. A `textDocument/didOpen`-triggering tool call (hover,\ndefinition, diagnostics, etc.) for a document beyond this count fails\nwith `DocumentLimitExceeded`. Documents stay tracked for the whole\nmcpls process lifetime (there is no eviction), so once the ceiling is\nreached, opening any further new path fails until either the process\nis restarted or this limit is raised; already-tracked paths are\nunaffected. `0` disables the limit.\nDefault: 100",
+          "description": "Most documents mcpls keeps open. Documents are never evicted, so once\nthe limit is hit, a tool call that opens a new file fails until the\nbackend restarts; files already open keep working. `0` disables the\nlimit.\n\nA diagnostics sweep opens files too, and keeps one slot free for an\nordinary request. Each open document's content stays in memory.",
           "format": "uint",
           "minimum": 0,
           "type": "integer"
         },
         "max_file_size": {
           "default": 10485760,
-          "description": "Maximum size, in bytes, of a single file `DocumentTracker` will open.\nA file larger than this fails with `FileSizeLimitExceeded`. `0`\ndisables the limit.\nDefault: 10485760 (10MB)",
+          "description": "Largest file, in bytes, mcpls opens. `0` disables the limit.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -737,7 +737,7 @@
             "utf-8",
             "utf-16"
           ],
-          "description": "Position encoding preference order, offered to each spawned LSP\nserver as `capabilities.general.positionEncodings` during the\n`initialize` handshake (see [`crate::lsp::LspServer::spawn`]), in the\norder configured here.\n\nValid values: `\"utf-8\"`, `\"utf-16\"`, `\"utf-32\"`. Must be non-empty;\n[`ServerConfig::validate`] rejects an empty list or an unrecognized\nvalue.",
+          "description": "Position encodings offered to each language server during\n`initialize`, most preferred first: `\"utf-8\"`, `\"utf-16\"`, or\n`\"utf-32\"`. Must not be empty. A server may still pick UTF-16, which\nthe LSP spec makes mandatory.",
           "items": {
             "type": "string"
           },
@@ -745,7 +745,7 @@
         },
         "roots": {
           "default": [],
-          "description": "Root directories for the workspace.",
+          "description": "Workspace root directories. Empty means the checkout root. Each root\nmust exist.\n\nA relative root in a file named by `--config`, or in a checkout's\n`mcpls.toml`, resolves against the directory holding that file, so\n`roots = [\"..\"]` in `<repo>/.agents/mcpls.toml` means the repository\nroot. In the user config file it resolves against the checkout root.\nOn Windows, `\\dir` and `C:dir` are joined like any other relative\nroot.",
           "items": {
             "type": "string"
           },
@@ -762,22 +762,22 @@
   "properties": {
     "apply": {
       "$ref": "#/$defs/ApplyConfig",
-      "description": "Which tools may write their edits to the working tree."
+      "description": "Which tools may write their edits to the source tree. Without this\ntable mcpls is read-only: every tool returns its edit for you to\nread, and nothing on disk changes.\n\nA key hands the write to the language server, which decides which\nfiles the edit touches and what goes in them. mcpls checks that every\npath stays inside the workspace roots, applies the whole edit or none\nof it, and reports what it wrote. It does not review the content, and\ncannot tell a correct rename from a wrong one.\n\nThere is no undo. mcpls rolls an edit back only while that apply is\nrunning: when a step fails, the completed steps are reversed and the\nerror names any file it could not restore. Once an apply returns, the\nchange is on disk and mcpls keeps no record of what was there. Commit\nfirst, and read the `files_written` list the tool returns.\n\nAn edit is refused whole, with nothing written, when a path resolves\noutside the workspace roots (following symlinks), when it would\nchange or destroy a file marked read-only, when a file it edits has\nno readable text, or when two edits to one document overlap."
     },
     "backend": {
       "$ref": "#/$defs/BackendConfig",
-      "description": "How a shared backend manages its own lifetime."
+      "description": "The shared backend. The first session in a checkout starts one\nbackend, and every later session in that checkout, from any\nsubdirectory, attaches to it and shares its language servers. Two\nworktrees of one repository are two checkouts. `mcpls --no-backend`\nserves one session in-process instead.\n\nA session whose configuration differs from the running backend's\nstill attaches, and the backend's configuration stays in effect; its\nserver instructions name both fingerprints. A session that trusts the\ncheckout's `mcpls.toml` when the backend does not, or the reverse, is\nrefused."
     },
     "brief": {
       "$ref": "#/$defs/BriefConfig",
-      "description": "What an agent session is told about mcpls when it starts."
+      "description": "The note `mcpls brief` hands an agent session when it starts, naming\nthe installed language servers that serve the checkout and pointing\nthe agent at the mcpls tools. Run `mcpls brief` to see what a session\nin the current directory gets."
     },
     "diagnostics": {
       "$ref": "#/$defs/DiagnosticsConfig",
       "description": "How much of what the language servers report reaches the agent."
     },
     "lsp_servers": {
-      "description": "If omitted, the built-in servers are used. Entries identify a server\nby `name`, or `language_id` when `name` is absent. The first enabled\nentry for an existing server overlays it; a new identity needs\n`command`. Once claimed, a later entry with `command` adds another\nserver, while a later `spawn`-only entry overlays the resolved server.",
+      "description": "The language servers mcpls runs. mcpls has built-in servers for\nRust (rust-analyzer), Python (pyright), TypeScript, Go (gopls), C and\nC++ (clangd), and Zig (zls), and uses them when this list is omitted.\n\nEntries identify a server by `name`, or `language_id` when `name` is\nabsent. The first enabled entry naming a built-in overlays it: a field\nthe entry omits is inherited, and a field it sets overrides. Setting\n`command` also clears the built-in's `args`, `env`,\n`initialization_options`, and `install`, since those belong to the\nbinary being replaced; `file_patterns` describe the language and\nsurvive. An entry naming no built-in defines a new server, and needs\n`command`.\n\nEntries fold top to bottom. Once an identity is claimed, a later entry\nwith `command` adds another server, while a later `spawn`-only entry\noverlays the resolved server. Two servers with one identity must never\nboth apply to one workspace, so give them mutually exclusive\n`heuristics.project_markers`. To run two servers for one language at\nonce, give each its own `name` and split the tools with `handles`.\n\n`enabled = false` removes whatever has the entry's identity at that\npoint, including an entry of your own written earlier, so put it\nbefore any entry it should leave alone.",
       "items": {
         "$ref": "#/$defs/PartialLspServerConfig"
       },
@@ -785,7 +785,7 @@
     },
     "workspace": {
       "$ref": "#/$defs/WorkspaceConfig",
-      "description": "Workspace configuration."
+      "description": "Where the workspace is, and which files mcpls opens."
     }
   },
   "title": "mcpls.toml",

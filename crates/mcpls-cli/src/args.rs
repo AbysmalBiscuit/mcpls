@@ -30,6 +30,12 @@ pub fn parse_bool_flag(s: &str) -> Result<bool, String> {
 #[command(name = "mcpls")]
 #[command(version, about, long_about = None)]
 #[command(propagate_version = true, disable_help_subcommand = true)]
+#[command(after_long_help = "\
+Each flag's MCPLS_* variable applies when the flag is absent.
+
+Serving over HTTP needs a build with the `transport-http` feature, which adds \
+--listen and --http-path. Without it, --listen is a parse error, while MCPLS_LISTEN \
+and MCPLS_HTTP_PATH are ignored and mcpls serves stdio.")]
 pub struct Args {
     /// Subcommand to run instead of the MCP server
     #[command(subcommand)]
@@ -37,25 +43,37 @@ pub struct Args {
 
     /// Path to configuration file
     ///
-    /// If not specified, searches for mcpls.toml in:
-    /// 1. `$MCPLS_CONFIG` environment variable
-    /// 2. The checkout root (only loaded with `--trust-project-config`)
-    /// 3. Platform config file: `$XDG_CONFIG_HOME/mcpls/mcpls.toml`, else
-    ///    `~/.config/mcpls/mcpls.toml` (Linux); `~/Library/Application
-    ///    Support/mcpls/mcpls.toml` (macOS); `%APPDATA%\mcpls\mcpls.toml` (Windows)
+    /// If not specified, mcpls loads the first of: `mcpls.toml` at the
+    /// checkout root, only with `--trust-project-config`; the user config
+    /// file, `$XDG_CONFIG_HOME/mcpls/mcpls.toml` or
+    /// `~/.config/mcpls/mcpls.toml` on Linux, `~/Library/Application
+    /// Support/mcpls/mcpls.toml` on macOS, `%APPDATA%\mcpls\mcpls.toml` on
+    /// Windows; and otherwise the built-in defaults.
+    ///
+    /// A named file is always trusted, even a relative path, because naming
+    /// it is consent, and a missing one fails startup instead of falling
+    /// through. That includes `MCPLS_CONFIG` exported by a checkout's own
+    /// `.envrc`. `mcpls schema` describes every key, and
+    /// `mcpls config --origin` shows which file each setting came from.
     #[arg(short, long, value_name = "FILE", env = "MCPLS_CONFIG")]
     pub config: Option<PathBuf>,
 
     /// Trust and load a `mcpls.toml` found at the checkout root.
     ///
-    /// A project-local config discovered this way (as opposed to one passed
-    /// explicitly via `--config`/`MCPLS_CONFIG`) can control the LSP server
-    /// `command`/`args` mcpls spawns, so it is ignored by default to avoid
-    /// arbitrary code execution when running mcpls against an untrusted
-    /// checkout. Pass this flag only for repositories you trust. Via
-    /// `MCPLS_TRUST_PROJECT_CONFIG`, accepted values are `1`/`0`, `true`/
-    /// `false`, `yes`/`no`, `y`/`n`, and `on`/`off` (case-insensitive); any
-    /// other value is a parse error at startup.
+    /// The checkout root is the nearest directory at or above the working
+    /// directory holding a `.git` entry, stopping before the home directory,
+    /// or the working directory when none does. That file can set the
+    /// `command` mcpls spawns, so without this flag it is ignored with a
+    /// warning, and mcpls falls through to the user config or the built-in
+    /// defaults. Pass it only for repositories you trust.
+    ///
+    /// The grant covers every checkout this process serves. Put the flag in
+    /// one MCP client entry's `args` rather than exporting
+    /// `MCPLS_TRUST_PROJECT_CONFIG=true` from a shell profile, which trusts
+    /// every mcpls that shell launches, future untrusted checkouts included.
+    /// Via the variable, accepted values are `1`/`0`, `true`/`false`,
+    /// `yes`/`no`, `y`/`n`, and `on`/`off` (case-insensitive); any other
+    /// value is a parse error at startup.
     #[arg(long, env = "MCPLS_TRUST_PROJECT_CONFIG", value_parser = parse_bool_flag)]
     pub trust_project_config: bool,
 
@@ -69,14 +87,17 @@ pub struct Args {
 
     /// Logging level
     ///
-    /// Valid values: trace, debug, info, warn, error
+    /// One of trace, debug, info, warn, error, or any `tracing` filter such
+    /// as `mcpls=debug,info`. An invalid value falls back to `info` without
+    /// a warning.
     #[arg(short, long, default_value = "info", env = "MCPLS_LOG")]
     pub log_level: String,
 
     /// Output logs as JSON (for structured logging)
     ///
     /// Via `MCPLS_LOG_JSON`, accepted values are `1`/`0`, `true`/`false`,
-    /// `yes`/`no`, `y`/`n`, and `on`/`off` (case-insensitive).
+    /// `yes`/`no`, `y`/`n`, and `on`/`off` (case-insensitive). Any other
+    /// value, including an empty one, fails startup.
     #[arg(long, default_value = "false", env = "MCPLS_LOG_JSON", value_parser = parse_bool_flag)]
     pub log_json: bool,
 
@@ -214,6 +235,9 @@ pub enum Command {
     /// Prints each backend's checkout, pid, version, attached sessions,
     /// language servers by state, and log. Examines `$CLAUDE_PROJECT_DIR`,
     /// then the working directory. Exits 0 whether or not a backend runs.
+    ///
+    /// With `--all`, a backend that refuses to report, such as one from
+    /// another mcpls build, appears with an unknown checkout and the reason.
     Status {
         /// Every backend this user runs, across all checkouts
         #[arg(long)]
@@ -327,6 +351,9 @@ pub enum BackendAction {
 #[derive(Debug, Subcommand)]
 pub enum LspCommand {
     /// Print each applicable server and its state
+    ///
+    /// A state is one of `idle`, `starting`, `running`, `not installed`,
+    /// `failed`, or `stopped`.
     Status {
         /// Directory whose backend to ask
         ///
@@ -335,6 +362,8 @@ pub enum LspCommand {
         dir: Option<PathBuf>,
     },
     /// Start servers that are not running
+    ///
+    /// Also retries a server recorded as not installed.
     Start {
         #[command(flatten)]
         targets: LspTargets,
@@ -343,6 +372,8 @@ pub enum LspCommand {
         no_wait: bool,
     },
     /// Shut servers down and keep them down
+    ///
+    /// A tool call on a stopped server is refused rather than starting it.
     Stop {
         #[command(flatten)]
         targets: LspTargets,
@@ -359,10 +390,13 @@ pub enum LspCommand {
     /// missing
     ///
     /// Runs each server's `install` command, one at a time, in the
-    /// checkout root, skipping servers already installed. Exits non-zero
-    /// when a command fails, a binary still does not resolve afterwards,
-    /// a server named here has no install command, or a name does not
-    /// apply to the checkout.
+    /// checkout root, and prints one line per server. Skips a server whose
+    /// `command` already resolves, and one with no install command for this
+    /// OS. Needs no backend; when one answers, it is asked to start the
+    /// servers installed. Exits non-zero when a command fails, a binary still
+    /// does not resolve afterwards, as when an installer changes `PATH` only
+    /// for new shells, a server named here has no install command, or a name
+    /// does not apply to the checkout.
     Install {
         #[command(flatten)]
         targets: LspTargets,
@@ -398,6 +432,11 @@ pub struct LspTargets {
 #[derive(Debug, Subcommand)]
 pub enum SchemaAction {
     /// Create a default `mcpls.toml` in the current directory
+    ///
+    /// The file starts with a Taplo schema link and lists every setting
+    /// commented out. An existing file is left untouched. mcpls finds a
+    /// project config only at the checkout root, and loads it only with
+    /// `--trust-project-config`.
     Init,
 }
 
