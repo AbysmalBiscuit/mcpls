@@ -207,6 +207,32 @@ fn a_named_server_without_an_install_command_fails_but_all_does_not() {
     assert_eq!(stdout(&all), "fake  no install command\n");
 }
 
+/// A fresh checkout's own `mcpls.toml` is the config most likely to carry
+/// install commands, and it is ignored until trusted.
+#[test]
+fn install_names_a_project_config_it_ignored() {
+    let (project, runtime) = checkout();
+    let root = dunce::canonicalize(project.path()).unwrap();
+    let planted = root.join("mcpls.toml");
+    std::fs::rename(write_config(&root, Some(CREATES_THE_SERVER)), &planted).unwrap();
+
+    let output = run(
+        &root,
+        runtime.path(),
+        &["lsp", "install", "--all", "--dry-run"],
+    );
+    let report = stdout(&output);
+
+    assert!(
+        report.contains(&format!(
+            "project config: {} was found and ignored; pass --trust-project-config",
+            planted.display()
+        )),
+        "{report}"
+    );
+    assert!(!report.contains("fake"), "{report}");
+}
+
 #[test]
 fn an_unknown_server_names_the_ones_that_apply() {
     let (project, runtime) = checkout();

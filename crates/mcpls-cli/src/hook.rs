@@ -764,7 +764,7 @@ fn config_file_line(local: &mcpls_core::Resolved) -> String {
 /// skipped, which is the single most confusing state the configuration can
 /// be in: the file a reader just edited has no effect and nothing else on
 /// the report says why.
-fn ignored_project_config_line(path: &Path) -> String {
+pub fn ignored_project_config_line(path: &Path) -> String {
     format!(
         "project config: {} was found and ignored; pass --trust-project-config \
          (or set MCPLS_TRUST_PROJECT_CONFIG=true) to load it",

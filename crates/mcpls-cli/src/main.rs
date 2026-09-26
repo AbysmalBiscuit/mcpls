@@ -502,8 +502,13 @@ async fn run_install(args: &Args, targets: &LspTargets, dry_run: bool) -> lsp::O
         .iter()
         .zip(&results)
         .all(|(target, (_, status))| !status.fails(target.named));
+    let ignored = resolved
+        .ignored_project_config
+        .as_deref()
+        .map(|path| format!("{}\n", hook::ignored_project_config_line(path)))
+        .unwrap_or_default();
     lsp::Outcome {
-        text: install::render(&results),
+        text: format!("{ignored}{}", install::render(&results)),
         success,
     }
 }
