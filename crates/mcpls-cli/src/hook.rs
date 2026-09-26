@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use mcpls_core::bridge::{HookAgent, HookHost};
+use mcpls_core::config::InstallCommand;
 use mcpls_core::hooks::protocol::ServerStatus;
 use mcpls_core::hooks::{
     ChangeEvent, ProbeOutcome, Request, Response, SocketIdentity, WatcherStatus, probe, send,
@@ -716,11 +717,14 @@ fn server_reports(
                     server.command
                 )
             });
-            reports.push(ServerReport {
-                state: format!("not installed: {} is not on PATH", server.command),
-                id,
-                problem,
-            });
+            let hint = server
+                .install
+                .as_ref()
+                .and_then(InstallCommand::for_this_os)
+                .map(|_| format!("; run `mcpls lsp install {id}`"))
+                .unwrap_or_default();
+            let state = format!("not installed: {} is not on PATH{hint}", server.command);
+            reports.push(ServerReport { id, state, problem });
         }
     }
 
@@ -760,7 +764,7 @@ fn config_file_line(local: &mcpls_core::Resolved) -> String {
 /// skipped, which is the single most confusing state the configuration can
 /// be in: the file a reader just edited has no effect and nothing else on
 /// the report says why.
-fn ignored_project_config_line(path: &Path) -> String {
+pub fn ignored_project_config_line(path: &Path) -> String {
     format!(
         "project config: {} was found and ignored; pass --trust-project-config \
          (or set MCPLS_TRUST_PROJECT_CONFIG=true) to load it",

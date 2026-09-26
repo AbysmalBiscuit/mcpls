@@ -195,10 +195,11 @@ pub enum Command {
         json: bool,
     },
 
-    /// Start, stop, restart, or list the language servers a checkout's
-    /// backend runs
+    /// Install, start, stop, restart, or list the language servers of a
+    /// checkout
     ///
-    /// Talks to the running backend. A stopped server stays stopped until
+    /// `install` runs configured install commands and needs no backend.
+    /// The rest talk to the running backend. A stopped server stays stopped until
     /// `mcpls lsp start` or `restart`, or until the backend exits. Exits
     /// non-zero when a server misses the state asked for, or no backend
     /// answers.
@@ -338,6 +339,21 @@ pub enum LspCommand {
         /// Return without waiting for the servers to finish starting
         #[arg(long)]
         no_wait: bool,
+    },
+    /// Run the configured install command for servers whose binary is
+    /// missing
+    ///
+    /// Runs each server's `install` command, one at a time, in the
+    /// checkout root, skipping servers already installed. Exits non-zero
+    /// when a command fails, a binary still does not resolve afterwards,
+    /// a server named here has no install command, or a name does not
+    /// apply to the checkout.
+    Install {
+        #[command(flatten)]
+        targets: LspTargets,
+        /// Print each command that would run, and run nothing
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 

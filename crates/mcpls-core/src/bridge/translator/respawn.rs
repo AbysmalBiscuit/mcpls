@@ -875,6 +875,7 @@ while True:
                     name: Some(id.to_string()),
                     handles: None,
                     diagnostics_severity: None,
+                    install: None,
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
@@ -2220,6 +2221,7 @@ fi
                     name: Some("hover-only".to_string()),
                     handles: Some(vec![ToolKind::Hover]),
                     diagnostics_severity: None,
+                    install: None,
                 },
                 LspServerConfig {
                     language_id: "rust".to_string(),
@@ -2235,6 +2237,7 @@ fi
                     name: Some("diag-catchall".to_string()),
                     handles: None,
                     diagnostics_severity: None,
+                    install: None,
                 },
             ];
             let router = ToolRouter::from_configs(configs.iter()).unwrap();

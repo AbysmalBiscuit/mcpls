@@ -42,6 +42,7 @@ mcpls has built-in servers for Rust (rust-analyzer), Python (pyright), TypeScrip
 | `heuristics.project_markers` | array of strings | no | unset, or inherited | Marker files or directories that make this server applicable, e.g. `["pyproject.toml"]`. mcpls searches the workspace tree up to `heuristics_max_depth` levels, skipping `node_modules`, `target`, and `.git`. |
 | `enabled` | boolean | no | unset = stays enabled | `false` removes every server sharing this entry's identity, most often a built-in you don't want. Entries fold top to bottom, so it removes whatever has that identity at that point, including your own earlier entry. Put it before any entry it should leave alone. |
 | `diagnostics_severity` | `"off"` \| `"error"` \| `"warning"` \| `"information"` \| `"hint"` | no | falls back to `[diagnostics] severity` | The least severe diagnostic worth delivering from this server. `"off"` mutes it without disabling the server. |
+| `install` | string, or table with `unix`/`windows` strings | no | unset, or inherited unless `command` is replaced | Shell command `mcpls lsp install` runs when `command` does not resolve. Unix runs `sh -c`; Windows runs Windows PowerShell 5.1, which has no `&&`; `;` keeps going after a failure, so put the installer last or follow a step with `if (-not $?) { exit 1 }`. Runs in the checkout root. Built-ins carry none. |
 
 ## `[workspace]` fields
 

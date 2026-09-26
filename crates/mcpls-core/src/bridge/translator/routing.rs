@@ -777,6 +777,7 @@ mod tests {
             name: None,
             handles: None,
             diagnostics_severity: None,
+            install: None,
         };
 
         let translator = Translator::new()
@@ -827,6 +828,7 @@ mod tests {
             name: None,
             handles: None,
             diagnostics_severity: None,
+            install: None,
         };
         let translator = Translator::new()
             .with_extensions(extension_map)
@@ -1073,6 +1075,7 @@ mod tests {
                 name: Some("pyright".to_string()),
                 handles: Some(vec![ToolKind::Hover]),
                 diagnostics_severity: None,
+                install: None,
             },
             LspServerConfig {
                 language_id: "python".to_string(),
@@ -1088,6 +1091,7 @@ mod tests {
                 name: Some("pylsp".to_string()),
                 handles: Some(vec![ToolKind::Diagnostics]),
                 diagnostics_severity: None,
+                install: None,
             },
         ];
         let router = ToolRouter::from_configs(&configs).unwrap();

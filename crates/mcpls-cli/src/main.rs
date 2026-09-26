@@ -13,11 +13,12 @@ mod brief;
 mod completions;
 mod config;
 mod hook;
+mod install;
 mod logging;
 mod lsp;
 mod status;
 
-use args::{Args, BackendAction, Command, HookAction, LspCommand, SchemaAction};
+use args::{Args, BackendAction, Command, HookAction, LspCommand, LspTargets, SchemaAction};
 use hook::{Examined, Report};
 use mcpls_core::bridge::LspAction;
 
@@ -426,6 +427,9 @@ async fn diagnose(args: &Args, path: Option<&std::path::Path>) -> Report {
 /// Run one `mcpls lsp` action against the backend for its directory.
 async fn run_lsp(args: &Args, action: &LspCommand) -> lsp::Outcome {
     let (dir, change) = match action {
+        LspCommand::Install { targets, dry_run } => {
+            return run_install(args, targets, *dry_run).await;
+        }
         LspCommand::Status { dir } => (dir.as_deref(), None),
         LspCommand::Start { targets, no_wait } => (
             targets.dir.as_deref(),
@@ -464,6 +468,48 @@ async fn run_lsp(args: &Args, action: &LspCommand) -> lsp::Outcome {
     };
     let ceiling = wait.then(|| wait_ceiling(resolve_config(args, &root).ok().as_ref()));
     lsp::control(&identity, &root, lsp_action, servers, ceiling).await
+}
+
+/// Install the missing language servers `targets` names, from the
+/// configuration for its directory.
+async fn run_install(args: &Args, targets: &LspTargets, dry_run: bool) -> lsp::Outcome {
+    let (directory, _) = examined_directory(targets.dir.as_deref());
+    let root = hook::checkout_root(&directory);
+    let failed = |text: String| lsp::Outcome {
+        text: format!("{text}\n"),
+        success: false,
+    };
+    let resolved = match resolve_config(args, &root) {
+        Ok(resolved) => resolved,
+        Err(error) => return failed(format!("{error:#}")),
+    };
+    let named: &[String] = if targets.all { &[] } else { &targets.servers };
+    let planned = match install::plan(&resolved.config, &root, named) {
+        Ok(planned) => planned,
+        Err(message) => return failed(message),
+    };
+    let results = install::install(&planned, &root, dry_run, |program| {
+        hook::resolve_program(program, &root).is_some()
+    })
+    .await;
+    let installed = results
+        .iter()
+        .filter(|(_, status)| *status == install::Status::Installed)
+        .map(|(target, _)| target.id.clone())
+        .collect();
+    install::nudge(&root, installed).await;
+    let success = results
+        .iter()
+        .all(|(target, status)| !status.fails(target.named));
+    let ignored = resolved
+        .ignored_project_config
+        .as_deref()
+        .map(|path| format!("{}\n", hook::ignored_project_config_line(path)))
+        .unwrap_or_default();
+    lsp::Outcome {
+        text: format!("{ignored}{}", install::render(&results)),
+        success,
+    }
 }
 
 /// The longest any configured server may take to finish `initialize`.

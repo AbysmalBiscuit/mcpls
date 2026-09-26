@@ -19,8 +19,8 @@ pub use routing::{NoServerReason, ServerId, ToolKind, ToolRouter};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 pub use server::{
-    DEFAULT_HEURISTICS_MAX_DEPTH, LspServerConfig, MAX_TIMEOUT_SECONDS, PartialLspServerConfig,
-    ServerHeuristics, SpawnPolicy, resolve_lsp_servers,
+    DEFAULT_HEURISTICS_MAX_DEPTH, InstallCommand, LspServerConfig, MAX_TIMEOUT_SECONDS,
+    PartialLspServerConfig, PerOsInstall, ServerHeuristics, SpawnPolicy, resolve_lsp_servers,
 };
 
 use crate::bridge::{DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE, ResourceLimits};
@@ -2455,6 +2455,7 @@ mod tests {
                 name: None,
                 handles: None,
                 diagnostics_severity: None,
+                install: None,
             }],
             apply: ApplyConfig::default(),
             diagnostics: DiagnosticsConfig::default(),
@@ -2487,6 +2488,7 @@ mod tests {
                 name: None,
                 handles: None,
                 diagnostics_severity: None,
+                install: None,
             }],
             apply: ApplyConfig::default(),
             diagnostics: DiagnosticsConfig::default(),
@@ -2519,6 +2521,7 @@ mod tests {
                 name: None,
                 handles: None,
                 diagnostics_severity: None,
+                install: None,
             }],
             apply: ApplyConfig::default(),
             diagnostics: DiagnosticsConfig::default(),
@@ -2551,6 +2554,7 @@ mod tests {
                 name: None,
                 handles: None,
                 diagnostics_severity: None,
+                install: None,
             }],
             apply: ApplyConfig::default(),
             diagnostics: DiagnosticsConfig::default(),

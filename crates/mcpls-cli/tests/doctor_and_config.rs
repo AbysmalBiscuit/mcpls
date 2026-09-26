@@ -133,6 +133,38 @@ fn the_doctor_says_a_configured_server_is_not_installed_and_exits_non_zero() {
     );
 }
 
+#[test]
+fn the_doctor_points_a_missing_server_at_its_install_command() {
+    let (project, runtime) = checkout();
+    let root = dunce::canonicalize(project.path()).unwrap();
+    std::fs::write(root.join("present.marker"), "").unwrap();
+    let config = root.join("test-mcpls.toml");
+    std::fs::write(
+        &config,
+        "[[lsp_servers]]\nlanguage_id = \"invented\"\n\
+         command = \"mcpls-no-such-language-server\"\n\
+         file_patterns = [\"**/*.invented\"]\n\
+         install = \"echo nothing\"\n\
+         [lsp_servers.heuristics]\nproject_markers = [\"present.marker\"]\n",
+    )
+    .unwrap();
+
+    let output = run(
+        &root,
+        runtime.path(),
+        &["--config", &config.display().to_string(), "doctor"],
+    );
+    let report = stdout(&output);
+
+    assert!(
+        report.contains(
+            "invented (not installed: mcpls-no-such-language-server is not on PATH; \
+             run `mcpls lsp install invented`)"
+        ),
+        "{report}"
+    );
+}
+
 /// A server that does not serve this checkout is not a fault, so a
 /// working install exits 0 with nothing to report.
 #[test]

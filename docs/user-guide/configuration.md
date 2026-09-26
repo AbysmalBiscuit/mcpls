@@ -615,6 +615,32 @@ language_id = "rust"
 diagnostics_severity = "error"
 ```
 
+### `install`
+
+**Type**: String, or a table with `unix` and `windows` string keys
+**Default**: unset (no install command; the built-in servers carry none)
+
+The shell command that installs this server's binary. mcpls runs it only when you run `mcpls lsp install`, and only when `command` does not already resolve. A single string runs on every OS; the table form gives each OS family its own command, and an OS with no key has no command.
+
+```toml
+[[lsp_servers]]
+language_id = "python"
+command = "pyrefly"
+args = ["lsp"]
+install = "uv tool install pyrefly"
+
+[[lsp_servers]]
+language_id = "zig"
+
+[lsp_servers.install]
+unix = "brew install zls"
+windows = "winget install zigtools.zls"
+```
+
+Unix runs the command with `sh -c`. Windows runs it with Windows PowerShell 5.1, which has no `&&`. Its `;` runs the next command even when one fails, so a failed installer followed by another step reports `installed, but ... is still not on PATH` instead of the failure. Put the installer last, or stop after a failed step with `if (-not $?) { exit 1 }`. The command runs in the checkout root with mcpls's own environment; the server's `env` table does not apply. An overlay inherits a built-in's `install` unless it replaces `command`.
+
+An install command runs arbitrary code, the same as `command` does, so one in a checkout-root `mcpls.toml` counts only with `--trust-project-config`.
+
 ## Apply Section
 
 The `[apply]` table is the only thing that lets mcpls write to your source tree. Leave it out and mcpls is read-only: every tool returns an edit for you to read, and nothing on disk changes.
