@@ -58,7 +58,7 @@ pub struct PerOsInstall {
 }
 ```
 
-- `InstallCommand::for_this_os() -> Option<&str>` picks the command for the running OS. `unix` covers Linux and macOS.
+- `InstallCommand::for_this_os() -> Option<&str>` picks the command for the running OS. `unix` covers Linux and macOS. A blank command counts as none.
 - `LspServerConfig::install` is `Option<InstallCommand>`, absent by default, and skipped when serializing a `None`.
 - Overlay rule, same as `args` and `env`: an overlay inherits the built-in's `install` unless it replaces `command`, in which case an omitted value means none. Built-ins carry no install command.
 - A table with an unknown key, such as `macos`, is a config error.
@@ -90,7 +90,7 @@ Each command runs to completion before the next starts, because package managers
 ==> python: uv tool install pyrefly
 ```
 
-The command runs with inherited stdio, so installer output and prompts reach the terminal. Unix runs `sh -c <command>`; Windows runs `powershell -NoProfile -Command <command>`. The working directory is the checkout root and the environment is the CLI's own. The server's `env` table does not apply, since it describes the server process.
+The command runs with inherited stdio, so installer output and prompts reach the terminal. Unix runs `sh -c <command>`. Windows runs `powershell -NoProfile -EncodedCommand <base64 of the UTF-16LE command>`, because Windows argument quoting mangles double quotes on their way into `-Command`. That shell is Windows PowerShell 5.1, which has no `&&`, so a Windows command chains with `;`. The working directory is the checkout root and the environment is the CLI's own. The server's `env` table does not apply, since it describes the server process.
 
 After a command exits 0, the CLI resolves the binary again. When it still does not resolve, the installer most likely changed `PATH` only for new shells, as winget and rustup do. The report says so and suggests opening a new shell.
 
@@ -106,8 +106,8 @@ The run ends with one line per target, id then outcome, in the shape `mcpls lsp 
 
 ```
 python  installed
-zig     no install command
-rust    already installed
+zig  no install command
+rust  already installed
 ```
 
 Outcomes: `installed`, `already installed`, `no install command`, `failed (exit N)`, `installed, but <command> is still not on PATH; open a new shell`, and under `--dry-run`, `would run`.
