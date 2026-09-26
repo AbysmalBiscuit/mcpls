@@ -1,6 +1,6 @@
 # Custom language server install commands
 
-Status: approved design, not yet implemented.
+Status: implemented.
 
 Target: the `AbysmalBiscuit/mcpls` fork, issue #71.
 
