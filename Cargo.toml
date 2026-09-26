@@ -19,6 +19,7 @@ categories = ["development-tools", "command-line-utilities"]
 anyhow = "1.0"
 assert_cmd = "2.2"
 axum = "0.8"
+base64 = "0.23"
 chrono = "0.4.45"
 clap = "4.6"
 clap_complete = "4.6"
