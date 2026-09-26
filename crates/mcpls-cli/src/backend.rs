@@ -1,5 +1,5 @@
-//! `mcpls backend start`, `stop` and `status`: what each found, worded for
-//! the person at the terminal.
+//! `mcpls backend start`, `stop`, `auto` and `status`: what each found,
+//! worded for the person at the terminal.
 
 use std::path::Path;
 
@@ -94,6 +94,32 @@ pub fn stop(stopped: Stopped, root: &Path) -> Outcome {
     }
 }
 
+pub fn auto(found: Found, root: &Path) -> Outcome {
+    let root = root.display();
+    match found {
+        Found::Answered(reply) if reply.in_process => Outcome::failed(in_process(&reply, &root)),
+        Found::Answered(reply) if reply.kept => Outcome::failed(format!(
+            "the backend for {root} is kept, and its version {} cannot be released. `mcpls \
+             backend stop` ends it: {}\n",
+            reply.version,
+            describe(&reply)
+        )),
+        Found::Answered(reply) => Outcome::ok(format!(
+            "the backend for {root} follows its sessions: {}, so it exits {}\n",
+            describe(&reply),
+            if reply.sessions == 0 {
+                "on its idle timer"
+            } else {
+                "after the last one leaves"
+            }
+        )),
+        Found::Absent => Outcome::ok(format!(
+            "the backend for {root} is not running; the next session starts one\n"
+        )),
+        Found::Busy => Outcome::failed(busy(&root)),
+    }
+}
+
 fn describe(reply: &HandshakeReply) -> String {
     use std::fmt::Write as _;
 
@@ -103,7 +129,7 @@ fn describe(reply: &HandshakeReply) -> String {
     }
     let _ = write!(text, ", {} attached", sessions(reply.sessions));
     if reply.kept {
-        text.push_str(", kept running until `mcpls backend stop`");
+        text.push_str(", kept running until `mcpls backend stop` or `mcpls backend auto`");
     }
     text
 }

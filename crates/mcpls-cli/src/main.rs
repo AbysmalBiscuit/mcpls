@@ -317,6 +317,7 @@ async fn control_backend(args: &Args, action: &BackendAction) -> backend::Outcom
     let path = match action {
         BackendAction::Start { path }
         | BackendAction::Stop { path, .. }
+        | BackendAction::Auto { path }
         | BackendAction::Status { path } => path.as_deref(),
     };
     let (directory, _) = examined_directory(path);
@@ -339,6 +340,7 @@ async fn control_backend(args: &Args, action: &BackendAction) -> backend::Outcom
         BackendAction::Stop { force, .. } => {
             backend::stop(control::stop(&identity, *force).await, &root)
         }
+        BackendAction::Auto { .. } => backend::auto(control::release(&identity).await, &root),
         BackendAction::Start { .. } => {
             // The backend would fail on the same configuration, with the
             // reason only in its log.
