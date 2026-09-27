@@ -20,7 +20,10 @@ use mcpls_core::hooks::{
     ChangeEvent, ProbeOutcome, Request, Response, SocketIdentity, WatcherStatus, probe, send,
     send_and_acknowledge,
 };
-use serde::{Deserialize, Serialize};
+use pabal::{
+    AddContext, ClaudeCode, ClaudeCodeView, Fields, Payload, Response as HookOutput, Tool,
+};
+use serde::Deserialize;
 
 /// How long a hook waits for an answer to `Changed` or `EndSession`, which
 /// carry no context back and are never worth stalling an edit for.
@@ -44,12 +47,11 @@ pub enum Harness {
 /// The hook events mcpls answers, one verb per harness event.
 ///
 /// The serde spelling is the harness's own `hook_event_name`, which a
-/// manifest from before the verbs leaves as the only name the event has, and
-/// which `hookEventName` in the answer has to repeat.
+/// manifest from before the verbs leaves as the only name the event has.
 ///
 /// There is no `Stop`: context a `Stop` hook returns resumes the
 /// conversation, so diagnostics wait for the next prompt instead.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::Subcommand, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::Subcommand, Deserialize)]
 pub enum HookEvent {
     /// A tool call finished
     PostToolUse,
@@ -73,6 +75,17 @@ impl HookEvent {
             .ok()
             .map(|named| named.hook_event_name)
     }
+
+    /// The harness's `hook_event_name` for this event, which names the
+    /// event of a payload that leaves it out.
+    const fn wire_name(self) -> &'static str {
+        match self {
+            Self::PostToolUse => "PostToolUse",
+            Self::PostToolBatch => "PostToolBatch",
+            Self::UserPromptSubmit => "UserPromptSubmit",
+            Self::SessionEnd => "SessionEnd",
+        }
+    }
 }
 
 /// The directory a hook invocation names as its project, before
@@ -80,43 +93,35 @@ impl HookEvent {
 pub fn project_dir(harness: Harness, stdin: &str) -> PathBuf {
     let named = match harness {
         Harness::ClaudeCode => std::env::var_os("CLAUDE_PROJECT_DIR").map(PathBuf::from),
-        Harness::Codex => serde_json::from_str::<serde_json::Value>(stdin)
+        Harness::Codex => Payload::<pabal::Codex>::parse(stdin)
             .ok()
-            .and_then(|payload| payload.get("cwd")?.as_str().map(PathBuf::from)),
+            .and_then(|payload| payload.cwd().map(Path::to_path_buf)),
     };
     named.unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// The hook payload Claude Code writes to stdin, keeping only the fields
-/// the dispatch table below reads. Every field is optional or defaulted,
-/// since which ones are present depends on the event.
-#[derive(Debug, Deserialize)]
-struct HookPayload {
-    #[serde(default)]
-    session_id: String,
-    #[serde(default)]
-    agent_id: Option<String>,
-    #[serde(default)]
-    tool_calls: Vec<ToolCall>,
-    #[serde(default)]
-    tool_name: String,
-    #[serde(default)]
-    tool_input: Option<ToolInput>,
+/// Every file a tool call wrote, as the call names them.
+///
+/// pabal decides which tools write files. `plugin/hooks/hooks.json` matches
+/// Claude's `PostToolUse` against the same tools, so a write tool missing
+/// from the matcher goes unattributed.
+fn written_paths(tool: Option<Tool<'_>>) -> Vec<PathBuf> {
+    match tool {
+        Some(Tool::Edit(edit)) => edit.paths(),
+        _ => Vec::new(),
+    }
 }
 
-/// One entry of `PostToolBatch`'s `tool_calls`, keeping only the field its
-/// `changed` request needs.
-#[derive(Debug, Deserialize)]
-struct ToolCall {
-    #[serde(default)]
-    tool_name: String,
-    tool_input: ToolInput,
-}
-
-#[derive(Debug, Deserialize)]
-struct ToolInput {
-    #[serde(default)]
-    file_path: Option<PathBuf>,
+/// The answer carrying a `Flush` response's context, or no answer when
+/// there is nothing to report.
+fn flush_output(view: &impl AddContext, response: Option<Response>) -> HookOutput {
+    match response {
+        Some(Response::Flush {
+            context: Some(text),
+            ..
+        }) if !text.is_empty() => view.add_context(&text),
+        _ => HookOutput::none(),
+    }
 }
 
 /// Convert returned errors to an empty answer; panics are not caught.
@@ -132,128 +137,86 @@ pub async fn dispatch_payload(
     project_dir: &Path,
     identity: Option<&SocketIdentity>,
 ) -> String {
-    match harness {
+    let output = match harness {
         Harness::ClaudeCode => silently(run(event, stdin, identity)).await,
         Harness::Codex => silently(codex::run(event, stdin, project_dir, identity)).await,
-    }
-}
-
-async fn attribute_claude_write(
-    payload: HookPayload,
-    agent: HookAgent,
-    identity: Option<&SocketIdentity>,
-) -> Result<String> {
-    let Some(identity) = identity else {
-        return Ok(String::new());
     };
-    let Some(path) = payload.tool_input.and_then(|input| input.file_path) else {
-        return Ok(String::new());
-    };
-    send(
-        identity,
-        &Request::Changed {
-            attributed: true,
-            agent,
-            session: payload.session_id,
-            paths: vec![path],
-            event: ChangeEvent::Change,
-        },
-        SOCKET_TIMEOUT,
-    )
-    .await?;
-    Ok(String::new())
+    output.to_string()
 }
 
-/// Whether a Claude tool name is one that puts a file on disk.
-///
-/// `plugin/hooks/hooks.json` matches `PostToolUse` against the same set, so
-/// a tool added to one and not the other either writes unattributed or is
-/// dispatched for nothing.
-fn writes_a_file(tool_name: &str) -> bool {
-    matches!(tool_name, "Write" | "Edit" | "MultiEdit")
-}
-
-async fn run(event: HookEvent, stdin: &str, identity: Option<&SocketIdentity>) -> Result<String> {
-    let payload: HookPayload = serde_json::from_str(stdin)?;
+/// The payload's session and the agent it speaks for.
+fn session_and_agent(payload: &impl Fields, host: HookHost) -> (String, HookAgent) {
+    let session = payload.session_id().unwrap_or_default().to_owned();
     let agent = HookAgent {
-        agent_id: payload.agent_id.clone(),
-        host: HookHost::Claude,
+        agent_id: payload.agent_id().map(str::to_owned),
+        host,
     };
+    (session, agent)
+}
 
-    match event {
-        HookEvent::PostToolUse if writes_a_file(&payload.tool_name) => {
-            attribute_claude_write(payload, agent, identity).await
-        }
-        HookEvent::PostToolUse => Ok(String::new()),
+async fn run(
+    event: HookEvent,
+    stdin: &str,
+    identity: Option<&SocketIdentity>,
+) -> Result<HookOutput> {
+    let payload = Payload::<ClaudeCode>::parse_named(event.wire_name(), stdin)?;
+    let Some(identity) = identity else {
+        return Ok(HookOutput::none());
+    };
+    let (session, agent) = session_and_agent(&payload, HookHost::Claude);
 
-        HookEvent::PostToolBatch => {
-            let Some(identity) = identity else {
-                return Ok(String::new());
+    match payload.view() {
+        ClaudeCodeView::PostToolUse(post) => {
+            let paths = written_paths(post.tool());
+            if paths.is_empty() {
+                return Ok(HookOutput::none());
+            }
+            let changed = Request::Changed {
+                attributed: true,
+                agent,
+                session,
+                paths,
+                event: ChangeEvent::Change,
             };
-            let paths = payload
-                .tool_calls
-                .into_iter()
-                .filter(|call| writes_a_file(&call.tool_name))
-                .filter_map(|call| call.tool_input.file_path)
+            send(identity, &changed, SOCKET_TIMEOUT).await?;
+            Ok(HookOutput::none())
+        }
+
+        ClaudeCodeView::PostToolBatch(batch) => {
+            let paths = batch
+                .tool_calls()
+                .flat_map(|call| written_paths(Some(call.tool)))
                 .collect();
             let requests = [
                 Request::Changed {
                     attributed: false,
                     agent: agent.clone(),
-                    session: payload.session_id.clone(),
+                    session: session.clone(),
                     paths,
                     event: ChangeEvent::Change,
                 },
-                Request::Flush {
-                    agent: agent.clone(),
-                    session: payload.session_id,
-                },
+                Request::Flush { agent, session },
             ];
             let responses = send_and_acknowledge(identity, &requests, FLUSH_SOCKET_TIMEOUT).await?;
-            let context = responses.into_iter().nth(1).and_then(flush_context);
-            Ok(additional_context_output(event, context))
+            Ok(flush_output(&batch, responses.into_iter().nth(1)))
         }
 
-        HookEvent::UserPromptSubmit => {
-            let Some(identity) = identity else {
-                return Ok(String::new());
-            };
+        ClaudeCodeView::UserPromptSubmit(prompt) => {
             let responses = send_and_acknowledge(
                 identity,
-                &[Request::Flush {
-                    agent: agent.clone(),
-                    session: payload.session_id,
-                }],
+                &[Request::Flush { agent, session }],
                 FLUSH_SOCKET_TIMEOUT,
             )
             .await?;
-            let context = responses.into_iter().next().and_then(flush_context);
-            Ok(additional_context_output(event, context))
+            Ok(flush_output(&prompt, responses.into_iter().next()))
         }
 
-        HookEvent::SessionEnd => {
-            let Some(identity) = identity else {
-                return Ok(String::new());
-            };
-            send(
-                identity,
-                &Request::EndSession {
-                    session: payload.session_id,
-                },
-                SOCKET_TIMEOUT,
-            )
-            .await?;
-            Ok(String::new())
+        ClaudeCodeView::SessionEnd(_) => {
+            send(identity, &Request::EndSession { session }, SOCKET_TIMEOUT).await?;
+            Ok(HookOutput::none())
         }
-    }
-}
 
-/// The context a `Flush` response carries, or `None` for any other answer.
-fn flush_context(response: Response) -> Option<String> {
-    if let Response::Flush { context, .. } = response {
-        context
-    } else {
-        None
+        _ => Ok(HookOutput::none()),
     }
 }
 
@@ -281,19 +244,6 @@ fn watcher_line(watcher: Option<&WatcherStatus>) -> String {
         ),
         (None, false) => "watcher: not watching; this backend predates the watcher".to_string(),
     }
-}
-
-/// The hook JSON carrying diagnostics context, or the empty string when
-/// there is nothing to report.
-fn additional_context_output(event: HookEvent, context: Option<String>) -> String {
-    context
-        .filter(|text| !text.is_empty())
-        .map_or_else(String::new, |text| {
-            serde_json::json!({ "hookSpecificOutput": {
-                "hookEventName": event, "additionalContext": text
-            } })
-            .to_string()
-        })
 }
 
 /// How many candidate sockets or pipes the doctor probes when this
@@ -1294,6 +1244,14 @@ mod tests {
     /// than passing on a fixture too flat to notice.
     const DEFAULT_FLUSH_TEXT: &str = "2 problems in a.rs\n  1 warning in b.rs\n";
 
+    /// The hook JSON that hands `DEFAULT_FLUSH_TEXT` to the agent after `event`.
+    fn flushed_context(event: HookEvent) -> String {
+        json!({ "hookSpecificOutput": {
+            "hookEventName": event.wire_name(), "additionalContext": DEFAULT_FLUSH_TEXT
+        } })
+        .to_string()
+    }
+
     fn status(id: &str, state: ServerLifecycle) -> ServerStatus {
         ServerStatus {
             id: id.to_string(),
@@ -2147,10 +2105,7 @@ mod tests {
 
         assert_eq!(
             out,
-            additional_context_output(
-                HookEvent::UserPromptSubmit,
-                Some(DEFAULT_FLUSH_TEXT.to_string())
-            ),
+            flushed_context(HookEvent::UserPromptSubmit),
             "an owner slower than the old 50ms bound but inside \
              FLUSH_SOCKET_TIMEOUT must still be waited out, or raising the \
              timeout had no effect at this call site"
@@ -2177,10 +2132,7 @@ mod tests {
 
         assert_eq!(
             out,
-            additional_context_output(
-                HookEvent::PostToolBatch,
-                Some(DEFAULT_FLUSH_TEXT.to_string())
-            ),
+            flushed_context(HookEvent::PostToolBatch),
             "an owner slower than the old 50ms bound but inside \
              FLUSH_SOCKET_TIMEOUT must still be waited out, or raising the \
              timeout had no effect at this call site"
@@ -2330,6 +2282,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_a_claude_notebook_edit_claims_its_notebook() {
+        let recorder = RecordingOwner::start();
+        dispatch_against(
+            &json!({
+                "hook_event_name": "PostToolUse", "session_id": "s1",
+                "tool_name": "NotebookEdit", "tool_input": {"notebook_path": "a.ipynb"}
+            }),
+            &recorder,
+        )
+        .await;
+        let requests = recorder.requests();
+        assert!(
+            matches!(&requests[..], [Request::Changed { attributed: true, paths, .. }] if paths == &[PathBuf::from("a.ipynb")]),
+            "{requests:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_post_tool_batch_sends_changed_then_flush() {
         let recorder = RecordingOwner::start();
         let file = recorder.project_dir().join("a.rs");
@@ -2430,10 +2400,7 @@ mod tests {
 
         assert_eq!(
             out,
-            additional_context_output(
-                HookEvent::PostToolBatch,
-                Some(DEFAULT_FLUSH_TEXT.to_string())
-            ),
+            flushed_context(HookEvent::PostToolBatch),
             "an error answering changed must not swallow a flush answer \
              that arrived on the same connection: {out}"
         );
@@ -2473,10 +2440,7 @@ mod tests {
 
         assert_eq!(
             out,
-            additional_context_output(
-                HookEvent::UserPromptSubmit,
-                Some(DEFAULT_FLUSH_TEXT.to_string())
-            ),
+            flushed_context(HookEvent::UserPromptSubmit),
             "the flush answer was read before the owner hung up, so it is \
              printed: {out}"
         );
@@ -4296,10 +4260,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(
-            out,
-            additional_context_output(HookEvent::PostToolUse, Some(DEFAULT_FLUSH_TEXT.to_string()))
-        );
+        assert_eq!(out, flushed_context(HookEvent::PostToolUse));
         let requests = recorder.requests();
         let Request::Changed {
             session,
