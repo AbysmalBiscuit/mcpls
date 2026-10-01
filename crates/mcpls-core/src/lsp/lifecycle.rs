@@ -1401,7 +1401,7 @@ mod tests {
             watch_registry: None,
         };
 
-        assert!(config.workspace_roots.is_empty());
+        assert_eq!(config.workspace_roots, Vec::<PathBuf>::new());
     }
 
     #[test]

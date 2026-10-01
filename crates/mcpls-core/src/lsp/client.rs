@@ -1082,10 +1082,9 @@ mod tests {
             &go,
         );
 
-        assert!(
-            registry
-                .servers_for(&abs("main.go"), lsp_types::FileChangeType::CHANGED)
-                .is_empty()
+        assert_eq!(
+            registry.servers_for(&abs("main.go"), lsp_types::FileChangeType::CHANGED),
+            Vec::<ServerId>::new()
         );
     }
 
@@ -1113,10 +1112,9 @@ mod tests {
             Value::Null,
             "a server registering something mcpls does not track must not get an error"
         );
-        assert!(
-            registry
-                .servers_for(&abs("main.go"), lsp_types::FileChangeType::CHANGED)
-                .is_empty()
+        assert_eq!(
+            registry.servers_for(&abs("main.go"), lsp_types::FileChangeType::CHANGED),
+            Vec::<ServerId>::new()
         );
     }
 

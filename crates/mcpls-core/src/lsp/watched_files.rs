@@ -305,10 +305,9 @@ mod tests {
         // 1 = Created, 2 = Changed, 4 = Deleted. 5 is create and delete.
         registry.register(&go, "r1", &json!([{ "globPattern": "**/*.go", "kind": 5 }]));
 
-        assert!(
-            registry
-                .servers_for(&abs("main.go"), lsp_types::FileChangeType::CHANGED)
-                .is_empty()
+        assert_eq!(
+            registry.servers_for(&abs("main.go"), lsp_types::FileChangeType::CHANGED),
+            Vec::<ServerId>::new()
         );
         assert_eq!(
             registry.servers_for(&abs("main.go"), lsp_types::FileChangeType::DELETED),
@@ -376,10 +375,9 @@ mod tests {
         registry.register(&go, "r2", &json!([{ "globPattern": "**/*.mod" }]));
         registry.unregister(&go, "r1");
 
-        assert!(
-            registry
-                .servers_for(&abs("main.go"), lsp_types::FileChangeType::CHANGED)
-                .is_empty()
+        assert_eq!(
+            registry.servers_for(&abs("main.go"), lsp_types::FileChangeType::CHANGED),
+            Vec::<ServerId>::new()
         );
         assert_eq!(
             registry.servers_for(&abs("go.mod"), lsp_types::FileChangeType::CHANGED),
@@ -507,10 +505,9 @@ mod tests {
         let registry = WatchRegistry::new();
         let go = ServerId::from("go");
         registry.register(&go, "r1", &json!([{ "globPattern": "**/[" }]));
-        assert!(
-            registry
-                .servers_for(&abs("main.go"), lsp_types::FileChangeType::CHANGED)
-                .is_empty()
+        assert_eq!(
+            registry.servers_for(&abs("main.go"), lsp_types::FileChangeType::CHANGED),
+            Vec::<ServerId>::new()
         );
     }
 }

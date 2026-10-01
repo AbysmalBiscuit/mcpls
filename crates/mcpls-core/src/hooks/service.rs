@@ -1457,7 +1457,10 @@ mod tests {
         std::os::unix::fs::symlink(&actual, &alias).unwrap();
         assert_eq!(harness.sweeper.admitted_paths(&[alias]), vec![actual]);
         let escape = harness.fixture("missing/../../escape.rs");
-        assert!(harness.sweeper.admitted_paths(&[escape]).is_empty());
+        assert_eq!(
+            harness.sweeper.admitted_paths(&[escape]),
+            Vec::<PathBuf>::new()
+        );
         let deleted = harness.fixture("missing/../deleted.rs");
         assert_eq!(
             harness.sweeper.admitted_paths(&[deleted]),
