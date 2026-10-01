@@ -505,8 +505,10 @@ fn test_e2e_workspace_symbols_merge_despite_server_error() -> Result<()> {
         let receipt = workspace.path().join(format!("{sentinel}.received"));
         assert_eq!(
             fs::read_to_string(&receipt)
-                .with_context(|| format!("{sentinel} must receive workspace/symbol"))?,
-            "workspace\n"
+                .with_context(|| format!("{sentinel} must receive workspace/symbol"))?
+                .lines()
+                .collect::<Vec<_>>(),
+            ["workspace"]
         );
     }
     let text = response["result"]["content"][0]["text"]
@@ -539,7 +541,10 @@ fn test_e2e_workspace_symbols_merge_despite_server_error() -> Result<()> {
     );
     for sentinel in ["workspace-error", "workspace-timeout"] {
         let receipt = workspace.path().join(format!("{sentinel}.received"));
-        assert_eq!(fs::read_to_string(&receipt)?, "workspace\nworkspace\n");
+        assert_eq!(
+            fs::read_to_string(&receipt)?.lines().collect::<Vec<_>>(),
+            ["workspace", "workspace"]
+        );
     }
     Ok(())
 }
