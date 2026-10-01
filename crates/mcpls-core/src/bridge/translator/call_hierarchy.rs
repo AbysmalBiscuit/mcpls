@@ -6,6 +6,7 @@ use lsp_types::{
     CallHierarchyPrepareParams as LspCallHierarchyPrepareParams, PartialResultParams,
     TextDocumentIdentifier, TextDocumentPositionParams, WorkDoneProgressParams,
 };
+use serde::{Deserialize, Serialize};
 
 use super::Translator;
 use super::dto::{
@@ -14,7 +15,8 @@ use super::dto::{
 };
 use super::encoding_ctx::EncodingCtx;
 use super::routing::MAX_POSITION_VALUE;
-use crate::config::ToolKind;
+use crate::bridge::lock_std;
+use crate::config::{ServerId, ToolKind};
 use crate::error::{Error, Result};
 
 /// Whether a server's capabilities advertise `callHierarchyProvider` support.
@@ -33,12 +35,23 @@ const fn call_hierarchy_provider_supported(caps: &lsp_types::ServerCapabilities)
 
 /// Parsed form of an MCP-facing `CallHierarchyItemResult` JSON value (1-based
 /// coordinates), before its ranges are converted back to the routed server's
-/// negotiated encoding -- which requires resolving that server first (from
-/// [`Self::uri`]), so that step is left to callers via
+/// negotiated encoding -- which requires resolving the originating server
+/// first, so that step is left to callers via
 /// [`call_hierarchy_item_to_lsp`].
 struct ParsedCallHierarchyItem {
     uri: lsp_types::Uri,
     mcp: CallHierarchyItemResult,
+    origin: Option<ServerId>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "_mcpls", deny_unknown_fields)]
+enum CallHierarchyOrigin {
+    #[serde(rename = "call-hierarchy/v1")]
+    V1 {
+        server_id: ServerId,
+        data: Option<serde_json::Value>,
+    },
 }
 
 /// Deserialize an MCP-facing `CallHierarchyItemResult` JSON value and parse
@@ -47,14 +60,22 @@ struct ParsedCallHierarchyItem {
 /// MCP clients receive `CallHierarchyItemResult` from `prepare_call_hierarchy`
 /// and pass it back opaquely to `get_incoming_calls` / `get_outgoing_calls`.
 fn parse_mcp_call_hierarchy_item(item: serde_json::Value) -> Result<ParsedCallHierarchyItem> {
-    let mcp: CallHierarchyItemResult = serde_json::from_value(item)
+    let mut mcp: CallHierarchyItemResult = serde_json::from_value(item)
         .map_err(|e| Error::InvalidToolParams(format!("Invalid call hierarchy item: {e}")))?;
 
     let uri = mcp.uri.parse::<lsp_types::Uri>().map_err(|e| {
         Error::InvalidToolParams(format!("Invalid URI in call hierarchy item: {e}"))
     })?;
 
-    Ok(ParsedCallHierarchyItem { uri, mcp })
+    let origin = mcp
+        .data
+        .as_ref()
+        .and_then(|data| serde_json::from_value::<CallHierarchyOrigin>(data.clone()).ok());
+    let origin = origin.map(|CallHierarchyOrigin::V1 { server_id, data }| {
+        mcp.data = data;
+        server_id
+    });
+    Ok(ParsedCallHierarchyItem { uri, mcp, origin })
 }
 
 /// Convert a parsed MCP call hierarchy item (1-based coordinates) into a
@@ -63,7 +84,7 @@ async fn call_hierarchy_item_to_lsp(
     parsed: ParsedCallHierarchyItem,
     ctx: &EncodingCtx,
 ) -> CallHierarchyItem {
-    let ParsedCallHierarchyItem { uri, mcp } = parsed;
+    let ParsedCallHierarchyItem { uri, mcp, .. } = parsed;
 
     // Round-trip via serde: `convert_call_hierarchy_item` stored the kind as a u32
     // by serialising `SymbolKind`; we reverse this to reconstruct the same value.
@@ -88,6 +109,7 @@ async fn call_hierarchy_item_to_lsp(
 async fn convert_call_hierarchy_item(
     item: CallHierarchyItem,
     ctx: &EncodingCtx,
+    server_id: &ServerId,
 ) -> CallHierarchyItemResult {
     let range = ctx.normalize_range(&item.uri, item.range).await;
     let selection_range = ctx.normalize_range(&item.uri, item.selection_range).await;
@@ -103,11 +125,35 @@ async fn convert_call_hierarchy_item(
         uri: item.uri.to_string(),
         range,
         selection_range,
-        data: item.data,
+        data: Some(serde_json::json!(CallHierarchyOrigin::V1 {
+            server_id: server_id.clone(),
+            data: item.data,
+        })),
     }
 }
 
 impl Translator {
+    async fn call_hierarchy_client(
+        &self,
+        parsed: &ParsedCallHierarchyItem,
+    ) -> Result<(ServerId, crate::lsp::LspClient)> {
+        let path = self.parse_file_uri(&parsed.uri)?;
+        let Some(server_id) = parsed.origin.as_ref() else {
+            return self
+                .resolve_client_for_file(&path, ToolKind::CallHierarchy)
+                .await;
+        };
+        self.ensure_server(server_id, Some(super::routing::FIRST_SPAWN_BUDGET))
+            .await?;
+        let client = lock_std(&self.lsp_clients)
+            .get(server_id)
+            .cloned()
+            .ok_or_else(|| Error::ServerInitializing {
+                server_id: server_id.clone(),
+            })?;
+        Ok((server_id.clone(), client))
+    }
+
     /// Handle call hierarchy prepare request.
     ///
     /// # Errors
@@ -164,7 +210,7 @@ impl Translator {
         let lsp_items = response.unwrap_or_default();
         let mut items = Vec::with_capacity(lsp_items.len());
         for item in lsp_items {
-            items.push(convert_call_hierarchy_item(item, &ctx).await);
+            items.push(convert_call_hierarchy_item(item, &ctx, &server_id).await);
         }
 
         Ok(CallHierarchyPrepareResult { items })
@@ -183,15 +229,7 @@ impl Translator {
         // Deserialize as our own type (1-based coords).
         let parsed = parse_mcp_call_hierarchy_item(item)?;
 
-        // Parse and validate the URI. Resolved with the same ToolKind as
-        // `handle_call_hierarchy_prepare` -- the opaque item this call
-        // receives is only meaningful to the server that produced it, and
-        // that server is guaranteed to be the same one `prepare` synced the
-        // document to since both resolve via the same (language, tool) route.
-        let path = self.parse_file_uri(&parsed.uri)?;
-        let (server_id, client) = self
-            .resolve_client_for_file(&path, ToolKind::CallHierarchy)
-            .await?;
+        let (server_id, client) = self.call_hierarchy_client(&parsed).await?;
         self.require_capability(
             &server_id,
             "callHierarchyProvider",
@@ -231,7 +269,7 @@ impl Translator {
             };
 
             calls.push(IncomingCall {
-                from: convert_call_hierarchy_item(call.from, &ctx).await,
+                from: convert_call_hierarchy_item(call.from, &ctx, &server_id).await,
                 from_ranges,
             });
         }
@@ -252,12 +290,7 @@ impl Translator {
         // Deserialize as our own type (1-based coords).
         let parsed = parse_mcp_call_hierarchy_item(item)?;
 
-        // Parse and validate the URI. Same ToolKind/route as `prepare` and
-        // `handle_incoming_calls` -- see that function's comment.
-        let path = self.parse_file_uri(&parsed.uri)?;
-        let (server_id, client) = self
-            .resolve_client_for_file(&path, ToolKind::CallHierarchy)
-            .await?;
+        let (server_id, client) = self.call_hierarchy_client(&parsed).await?;
         self.require_capability(
             &server_id,
             "callHierarchyProvider",
@@ -297,7 +330,7 @@ impl Translator {
             };
 
             calls.push(OutgoingCall {
-                to: convert_call_hierarchy_item(call.to, &ctx).await,
+                to: convert_call_hierarchy_item(call.to, &ctx, &server_id).await,
                 from_ranges,
             });
         }
@@ -397,7 +430,7 @@ mod tests {
             },
             data: None,
         };
-        let result = convert_call_hierarchy_item(item, &test_ctx()).await;
+        let result = convert_call_hierarchy_item(item, &test_ctx(), &ServerId::from("rust")).await;
         // SymbolKind::FUNCTION is LSP integer 12
         assert_eq!(result.kind, 12u32);
         assert_eq!(result.name, "my_fn");

@@ -4099,7 +4099,12 @@ mod tests {
             let (translator, mut lsp) = translator_with_capabilities(
                 &dir,
                 &ServerId::from("rust"),
-                lsp_types::ServerCapabilities::default(),
+                lsp_types::ServerCapabilities {
+                    diagnostic_provider: Some(lsp_types::DiagnosticServerCapabilities::Options(
+                        lsp_types::DiagnosticOptions::default(),
+                    )),
+                    ..Default::default()
+                },
             );
             let cache = Arc::new(Mutex::new(NotificationCache::new()));
             let uri = crate::bridge::path_to_uri(&dunce::canonicalize(&path).unwrap()).unwrap();
@@ -5364,7 +5369,7 @@ mod tests {
     fn test_paginate_out_of_range_cursor_yields_empty_page_not_error() {
         let p = paths(5);
         let (page, next_cursor) = paginate_resource_paths(&p, Some("9999"), 100).unwrap();
-        assert!(page.is_empty());
+        assert_eq!(page, &[] as &[PathBuf]);
         assert!(next_cursor.is_none());
     }
 
@@ -5375,7 +5380,7 @@ mod tests {
         let p = paths(5);
         let cursor = usize::MAX.to_string();
         let (page, next_cursor) = paginate_resource_paths(&p, Some(&cursor), 100).unwrap();
-        assert!(page.is_empty());
+        assert_eq!(page, &[] as &[PathBuf]);
         assert!(next_cursor.is_none());
     }
 
@@ -5420,7 +5425,7 @@ mod tests {
         let response = ResourceDiagnosticsResponse::new(false, None);
         assert!(!response.tracked);
         assert!(response.version.is_none());
-        assert!(response.diagnostics.is_empty());
+        assert_eq!(response.diagnostics, Vec::<lsp_types::Diagnostic>::new());
 
         // #132's contract is the wire shape, not the Rust struct -- assert the JSON directly.
         let json = serde_json::to_value(&response).unwrap();
@@ -5434,7 +5439,7 @@ mod tests {
         let response = ResourceDiagnosticsResponse::new(true, None);
         assert!(response.tracked);
         assert!(response.version.is_none());
-        assert!(response.diagnostics.is_empty());
+        assert_eq!(response.diagnostics, Vec::<lsp_types::Diagnostic>::new());
 
         let json = serde_json::to_value(&response).unwrap();
         assert_eq!(json["tracked"], true);
@@ -5492,14 +5497,14 @@ mod tests {
     fn test_build_resource_diagnostics_response_neither_open_nor_cached_is_untracked() {
         let response = build_resource_diagnostics_response(false, None);
         assert!(!response.tracked);
-        assert!(response.diagnostics.is_empty());
+        assert_eq!(response.diagnostics, Vec::<lsp_types::Diagnostic>::new());
     }
 
     #[test]
     fn test_build_resource_diagnostics_response_open_but_uncached_is_tracked() {
         let response = build_resource_diagnostics_response(true, None);
         assert!(response.tracked);
-        assert!(response.diagnostics.is_empty());
+        assert_eq!(response.diagnostics, Vec::<lsp_types::Diagnostic>::new());
     }
 
     /// Regression: an LSP server can publish diagnostics for a file mcpls never

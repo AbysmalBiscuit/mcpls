@@ -427,8 +427,8 @@ mod tests {
         else {
             panic!("a status");
         };
-        assert!(sessions.is_empty());
-        assert!(version.is_empty());
+        assert_eq!(sessions, Vec::<String>::new());
+        assert_eq!(version, "");
         assert!(
             !watcher.watching,
             "a backend from before this field existed reports no watcher, \

@@ -256,7 +256,7 @@
           ]
         },
         "handles": {
-          "description": "Tools this server handles. An overlay inherits the built-in value; a\nnew server without a list is its language's catch-all, handling every\ntool no other server claims.\n\nA language may have one catch-all, and a tool may be claimed by one\nserver per language; a config that breaks either for two servers that\nboth apply fails at startup, naming the entries. `rename` routes\n`rename_symbol`, `workspace_symbols` routes `workspace_symbol_search`,\n`call_hierarchy` routes all three call hierarchy tools, and\n`diagnostics` routes both diagnostics tools. A tool whose server has no\nbinary moves to the catch-all. `workspace_symbols` has no document to\nroute by, so it goes to the first server anywhere that claims it, else\nthe first catch-all.",
+          "description": "Tools this server handles. Overlays inherit the built-in value; new\nentries without a list catch tools no other server claims. Each language\nallows one catch-all and one claimant per tool; conflicts name the\napplicable entries at startup. `rename` routes `rename_symbol`,\n`diagnostics` both diagnostic tools, and `call_hierarchy` all call\nhierarchy tools. Missing binaries fall back to the catch-all. Workspace\nsearches query all capable running servers; with none, the first\n`workspace_symbols` claimant or catch-all starts.",
           "items": {
             "$ref": "#/$defs/ToolKind"
           },
@@ -417,7 +417,7 @@
       ]
     },
     "ToolKind": {
-      "description": "A routable MCP tool: every MCP tool that dispatches a request to a\nspecific LSP server via [`ToolRouter`].\n\nCache-only tools (`get_cached_diagnostics`, `get_new_diagnostics`,\n`get_server_logs`, `get_server_messages`) are deliberately excluded —\nthey never reach a client directly, so they have nothing to route.\n\n`CallHierarchy` covers `prepare`, `incoming_calls`, and `outgoing_calls`\nas a single route: the opaque item returned by `prepare` is only\nmeaningful to the server that produced it, and the incoming/outgoing\nhandlers never call `ensure_open` themselves — they rely on `prepare`\nhaving already synced the document to the *same* server.\n\n# Examples\n\n```\nuse mcpls_core::config::ToolKind;\n\nassert_eq!(ToolKind::Hover.as_str(), \"hover\");\nassert_eq!(ToolKind::ALL.len(), 15);\n```",
+      "description": "A routable MCP tool: every MCP tool that dispatches a request to a\nspecific LSP server via [`ToolRouter`].\n\nCache-only tools (`get_cached_diagnostics`, `get_new_diagnostics`,\n`get_server_logs`, `get_server_messages`) are deliberately excluded —\nthey never reach a client directly, so they have nothing to route.\n\n`CallHierarchy` covers `prepare`, `incoming_calls`, and `outgoing_calls`\nas a single route: the opaque item returned by `prepare` is only\nmeaningful to the server that produced it. Returned items preserve that\nserver's identity in their opaque data, including foreign-language items;\nlegacy items without an origin use this route.\n\n# Examples\n\n```\nuse mcpls_core::config::ToolKind;\n\nassert_eq!(ToolKind::Hover.as_str(), \"hover\");\nassert_eq!(ToolKind::ALL.len(), 15);\n```",
       "oneOf": [
         {
           "const": "hover",

@@ -13,8 +13,7 @@ use crate::bridge::state::uri_to_path;
 /// position/range in that response between MCP's 1-based UTF-16 columns and
 /// the server's own 0-based columns.
 ///
-/// A single MCP tool call is always answered by exactly one LSP server, so
-/// one context covers every location in its response -- even when
+/// One context covers every location returned by its LSP server, even when
 /// individual locations point into other files (e.g. `references` results
 /// spanning multiple documents): each conversion resolves the *referenced*
 /// file's line text independently rather than assuming it matches the

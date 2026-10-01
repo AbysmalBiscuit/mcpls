@@ -312,7 +312,7 @@ fn a_muted_file_forgets_history_without_reporting_a_clear() {
     delivery.flush(&a.record, &[entry("a.rs", &errors, SeverityFloor::Warning)]);
     let muted = delivery.flush(&a.record, &[entry("a.rs", &errors, SeverityFloor::Off)]);
     assert!(muted.changed.is_empty());
-    assert!(muted.cleared.is_empty());
+    assert_eq!(muted.cleared, Vec::<String>::new());
     assert_eq!(
         delivery
             .flush(&a.record, &[entry("a.rs", &errors, SeverityFloor::Warning)])

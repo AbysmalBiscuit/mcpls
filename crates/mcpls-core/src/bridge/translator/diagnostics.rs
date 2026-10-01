@@ -132,9 +132,22 @@ impl Translator {
 
         let params = diagnostic_request_params(TextDocumentIdentifier { uri: uri.clone() });
 
-        let pull_response: Result<lsp_types::DocumentDiagnosticReportResult> = client
-            .request("textDocument/diagnostic", params, client.request_timeout())
-            .await;
+        let path = self.parse_file_uri(&uri)?;
+        let language = crate::bridge::state::detect_language(&path, &self.extension_map);
+        let pull_response: Result<lsp_types::DocumentDiagnosticReportResult> = match self
+            .require_capability_for_document(
+                &server_id,
+                "diagnosticProvider",
+                Some((&path, &language)),
+                |caps| caps.diagnostic_provider.is_some(),
+            ) {
+            Ok(()) => {
+                client
+                    .request("textDocument/diagnostic", params, client.request_timeout())
+                    .await
+            }
+            Err(error) => Err(error),
+        };
 
         let diag_info = {
             let cache = notification_cache.lock().await;

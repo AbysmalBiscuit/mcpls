@@ -62,6 +62,15 @@ while True:
             },
         })
     elif method == "workspace/symbol":
+        if len(sys.argv) > 2:
+            with open(sys.argv[2], "a", encoding="utf-8") as marker:
+                marker.write(request["params"]["query"] + "\n")
+        if sentinel == "workspace-error":
+            send({"jsonrpc": "2.0", "id": request["id"],
+                  "error": {"code": -32603, "message": "fixture failure"}})
+            continue
+        if sentinel == "workspace-timeout":
+            continue
         send({
             "jsonrpc": "2.0",
             "id": request["id"],

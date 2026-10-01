@@ -967,7 +967,7 @@ mod tests {
              raising the document limit would not have helped this one"
         );
         assert_eq!(sweeper.opened_count(), 0);
-        assert!(sweeper.notifications().is_empty());
+        assert_eq!(sweeper.notifications(), Vec::<String>::new());
     }
 
     /// A hand-built translator has no spawn handle, so a trigger publishes

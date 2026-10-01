@@ -1494,7 +1494,10 @@ handles = ["diagnostics"]
         harness.queue_invalidation(&target);
         harness.translator.resync_changed_documents().await;
         assert!(harness.translator.document_tracker().is_open(&target));
-        assert!(harness.translator.pending_invalidations.take().is_empty());
+        assert_eq!(
+            harness.translator.pending_invalidations.take(),
+            Vec::<std::path::PathBuf>::new()
+        );
     }
 
     #[tokio::test]
@@ -1569,7 +1572,10 @@ handles = ["diagnostics"]
             assert_eq!(saved["method"], "textDocument/didSave");
             assert_eq!(saved["params"]["textDocument"]["uri"], state.uri().as_str());
             assert_eq!(state.saved_version(&healthy), Some(1));
-            assert!(harness.translator.pending_invalidations.take().is_empty());
+            assert_eq!(
+                harness.translator.pending_invalidations.take(),
+                Vec::<std::path::PathBuf>::new()
+            );
         }
     }
 
@@ -1585,7 +1591,10 @@ handles = ["diagnostics"]
             vec!["workspace/didChangeWatchedFiles"]
         );
         assert!(!harness.translator.document_tracker().is_open(&path));
-        assert!(harness.translator.pending_invalidations.take().is_empty());
+        assert_eq!(
+            harness.translator.pending_invalidations.take(),
+            Vec::<std::path::PathBuf>::new()
+        );
     }
 
     /// Matching disk content does not discharge the save owed after an

@@ -1393,8 +1393,8 @@ mod tests {
         state.mark_synced(rust.clone(), 2);
         state.mark_saved(rust, 2);
 
-        assert!(state.servers_needing_change(2).is_empty());
-        assert!(state.servers_needing_save(2).is_empty());
+        assert_eq!(state.servers_needing_change(2), Vec::<ServerId>::new());
+        assert_eq!(state.servers_needing_save(2), Vec::<ServerId>::new());
     }
 
     #[test]
@@ -1416,7 +1416,7 @@ mod tests {
             "a resync tells servers that already hold the document; opening it \
              for a new server is ensure_open's job, not the resync's"
         );
-        assert!(state.servers_needing_save(2).is_empty());
+        assert_eq!(state.servers_needing_save(2), Vec::<ServerId>::new());
     }
 
     #[test]
@@ -3051,7 +3051,7 @@ mod tests {
             .expect("resync")
             .expect("tracked");
         drop(guard);
-        assert!(again.needs_change.is_empty());
+        assert_eq!(again.needs_change, Vec::<ServerId>::new());
         assert_eq!(again.needs_save, vec![rust]);
         assert_eq!(
             again.version, version,

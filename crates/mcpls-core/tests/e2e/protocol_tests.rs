@@ -3,6 +3,7 @@
 //! These tests validate the complete MCP protocol flow by spawning the mcpls
 //! binary and communicating with it as a real MCP client would.
 
+use std::fmt::Write;
 use std::path::Path;
 use std::time::{Duration, Instant};
 use std::{fs, thread};
@@ -12,8 +13,338 @@ use mcpls_core::config::SpawnPolicy;
 use serde_json::json;
 use tempfile::TempDir;
 
-use super::diagnostics_fixture;
 use super::mcp_client::McpClient;
+use super::{diagnostics_fixture, routing_fixture};
+
+fn tool_payload(response: &serde_json::Value) -> Result<serde_json::Value> {
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("tool must return text")?;
+    Ok(serde_json::from_str(text)?)
+}
+
+#[rstest::rstest]
+#[case("textDocument/hover", "hoverProvider", "get_hover", "normal")]
+#[case("textDocument/hover", "hoverProvider", "get_hover", "relative")]
+#[case(
+    "textDocument/definition",
+    "definitionProvider",
+    "get_definition",
+    "normal"
+)]
+#[case(
+    "textDocument/typeDefinition",
+    "typeDefinitionProvider",
+    "go_to_type_definition",
+    "normal"
+)]
+#[case(
+    "textDocument/implementation",
+    "implementationProvider",
+    "go_to_implementation",
+    "normal"
+)]
+#[case(
+    "textDocument/references",
+    "referencesProvider",
+    "get_references",
+    "normal"
+)]
+#[case("textDocument/rename", "renameProvider", "rename_symbol", "normal")]
+#[case(
+    "textDocument/completion",
+    "completionProvider",
+    "get_completions",
+    "normal"
+)]
+#[case(
+    "textDocument/signatureHelp",
+    "signatureHelpProvider",
+    "get_signature_help",
+    "normal"
+)]
+#[case(
+    "textDocument/documentSymbol",
+    "documentSymbolProvider",
+    "get_document_symbols",
+    "normal"
+)]
+#[case(
+    "workspace/symbol",
+    "workspaceSymbolProvider",
+    "workspace_symbol_search",
+    "normal"
+)]
+#[case(
+    "textDocument/formatting",
+    "documentFormattingProvider",
+    "format_document",
+    "normal"
+)]
+#[case(
+    "textDocument/rangeFormatting",
+    "documentRangeFormattingProvider",
+    "format_document",
+    "normal"
+)]
+#[case(
+    "textDocument/codeAction",
+    "codeActionProvider",
+    "get_code_actions",
+    "normal"
+)]
+#[case(
+    "textDocument/prepareCallHierarchy",
+    "callHierarchyProvider",
+    "prepare_call_hierarchy",
+    "normal"
+)]
+#[case(
+    "textDocument/inlayHint",
+    "inlayHintProvider",
+    "get_inlay_hints",
+    "normal"
+)]
+#[case(
+    "textDocument/diagnostic",
+    "diagnosticProvider",
+    "get_diagnostics",
+    "normal"
+)]
+#[ignore = "Requires mcpls binary built"]
+fn test_e2e_dynamic_tool_registration_and_selector(
+    #[case] method: &str,
+    #[case] capability: &str,
+    #[case] tool: &str,
+    #[case] mode: &str,
+) -> Result<()> {
+    let workspace = TempDir::new()?;
+    for name in [
+        "good.rs",
+        "bad.rs",
+        "register.rs",
+        "unregister.rs",
+        "register-language.rs",
+        "register-scheme.rs",
+        "register-empty.rs",
+    ] {
+        fs::write(workspace.path().join(name), "fn main() {}\n")?;
+    }
+    let receipt_path = workspace.path().join("requests.received");
+    let mut client = dynamic_client(workspace.path(), method, capability, mode)?;
+    let arguments = |name: &str| {
+        let path = workspace.path().join(name);
+        let mut args = match tool {
+            "workspace_symbol_search" => json!({"query": "dynamic"}),
+            "get_document_symbols" | "get_diagnostics" | "format_document" => {
+                json!({"file_path": path})
+            }
+            "get_code_actions" | "get_inlay_hints" => {
+                json!({"file_path": path, "start_line": 1, "start_character": 1, "end_line": 1, "end_character": 2})
+            }
+            "rename_symbol" => {
+                json!({"file_path": path, "line": 1, "character": 1, "new_name": "renamed"})
+            }
+            _ => json!({"file_path": path, "line": 1, "character": 1}),
+        };
+        if method == "textDocument/rangeFormatting" {
+            args["range"] =
+                json!({"start_line": 1, "start_character": 1, "end_line": 1, "end_character": 2});
+        }
+        args
+    };
+    let control_tool = if method == "textDocument/documentSymbol" {
+        "get_hover"
+    } else {
+        "get_document_symbols"
+    };
+    let control =
+        |name: &str| json!({"file_path": workspace.path().join(name), "line": 1, "character": 1});
+    let good = arguments("good.rs");
+    let missing = client
+        .call_tool(tool, &good)
+        .err()
+        .context("tool is initially unsupported")?;
+    assert!(missing.to_string().contains(capability), "{missing}");
+    if method != "workspace/symbol" {
+        for name in [
+            "register-language.rs",
+            "register-scheme.rs",
+            "register-empty.rs",
+        ] {
+            client.call_tool(control_tool, &control(name))?;
+            let mismatch = client
+                .call_tool(tool, &good)
+                .err()
+                .context("nonmatching registration must not enable the tool")?;
+            assert!(mismatch.to_string().contains(capability), "{mismatch}");
+            client.call_tool(control_tool, &control("unregister.rs"))?;
+        }
+    }
+    client.call_tool(control_tool, &control("register.rs"))?;
+    client.call_tool(tool, &good)?;
+    assert_eq!(
+        fs::read_to_string(&receipt_path)?
+            .lines()
+            .collect::<Vec<_>>(),
+        [method]
+    );
+    if method != "workspace/symbol" {
+        let mismatch = client
+            .call_tool(tool, &arguments("bad.rs"))
+            .err()
+            .context("selector must exclude bad.rs")?;
+        assert!(mismatch.to_string().contains(capability), "{mismatch}");
+    }
+    client.call_tool(control_tool, &control("unregister.rs"))?;
+    let removed = client
+        .call_tool(tool, &good)
+        .err()
+        .context("unregistered tool is unsupported")?;
+    assert!(removed.to_string().contains(capability), "{removed}");
+    assert_eq!(
+        fs::read_to_string(&receipt_path)?
+            .lines()
+            .collect::<Vec<_>>(),
+        [method]
+    );
+    Ok(())
+}
+
+fn dynamic_client(root: &Path, method: &str, capability: &str, mode: &str) -> Result<McpClient> {
+    let script = routing_fixture::write_dynamic_server(root)?;
+    let args = toml_array(&[
+        script.to_string_lossy().into_owned(),
+        method.to_owned(),
+        capability.to_owned(),
+        root.join("requests.received")
+            .to_string_lossy()
+            .into_owned(),
+        mode.to_owned(),
+    ]);
+    let root_value = toml::Value::String(root.to_string_lossy().into_owned());
+    let config_path = root.join("mcpls.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[workspace]\nroots = [{root_value}]\n[backend]\nspawn = \"eager\"\n[diagnostics.hooks]\nenabled = false\n[[lsp_servers]]\nlanguage_id = \"rust\"\ncommand = \"python3\"\nargs = [{args}]\nfile_patterns = [\"**/*.rs\"]\n[lsp_servers.heuristics]\nproject_markers = []\n"
+        ),
+    )?;
+    let mut client = McpClient::spawn_with_args(&["--config", &config_path.to_string_lossy()])?;
+    client.initialize()?;
+    Ok(client)
+}
+
+#[test]
+#[ignore = "Requires mcpls binary built"]
+fn test_e2e_dynamic_preserves_static_selector_and_registration_id() -> Result<()> {
+    let workspace = TempDir::new()?;
+    for name in [
+        "good.rs",
+        "static.rs",
+        "register.rs",
+        "unregister.rs",
+        "unregister-static.rs",
+    ] {
+        fs::write(workspace.path().join(name), "fn main() {}\n")?;
+    }
+    let mut client = dynamic_client(
+        workspace.path(),
+        "textDocument/implementation",
+        "implementationProvider",
+        "static",
+    )?;
+    let args =
+        |name: &str| json!({"file_path": workspace.path().join(name), "line": 1, "character": 1});
+    let tool = "go_to_implementation";
+    client.call_tool(tool, &args("static.rs"))?;
+    let excluded = client
+        .call_tool(tool, &args("good.rs"))
+        .err()
+        .context("initial selector must exclude good.rs")?;
+    assert!(excluded.to_string().contains("implementationProvider"));
+    client.call_tool("get_document_symbols", &args("register.rs"))?;
+    client.call_tool(tool, &args("good.rs"))?;
+    client.call_tool(tool, &args("static.rs"))?;
+    client.call_tool("get_document_symbols", &args("unregister.rs"))?;
+    let removed = client
+        .call_tool(tool, &args("good.rs"))
+        .err()
+        .context("dynamic selector must be removed")?;
+    assert!(removed.to_string().contains("implementationProvider"));
+    client.call_tool(tool, &args("static.rs"))?;
+    client.call_tool("get_document_symbols", &args("unregister-static.rs"))?;
+    let removed = client
+        .call_tool(tool, &args("static.rs"))
+        .err()
+        .context("initial registration ID must be removed")?;
+    assert!(removed.to_string().contains("implementationProvider"));
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("requests.received"))?
+            .lines()
+            .collect::<Vec<_>>(),
+        ["textDocument/implementation"; 4]
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "Requires mcpls binary built"]
+fn test_e2e_call_hierarchy_preserves_foreign_item_origin() -> Result<()> {
+    let workspace = TempDir::new()?;
+    let source = workspace.path().join("main.rs");
+    let foreign = workspace.path().join("other.ts");
+    fs::write(&source, "fn main() {}\n")?;
+    fs::write(&foreign, "function other() {}\n")?;
+    let foreign_uri = url::Url::from_file_path(&foreign)
+        .map_err(|()| anyhow::anyhow!("fixture path must be a file URI"))?;
+    let script = routing_fixture::write_call_hierarchy_server(workspace.path())?;
+    let root = toml::Value::String(workspace.path().to_string_lossy().into_owned());
+    let script = toml::Value::String(script.to_string_lossy().into_owned());
+    let uri_arg = toml::Value::String(foreign_uri.to_string());
+    let mut config = format!(
+        "[workspace]\nroots = [{root}]\n[backend]\nspawn = \"eager\"\n[diagnostics.hooks]\nenabled = false\n"
+    );
+    for (language, extension) in [("rust", "rs"), ("typescript", "ts")] {
+        write!(
+            config,
+            "\n[[lsp_servers]]\nlanguage_id = {language:?}\ncommand = \"python3\"\nargs = [{script}, {language:?}, {uri_arg}]\nfile_patterns = [\"**/*.{extension}\"]\n[lsp_servers.heuristics]\nproject_markers = []\n"
+        )?;
+    }
+    let config_path = workspace.path().join("mcpls.toml");
+    fs::write(&config_path, config)?;
+    let mut client = McpClient::spawn_with_args(&["--config", &config_path.to_string_lossy()])?;
+    client.initialize()?;
+    let prepared = client.call_tool(
+        "prepare_call_hierarchy",
+        &json!({"file_path": source, "line": 1, "character": 1}),
+    )?;
+    let prepared = tool_payload(&prepared)?;
+    let item = &prepared["items"][0];
+    assert_eq!(item["name"], "rust-prepare");
+    assert_eq!(item["uri"], foreign_uri.as_str());
+    let incoming = tool_payload(&client.call_tool("get_incoming_calls", &json!({"item": item}))?)?;
+    assert_eq!(incoming["calls"][0]["from"]["name"], "rust-incoming");
+    let outgoing = tool_payload(&client.call_tool("get_outgoing_calls", &json!({"item": item}))?)?;
+    assert_eq!(outgoing["calls"][0]["to"]["name"], "rust-outgoing");
+    let nested = &incoming["calls"][0]["from"];
+    let nested_outgoing =
+        tool_payload(&client.call_tool("get_outgoing_calls", &json!({"item": nested}))?)?;
+    assert_eq!(nested_outgoing["calls"][0]["to"]["name"], "rust-outgoing");
+    let nested = &outgoing["calls"][0]["to"];
+    let nested_incoming =
+        tool_payload(&client.call_tool("get_incoming_calls", &json!({"item": nested}))?)?;
+    assert_eq!(nested_incoming["calls"][0]["from"]["name"], "rust-incoming");
+    let mut legacy = item.clone();
+    legacy["data"] = json!({"_mcpls_call_hierarchy": {"version": 1, "server_id": "typescript"}, "payload": [null, "opaque", 7]});
+    let legacy_outgoing =
+        tool_payload(&client.call_tool("get_outgoing_calls", &json!({"item": legacy}))?)?;
+    assert_eq!(
+        legacy_outgoing["calls"][0]["to"]["name"],
+        "typescript-outgoing"
+    );
+    Ok(())
+}
 
 fn toml_array(values: &[String]) -> String {
     values
@@ -449,6 +780,102 @@ fn i1_t1_workspace_only_server_without_mapping_is_accepted() -> Result<()> {
         response.to_string().contains("workspace-fixture"),
         "workspace symbol response should contain the fixture sentinel, got {response}"
     );
+    Ok(())
+}
+
+#[test]
+#[ignore = "Requires mcpls binary built"]
+fn test_e2e_workspace_symbols_merge_despite_server_error() -> Result<()> {
+    let workspace = TempDir::new()?;
+    let script = diagnostics_fixture::write_hover_server(workspace.path())?;
+    let config_path = workspace.path().join("mcpls.toml");
+    let root = toml::Value::String(workspace.path().to_string_lossy().into_owned());
+    let script = toml::Value::String(script.to_string_lossy().into_owned());
+    let mut config = format!(
+        "[workspace]\nroots = [{root}]\n[backend]\nspawn = \"eager\"\n[diagnostics.hooks]\nenabled = false\n"
+    );
+    for (language, sentinel, handles) in [
+        (
+            "rust",
+            "workspace-rust",
+            "handles = [\"workspace_symbols\", \"hover\"]\n",
+        ),
+        (
+            "typescript",
+            "workspace-typescript",
+            "handles = [\"hover\"]\n",
+        ),
+        ("python", "workspace-python", ""),
+        ("elixir", "workspace-error", ""),
+        ("lua", "workspace-timeout", ""),
+    ] {
+        let receipt = workspace.path().join(format!("{sentinel}.received"));
+        let receipt = toml::Value::String(receipt.to_string_lossy().into_owned());
+        write!(
+            config,
+            "\n[[lsp_servers]]\nlanguage_id = {language:?}\ncommand = \"python3\"\nargs = [{script}, {sentinel:?}, {receipt}]\nfile_patterns = [\"**/*.{language}\"]\nrequest_timeout_seconds = 1\n{handles}[lsp_servers.heuristics]\nproject_markers = []\n"
+        )?;
+        fs::write(
+            workspace.path().join(format!("main.{language}")),
+            "fixture\n",
+        )?;
+    }
+    fs::write(&config_path, config)?;
+    let config_arg = config_path.to_string_lossy();
+    let mut client = McpClient::spawn_with_args(&["--config", &config_arg])?;
+    client.initialize()?;
+    for language in ["rust", "typescript", "python", "elixir", "lua"] {
+        call_hover_when_ready(
+            &mut client,
+            &workspace.path().join(format!("main.{language}")),
+        )?;
+    }
+    let response = call_workspace_symbol_when_ready(&mut client)?;
+    for sentinel in ["workspace-error", "workspace-timeout"] {
+        let receipt = workspace.path().join(format!("{sentinel}.received"));
+        assert_eq!(
+            fs::read_to_string(&receipt)
+                .with_context(|| format!("{sentinel} must receive workspace/symbol"))?
+                .lines()
+                .collect::<Vec<_>>(),
+            ["workspace"]
+        );
+    }
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("workspace search must return text")?;
+    let result: serde_json::Value = serde_json::from_str(text)?;
+    let symbols = result["symbols"].as_array().context("expected symbols")?;
+    for name in ["workspace-rust", "workspace-typescript", "workspace-python"] {
+        assert!(
+            symbols.iter().any(|symbol| symbol["name"] == name),
+            "missing {name}: {result}"
+        );
+    }
+    assert_eq!(symbols.len(), 3);
+
+    let response = client.call_tool(
+        "workspace_symbol_search",
+        &json!({"query": "workspace", "limit": 2, "kind_filter": "function"}),
+    )?;
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("workspace search must return text")?;
+    let result: serde_json::Value = serde_json::from_str(text)?;
+    assert_eq!(
+        result["symbols"]
+            .as_array()
+            .context("expected symbols")?
+            .len(),
+        2
+    );
+    for sentinel in ["workspace-error", "workspace-timeout"] {
+        let receipt = workspace.path().join(format!("{sentinel}.received"));
+        assert_eq!(
+            fs::read_to_string(&receipt)?.lines().collect::<Vec<_>>(),
+            ["workspace", "workspace"]
+        );
+    }
     Ok(())
 }
 

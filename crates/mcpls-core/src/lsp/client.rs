@@ -12,6 +12,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Duration, timeout};
 use tracing::{debug, error, trace, warn};
 
+use super::capabilities::CapabilityRegistry;
 use crate::config::{LspServerConfig, ServerId};
 use crate::error::{Error, Result};
 use crate::lsp::WatchRegistry;
@@ -130,6 +131,7 @@ pub struct LspClient {
     /// false`, so a server cannot write to the tree at a moment of its own
     /// choosing.
     apply_sink: Arc<Mutex<Option<ApplySink>>>,
+    pub(crate) capabilities: Arc<CapabilityRegistry>,
 
     /// Background receiver task handle.
     receiver_task: Option<JoinHandle<Result<()>>>,
@@ -148,6 +150,7 @@ impl Clone for LspClient {
             command_tx: self.command_tx.clone(),
             pending_requests: Arc::clone(&self.pending_requests),
             apply_sink: Arc::clone(&self.apply_sink),
+            capabilities: Arc::clone(&self.capabilities),
             receiver_task: None,
         }
     }
@@ -194,6 +197,7 @@ impl LspClient {
             command_tx,
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
             apply_sink: Arc::new(Mutex::new(None)),
+            capabilities: Arc::new(CapabilityRegistry::default()),
             receiver_task: None,
         }
     }
@@ -208,6 +212,7 @@ impl LspClient {
         let pending_requests = Arc::new(Mutex::new(HashMap::new()));
         let apply_sink = Arc::new(Mutex::new(None));
         let server = config.id();
+        let capabilities = Arc::new(CapabilityRegistry::default());
 
         let (command_tx, command_rx) = mpsc::channel(100);
 
@@ -220,6 +225,7 @@ impl LspClient {
             None,
             None,
             server,
+            Arc::clone(&capabilities),
         ));
 
         Self {
@@ -229,6 +235,7 @@ impl LspClient {
             command_tx,
             pending_requests,
             apply_sink,
+            capabilities,
             receiver_task: Some(receiver_task),
         }
     }
@@ -255,6 +262,7 @@ impl LspClient {
         let request_counter = Arc::new(AtomicI64::new(1));
         let pending_requests = Arc::new(Mutex::new(HashMap::new()));
         let apply_sink = Arc::new(Mutex::new(None));
+        let capabilities = Arc::new(CapabilityRegistry::default());
 
         let (command_tx, command_rx) = mpsc::channel(100);
 
@@ -267,6 +275,7 @@ impl LspClient {
             Some(notification_tx),
             watch_registry,
             server,
+            Arc::clone(&capabilities),
         ));
 
         Self {
@@ -276,6 +285,7 @@ impl LspClient {
             command_tx,
             pending_requests,
             apply_sink,
+            capabilities,
             receiver_task: Some(receiver_task),
         }
     }
@@ -615,6 +625,7 @@ impl LspClient {
         notification_tx: Option<mpsc::Sender<LspNotification>>,
         watch_registry: Option<Arc<WatchRegistry>>,
         server: ServerId,
+        capabilities: Arc<CapabilityRegistry>,
     ) -> Result<()> {
         debug!("Message loop started");
         let result = Self::message_loop_inner(
@@ -626,6 +637,7 @@ impl LspClient {
             notification_tx.as_ref(),
             watch_registry.as_ref(),
             &server,
+            &capabilities,
         )
         .await;
         if let Err(ref e) = result {
@@ -664,6 +676,7 @@ impl LspClient {
         notification_tx: Option<&mpsc::Sender<LspNotification>>,
         watch_registry: Option<&Arc<WatchRegistry>>,
         server: &ServerId,
+        capabilities: &CapabilityRegistry,
     ) -> Result<()> {
         loop {
             tokio::select! {
@@ -749,6 +762,14 @@ impl LspClient {
                                 "Received server request: {} (id={:?})",
                                 request.method, request.id
                             );
+                            if let Err(error) = capabilities.update(&request.method, request.params.as_ref()) {
+                                let response = JsonRpcResponse {
+                                    jsonrpc: JSONRPC_VERSION.to_string(), id: request.id,
+                                    result: None, error: Some(error),
+                                };
+                                transport.send(&serde_json::to_value(response)?).await?;
+                                continue;
+                            }
                             // Answered off the loop: the applier this may
                             // reach sends its own notifications back
                             // through `command_tx`, so awaiting it here
@@ -1061,10 +1082,9 @@ mod tests {
             &go,
         );
 
-        assert!(
-            registry
-                .servers_for(&abs("main.go"), lsp_types::FileChangeType::CHANGED)
-                .is_empty()
+        assert_eq!(
+            registry.servers_for(&abs("main.go"), lsp_types::FileChangeType::CHANGED),
+            Vec::<ServerId>::new()
         );
     }
 
@@ -1092,10 +1112,9 @@ mod tests {
             Value::Null,
             "a server registering something mcpls does not track must not get an error"
         );
-        assert!(
-            registry
-                .servers_for(&abs("main.go"), lsp_types::FileChangeType::CHANGED)
-                .is_empty()
+        assert_eq!(
+            registry.servers_for(&abs("main.go"), lsp_types::FileChangeType::CHANGED),
+            Vec::<ServerId>::new()
         );
     }
 
@@ -1576,6 +1595,7 @@ mod tests {
             command_tx,
             pending_requests: Arc::clone(&pending_requests),
             apply_sink: Arc::new(Mutex::new(None)),
+            capabilities: Arc::new(CapabilityRegistry::default()),
             receiver_task: None,
         };
 

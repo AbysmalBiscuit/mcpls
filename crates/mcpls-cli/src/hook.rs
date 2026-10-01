@@ -4295,7 +4295,7 @@ mod tests {
         .await;
 
         assert_eq!(out, "");
-        assert!(recorder.requests().is_empty());
+        assert_eq!(recorder.requests(), Vec::<Request>::new());
     }
 
     #[tokio::test]

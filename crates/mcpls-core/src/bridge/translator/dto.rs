@@ -342,12 +342,8 @@ pub struct CallHierarchyItemResult {
     pub uri: String,
     /// Range of the symbol.
     pub range: Range,
-    /// Selection range (identifier location).
-    ///
-    /// Serialized as `selectionRange` (camelCase) so that the value returned by
-    /// `prepare_call_hierarchy` round-trips correctly when the MCP client passes
-    /// it back to `get_incoming_calls` / `get_outgoing_calls`, which deserialize
-    /// it as `lsp_types::CallHierarchyItem` (camelCase).
+    /// Identifier location, serialized as `selectionRange` for opaque item
+    /// round-trips between prepare and incoming/outgoing calls.
     #[serde(rename = "selectionRange")]
     pub selection_range: Range,
     /// Opaque data to pass to incoming/outgoing calls.

@@ -1252,7 +1252,10 @@ mod tests {
         let result = convert_code_action(lsp_action, &test_ctx(), &test_uri()).await;
         assert_eq!(result.title, "Fix issue");
         assert!(result.kind.is_none());
-        assert!(result.diagnostics.is_empty());
+        assert_eq!(
+            result.diagnostics,
+            Vec::<crate::bridge::translator::dto::Diagnostic>::new()
+        );
         assert!(result.edit.is_none());
         assert!(result.command.is_none());
         assert!(!result.is_preferred);
@@ -2481,7 +2484,10 @@ mod tests {
                     Some(state.version())
                 );
             }
-            assert!(translator.pending_invalidations.take().is_empty());
+            assert_eq!(
+                translator.pending_invalidations.take(),
+                Vec::<std::path::PathBuf>::new()
+            );
         }
     }
 
