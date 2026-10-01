@@ -479,9 +479,11 @@ fn test_e2e_workspace_symbols_merge_despite_server_error() -> Result<()> {
         ("elixir", "workspace-error", ""),
         ("lua", "workspace-timeout", ""),
     ] {
+        let receipt = workspace.path().join(format!("{sentinel}.received"));
+        let receipt = receipt.to_string_lossy();
         write!(
             config,
-            "\n[[lsp_servers]]\nlanguage_id = {language:?}\ncommand = \"python3\"\nargs = [{script:?}, {sentinel:?}]\nfile_patterns = [\"**/*.{language}\"]\nrequest_timeout_seconds = 1\n{handles}[lsp_servers.heuristics]\nproject_markers = []\n"
+            "\n[[lsp_servers]]\nlanguage_id = {language:?}\ncommand = \"python3\"\nargs = [{script:?}, {sentinel:?}, {receipt:?}]\nfile_patterns = [\"**/*.{language}\"]\nrequest_timeout_seconds = 1\n{handles}[lsp_servers.heuristics]\nproject_markers = []\n"
         )?;
         fs::write(
             workspace.path().join(format!("main.{language}")),
@@ -499,6 +501,14 @@ fn test_e2e_workspace_symbols_merge_despite_server_error() -> Result<()> {
         )?;
     }
     let response = call_workspace_symbol_when_ready(&mut client)?;
+    for sentinel in ["workspace-error", "workspace-timeout"] {
+        let receipt = workspace.path().join(format!("{sentinel}.received"));
+        assert_eq!(
+            fs::read_to_string(&receipt)
+                .with_context(|| format!("{sentinel} must receive workspace/symbol"))?,
+            "workspace\n"
+        );
+    }
     let text = response["result"]["content"][0]["text"]
         .as_str()
         .context("workspace search must return text")?;
@@ -527,6 +537,10 @@ fn test_e2e_workspace_symbols_merge_despite_server_error() -> Result<()> {
             .len(),
         2
     );
+    for sentinel in ["workspace-error", "workspace-timeout"] {
+        let receipt = workspace.path().join(format!("{sentinel}.received"));
+        assert_eq!(fs::read_to_string(&receipt)?, "workspace\nworkspace\n");
+    }
     Ok(())
 }
 
