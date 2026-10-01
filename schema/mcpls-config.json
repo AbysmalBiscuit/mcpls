@@ -256,7 +256,7 @@
           ]
         },
         "handles": {
-          "description": "Tools this server handles. An overlay inherits the built-in value; a\nnew server without a list is its language's catch-all, handling every\ntool no other server claims.\n\nA language may have one catch-all, and a tool may be claimed by one\nserver per language; a config that breaks either for two servers that\nboth apply fails at startup, naming the entries. `rename` routes\n`rename_symbol`, `workspace_symbols` routes `workspace_symbol_search`,\n`call_hierarchy` routes all three call hierarchy tools, and\n`diagnostics` routes both diagnostics tools. A tool whose server has no\nbinary moves to the catch-all. `workspace_symbols` has no document to\nroute by, so it goes to the first server anywhere that claims it, else\nthe first catch-all.",
+          "description": "Tools this server handles. Overlays inherit; new entries without a\nlist catch tools no other server claims. Each language allows one\ncatch-all and one claimant per tool; applicable conflicts fail startup.\nMissing binaries fall back to the catch-all. Workspace symbols query\nall capable running servers, starting the first claimant or catch-all\nonly when none can answer.",
           "items": {
             "$ref": "#/$defs/ToolKind"
           },

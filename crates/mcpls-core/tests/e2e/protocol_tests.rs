@@ -3,6 +3,7 @@
 //! These tests validate the complete MCP protocol flow by spawning the mcpls
 //! binary and communicating with it as a real MCP client would.
 
+use std::fmt::Write;
 use std::path::Path;
 use std::time::{Duration, Instant};
 use std::{fs, thread};
@@ -448,6 +449,83 @@ fn i1_t1_workspace_only_server_without_mapping_is_accepted() -> Result<()> {
     assert!(
         response.to_string().contains("workspace-fixture"),
         "workspace symbol response should contain the fixture sentinel, got {response}"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "Requires mcpls binary built"]
+fn test_e2e_workspace_symbols_merge_despite_server_error() -> Result<()> {
+    let workspace = TempDir::new()?;
+    let script = diagnostics_fixture::write_hover_server(workspace.path())?;
+    let config_path = workspace.path().join("mcpls.toml");
+    let root = workspace.path().to_string_lossy();
+    let script = script.to_string_lossy();
+    let mut config = format!(
+        "[workspace]\nroots = [{root:?}]\n[backend]\nspawn = \"eager\"\n[diagnostics.hooks]\nenabled = false\n"
+    );
+    for (language, sentinel, handles) in [
+        (
+            "rust",
+            "workspace-rust",
+            "handles = [\"workspace_symbols\", \"hover\"]\n",
+        ),
+        (
+            "typescript",
+            "workspace-typescript",
+            "handles = [\"hover\"]\n",
+        ),
+        ("python", "workspace-python", ""),
+        ("elixir", "workspace-error", ""),
+        ("lua", "workspace-timeout", ""),
+    ] {
+        write!(
+            config,
+            "\n[[lsp_servers]]\nlanguage_id = {language:?}\ncommand = \"python3\"\nargs = [{script:?}, {sentinel:?}]\nfile_patterns = [\"**/*.{language}\"]\nrequest_timeout_seconds = 1\n{handles}[lsp_servers.heuristics]\nproject_markers = []\n"
+        )?;
+        fs::write(
+            workspace.path().join(format!("main.{language}")),
+            "fixture\n",
+        )?;
+    }
+    fs::write(&config_path, config)?;
+    let config_arg = config_path.to_string_lossy();
+    let mut client = McpClient::spawn_with_args(&["--config", &config_arg])?;
+    client.initialize()?;
+    for language in ["rust", "typescript", "python", "elixir", "lua"] {
+        call_hover_when_ready(
+            &mut client,
+            &workspace.path().join(format!("main.{language}")),
+        )?;
+    }
+    let response = call_workspace_symbol_when_ready(&mut client)?;
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("workspace search must return text")?;
+    let result: serde_json::Value = serde_json::from_str(text)?;
+    let symbols = result["symbols"].as_array().context("expected symbols")?;
+    for name in ["workspace-rust", "workspace-typescript", "workspace-python"] {
+        assert!(
+            symbols.iter().any(|symbol| symbol["name"] == name),
+            "missing {name}: {result}"
+        );
+    }
+    assert_eq!(symbols.len(), 3);
+
+    let response = client.call_tool(
+        "workspace_symbol_search",
+        &json!({"query": "workspace", "limit": 2, "kind_filter": "function"}),
+    )?;
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("workspace search must return text")?;
+    let result: serde_json::Value = serde_json::from_str(text)?;
+    assert_eq!(
+        result["symbols"]
+            .as_array()
+            .context("expected symbols")?
+            .len(),
+        2
     );
     Ok(())
 }

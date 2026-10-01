@@ -62,6 +62,12 @@ while True:
             },
         })
     elif method == "workspace/symbol":
+        if sentinel == "workspace-error":
+            send({"jsonrpc": "2.0", "id": request["id"],
+                  "error": {"code": -32603, "message": "fixture failure"}})
+            continue
+        if sentinel == "workspace-timeout":
+            continue
         send({
             "jsonrpc": "2.0",
             "id": request["id"],

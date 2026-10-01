@@ -679,7 +679,15 @@ async fn replacement_owner_scenario(order: ReplacementOwnerOrder, attempt: Repla
                     .unwrap();
                 wire = new_wire;
                 let response = response.unwrap();
-                assert!(response["error"].is_object(), "{response}");
+                assert_eq!(response["result"]["isError"], false, "{response}");
+                assert!(
+                    response.to_string().contains("python-generation-1"),
+                    "{response}"
+                );
+                assert!(
+                    !response.to_string().contains("rust-generation-2"),
+                    "{response}"
+                );
                 let baseline_ready =
                     tokio::time::timeout(Duration::from_secs(5), baseline_check_entered)
                         .await
@@ -1037,9 +1045,17 @@ while True:
         1,
         "lazy spawn count: {lazy_processes:?}"
     );
-    assert_eq!(
-        first_symbols, second_symbols,
+    let first_symbols = first_symbols.unwrap();
+    let second_symbols = second_symbols.unwrap();
+    assert_eq!(first_symbols.len(), 1);
+    assert!(first_symbols[0].starts_with("lazy-"));
+    assert!(
+        second_symbols.contains(&first_symbols[0]),
         "lazy client changed during batch registration"
+    );
+    assert!(
+        second_symbols.iter().any(|name| name.starts_with("eager-")),
+        "running eager server must join the workspace search"
     );
     assert_eq!(untouched_lazy_state, Some(ServerLifecycle::Idle));
 }

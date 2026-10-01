@@ -12,8 +12,9 @@ use super::encoding_ctx::EncodingCtx;
 use super::routing::FIRST_SPAWN_BUDGET;
 use super::{ServerLifecycle, Translator};
 use crate::bridge::lock_std;
-use crate::config::{NoServerReason, ToolKind};
+use crate::config::{NoServerReason, ServerId, ToolKind};
 use crate::error::{Error, Result};
+use crate::lsp::LspClient;
 
 /// Validate parameters for `handle_workspace_symbol`.
 fn validate_workspace_symbol_params(query: &str, kind_filter: Option<&str>) -> Result<()> {
@@ -178,8 +179,8 @@ impl Translator {
     ///
     /// # Errors
     ///
-    /// Returns an error if the LSP request fails, no server is configured, or
-    /// the routed server does not advertise `workspaceSymbolProvider` support.
+    /// Returns an error if parameters are invalid or no capable server can
+    /// be started. Individual running servers' request failures are skipped.
     pub async fn handle_workspace_symbol(
         &self,
         query: String,
@@ -188,6 +189,95 @@ impl Translator {
     ) -> Result<WorkspaceSymbolResult> {
         validate_workspace_symbol_params(&query, kind_filter.as_deref())?;
 
+        if self.workspace_symbol_clients().is_empty() {
+            self.ensure_workspace_symbol_server().await?;
+        }
+        let clients = self.workspace_symbol_clients();
+        let responses = futures::future::join_all(clients.into_iter().map(|(server_id, _)| {
+            let params = LspWorkspaceSymbolParams {
+                query: query.clone(),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            };
+            async move {
+                let response: Result<Option<Vec<lsp_types::SymbolInformation>>> = async {
+                    self.ensure_server(&server_id, Some(FIRST_SPAWN_BUDGET))
+                        .await?;
+                    let client = lock_std(&self.lsp_clients)
+                        .get(&server_id)
+                        .cloned()
+                        .ok_or(Error::NoServerConfigured)?;
+                    self.require_capability(&server_id, "workspaceSymbolProvider", |caps| {
+                        matches!(
+                            caps.workspace_symbol_provider,
+                            Some(lsp_types::OneOf::Left(true) | lsp_types::OneOf::Right(_))
+                        )
+                    })?;
+                    client
+                        .request("workspace/symbol", params, client.request_timeout())
+                        .await
+                }
+                .await;
+                let ctx = self.encoding_ctx(&server_id);
+                match response {
+                    Ok(symbols) => (ctx, symbols.unwrap_or_default()),
+                    Err(error) => {
+                        tracing::warn!(%server_id, %error, "workspace symbol search failed");
+                        (ctx, Vec::new())
+                    }
+                }
+            }
+        }))
+        .await;
+        let mut symbols = Vec::new();
+        for (ctx, response) in responses {
+            for sym in response {
+                let kind = format!("{:?}", sym.kind);
+                if kind_filter
+                    .as_ref()
+                    .is_some_and(|filter| !kind.eq_ignore_ascii_case(filter))
+                {
+                    continue;
+                }
+                if symbols.len() >= limit as usize {
+                    return Ok(WorkspaceSymbolResult { symbols });
+                }
+                let range = ctx
+                    .normalize_range(&sym.location.uri, sym.location.range)
+                    .await;
+                symbols.push(WorkspaceSymbol {
+                    name: sym.name,
+                    kind,
+                    location: Location {
+                        uri: sym.location.uri.to_string(),
+                        range,
+                    },
+                    container_name: sym.container_name,
+                });
+            }
+        }
+        Ok(WorkspaceSymbolResult { symbols })
+    }
+
+    fn workspace_symbol_clients(&self) -> Vec<(ServerId, LspClient)> {
+        let mut clients: Vec<_> = lock_std(&self.lsp_clients)
+            .iter()
+            .map(|(id, client)| (id.clone(), client.clone()))
+            .collect();
+        clients.retain(|(id, _)| {
+            self.require_capability(id, "workspaceSymbolProvider", |caps| {
+                matches!(
+                    caps.workspace_symbol_provider,
+                    Some(lsp_types::OneOf::Left(true) | lsp_types::OneOf::Right(_))
+                )
+            })
+            .is_ok()
+        });
+        clients.sort_by(|(left, _), (right, _)| left.cmp(right));
+        clients
+    }
+
+    async fn ensure_workspace_symbol_server(&self) -> Result<()> {
         let mut excluded = HashSet::new();
         let server_id = loop {
             let candidate = lock_std(&self.router)
@@ -221,7 +311,7 @@ impl Translator {
             });
         }
         let client = lock_std(&self.lsp_clients).get(&server_id).cloned();
-        let client = client.ok_or_else(|| match self.lifecycle_of(&server_id) {
+        client.ok_or_else(|| match self.lifecycle_of(&server_id) {
             Some(ServerLifecycle::Idle | ServerLifecycle::Starting) => Error::ServerInitializing {
                 server_id: server_id.clone(),
             },
@@ -238,44 +328,7 @@ impl Translator {
                 caps.workspace_symbol_provider,
                 Some(lsp_types::OneOf::Left(true) | lsp_types::OneOf::Right(_))
             )
-        })?;
-
-        let params = LspWorkspaceSymbolParams {
-            query,
-            work_done_progress_params: WorkDoneProgressParams::default(),
-            partial_result_params: PartialResultParams::default(),
-        };
-
-        let response: Option<Vec<lsp_types::SymbolInformation>> = client
-            .request("workspace/symbol", params, client.request_timeout())
-            .await?;
-
-        let ctx = self.encoding_ctx(&server_id);
-        let mut symbols: Vec<WorkspaceSymbol> = Vec::new();
-        for sym in response.unwrap_or_default() {
-            let range = ctx
-                .normalize_range(&sym.location.uri, sym.location.range)
-                .await;
-            symbols.push(WorkspaceSymbol {
-                name: sym.name,
-                kind: format!("{:?}", sym.kind),
-                location: Location {
-                    uri: sym.location.uri.to_string(),
-                    range,
-                },
-                container_name: sym.container_name,
-            });
-        }
-
-        // Apply kind filter if specified
-        if let Some(kind) = kind_filter {
-            symbols.retain(|s| s.kind.eq_ignore_ascii_case(&kind));
-        }
-
-        // Limit results
-        symbols.truncate(limit as usize);
-
-        Ok(WorkspaceSymbolResult { symbols })
+        })
     }
 }
 
