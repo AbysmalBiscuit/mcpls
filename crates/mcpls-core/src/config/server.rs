@@ -594,12 +594,14 @@ pub struct PartialLspServerConfig {
     /// language keeps running beside it unless an entry disables it.
     #[serde(default)]
     pub name: Option<String>,
-    /// Tools this server handles. Overlays inherit; new entries without a
-    /// list catch tools no other server claims. Each language allows one
-    /// catch-all and one claimant per tool; applicable conflicts fail startup.
-    /// Missing binaries fall back to the catch-all. Workspace symbols query
-    /// all capable running servers, starting the first claimant or catch-all
-    /// only when none can answer.
+    /// Tools this server handles. Overlays inherit the built-in value; new
+    /// entries without a list catch tools no other server claims. Each language
+    /// allows one catch-all and one claimant per tool; conflicts name the
+    /// applicable entries at startup. `rename` routes `rename_symbol`,
+    /// `diagnostics` both diagnostic tools, and `call_hierarchy` all call
+    /// hierarchy tools. Missing binaries fall back to the catch-all. Workspace
+    /// searches query all capable running servers; with none, the first
+    /// `workspace_symbols` claimant or catch-all starts.
     #[serde(default)]
     pub handles: Option<Vec<ToolKind>>,
     /// Set to `false` to drop the server this entry names. Omission leaves an
