@@ -14,7 +14,6 @@ use super::{ServerLifecycle, Translator};
 use crate::bridge::lock_std;
 use crate::config::{NoServerReason, ServerId, ToolKind};
 use crate::error::{Error, Result};
-use crate::lsp::LspClient;
 
 /// Validate parameters for `handle_workspace_symbol`.
 fn validate_workspace_symbol_params(query: &str, kind_filter: Option<&str>) -> Result<()> {
@@ -189,11 +188,11 @@ impl Translator {
     ) -> Result<WorkspaceSymbolResult> {
         validate_workspace_symbol_params(&query, kind_filter.as_deref())?;
 
-        if self.workspace_symbol_clients().is_empty() {
+        if self.workspace_symbol_servers().is_empty() {
             self.ensure_workspace_symbol_server().await?;
         }
-        let clients = self.workspace_symbol_clients();
-        let responses = futures::future::join_all(clients.into_iter().map(|(server_id, _)| {
+        let servers = self.workspace_symbol_servers();
+        let responses = futures::future::join_all(servers.into_iter().map(|server_id| {
             let params = LspWorkspaceSymbolParams {
                 query: query.clone(),
                 work_done_progress_params: WorkDoneProgressParams::default(),
@@ -259,12 +258,9 @@ impl Translator {
         Ok(WorkspaceSymbolResult { symbols })
     }
 
-    fn workspace_symbol_clients(&self) -> Vec<(ServerId, LspClient)> {
-        let mut clients: Vec<_> = lock_std(&self.lsp_clients)
-            .iter()
-            .map(|(id, client)| (id.clone(), client.clone()))
-            .collect();
-        clients.retain(|(id, _)| {
+    fn workspace_symbol_servers(&self) -> Vec<ServerId> {
+        let mut servers: Vec<_> = lock_std(&self.lsp_clients).keys().cloned().collect();
+        servers.retain(|id| {
             self.require_capability(id, "workspaceSymbolProvider", |caps| {
                 matches!(
                     caps.workspace_symbol_provider,
@@ -273,8 +269,8 @@ impl Translator {
             })
             .is_ok()
         });
-        clients.sort_by(|(left, _), (right, _)| left.cmp(right));
-        clients
+        servers.sort();
+        servers
     }
 
     async fn ensure_workspace_symbol_server(&self) -> Result<()> {
