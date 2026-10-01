@@ -67,9 +67,9 @@ impl From<&str> for ServerId {
 ///
 /// `CallHierarchy` covers `prepare`, `incoming_calls`, and `outgoing_calls`
 /// as a single route: the opaque item returned by `prepare` is only
-/// meaningful to the server that produced it, and the incoming/outgoing
-/// handlers never call `ensure_open` themselves — they rely on `prepare`
-/// having already synced the document to the *same* server.
+/// meaningful to the server that produced it. Returned items preserve that
+/// server's identity in their opaque data, including foreign-language items;
+/// legacy items without an origin use this route.
 ///
 /// # Examples
 ///

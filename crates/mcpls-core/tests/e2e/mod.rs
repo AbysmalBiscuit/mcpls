@@ -3,3 +3,4 @@
 pub mod diagnostics_fixture;
 pub mod mcp_client;
 pub mod protocol_tests;
+pub mod routing_fixture;

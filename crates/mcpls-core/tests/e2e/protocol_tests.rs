@@ -13,8 +13,73 @@ use mcpls_core::config::SpawnPolicy;
 use serde_json::json;
 use tempfile::TempDir;
 
-use super::diagnostics_fixture;
 use super::mcp_client::McpClient;
+use super::{diagnostics_fixture, routing_fixture};
+
+fn tool_payload(response: &serde_json::Value) -> Result<serde_json::Value> {
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("tool must return text")?;
+    Ok(serde_json::from_str(text)?)
+}
+
+#[test]
+#[ignore = "Requires mcpls binary built"]
+fn test_e2e_call_hierarchy_preserves_foreign_item_origin() -> Result<()> {
+    let workspace = TempDir::new()?;
+    let source = workspace.path().join("main.rs");
+    let foreign = workspace.path().join("other.ts");
+    fs::write(&source, "fn main() {}\n")?;
+    fs::write(&foreign, "function other() {}\n")?;
+    let foreign_uri = url::Url::from_file_path(&foreign)
+        .map_err(|()| anyhow::anyhow!("fixture path must be a file URI"))?;
+    let script = routing_fixture::write_call_hierarchy_server(workspace.path())?;
+    let root = toml::Value::String(workspace.path().to_string_lossy().into_owned());
+    let script = toml::Value::String(script.to_string_lossy().into_owned());
+    let uri_arg = toml::Value::String(foreign_uri.to_string());
+    let mut config = format!(
+        "[workspace]\nroots = [{root}]\n[backend]\nspawn = \"eager\"\n[diagnostics.hooks]\nenabled = false\n"
+    );
+    for (language, extension) in [("rust", "rs"), ("typescript", "ts")] {
+        write!(
+            config,
+            "\n[[lsp_servers]]\nlanguage_id = {language:?}\ncommand = \"python3\"\nargs = [{script}, {language:?}, {uri_arg}]\nfile_patterns = [\"**/*.{extension}\"]\n[lsp_servers.heuristics]\nproject_markers = []\n"
+        )?;
+    }
+    let config_path = workspace.path().join("mcpls.toml");
+    fs::write(&config_path, config)?;
+    let mut client = McpClient::spawn_with_args(&["--config", &config_path.to_string_lossy()])?;
+    client.initialize()?;
+    let prepared = client.call_tool(
+        "prepare_call_hierarchy",
+        &json!({"file_path": source, "line": 1, "character": 1}),
+    )?;
+    let prepared = tool_payload(&prepared)?;
+    let item = &prepared["items"][0];
+    assert_eq!(item["name"], "rust-prepare");
+    assert_eq!(item["uri"], foreign_uri.as_str());
+    let incoming = tool_payload(&client.call_tool("get_incoming_calls", &json!({"item": item}))?)?;
+    assert_eq!(incoming["calls"][0]["from"]["name"], "rust-incoming");
+    let outgoing = tool_payload(&client.call_tool("get_outgoing_calls", &json!({"item": item}))?)?;
+    assert_eq!(outgoing["calls"][0]["to"]["name"], "rust-outgoing");
+    let nested = &incoming["calls"][0]["from"];
+    let nested_outgoing =
+        tool_payload(&client.call_tool("get_outgoing_calls", &json!({"item": nested}))?)?;
+    assert_eq!(nested_outgoing["calls"][0]["to"]["name"], "rust-outgoing");
+    let nested = &outgoing["calls"][0]["to"];
+    let nested_incoming =
+        tool_payload(&client.call_tool("get_incoming_calls", &json!({"item": nested}))?)?;
+    assert_eq!(nested_incoming["calls"][0]["from"]["name"], "rust-incoming");
+    let mut legacy = item.clone();
+    legacy["data"] = json!({"_mcpls_call_hierarchy": {"version": 1, "server_id": "typescript"}, "payload": [null, "opaque", 7]});
+    let legacy_outgoing =
+        tool_payload(&client.call_tool("get_outgoing_calls", &json!({"item": legacy}))?)?;
+    assert_eq!(
+        legacy_outgoing["calls"][0]["to"]["name"],
+        "typescript-outgoing"
+    );
+    Ok(())
+}
 
 fn toml_array(values: &[String]) -> String {
     values
