@@ -15,7 +15,7 @@ use crate::bridge::lock_std;
 use crate::config::{NoServerReason, ServerId, ToolKind};
 use crate::error::{Error, Result};
 
-fn supports_workspace_symbols(caps: &lsp_types::ServerCapabilities) -> bool {
+const fn supports_workspace_symbols(caps: &lsp_types::ServerCapabilities) -> bool {
     matches!(
         caps.workspace_symbol_provider,
         Some(lsp_types::OneOf::Left(true) | lsp_types::OneOf::Right(_))
