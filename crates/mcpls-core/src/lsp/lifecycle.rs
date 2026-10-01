@@ -512,7 +512,7 @@ impl LspServer {
         // Use the server's configured timeout for the initialize handshake too,
         // not a hardcoded 30s: large solutions (e.g. a 130-project Unity .sln via
         // OmniSharp) take minutes to respond to `initialize`.
-        let result: InitializeResult = client
+        let result: serde_json::Value = client
             .request(
                 "initialize",
                 params,
@@ -536,6 +536,14 @@ impl LspServer {
             .map_err(|e| Error::LspInitFailed {
                 message: format!("Initialize request failed: {e}"),
             })?;
+
+        client
+            .capabilities
+            .initialize(&result)
+            .map_err(|error| Error::LspInitFailed {
+                message: format!("Invalid initialization capabilities: {}", error.message),
+            })?;
+        let result: InitializeResult = serde_json::from_value(result)?;
 
         let position_encoding = result
             .capabilities
@@ -788,6 +796,7 @@ async fn exited_during_startup(
 /// asserted directly: several servers change behavior based on these, and a
 /// silent regression is invisible until a tool quietly returns less than it
 /// should.
+#[allow(clippy::too_many_lines)]
 fn build_client_capabilities(
     position_encodings: Vec<lsp_types::PositionEncodingKind>,
     applies_edits: bool,
@@ -806,7 +815,7 @@ fn build_client_capabilities(
         }),
         text_document: Some(lsp_types::TextDocumentClientCapabilities {
             document_symbol: Some(lsp_types::DocumentSymbolClientCapabilities {
-                dynamic_registration: Some(false),
+                dynamic_registration: Some(true),
                 symbol_kind: Some(lsp_types::SymbolKindCapability {
                     value_set: Some(SUPPORTED_SYMBOL_KINDS.to_vec()),
                 }),
@@ -820,21 +829,21 @@ fn build_client_capabilities(
                 will_save_wait_until: Some(false),
             }),
             hover: Some(lsp_types::HoverClientCapabilities {
-                dynamic_registration: Some(false),
+                dynamic_registration: Some(true),
                 content_format: Some(vec![
                     lsp_types::MarkupKind::Markdown,
                     lsp_types::MarkupKind::PlainText,
                 ]),
             }),
             definition: Some(lsp_types::GotoCapability {
-                dynamic_registration: Some(false),
+                dynamic_registration: Some(true),
                 link_support: Some(true),
             }),
             references: Some(lsp_types::ReferenceClientCapabilities {
-                dynamic_registration: Some(false),
+                dynamic_registration: Some(true),
             }),
             code_action: Some(lsp_types::CodeActionClientCapabilities {
-                dynamic_registration: Some(false),
+                dynamic_registration: Some(true),
                 data_support: Some(true),
                 resolve_support: Some(lsp_types::CodeActionCapabilityResolveSupport {
                     properties: vec!["edit".to_string()],
@@ -860,10 +869,51 @@ fn build_client_capabilities(
                 }),
                 ..Default::default()
             }),
+            type_definition: Some(lsp_types::GotoCapability {
+                dynamic_registration: Some(true),
+                link_support: Some(true),
+            }),
+            implementation: Some(lsp_types::GotoCapability {
+                dynamic_registration: Some(true),
+                link_support: Some(true),
+            }),
+            completion: Some(lsp_types::CompletionClientCapabilities {
+                dynamic_registration: Some(true),
+                ..Default::default()
+            }),
+            signature_help: Some(lsp_types::SignatureHelpClientCapabilities {
+                dynamic_registration: Some(true),
+                ..Default::default()
+            }),
+            rename: Some(lsp_types::RenameClientCapabilities {
+                dynamic_registration: Some(true),
+                ..Default::default()
+            }),
+            formatting: Some(lsp_types::DynamicRegistrationClientCapabilities {
+                dynamic_registration: Some(true),
+            }),
+            range_formatting: Some(lsp_types::DynamicRegistrationClientCapabilities {
+                dynamic_registration: Some(true),
+            }),
+            call_hierarchy: Some(lsp_types::DynamicRegistrationClientCapabilities {
+                dynamic_registration: Some(true),
+            }),
+            inlay_hint: Some(lsp_types::InlayHintClientCapabilities {
+                dynamic_registration: Some(true),
+                ..Default::default()
+            }),
+            diagnostic: Some(lsp_types::DiagnosticClientCapabilities {
+                dynamic_registration: Some(true),
+                ..Default::default()
+            }),
             ..Default::default()
         }),
         workspace: Some(lsp_types::WorkspaceClientCapabilities {
             workspace_folders: Some(true),
+            symbol: Some(lsp_types::WorkspaceSymbolClientCapabilities {
+                dynamic_registration: Some(true),
+                ..Default::default()
+            }),
             apply_edit: Some(applies_edits),
             did_change_watched_files: Some(lsp_types::DidChangeWatchedFilesClientCapabilities {
                 dynamic_registration: Some(true),
@@ -2069,7 +2119,7 @@ mod tests {
                 .unwrap();
 
             assert_eq!(request["method"], "initialize");
-            assert_eq!(document_symbol.dynamic_registration, Some(false));
+            assert_eq!(document_symbol.dynamic_registration, Some(true));
             assert_eq!(
                 document_symbol.hierarchical_document_symbol_support,
                 Some(true)

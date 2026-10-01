@@ -263,7 +263,13 @@ impl Translator {
         let (server_id, client, validated_path) = self
             .resolve_validated_client_for_file(file_path, tool)
             .await?;
-        self.require_capability(&server_id, capability, supported)?;
+        let language = detect_language(&validated_path, &self.extension_map);
+        self.require_capability_for_document(
+            &server_id,
+            capability,
+            Some((&validated_path, &language)),
+            supported,
+        )?;
         let uri = self
             .document_tracker
             .ensure_open(&validated_path, &server_id, &client)
@@ -285,11 +291,8 @@ impl Translator {
     /// stance used elsewhere in `Translator` when capability information is
     /// unavailable rather than known-absent.
     ///
-    /// Note: this checks the `ServerCapabilities` snapshot captured at
-    /// `initialize` time. A server that advertises a capability later via
-    /// `client/registerCapability` (dynamic registration) is not reflected
-    /// here and will be incorrectly rejected; mcpls does not currently apply
-    /// dynamic registrations back onto the stored capabilities.
+    /// Combines initialization support with active registrations on the
+    /// current connection. Document preparation also checks selector scope.
     ///
     /// # Errors
     ///
@@ -301,15 +304,34 @@ impl Translator {
         capability: &'static str,
         supported: impl FnOnce(&lsp_types::ServerCapabilities) -> bool,
     ) -> Result<()> {
-        let servers = lock_std(&self.lsp_servers);
-        match servers.get(server_id) {
-            Some(server) if !supported(server.capabilities()) => {
-                Err(Error::CapabilityNotSupported {
-                    server_id: server_id.clone(),
-                    capability,
-                })
-            }
-            _ => Ok(()),
+        self.require_capability_for_document(server_id, capability, None, supported)
+    }
+
+    pub(super) fn require_capability_for_document(
+        &self,
+        server_id: &ServerId,
+        capability: &'static str,
+        document: Option<(&Path, &str)>,
+        supported: impl FnOnce(&lsp_types::ServerCapabilities) -> bool,
+    ) -> Result<()> {
+        let initial = {
+            let servers = lock_std(&self.lsp_servers);
+            servers
+                .get(server_id)
+                .is_none_or(|server| supported(server.capabilities()))
+        };
+        let supported = lock_std(&self.lsp_clients)
+            .get(server_id)
+            .map_or(initial, |client| {
+                client.capabilities.supports(capability, document, initial)
+            });
+        if supported {
+            Ok(())
+        } else {
+            Err(Error::CapabilityNotSupported {
+                server_id: server_id.clone(),
+                capability,
+            })
         }
     }
 

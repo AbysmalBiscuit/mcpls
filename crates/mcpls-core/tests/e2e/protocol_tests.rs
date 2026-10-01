@@ -23,6 +23,271 @@ fn tool_payload(response: &serde_json::Value) -> Result<serde_json::Value> {
     Ok(serde_json::from_str(text)?)
 }
 
+#[rstest::rstest]
+#[case("textDocument/hover", "hoverProvider", "get_hover", "normal")]
+#[case("textDocument/hover", "hoverProvider", "get_hover", "relative")]
+#[case(
+    "textDocument/definition",
+    "definitionProvider",
+    "get_definition",
+    "normal"
+)]
+#[case(
+    "textDocument/typeDefinition",
+    "typeDefinitionProvider",
+    "go_to_type_definition",
+    "normal"
+)]
+#[case(
+    "textDocument/implementation",
+    "implementationProvider",
+    "go_to_implementation",
+    "normal"
+)]
+#[case(
+    "textDocument/references",
+    "referencesProvider",
+    "get_references",
+    "normal"
+)]
+#[case("textDocument/rename", "renameProvider", "rename_symbol", "normal")]
+#[case(
+    "textDocument/completion",
+    "completionProvider",
+    "get_completions",
+    "normal"
+)]
+#[case(
+    "textDocument/signatureHelp",
+    "signatureHelpProvider",
+    "get_signature_help",
+    "normal"
+)]
+#[case(
+    "textDocument/documentSymbol",
+    "documentSymbolProvider",
+    "get_document_symbols",
+    "normal"
+)]
+#[case(
+    "workspace/symbol",
+    "workspaceSymbolProvider",
+    "workspace_symbol_search",
+    "normal"
+)]
+#[case(
+    "textDocument/formatting",
+    "documentFormattingProvider",
+    "format_document",
+    "normal"
+)]
+#[case(
+    "textDocument/rangeFormatting",
+    "documentRangeFormattingProvider",
+    "format_document",
+    "normal"
+)]
+#[case(
+    "textDocument/codeAction",
+    "codeActionProvider",
+    "get_code_actions",
+    "normal"
+)]
+#[case(
+    "textDocument/prepareCallHierarchy",
+    "callHierarchyProvider",
+    "prepare_call_hierarchy",
+    "normal"
+)]
+#[case(
+    "textDocument/inlayHint",
+    "inlayHintProvider",
+    "get_inlay_hints",
+    "normal"
+)]
+#[case(
+    "textDocument/diagnostic",
+    "diagnosticProvider",
+    "get_diagnostics",
+    "normal"
+)]
+#[ignore = "Requires mcpls binary built"]
+fn test_e2e_dynamic_tool_registration_and_selector(
+    #[case] method: &str,
+    #[case] capability: &str,
+    #[case] tool: &str,
+    #[case] mode: &str,
+) -> Result<()> {
+    let workspace = TempDir::new()?;
+    for name in [
+        "good.rs",
+        "bad.rs",
+        "register.rs",
+        "unregister.rs",
+        "register-language.rs",
+        "register-scheme.rs",
+        "register-empty.rs",
+    ] {
+        fs::write(workspace.path().join(name), "fn main() {}\n")?;
+    }
+    let receipt_path = workspace.path().join("requests.received");
+    let mut client = dynamic_client(workspace.path(), method, capability, mode)?;
+    let arguments = |name: &str| {
+        let path = workspace.path().join(name);
+        let mut args = match tool {
+            "workspace_symbol_search" => json!({"query": "dynamic"}),
+            "get_document_symbols" | "get_diagnostics" | "format_document" => {
+                json!({"file_path": path})
+            }
+            "get_code_actions" | "get_inlay_hints" => {
+                json!({"file_path": path, "start_line": 1, "start_character": 1, "end_line": 1, "end_character": 2})
+            }
+            "rename_symbol" => {
+                json!({"file_path": path, "line": 1, "character": 1, "new_name": "renamed"})
+            }
+            _ => json!({"file_path": path, "line": 1, "character": 1}),
+        };
+        if method == "textDocument/rangeFormatting" {
+            args["range"] =
+                json!({"start_line": 1, "start_character": 1, "end_line": 1, "end_character": 2});
+        }
+        args
+    };
+    let control_tool = if method == "textDocument/documentSymbol" {
+        "get_hover"
+    } else {
+        "get_document_symbols"
+    };
+    let control =
+        |name: &str| json!({"file_path": workspace.path().join(name), "line": 1, "character": 1});
+    let good = arguments("good.rs");
+    let missing = client
+        .call_tool(tool, &good)
+        .err()
+        .context("tool is initially unsupported")?;
+    assert!(missing.to_string().contains(capability), "{missing}");
+    if method != "workspace/symbol" {
+        for name in [
+            "register-language.rs",
+            "register-scheme.rs",
+            "register-empty.rs",
+        ] {
+            client.call_tool(control_tool, &control(name))?;
+            let mismatch = client
+                .call_tool(tool, &good)
+                .err()
+                .context("nonmatching registration must not enable the tool")?;
+            assert!(mismatch.to_string().contains(capability), "{mismatch}");
+            client.call_tool(control_tool, &control("unregister.rs"))?;
+        }
+    }
+    client.call_tool(control_tool, &control("register.rs"))?;
+    client.call_tool(tool, &good)?;
+    assert_eq!(
+        fs::read_to_string(&receipt_path)?
+            .lines()
+            .collect::<Vec<_>>(),
+        [method]
+    );
+    if method != "workspace/symbol" {
+        let mismatch = client
+            .call_tool(tool, &arguments("bad.rs"))
+            .err()
+            .context("selector must exclude bad.rs")?;
+        assert!(mismatch.to_string().contains(capability), "{mismatch}");
+    }
+    client.call_tool(control_tool, &control("unregister.rs"))?;
+    let removed = client
+        .call_tool(tool, &good)
+        .err()
+        .context("unregistered tool is unsupported")?;
+    assert!(removed.to_string().contains(capability), "{removed}");
+    assert_eq!(
+        fs::read_to_string(&receipt_path)?
+            .lines()
+            .collect::<Vec<_>>(),
+        [method]
+    );
+    Ok(())
+}
+
+fn dynamic_client(root: &Path, method: &str, capability: &str, mode: &str) -> Result<McpClient> {
+    let script = routing_fixture::write_dynamic_server(root)?;
+    let args = toml_array(&[
+        script.to_string_lossy().into_owned(),
+        method.to_owned(),
+        capability.to_owned(),
+        root.join("requests.received")
+            .to_string_lossy()
+            .into_owned(),
+        mode.to_owned(),
+    ]);
+    let root_value = toml::Value::String(root.to_string_lossy().into_owned());
+    let config_path = root.join("mcpls.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[workspace]\nroots = [{root_value}]\n[backend]\nspawn = \"eager\"\n[diagnostics.hooks]\nenabled = false\n[[lsp_servers]]\nlanguage_id = \"rust\"\ncommand = \"python3\"\nargs = [{args}]\nfile_patterns = [\"**/*.rs\"]\n[lsp_servers.heuristics]\nproject_markers = []\n"
+        ),
+    )?;
+    let mut client = McpClient::spawn_with_args(&["--config", &config_path.to_string_lossy()])?;
+    client.initialize()?;
+    Ok(client)
+}
+
+#[test]
+#[ignore = "Requires mcpls binary built"]
+fn test_e2e_dynamic_preserves_static_selector_and_registration_id() -> Result<()> {
+    let workspace = TempDir::new()?;
+    for name in [
+        "good.rs",
+        "static.rs",
+        "register.rs",
+        "unregister.rs",
+        "unregister-static.rs",
+    ] {
+        fs::write(workspace.path().join(name), "fn main() {}\n")?;
+    }
+    let mut client = dynamic_client(
+        workspace.path(),
+        "textDocument/implementation",
+        "implementationProvider",
+        "static",
+    )?;
+    let args =
+        |name: &str| json!({"file_path": workspace.path().join(name), "line": 1, "character": 1});
+    let tool = "go_to_implementation";
+    client.call_tool(tool, &args("static.rs"))?;
+    let excluded = client
+        .call_tool(tool, &args("good.rs"))
+        .err()
+        .context("initial selector must exclude good.rs")?;
+    assert!(excluded.to_string().contains("implementationProvider"));
+    client.call_tool("get_document_symbols", &args("register.rs"))?;
+    client.call_tool(tool, &args("good.rs"))?;
+    client.call_tool(tool, &args("static.rs"))?;
+    client.call_tool("get_document_symbols", &args("unregister.rs"))?;
+    let removed = client
+        .call_tool(tool, &args("good.rs"))
+        .err()
+        .context("dynamic selector must be removed")?;
+    assert!(removed.to_string().contains("implementationProvider"));
+    client.call_tool(tool, &args("static.rs"))?;
+    client.call_tool("get_document_symbols", &args("unregister-static.rs"))?;
+    let removed = client
+        .call_tool(tool, &args("static.rs"))
+        .err()
+        .context("initial registration ID must be removed")?;
+    assert!(removed.to_string().contains("implementationProvider"));
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("requests.received"))?
+            .lines()
+            .collect::<Vec<_>>(),
+        ["textDocument/implementation"; 4]
+    );
+    Ok(())
+}
+
 #[test]
 #[ignore = "Requires mcpls binary built"]
 fn test_e2e_call_hierarchy_preserves_foreign_item_origin() -> Result<()> {

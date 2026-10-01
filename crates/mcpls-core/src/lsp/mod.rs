@@ -3,6 +3,7 @@
 //! This module provides the LSP client for communicating with language servers
 //! over JSON-RPC 2.0.
 
+pub(crate) mod capabilities;
 mod client;
 mod lifecycle;
 mod transport;

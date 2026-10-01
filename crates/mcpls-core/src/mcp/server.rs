@@ -4099,7 +4099,12 @@ mod tests {
             let (translator, mut lsp) = translator_with_capabilities(
                 &dir,
                 &ServerId::from("rust"),
-                lsp_types::ServerCapabilities::default(),
+                lsp_types::ServerCapabilities {
+                    diagnostic_provider: Some(lsp_types::DiagnosticServerCapabilities::Options(
+                        lsp_types::DiagnosticOptions::default(),
+                    )),
+                    ..Default::default()
+                },
             );
             let cache = Arc::new(Mutex::new(NotificationCache::new()));
             let uri = crate::bridge::path_to_uri(&dunce::canonicalize(&path).unwrap()).unwrap();
