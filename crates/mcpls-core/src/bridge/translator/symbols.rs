@@ -15,6 +15,13 @@ use crate::bridge::lock_std;
 use crate::config::{NoServerReason, ServerId, ToolKind};
 use crate::error::{Error, Result};
 
+fn supports_workspace_symbols(caps: &lsp_types::ServerCapabilities) -> bool {
+    matches!(
+        caps.workspace_symbol_provider,
+        Some(lsp_types::OneOf::Left(true) | lsp_types::OneOf::Right(_))
+    )
+}
+
 /// Validate parameters for `handle_workspace_symbol`.
 fn validate_workspace_symbol_params(query: &str, kind_filter: Option<&str>) -> Result<()> {
     const MAX_QUERY_LENGTH: usize = 1000;
@@ -206,12 +213,11 @@ impl Translator {
                         .get(&server_id)
                         .cloned()
                         .ok_or(Error::NoServerConfigured)?;
-                    self.require_capability(&server_id, "workspaceSymbolProvider", |caps| {
-                        matches!(
-                            caps.workspace_symbol_provider,
-                            Some(lsp_types::OneOf::Left(true) | lsp_types::OneOf::Right(_))
-                        )
-                    })?;
+                    self.require_capability(
+                        &server_id,
+                        "workspaceSymbolProvider",
+                        supports_workspace_symbols,
+                    )?;
                     client
                         .request("workspace/symbol", params, client.request_timeout())
                         .await
@@ -261,13 +267,8 @@ impl Translator {
     fn workspace_symbol_servers(&self) -> Vec<ServerId> {
         let mut servers: Vec<_> = lock_std(&self.lsp_clients).keys().cloned().collect();
         servers.retain(|id| {
-            self.require_capability(id, "workspaceSymbolProvider", |caps| {
-                matches!(
-                    caps.workspace_symbol_provider,
-                    Some(lsp_types::OneOf::Left(true) | lsp_types::OneOf::Right(_))
-                )
-            })
-            .is_ok()
+            self.require_capability(id, "workspaceSymbolProvider", supports_workspace_symbols)
+                .is_ok()
         });
         servers.sort();
         servers
@@ -319,12 +320,11 @@ impl Translator {
             Some(ServerLifecycle::Stopped) => super::respawn::stopped(&server_id),
             Some(ServerLifecycle::Running) | None => Error::NoServerConfigured,
         })?;
-        self.require_capability(&server_id, "workspaceSymbolProvider", |caps| {
-            matches!(
-                caps.workspace_symbol_provider,
-                Some(lsp_types::OneOf::Left(true) | lsp_types::OneOf::Right(_))
-            )
-        })
+        self.require_capability(
+            &server_id,
+            "workspaceSymbolProvider",
+            supports_workspace_symbols,
+        )
     }
 }
 
