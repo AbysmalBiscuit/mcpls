@@ -417,7 +417,7 @@
       ]
     },
     "ToolKind": {
-      "description": "A routable MCP tool: every MCP tool that dispatches a request to a\nspecific LSP server via [`ToolRouter`].\n\nCache-only tools (`get_cached_diagnostics`, `get_new_diagnostics`,\n`get_server_logs`, `get_server_messages`) are deliberately excluded —\nthey never reach a client directly, so they have nothing to route.\n\n`CallHierarchy` covers `prepare`, `incoming_calls`, and `outgoing_calls`\nas a single route: the opaque item returned by `prepare` is only\nmeaningful to the server that produced it, and the incoming/outgoing\nhandlers never call `ensure_open` themselves — they rely on `prepare`\nhaving already synced the document to the *same* server.\n\n# Examples\n\n```\nuse mcpls_core::config::ToolKind;\n\nassert_eq!(ToolKind::Hover.as_str(), \"hover\");\nassert_eq!(ToolKind::ALL.len(), 15);\n```",
+      "description": "A routable MCP tool: every MCP tool that dispatches a request to a\nspecific LSP server via [`ToolRouter`].\n\nCache-only tools (`get_cached_diagnostics`, `get_new_diagnostics`,\n`get_server_logs`, `get_server_messages`) are deliberately excluded —\nthey never reach a client directly, so they have nothing to route.\n\n`CallHierarchy` covers `prepare`, `incoming_calls`, and `outgoing_calls`\nas a single route: the opaque item returned by `prepare` is only\nmeaningful to the server that produced it. Returned items preserve that\nserver's identity in their opaque data, including foreign-language items;\nlegacy items without an origin use this route.\n\n# Examples\n\n```\nuse mcpls_core::config::ToolKind;\n\nassert_eq!(ToolKind::Hover.as_str(), \"hover\");\nassert_eq!(ToolKind::ALL.len(), 15);\n```",
       "oneOf": [
         {
           "const": "hover",
