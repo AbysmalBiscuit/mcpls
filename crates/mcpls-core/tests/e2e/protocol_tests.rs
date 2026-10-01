@@ -459,10 +459,10 @@ fn test_e2e_workspace_symbols_merge_despite_server_error() -> Result<()> {
     let workspace = TempDir::new()?;
     let script = diagnostics_fixture::write_hover_server(workspace.path())?;
     let config_path = workspace.path().join("mcpls.toml");
-    let root = workspace.path().to_string_lossy();
-    let script = script.to_string_lossy();
+    let root = toml::Value::String(workspace.path().to_string_lossy().into_owned());
+    let script = toml::Value::String(script.to_string_lossy().into_owned());
     let mut config = format!(
-        "[workspace]\nroots = [{root:?}]\n[backend]\nspawn = \"eager\"\n[diagnostics.hooks]\nenabled = false\n"
+        "[workspace]\nroots = [{root}]\n[backend]\nspawn = \"eager\"\n[diagnostics.hooks]\nenabled = false\n"
     );
     for (language, sentinel, handles) in [
         (
@@ -480,10 +480,10 @@ fn test_e2e_workspace_symbols_merge_despite_server_error() -> Result<()> {
         ("lua", "workspace-timeout", ""),
     ] {
         let receipt = workspace.path().join(format!("{sentinel}.received"));
-        let receipt = receipt.to_string_lossy();
+        let receipt = toml::Value::String(receipt.to_string_lossy().into_owned());
         write!(
             config,
-            "\n[[lsp_servers]]\nlanguage_id = {language:?}\ncommand = \"python3\"\nargs = [{script:?}, {sentinel:?}, {receipt:?}]\nfile_patterns = [\"**/*.{language}\"]\nrequest_timeout_seconds = 1\n{handles}[lsp_servers.heuristics]\nproject_markers = []\n"
+            "\n[[lsp_servers]]\nlanguage_id = {language:?}\ncommand = \"python3\"\nargs = [{script}, {sentinel:?}, {receipt}]\nfile_patterns = [\"**/*.{language}\"]\nrequest_timeout_seconds = 1\n{handles}[lsp_servers.heuristics]\nproject_markers = []\n"
         )?;
         fs::write(
             workspace.path().join(format!("main.{language}")),
