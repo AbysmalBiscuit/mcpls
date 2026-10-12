@@ -311,7 +311,9 @@ pub struct HooksConfig {
     ///
     /// Every `didSave` restarts rust-analyzer's flycheck and cancels the
     /// check in flight, so a `cargo fmt` forwarded one path at a time
-    /// produces a run of cancelled checks and no diagnostics at all.
+    /// produces a run of cancelled checks and no diagnostics at all. A
+    /// hook's flush sweeps whatever is pending at once, since its answer is
+    /// due sooner.
     #[serde(default = "default_sweep_quiet_ms")]
     pub sweep_quiet_ms: u64,
     /// How long an op may take before it answers anyway.
@@ -319,7 +321,8 @@ pub struct HooksConfig {
     /// The host's default hook timeout is 600 seconds, so a hook that hangs
     /// blocks the agent. This bound is the hook's protection, not the host's;
     /// work already started can continue, but the deadline does not guarantee
-    /// eventual success or delivery.
+    /// eventual success or delivery. A flush that follows an edit waits for
+    /// the check that edit started, up to this less a margin for the answer.
     #[serde(default = "default_op_deadline_ms")]
     pub op_deadline_ms: u64,
 }

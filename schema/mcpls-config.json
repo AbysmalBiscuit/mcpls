@@ -146,14 +146,14 @@
         },
         "op_deadline_ms": {
           "default": 1500,
-          "description": "How long an op may take before it answers anyway.\n\nThe host's default hook timeout is 600 seconds, so a hook that hangs\nblocks the agent. This bound is the hook's protection, not the host's;\nwork already started can continue, but the deadline does not guarantee\neventual success or delivery.",
+          "description": "How long an op may take before it answers anyway.\n\nThe host's default hook timeout is 600 seconds, so a hook that hangs\nblocks the agent. This bound is the hook's protection, not the host's;\nwork already started can continue, but the deadline does not guarantee\neventual success or delivery. A flush that follows an edit waits for\nthe check that edit started, up to this less a margin for the answer.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "sweep_quiet_ms": {
           "default": 500,
-          "description": "How long the pending set must be quiet before the sweep runs.\n\nEvery `didSave` restarts rust-analyzer's flycheck and cancels the\ncheck in flight, so a `cargo fmt` forwarded one path at a time\nproduces a run of cancelled checks and no diagnostics at all.",
+          "description": "How long the pending set must be quiet before the sweep runs.\n\nEvery `didSave` restarts rust-analyzer's flycheck and cancels the\ncheck in flight, so a `cargo fmt` forwarded one path at a time\nproduces a run of cancelled checks and no diagnostics at all. A\nhook's flush sweeps whatever is pending at once, since its answer is\ndue sooner.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"

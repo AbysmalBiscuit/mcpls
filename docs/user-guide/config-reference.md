@@ -74,10 +74,10 @@ How the agent's hooks reach the backend.
   Defaults on, because reaching this configuration means installing the plugin and installing the plugin is the opt-in. With this off, no listener binds, so nothing injects diagnostics between turns and an edit alone no longer starts a language server for a language that has none running; a tool call still does. The backend's watcher does not depend on this: changes on disk, the agent's own included, still reach the servers that are running.
 - `op_deadline_ms` (integer, default `1500`): How long an op may take before it answers anyway.
 
-  The host's default hook timeout is 600 seconds, so a hook that hangs blocks the agent. This bound is the hook's protection, not the host's; work already started can continue, but the deadline does not guarantee eventual success or delivery.
+  The host's default hook timeout is 600 seconds, so a hook that hangs blocks the agent. This bound is the hook's protection, not the host's; work already started can continue, but the deadline does not guarantee eventual success or delivery. A flush that follows an edit waits for the check that edit started, up to this less a margin for the answer.
 - `sweep_quiet_ms` (integer, default `500`): How long the pending set must be quiet before the sweep runs.
 
-  Every `didSave` restarts rust-analyzer's flycheck and cancels the check in flight, so a `cargo fmt` forwarded one path at a time produces a run of cancelled checks and no diagnostics at all.
+  Every `didSave` restarts rust-analyzer's flycheck and cancels the check in flight, so a `cargo fmt` forwarded one path at a time produces a run of cancelled checks and no diagnostics at all. A hook's flush sweeps whatever is pending at once, since its answer is due sooner.
 
 ## `[[lsp_servers]]`
 

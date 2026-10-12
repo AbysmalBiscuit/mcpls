@@ -128,7 +128,7 @@ The `[diagnostics.hooks]` table controls the hook listener:
 | Key | Default | Meaning |
 |---|---|---|
 | `enabled` | `true` | Whether the hook listener binds at all. |
-| `sweep_quiet_ms` | `500` | How long pending file changes must sit quiet before diagnostics are gathered and delivered. |
+| `sweep_quiet_ms` | `500` | How long pending file changes must sit quiet before diagnostics are gathered and delivered. A hook that asks for diagnostics right after an edit gathers them at once and waits for that edit's check, within `op_deadline_ms`. |
 | `op_deadline_ms` | `1500` | How long a hook operation may run before it answers anyway, so a slow op can't block the agent. |
 
 Setting `enabled = false` disables the hook listener, so mcpls binds no socket and socket-dependent hooks receive no diagnostics. Use this setting to run mcpls without push diagnostics, for example while diagnosing whether a problem is in the hook path or elsewhere.

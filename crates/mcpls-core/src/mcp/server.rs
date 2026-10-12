@@ -319,6 +319,10 @@ enum Advance {
     OnAcknowledgement,
 }
 
+/// What a hook's wait for its edit's check leaves of `op_deadline_ms` for
+/// building the report and writing the answer.
+const HOOK_ANSWER_MARGIN: Duration = Duration::from_millis(250);
+
 /// How long each phase of a footer's wait lasts.
 #[derive(Debug, Clone, Copy)]
 struct FooterTiming {
@@ -1223,6 +1227,39 @@ impl McplsServer {
         }
         let (report, token) = self.flush_now(session, Advance::OnAcknowledgement).await;
         (render_for_hook(&report), token)
+    }
+
+    /// How many long-running operations the language servers have begun,
+    /// read before a hook's edit is resynced so
+    /// [`Self::wait_for_hook_edit`] can tell that edit's check from work
+    /// already running.
+    pub(crate) fn progress_epoch(&self) -> u64 {
+        self.context.settle.progress_epoch()
+    }
+
+    /// Wait for the check a hook's resynced edit started, the way a write
+    /// tool's footer waits for its own.
+    ///
+    /// The footer's grace and quiet apply, but the cap is the hook's answer
+    /// deadline less [`HOOK_ANSWER_MARGIN`]: past `op_deadline_ms` the
+    /// listener answers with an error, which delivers nothing at all.
+    pub(crate) async fn wait_for_hook_edit(&self, epoch_before: u64) {
+        let diagnostics = &self.context.diagnostics;
+        let timing = FooterTiming {
+            cap: Duration::from_millis(diagnostics.hooks.op_deadline_ms)
+                .saturating_sub(HOOK_ANSWER_MARGIN),
+            ..FooterTiming::from_config(diagnostics)
+        };
+        wait_for_footer_quiet_at(
+            &self.context.settle,
+            epoch_before,
+            timing,
+            |step| async move {
+                tokio::time::sleep(step).await;
+                Instant::now()
+            },
+        )
+        .await;
     }
 
     /// Mark the report staged under `token` delivered to `session`.
