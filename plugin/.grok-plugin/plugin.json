@@ -1,0 +1,18 @@
+{
+  "name": "mcpls",
+  "version": "0.4.2",
+  "description": "Language server intelligence and push diagnostics through mcpls",
+  "author": {
+    "name": "Lev Velykoivanenko"
+  },
+  "homepage": "https://github.com/AbysmalBiscuit/mcpls",
+  "repository": "https://github.com/AbysmalBiscuit/mcpls",
+  "license": "MIT OR Apache-2.0",
+  "keywords": [
+    "mcp",
+    "lsp",
+    "language-server",
+    "diagnostics"
+  ],
+  "hooks": "./hooks/hooks-grok.json"
+}
