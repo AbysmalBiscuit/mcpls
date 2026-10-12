@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.3](https://github.com/AbysmalBiscuit/mcpls/compare/v0.4.2...v0.4.3) (2026-10-12)
+
+
+### Features
+
+* **plugin:** integrate with the Grok harness ([#86](https://github.com/AbysmalBiscuit/mcpls/issues/86)) ([56aa907](https://github.com/AbysmalBiscuit/mcpls/commit/56aa9071868c0979c4ab5fe1cbcf1a101448e41f))
+
 ## [0.4.2](https://github.com/AbysmalBiscuit/mcpls/compare/v0.4.1...v0.4.2) (2026-10-01)
 
 
