@@ -1,6 +1,6 @@
 # mcpls plugin
 
-Registers `mcpls` as an MCP server, wires it into Claude Code's hook events so diagnostics reach the agent without being asked for, and installs the mcpls skills alongside them.
+Registers `mcpls` as an MCP server, wires it into the harness's hook events so diagnostics reach the agent without being asked for, and installs the mcpls skills alongside them. It works in Claude Code, Codex and Grok.
 
 ## Install
 
@@ -20,9 +20,16 @@ codex plugin marketplace add AbysmalBiscuit/mcpls
 codex plugin add mcpls@mcpls
 ```
 
-Restart the session once after installing, from a new terminal if `~/.cargo/bin` was not already on your `PATH`. The first session starts before `mcpls` exists, so its MCP server fails to start and its hooks report `mcpls` as not found. Codex also asks you to trust the plugin's hooks on first load.
+Grok:
 
-When the `mcpls` on `PATH` does not match the plugin's version, the plugin tells the agent at session start, including which version to install and where to get it. That covers an `mcpls` you installed yourself, an install that failed, and an install still running in another session. A failed install is not retried every session: run the installer from the release page, or delete `~/.local/state/mcpls/bootstrap-failed` and restart.
+```fish
+grok plugin marketplace add AbysmalBiscuit/mcpls
+grok plugin install mcpls --trust
+```
+
+Restart the session once after installing, from a new terminal if `~/.cargo/bin` was not already on your `PATH`. The first session starts before `mcpls` exists, so its MCP server fails to start and its hooks report `mcpls` as not found. Codex also asks you to trust the plugin's hooks on first load. Grok loads a plugin's hooks and MCP server only once it is trusted, which `--trust` grants.
+
+When the `mcpls` on `PATH` does not match the plugin's version, the plugin tells the agent at session start, including which version to install and where to get it. That covers an `mcpls` you installed yourself, an install that failed, and an install still running in another session. A failed install is not retried every session: run the installer from the release page, or delete `~/.local/state/mcpls/bootstrap-failed` and restart. Grok ignores what a session-start hook prints, so a Grok session gets no such note.
 
 Edits made outside the agent's own edit tools (a terminal, another agent, a `git checkout`) reach mcpls through the backend's own filesystem watcher, on every host rather than only where the host offers a file-changed hook. It places one watch per directory the project's ignore rules keep, so generated trees like `target/` and `node_modules/` cost nothing, and it picks up directories created after the session started. A checkout it cannot watch, a Windows drive under WSL2 or a network mount, is reported as unwatched by `mcpls doctor` rather than silently missing edits.
 
@@ -121,7 +128,7 @@ The `[diagnostics.hooks]` table controls the hook listener:
 | Key | Default | Meaning |
 |---|---|---|
 | `enabled` | `true` | Whether the hook listener binds at all. |
-| `sweep_quiet_ms` | `500` | How long pending file changes must sit quiet before diagnostics are gathered and delivered. |
+| `sweep_quiet_ms` | `500` | How long pending file changes must sit quiet before diagnostics are gathered and delivered. A hook that asks for diagnostics right after an edit gathers them at once and waits for that edit's check, within `op_deadline_ms`. |
 | `op_deadline_ms` | `1500` | How long a hook operation may run before it answers anyway, so a slow op can't block the agent. |
 
 Setting `enabled = false` disables the hook listener, so mcpls binds no socket and socket-dependent hooks receive no diagnostics. Use this setting to run mcpls without push diagnostics, for example while diagnosing whether a problem is in the hook path or elsewhere.
@@ -129,8 +136,9 @@ Setting `enabled = false` disables the hook listener, so mcpls binds no socket a
 ## What's included
 
 - `hooks/bootstrap-binaries` installs the mcpls release this plugin version pins when a session starts, and tells the agent when the `mcpls` on `PATH` does not match. `hooks/run-hook.cmd` runs it through bash, or through its PowerShell twin on Windows without Git Bash.
-- `mcpls brief` runs when a session starts and tells the agent which installed language servers serve the checkout and to use the mcpls tools, so your own agent instructions don't have to. `[brief] enabled = false` in `mcpls.toml` turns it off.
-- `.mcp.json` registers the server with both harnesses, and `hooks/hooks.json` wires Claude Code's hooks.
+- `mcpls brief` runs when a Claude Code or Codex session starts and tells the agent which installed language servers serve the checkout and to use the mcpls tools, so your own agent instructions don't have to. `[brief] enabled = false` in `mcpls.toml` turns it off.
+- `.mcp.json` registers the server with every harness, and `hooks/hooks.json` wires Claude Code's hooks.
 - `.codex-plugin/plugin.json` and `hooks/hooks-codex.json` register the plugin with Codex. There is deliberately no `plugin.json` at this directory's root: Codex would load one as an Agent Plugins manifest, start mcpls inside the plugin cache instead of the project, and load no hooks.
+- `.grok-plugin/plugin.json` and `hooks/hooks-grok.json` register the plugin with Grok, which would otherwise read the Claude Code manifest and run `hooks/hooks.json`. Grok reads hook context only from `PostToolUse`, so an edit's own hook returns the diagnostics it caused, and nothing is held for the next prompt.
 - [`skills/mcpls`](skills/mcpls/) teaches the agent when and how to use the tools for coding work.
 - [`skills/setup-mcpls`](skills/setup-mcpls/) covers installing, configuring, and troubleshooting mcpls.

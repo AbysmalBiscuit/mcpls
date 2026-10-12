@@ -2,15 +2,15 @@
 # SessionStart hook: ensure the mcpls this plugin drives is on PATH and matches
 # the plugin's version, installing it from the matching GitHub release.
 #
-# Usage: bootstrap-binaries <claude-code|codex>
+# Usage: bootstrap-binaries <claude-code|codex|grok>
 #
 # The MCP server and every other hook run `mcpls` from PATH, and a plugin
 # install cannot place it there, so this runs at session start instead.
 #
-# Every path exits 0: a session must start even with no network. Both
-# harnesses read a SessionStart hook's stdout, so installer output goes to
+# Every path exits 0: a session must start even with no network. Claude Code
+# and Codex read a SessionStart hook's stdout, so installer output goes to
 # stderr and stdout carries at most one context object telling the agent
-# when the binary does not match the plugin.
+# when the binary does not match the plugin. Grok ignores that stdout.
 
 set -uo pipefail
 
@@ -23,7 +23,7 @@ MANIFEST="${PLUGIN_ROOT}/.claude-plugin/plugin.json"
 
 # Installs are serialised per harness, so the lock is named after it.
 case "${1:-}" in
-    claude-code | codex) harness="$1" ;;
+    claude-code | codex | grok) harness="$1" ;;
     *) harness=unknown ;;
 esac
 

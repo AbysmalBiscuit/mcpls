@@ -3,10 +3,11 @@
 //! A hook registration spawns `mcpls hook <event> --harness <name>`, writes
 //! one JSON payload to its stdin, and reads one JSON payload back from its
 //! stdout. The spelling is devkit's, so one manifest reads the same for both
-//! tools. Claude Code and Codex send different payload shapes, so
+//! tools. Claude Code, Codex and Grok send different payload shapes, so
 //! `--harness` picks which dispatcher reads it.
 
 mod codex;
+mod grok;
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -42,6 +43,8 @@ pub enum Harness {
     ClaudeCode,
     /// Codex, which names the project in every payload's `cwd`.
     Codex,
+    /// Grok, which names the project in every payload's `cwd`.
+    Grok,
 }
 
 /// The hook events mcpls answers, one verb per harness event.
@@ -96,15 +99,18 @@ pub fn project_dir(harness: Harness, stdin: &str) -> PathBuf {
         Harness::Codex => Payload::<pabal::Codex>::parse(stdin)
             .ok()
             .and_then(|payload| payload.cwd().map(Path::to_path_buf)),
+        Harness::Grok => Payload::<pabal::Grok>::parse(stdin)
+            .ok()
+            .and_then(|payload| payload.cwd().map(Path::to_path_buf)),
     };
     named.unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// Every file a tool call wrote, as the call names them.
 ///
-/// pabal decides which tools write files. `plugin/hooks/hooks.json` matches
-/// Claude's `PostToolUse` against the same tools, so a write tool missing
-/// from the matcher goes unattributed.
+/// pabal decides which tools write files. Each harness's hook file under
+/// `plugin/hooks/` matches `PostToolUse` against the same tools, so a write
+/// tool missing from a matcher goes unattributed.
 fn written_paths(tool: Option<Tool<'_>>) -> Vec<PathBuf> {
     match tool {
         Some(Tool::Edit(edit)) => edit.paths(),
@@ -140,6 +146,7 @@ pub async fn dispatch_payload(
     let output = match harness {
         Harness::ClaudeCode => silently(run(event, stdin, identity)).await,
         Harness::Codex => silently(codex::run(event, stdin, project_dir, identity)).await,
+        Harness::Grok => silently(grok::run(event, stdin, project_dir, identity)).await,
     };
     output.to_string()
 }
@@ -4328,6 +4335,160 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A Grok payload as Grok sends it: `camelCase` keys, with `snake_case`
+    /// copies of the ones Claude Code also names.
+    fn grok_payload(event: &str, session: &str, cwd: &Path, fields: &serde_json::Value) -> String {
+        let mut payload = json!({
+            "hookEventName": event, "hook_event_name": event,
+            "sessionId": session, "session_id": session,
+            "cwd": cwd, "workspaceRoot": cwd, "permissionMode": "default"
+        });
+        payload
+            .as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        payload.to_string()
+    }
+
+    async fn dispatch_grok(stdin: &str, recorder: &RecordingOwner) -> String {
+        dispatch_named(
+            Harness::Grok,
+            stdin,
+            recorder.project_dir(),
+            Some(&recorder.identity),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_grok_post_tool_use_reports_written_files_and_returns_their_diagnostics() {
+        for tool in ["search_replace", "write"] {
+            let recorder = RecordingOwner::start_with_flush(Some(DEFAULT_FLUSH_TEXT.to_string()));
+            let cwd = recorder.project_dir().join("crates");
+            let input = json!({"file_path": "src/a.rs", "old_string": "a", "new_string": "b"});
+            let out = dispatch_grok(
+                &grok_payload(
+                    "PostToolUse",
+                    "s1",
+                    &cwd,
+                    &json!({
+                        "toolName": tool, "tool_name": tool, "toolUseId": "call_1",
+                        "toolInput": input, "tool_input": input
+                    }),
+                ),
+                &recorder,
+            )
+            .await;
+
+            assert_eq!(out, flushed_context(HookEvent::PostToolUse), "{tool}");
+            let requests = recorder.requests();
+            let Request::Changed {
+                session,
+                paths,
+                agent,
+                ..
+            } = &requests[0]
+            else {
+                panic!("expected a changed request: {:?}", requests[0]);
+            };
+            assert_eq!(session.as_str(), "s1");
+            assert_eq!(agent.agent_id, None);
+            assert_eq!(
+                *paths,
+                vec![cwd.join("src/a.rs")],
+                "a relative file_path is written against the session's cwd"
+            );
+            let Request::Flush { session, .. } = &requests[1] else {
+                panic!("expected a flush request: {:?}", requests[1]);
+            };
+            assert_eq!(session.as_str(), "s1");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_grok_subagent_edit_flushes_under_its_own_session() {
+        let recorder = RecordingOwner::start_with_flush(Some(DEFAULT_FLUSH_TEXT.to_string()));
+        let path = recorder.project_dir().join("a.rs");
+        let input = json!({"file_path": path});
+        dispatch_grok(
+            &grok_payload(
+                "PostToolUse",
+                "child",
+                recorder.project_dir(),
+                &json!({
+                    "subagentType": "general", "toolName": "write", "tool_name": "write",
+                    "toolInput": input, "tool_input": input
+                }),
+            ),
+            &recorder,
+        )
+        .await;
+
+        let requests = recorder.requests();
+        assert_eq!(requests.len(), 3, "changed, flush, and its acknowledgement");
+        for request in requests {
+            let wire = serde_json::to_value(request).unwrap();
+            assert_eq!(wire["session"], "child");
+            assert_eq!(wire.get("agent_id"), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_grok_user_prompt_submit_leaves_diagnostics_pending() {
+        let recorder = RecordingOwner::start_with_flush(Some(DEFAULT_FLUSH_TEXT.to_string()));
+        let out = dispatch_grok(
+            &grok_payload(
+                "UserPromptSubmit",
+                "s1",
+                recorder.project_dir(),
+                &json!({"prompt": "hi"}),
+            ),
+            &recorder,
+        )
+        .await;
+
+        assert_eq!(out, "");
+        assert_eq!(
+            recorder.requests(),
+            Vec::<Request>::new(),
+            "Grok discards a prompt hook's context, so a flush here would lose the diagnostics"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_grok_session_end_ends_the_session() {
+        let recorder = RecordingOwner::start();
+        let out = dispatch_grok(
+            &grok_payload(
+                "SessionEnd",
+                "s1",
+                recorder.project_dir(),
+                &json!({"reason": "shutdown"}),
+            ),
+            &recorder,
+        )
+        .await;
+
+        assert_eq!(out, "");
+        assert_eq!(
+            recorder.requests(),
+            vec![Request::EndSession {
+                session: "s1".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn test_grok_project_dir_is_the_payload_cwd() {
+        assert_eq!(
+            project_dir(
+                Harness::Grok,
+                &grok_payload("Stop", "s1", Path::new("/work/project"), &json!({}))
+            ),
+            PathBuf::from("/work/project")
+        );
     }
 
     #[test]

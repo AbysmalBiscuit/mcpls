@@ -1,16 +1,16 @@
 # SessionStart hook: ensure the mcpls this plugin drives is on PATH and matches
 # the plugin's version, installing it from the matching GitHub release.
 #
-# Usage: bootstrap-binaries.ps1 <claude-code|codex>
+# Usage: bootstrap-binaries.ps1 <claude-code|codex|grok>
 #
 # PowerShell twin of `bootstrap-binaries`, for Windows hosts with no bash.
 # Both resolve the same state paths and locks, so a machine that later gains
 # Git Bash does not reinstall.
 #
-# Every path exits 0: a session must start even with no network. Both
-# harnesses read a SessionStart hook's stdout, so installer output goes to
+# Every path exits 0: a session must start even with no network. Claude Code
+# and Codex read a SessionStart hook's stdout, so installer output goes to
 # stderr and stdout carries at most one context object telling the agent
-# when the binary does not match the plugin.
+# when the binary does not match the plugin. Grok ignores that stdout.
 
 $ErrorActionPreference = 'Continue'
 
@@ -22,7 +22,7 @@ $manifest = Join-Path $pluginRoot '.claude-plugin/plugin.json'
 
 # Installs are serialised per harness, so the lock is named after it.
 $harness = 'unknown'
-if ($args.Count -gt 0 -and $args[0] -in @('claude-code', 'codex')) { $harness = $args[0] }
+if ($args.Count -gt 0 -and $args[0] -in @('claude-code', 'codex', 'grok')) { $harness = $args[0] }
 
 function Write-Note($message) { [Console]::Error.WriteLine("mcpls plugin: $message") }
 

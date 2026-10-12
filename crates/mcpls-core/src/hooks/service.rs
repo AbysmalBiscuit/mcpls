@@ -85,8 +85,8 @@ pub type StatusSource = Arc<dyn Fn() -> StatusExtras + Send + Sync>;
 /// both before it awaits the payload build, and reaches delivery alone
 /// only by way of `McplsServer::commit_for_hook` and `end_session`. No arm
 /// of this match takes either lock itself. Do not add one that does. The
-/// `lsp` arm reaches the cache only through the translator, and never
-/// while holding delivery.
+/// `lsp` arm and the `flush` arm's sweep reach the cache only through the
+/// translator, and never while holding delivery.
 pub fn build_handler(
     server: Arc<McplsServer>,
     sweeper: Arc<Sweeper>,
@@ -137,6 +137,10 @@ pub fn build_handler(
                     stats.record_hook_request();
                     let caller = agent.caller(&session);
                     server.touch_hook(&caller).await;
+                    let epoch_before = server.progress_epoch();
+                    if sweeper.sweep_pending().await {
+                        server.wait_for_hook_edit(epoch_before).await;
+                    }
                     let (report, token) = server.flush_for_hook(&caller.record).await;
                     let mut parts: Vec<String> = Vec::new();
                     if let Some(text) = report {
@@ -252,6 +256,9 @@ mod tests {
         notification_cache: Arc<Mutex<NotificationCache>>,
         delivery: Arc<Mutex<DiagnosticsDelivery>>,
         translator_harness: Option<TranslatorHarness>,
+        /// The tracker a language server's `$/progress` reaches, so a test
+        /// can stand in for a server running a check.
+        settle: Arc<ServerSettle>,
         _cancel: tokio::sync::watch::Sender<bool>,
     }
 
@@ -343,12 +350,14 @@ mod tests {
                 |harness| harness.root().to_path_buf(),
             );
             let root = dunce::canonicalize(root).expect("canonicalize the owner root");
+            let settle = test_settle();
             let context = Arc::new(test_context(
                 &root,
                 Arc::clone(&translator),
                 Arc::clone(&notification_cache),
                 Arc::clone(&delivery),
                 diagnostics,
+                Arc::clone(&settle),
             ));
             let server = Arc::new(McplsServer::from_context(context));
             let sweeper = Arc::new(test_sweeper_with_limit(
@@ -389,6 +398,7 @@ mod tests {
                 notification_cache,
                 delivery,
                 translator_harness,
+                settle,
                 _cancel: cancel_tx,
             }
         }
@@ -587,6 +597,7 @@ mod tests {
         notification_cache: Arc<Mutex<NotificationCache>>,
         delivery: Arc<Mutex<DiagnosticsDelivery>>,
         diagnostics: DiagnosticsConfig,
+        settle: Arc<ServerSettle>,
     ) -> crate::mcp::BridgeContext {
         crate::mcp::BridgeContext::new(
             translator,
@@ -597,11 +608,15 @@ mod tests {
             delivery,
             Arc::new(FloorTable::new(&diagnostics, &[])),
             diagnostics,
-            Arc::new(ServerSettle::new(
-                Duration::from_secs(1),
-                Duration::from_secs(300),
-            )),
+            settle,
         )
+    }
+
+    fn test_settle() -> Arc<ServerSettle> {
+        Arc::new(ServerSettle::new(
+            Duration::from_secs(1),
+            Duration::from_secs(300),
+        ))
     }
 
     fn test_sweeper_with_limit(
@@ -686,6 +701,75 @@ mod tests {
             "the debounce cannot fit inside the op deadline, and coalescing the \
              burst is the point"
         );
+    }
+
+    /// Codex and Grok send `Changed` and `Flush` back to back after an edit,
+    /// and Grok reads diagnostics from that answer alone. The flush has to
+    /// carry the check the edit started, not what was cached before it.
+    #[tokio::test]
+    async fn test_a_flush_after_an_edit_reports_the_check_that_edit_started() {
+        let harness = HookHarness::owner_with_document_limit(16).await;
+        let path = harness.fixture("edited.rs");
+        std::fs::write(&path, "fn edited() {}").expect("write");
+        let uri = crate::bridge::path_to_uri(&path).expect("a file uri");
+        let rust = ServerId::from("rust");
+        harness.notification_cache.lock().await.store_diagnostics(
+            &rust,
+            &uri,
+            Some(1),
+            vec![diagnostic("before the edit")],
+        );
+
+        // Stands in for the server: the resync starts a check, which
+        // publishes its result and then reports itself finished.
+        let mut completion = harness.sweeper.subscribe_completions();
+        let settle = Arc::clone(&harness.settle);
+        let cache = Arc::clone(&harness.notification_cache);
+        let server = tokio::spawn(async move {
+            wait_for_sweep(&mut completion).await;
+            let check = serde_json::json!("check");
+            settle.begin(&rust, &check);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cache.lock().await.store_diagnostics(
+                &rust,
+                &uri,
+                Some(2),
+                vec![diagnostic("after the edit")],
+            );
+            settle.end(&rust, &check);
+        });
+
+        let agent = crate::bridge::HookAgent::default();
+        let responses = crate::hooks::send_and_acknowledge(
+            &harness.identity,
+            &[
+                Request::Changed {
+                    attributed: true,
+                    agent: agent.clone(),
+                    session: "s1".to_string(),
+                    paths: vec![path],
+                    event: ChangeEvent::Change,
+                },
+                Request::Flush {
+                    agent,
+                    session: "s1".to_string(),
+                },
+            ],
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("the owner answers");
+        server.await.expect("the stand-in server finishes");
+
+        let Response::Flush {
+            context: Some(context),
+            ..
+        } = &responses[1]
+        else {
+            panic!("expected a flush with context: {responses:?}");
+        };
+        assert!(context.contains("after the edit"), "{context}");
+        assert!(!context.contains("before the edit"), "{context}");
     }
 
     #[tokio::test]
@@ -1209,6 +1293,7 @@ mod tests {
                     DiagnosticsConfig::default(),
                 ))),
                 DiagnosticsConfig::default(),
+                test_settle(),
             )))),
             Arc::clone(&harness.sweeper),
             HookLocation {

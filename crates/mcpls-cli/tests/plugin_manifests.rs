@@ -49,6 +49,10 @@ fn test_every_manifest_pins_the_workspace_version() {
             json("plugin/.codex-plugin/plugin.json")["version"].clone(),
         ),
         (
+            "plugin/.grok-plugin/plugin.json",
+            json("plugin/.grok-plugin/plugin.json")["version"].clone(),
+        ),
+        (
             ".claude-plugin/marketplace.json",
             json(".claude-plugin/marketplace.json")["plugins"][0]["version"].clone(),
         ),
@@ -75,11 +79,12 @@ fn test_every_entry_runs_mcpls_from_path() {
         "an inline object would replace the shared registration"
     );
 
-    let harnesses: [(&str, &str, &str, &str, &[&str]); 2] = [
+    // Grok ignores what a SessionStart hook prints, so it has no brief.
+    let harnesses: [HookFile; 3] = [
         (
             "plugin/hooks/hooks.json",
             "claude-code",
-            "mcpls brief",
+            Some("mcpls brief"),
             "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" bootstrap-binaries claude-code",
             &[
                 "PostToolBatch",
@@ -92,7 +97,7 @@ fn test_every_entry_runs_mcpls_from_path() {
         (
             "plugin/hooks/hooks-codex.json",
             "codex",
-            "mcpls brief --additional-context",
+            Some("mcpls brief --additional-context"),
             "\"${PLUGIN_ROOT}/hooks/run-hook.cmd\" bootstrap-binaries codex",
             &[
                 "PostToolUse",
@@ -100,6 +105,13 @@ fn test_every_entry_runs_mcpls_from_path() {
                 "SessionStart",
                 "UserPromptSubmit",
             ],
+        ),
+        (
+            "plugin/hooks/hooks-grok.json",
+            "grok",
+            None,
+            "\"$GROK_PLUGIN_ROOT/hooks/run-hook.cmd\" bootstrap-binaries grok",
+            &["PostToolUse", "SessionEnd", "SessionStart"],
         ),
     ];
     for (file, harness, brief, bootstrap, events) in harnesses {
@@ -121,7 +133,7 @@ fn test_every_entry_runs_mcpls_from_path() {
                     assert_eq!(registration["type"], "command", "{file}: {event}");
                     if registration["command"] == bootstrap {
                         bootstraps.push(event.as_str());
-                    } else if registration["command"] == brief {
+                    } else if brief.is_some_and(|brief| registration["command"] == brief) {
                         briefs.push(event.as_str());
                     } else {
                         assert_eq!(
@@ -140,7 +152,7 @@ fn test_every_entry_runs_mcpls_from_path() {
         );
         assert_eq!(
             briefs,
-            ["SessionStart"],
+            brief.map_or(vec![], |_| vec!["SessionStart"]),
             "{file}: the brief runs once, at session start"
         );
     }
@@ -149,6 +161,36 @@ fn test_every_entry_runs_mcpls_from_path() {
         json("plugin/hooks/hooks-codex.json")["hooks"]["SessionStart"][0]["hooks"][0]["commandWindows"],
         "& \"${PLUGIN_ROOT}/hooks/run-hook.cmd\" bootstrap-binaries codex",
         "Codex runs Windows hooks through PowerShell, where a quoted path needs the call operator"
+    );
+}
+
+/// A hook file: its path, the `--harness` its entries pass, its brief
+/// command if it has one, its bootstrap command, and the events it names.
+type HookFile = (
+    &'static str,
+    &'static str,
+    Option<&'static str>,
+    &'static str,
+    &'static [&'static str],
+);
+
+/// Grok finds `.grok-plugin/plugin.json` before the Claude Code manifest,
+/// and its `hooks` path replaces the default `hooks/hooks.json`.
+#[test]
+fn test_grok_reads_its_own_hook_file() {
+    assert_eq!(
+        json("plugin/.grok-plugin/plugin.json")["hooks"],
+        "./hooks/hooks-grok.json",
+        "without it Grok runs hooks/hooks.json, Claude Code's file"
+    );
+    // Grok writes a braced `${GROK_PLUGIN_ROOT}` into the command at load
+    // time, which leaves PowerShell a bare quoted path. Left unbraced, the
+    // variable survives to spawn, where Grok adds the call operator itself.
+    assert!(
+        !json("plugin/hooks/hooks-grok.json")
+            .to_string()
+            .contains("${"),
+        "Grok runs Windows hooks through PowerShell, where a quoted path needs the call operator"
     );
 }
 

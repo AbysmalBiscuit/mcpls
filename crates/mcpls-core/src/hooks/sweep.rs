@@ -92,6 +92,9 @@ pub struct Sweeper {
     /// polled -- under a paused clock, advancing time moves the clock but
     /// does not itself guarantee a separately spawned task gets scheduled.
     completed: watch::Sender<usize>,
+    /// Held for a whole sweep, since a hook's flush sweeps alongside
+    /// [`Sweeper::run`].
+    sweeping: tokio::sync::Mutex<()>,
 }
 
 impl Sweeper {
@@ -119,6 +122,7 @@ impl Sweeper {
             last_shortfall: StdMutex::new(None),
             last_sweep_at: StdMutex::new(None),
             completed: watch::channel(0).0,
+            sweeping: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -217,6 +221,19 @@ impl Sweeper {
                 }
             }
         }
+    }
+
+    /// Sweep the pending set now rather than once it goes quiet. Returns
+    /// whether anything was pending.
+    ///
+    /// For a hook whose answer waits on the edit it just reported: that
+    /// answer is due long before the burst could go quiet.
+    pub async fn sweep_pending(&self) -> bool {
+        if lock_std(&self.pending).is_empty() {
+            return false;
+        }
+        self.sweep().await;
+        true
     }
 
     /// Files the last sweep could not check, and why.
@@ -342,6 +359,7 @@ impl Sweeper {
     /// queue until it lands, so a sweep dropped partway through leaves the
     /// remaining saves for the next one instead of losing them.
     async fn sweep(&self) {
+        let _sweeping = self.sweeping.lock().await;
         let started = SystemTime::now();
         let origins: HashMap<PathBuf, Origin> = lock_std(&self.pending).drain().collect();
         if origins.is_empty() {
