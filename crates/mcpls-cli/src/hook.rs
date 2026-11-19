@@ -137,12 +137,6 @@ fn context_output(view: &impl AddContext, context: Option<String>) -> HookOutput
     context.map_or_else(HookOutput::none, |text| view.add_context(&text))
 }
 
-/// The answer carrying a `Flush` response's context, or no answer when
-/// there is nothing to report.
-fn flush_output(view: &impl AddContext, response: Option<Response>) -> HookOutput {
-    context_output(view, flush_context(response))
-}
-
 /// One backend a hook talks to: the checkout it serves, the paths of the
 /// tool call that fall in that checkout, and whether the hook flushes it.
 struct Backend {
@@ -4932,6 +4926,17 @@ mod tests {
         .await
     }
 
+    /// Dispatch a Grok payload run from the session's `main` checkout.
+    async fn dispatch_grok_from_main(owners: &LinkedOwners, stdin: &str) -> String {
+        dispatch_named(
+            Harness::Grok,
+            stdin,
+            &owners.main,
+            Some(&owners.session.identity),
+        )
+        .await
+    }
+
     #[tokio::test]
     async fn test_grok_post_tool_use_reports_written_files_and_returns_their_diagnostics() {
         for tool in ["search_replace", "write"] {
@@ -5048,6 +5053,57 @@ mod tests {
                 session: "s1".into()
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn test_a_grok_worktree_write_reaches_the_worktree_backend() {
+        let flushing = |text: &str| OwnerBehavior {
+            flush_text: Some(text.to_string()),
+            ..OwnerBehavior::default()
+        };
+        let owners =
+            start_linked_owners(flushing("main problem\n"), flushing("worktree problem\n"));
+        let input = json!({
+            "file_path": owners.wt.join("a.rs").display().to_string(),
+            "content": "fn a() {}"
+        });
+        let out = dispatch_grok_from_main(
+            &owners,
+            &grok_payload(
+                "PostToolUse",
+                "s1",
+                &owners.main,
+                &json!({
+                    "toolName": "write", "tool_name": "write", "toolUseId": "call_1",
+                    "toolInput": input, "tool_input": input
+                }),
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            owners.worktree.ops(),
+            vec![
+                "changed".to_string(),
+                "flush".to_string(),
+                "ack".to_string()
+            ]
+        );
+        let worktree_requests = owners.worktree.requests();
+        let Request::Changed {
+            attributed, paths, ..
+        } = &worktree_requests[0]
+        else {
+            panic!("expected a changed request: {:?}", worktree_requests[0]);
+        };
+        assert!(*attributed, "a Grok write is attributed to its agent");
+        assert_eq!(*paths, vec![owners.wt.join("a.rs")]);
+        assert!(
+            changed_paths(&owners.session).is_empty(),
+            "the session's backend must not receive the worktree path: {:?}",
+            owners.session.requests()
+        );
+        assert!(out.contains("worktree problem"), "{out:?}");
     }
 
     #[test]

@@ -5,16 +5,19 @@
 //! hook returns. So the edit's own hook carries its diagnostics back, and a
 //! prompt has nothing to flush them into. A subagent's events name it only by
 //! its own session id, with no link to the session that spawned it.
+//!
+//! File events and flushes reach the backend of each file's checkout, as Claude Code's do.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use mcpls_core::bridge::HookHost;
-use mcpls_core::hooks::{ChangeEvent, Request, SocketIdentity, send, send_and_acknowledge};
+use mcpls_core::hooks::{Request, SocketIdentity, send};
 use pabal::{Fields, Grok, GrokView, Payload, Response as HookOutput};
 
 use super::{
-    FLUSH_SOCKET_TIMEOUT, HookEvent, SOCKET_TIMEOUT, flush_output, session_and_agent, written_paths,
+    Changes, HookEvent, SOCKET_TIMEOUT, backends_for, context_output, flush_backends,
+    session_and_agent, written_paths,
 };
 
 pub(super) async fn run(
@@ -40,18 +43,9 @@ pub(super) async fn run(
                 .into_iter()
                 .map(|path| cwd.join(path))
                 .collect();
-            let requests = [
-                Request::Changed {
-                    attributed: true,
-                    agent: agent.clone(),
-                    session: session.clone(),
-                    paths,
-                    event: ChangeEvent::Change,
-                },
-                Request::Flush { agent, session },
-            ];
-            let responses = send_and_acknowledge(identity, &requests, FLUSH_SOCKET_TIMEOUT).await?;
-            Ok(flush_output(&post, responses.into_iter().nth(1)))
+            let backends = backends_for(project_dir, identity, paths);
+            let context = flush_backends(backends, agent, session, Changes::Attributed).await;
+            Ok(context_output(&post, context))
         }
 
         GrokView::SessionEnd(_) => {
