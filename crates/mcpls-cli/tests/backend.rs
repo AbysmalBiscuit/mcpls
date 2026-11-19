@@ -837,6 +837,7 @@ fn a_worktree_file_is_answered_by_a_backend_started_for_the_worktree() {
 
 /// Polls `get_new_diagnostics` until its note is null, which means every
 /// backend the session uses has taken its baseline.
+#[cfg(unix)]
 fn await_baseline(frontend: &mut Frontend) {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
