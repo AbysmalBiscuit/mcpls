@@ -14,17 +14,19 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Result;
+use mcpls_core::backend::route;
 use mcpls_core::bridge::{HookAgent, HookHost};
 use mcpls_core::config::InstallCommand;
 use mcpls_core::hooks::protocol::ServerStatus;
 use mcpls_core::hooks::{
-    ChangeEvent, ProbeOutcome, Request, Response, SocketIdentity, WatcherStatus, probe, send,
-    send_and_acknowledge,
+    ChangeEvent, ProbeOutcome, Request, Response, SocketIdentity, WatcherStatus, identity_for,
+    probe, send, send_and_acknowledge,
 };
 use pabal::{
     AddContext, ClaudeCode, ClaudeCodeView, Fields, Payload, Response as HookOutput, Tool,
 };
 use serde::Deserialize;
+use tokio::task::JoinSet;
 
 /// How long a hook waits for an answer to `Changed` or `EndSession`, which
 /// carry no context back and are never worth stalling an edit for.
@@ -118,16 +120,88 @@ fn written_paths(tool: Option<Tool<'_>>) -> Vec<PathBuf> {
     }
 }
 
-/// The answer carrying a `Flush` response's context, or no answer when
-/// there is nothing to report.
-fn flush_output(view: &impl AddContext, response: Option<Response>) -> HookOutput {
+/// The context a `Flush` response carries, when it carries a non-empty one.
+fn flush_context(response: Option<Response>) -> Option<String> {
     match response {
         Some(Response::Flush {
             context: Some(text),
             ..
-        }) if !text.is_empty() => view.add_context(&text),
-        _ => HookOutput::none(),
+        }) if !text.is_empty() => Some(text),
+        _ => None,
     }
+}
+
+/// The answer carrying a flush's context, or no answer when there is
+/// nothing to report.
+fn context_output(view: &impl AddContext, context: Option<String>) -> HookOutput {
+    context.map_or_else(HookOutput::none, |text| view.add_context(&text))
+}
+
+/// One backend a hook talks to: the checkout it serves, the paths of the
+/// tool call that fall in that checkout, and whether the hook flushes it.
+struct Backend {
+    identity: SocketIdentity,
+    paths: Vec<PathBuf>,
+    flush: bool,
+}
+
+/// Adds `incoming` to the group with its identity, or appends it as a new
+/// group. Two identities are equal when they name the same socket.
+fn merge_backend(backends: &mut Vec<Backend>, incoming: Backend) {
+    match backends
+        .iter_mut()
+        .find(|backend| backend.identity.socket == incoming.identity.socket)
+    {
+        Some(existing) => {
+            existing.paths.extend(incoming.paths);
+            existing.flush |= incoming.flush;
+        }
+        None => backends.push(incoming),
+    }
+}
+
+/// The backends a hook talks to, each with the paths it serves.
+///
+/// A file event goes to the backend of the file's checkout. The session's
+/// backend comes first, then every linked checkout's backend, then any other
+/// checkout that holds one of `paths`. A path in no checkout, or in `root`
+/// itself, goes to the session's backend.
+fn backends_for(root: &Path, session: &SocketIdentity, paths: Vec<PathBuf>) -> Vec<Backend> {
+    let mut backends = vec![Backend {
+        identity: session.clone(),
+        paths: Vec::new(),
+        flush: true,
+    }];
+    for checkout in route::linked_checkouts(root) {
+        if let Ok(identity) = identity_for(&checkout) {
+            merge_backend(
+                &mut backends,
+                Backend {
+                    identity,
+                    paths: Vec::new(),
+                    flush: true,
+                },
+            );
+        }
+    }
+    for path in paths {
+        let identity = match route::route(root, &path) {
+            Some((checkout, _)) => match identity_for(&checkout) {
+                Ok(identity) => identity,
+                Err(_) => continue,
+            },
+            None => session.clone(),
+        };
+        merge_backend(
+            &mut backends,
+            Backend {
+                identity,
+                paths: vec![path],
+                flush: false,
+            },
+        );
+    }
+    backends
 }
 
 /// Convert returned errors to an empty answer; panics are not caught.
@@ -144,7 +218,7 @@ pub async fn dispatch_payload(
     identity: Option<&SocketIdentity>,
 ) -> String {
     let output = match harness {
-        Harness::ClaudeCode => silently(run(event, stdin, identity)).await,
+        Harness::ClaudeCode => silently(run(event, stdin, project_dir, identity)).await,
         Harness::Codex => silently(codex::run(event, stdin, project_dir, identity)).await,
         Harness::Grok => silently(grok::run(event, stdin, project_dir, identity)).await,
     };
@@ -161,9 +235,89 @@ fn session_and_agent(payload: &impl Fields, host: HookHost) -> (String, HookAgen
     (session, agent)
 }
 
+/// Whether a delivering hook reports a tool call's paths before it flushes, and how.
+#[derive(Clone, Copy)]
+enum Changes {
+    None,
+    Unattributed,
+    Attributed,
+}
+
+/// Delivers one backend's share of a tool batch or prompt and returns the
+/// context its `Flush` answer carries.
+///
+/// A backend the hook does not flush receives only the `Changed`, sent on its
+/// own, so a checkout that holds no session gets the file event and nothing else.
+async fn flush_backend(
+    backend: Backend,
+    agent: HookAgent,
+    session: String,
+    changes: Changes,
+) -> Option<String> {
+    let Backend {
+        identity,
+        paths,
+        flush,
+    } = backend;
+    let report = match changes {
+        Changes::None => None,
+        Changes::Unattributed | Changes::Attributed => Some(Request::Changed {
+            attributed: matches!(changes, Changes::Attributed),
+            agent: agent.clone(),
+            session: session.clone(),
+            paths,
+            event: ChangeEvent::Change,
+        }),
+    };
+    if !flush {
+        if let Some(report) = report {
+            let _ = send(&identity, &report, SOCKET_TIMEOUT).await;
+        }
+        return None;
+    }
+    let requests: Vec<Request> = report
+        .into_iter()
+        .chain([Request::Flush { agent, session }])
+        .collect();
+    let responses = send_and_acknowledge(&identity, &requests, FLUSH_SOCKET_TIMEOUT)
+        .await
+        .ok()?;
+    flush_context(responses.into_iter().last())
+}
+
+/// Delivers every backend's share at once, and joins the contexts they return
+/// in backend order. Errors from one backend contribute nothing.
+async fn flush_backends(
+    backends: Vec<Backend>,
+    agent: HookAgent,
+    session: String,
+    changes: Changes,
+) -> Option<String> {
+    let count = backends.len();
+    let mut tasks = JoinSet::new();
+    for (index, backend) in backends.into_iter().enumerate() {
+        let agent = agent.clone();
+        let session = session.clone();
+        tasks.spawn(async move { (index, flush_backend(backend, agent, session, changes).await) });
+    }
+    let mut contexts = vec![None; count];
+    while let Some(joined) = tasks.join_next().await {
+        if let Ok((index, context)) = joined {
+            contexts[index] = context;
+        }
+    }
+    let texts: Vec<String> = contexts.into_iter().flatten().collect();
+    (!texts.is_empty()).then(|| texts.join("\n"))
+}
+
+/// Answers one Claude Code hook payload.
+///
+/// A file event goes to the backend of the file's checkout. The delivering
+/// hooks read the session's backend and every linked checkout's backend.
 async fn run(
     event: HookEvent,
     stdin: &str,
+    project_dir: &Path,
     identity: Option<&SocketIdentity>,
 ) -> Result<HookOutput> {
     let payload = Payload::<ClaudeCode>::parse_named(event.wire_name(), stdin)?;
@@ -178,14 +332,23 @@ async fn run(
             if paths.is_empty() {
                 return Ok(HookOutput::none());
             }
-            let changed = Request::Changed {
-                attributed: true,
-                agent,
-                session,
-                paths,
-                event: ChangeEvent::Change,
-            };
-            send(identity, &changed, SOCKET_TIMEOUT).await?;
+            for backend in backends_for(project_dir, identity, paths) {
+                if backend.paths.is_empty() {
+                    continue;
+                }
+                let changed = Request::Changed {
+                    attributed: true,
+                    agent: agent.clone(),
+                    session: session.clone(),
+                    paths: backend.paths,
+                    event: ChangeEvent::Change,
+                };
+                if backend.identity.socket == identity.socket {
+                    send(&backend.identity, &changed, SOCKET_TIMEOUT).await?;
+                } else {
+                    let _ = send(&backend.identity, &changed, SOCKET_TIMEOUT).await;
+                }
+            }
             Ok(HookOutput::none())
         }
 
@@ -194,28 +357,15 @@ async fn run(
                 .tool_calls()
                 .flat_map(|call| written_paths(Some(call.tool)))
                 .collect();
-            let requests = [
-                Request::Changed {
-                    attributed: false,
-                    agent: agent.clone(),
-                    session: session.clone(),
-                    paths,
-                    event: ChangeEvent::Change,
-                },
-                Request::Flush { agent, session },
-            ];
-            let responses = send_and_acknowledge(identity, &requests, FLUSH_SOCKET_TIMEOUT).await?;
-            Ok(flush_output(&batch, responses.into_iter().nth(1)))
+            let backends = backends_for(project_dir, identity, paths);
+            let context = flush_backends(backends, agent, session, Changes::Unattributed).await;
+            Ok(context_output(&batch, context))
         }
 
         ClaudeCodeView::UserPromptSubmit(prompt) => {
-            let responses = send_and_acknowledge(
-                identity,
-                &[Request::Flush { agent, session }],
-                FLUSH_SOCKET_TIMEOUT,
-            )
-            .await?;
-            Ok(flush_output(&prompt, responses.into_iter().next()))
+            let backends = backends_for(project_dir, identity, Vec::new());
+            let context = flush_backends(backends, agent, session, Changes::None).await;
+            Ok(context_output(&prompt, context))
         }
 
         ClaudeCodeView::SessionEnd(_) => {
@@ -472,6 +622,34 @@ async fn backend_answer(
     }
 }
 
+/// One line per linked checkout of `root`, naming the backend it routes to.
+async fn worktree_backend_lines(root: &Path) -> Vec<String> {
+    let mut lines = Vec::new();
+    for checkout in route::linked_checkouts(root) {
+        let line = match identity_for(&checkout) {
+            Ok(identity) => {
+                let state = match probe(&identity, &Request::Status, SOCKET_TIMEOUT).await {
+                    ProbeOutcome::Answered(_) | ProbeOutcome::Refused(_) => "running",
+                    ProbeOutcome::NoOwner => "no backend",
+                    ProbeOutcome::Busy => "busy",
+                    ProbeOutcome::Unintelligible(_) => "unreadable",
+                };
+                format!(
+                    "worktree backend: {} -> {} ({state})",
+                    checkout.display(),
+                    identity.hash
+                )
+            }
+            Err(error) => format!(
+                "worktree backend: {} -> no endpoint: {error}",
+                checkout.display()
+            ),
+        };
+        lines.push(line);
+    }
+    lines
+}
+
 /// `doctor`'s body, parameterized on the machine facts it reports.
 ///
 /// Production reaches this through `doctor`, with the real ones. A test
@@ -497,6 +675,7 @@ async fn doctor_scanning(
         ),
         format!("root: {} -> {}", root.display(), identity.hash),
     ];
+    lines.extend(worktree_backend_lines(root).await);
     let backend = backend_answer(project_dir, identity, &machine.pipe_prefix, local).await;
     lines.extend(backend.lines);
     let mut problems = backend.problems;
@@ -1821,6 +2000,9 @@ mod tests {
     /// Bind the owner's socket synchronously.
     #[cfg(not(windows))]
     fn bind_owner(socket: &Path) -> tokio::net::UnixListener {
+        if let Some(parent) = socket.parent() {
+            std::fs::create_dir_all(parent).expect("the socket's directory");
+        }
         tokio::net::UnixListener::bind(socket).expect("bind the recording owner")
     }
 
@@ -2380,6 +2562,343 @@ mod tests {
              Windows, and the owner commits nothing until the acknowledgement \
              arrives"
         );
+    }
+
+    /// A repository whose `wt` checkout is linked to `main` the way `git
+    /// worktree add` links one: `wt/.git` is a file naming an admin directory
+    /// under `main/.git/worktrees`, and that directory's `commondir` leads
+    /// back to `main/.git`. Returns the enclosing temp dir, which must
+    /// outlive both paths.
+    fn linked_checkouts_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let root = dunce::canonicalize(dir.path()).expect("canonical temp dir");
+        let main = root.join("main");
+        std::fs::create_dir(&main).expect("main checkout");
+        mark_checkout(&main);
+        let admin = main.join(".git").join("worktrees").join("w");
+        std::fs::create_dir_all(&admin).expect("admin dir");
+        let wt = root.join("wt");
+        std::fs::write(
+            admin.join("gitdir"),
+            format!("{}\n", wt.join(".git").display()),
+        )
+        .expect("gitdir");
+        std::fs::write(admin.join("commondir"), "../..\n").expect("commondir");
+        std::fs::create_dir(&wt).expect("worktree checkout");
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", admin.display()))
+            .expect("worktree .git file");
+        std::fs::write(main.join("a.rs"), "fn a() {}").expect("main a.rs");
+        std::fs::write(wt.join("a.rs"), "fn a() {}").expect("worktree a.rs");
+        (dir, main, wt)
+    }
+
+    /// A session owner on the `main` checkout and a worktree owner on `wt`,
+    /// each bound on the socket its own directory derives.
+    struct LinkedOwners {
+        _dir: tempfile::TempDir,
+        main: PathBuf,
+        wt: PathBuf,
+        session: RecordingOwner,
+        worktree: RecordingOwner,
+    }
+
+    fn start_linked_owners(session: OwnerBehavior, worktree: OwnerBehavior) -> LinkedOwners {
+        let (dir, main, wt) = linked_checkouts_fixture();
+        let session_dir = tempfile::tempdir().expect("a temp dir");
+        let session_identity = temp_identity(session_dir.path());
+        let session = RecordingOwner::start_on(session_dir, session_identity, session);
+        let worktree_dir = tempfile::tempdir().expect("a temp dir");
+        let worktree_identity =
+            mcpls_core::hooks::identity_for(&wt).expect("identity for the worktree");
+        let worktree = RecordingOwner::start_on(worktree_dir, worktree_identity, worktree);
+        LinkedOwners {
+            _dir: dir,
+            main,
+            wt,
+            session,
+            worktree,
+        }
+    }
+
+    /// Dispatch a Claude Code payload run from the session's `main` checkout.
+    async fn dispatch_from_main(owners: &LinkedOwners, payload: &serde_json::Value) -> String {
+        dispatch_named(
+            Harness::ClaudeCode,
+            &payload.to_string(),
+            &owners.main,
+            Some(&owners.session.identity),
+        )
+        .await
+    }
+
+    /// Dispatch a Codex payload run from the session's `main` checkout.
+    async fn dispatch_codex_from_main(
+        owners: &LinkedOwners,
+        payload: &serde_json::Value,
+    ) -> String {
+        dispatch_named(
+            Harness::Codex,
+            &payload.to_string(),
+            &owners.main,
+            Some(&owners.session.identity),
+        )
+        .await
+    }
+
+    /// The paths of every `changed` request `owner` received, in order.
+    fn changed_paths(owner: &RecordingOwner) -> Vec<PathBuf> {
+        owner
+            .requests()
+            .into_iter()
+            .filter_map(|request| match request {
+                Request::Changed { paths, .. } => Some(paths),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_a_worktree_edit_reaches_only_the_worktree_backend() {
+        let owners = start_linked_owners(OwnerBehavior::default(), OwnerBehavior::default());
+        dispatch_from_main(
+            &owners,
+            &json!({
+                "hook_event_name": "PostToolUse", "session_id": "s1",
+                "tool_name": "Edit",
+                "tool_input": { "file_path": owners.wt.join("a.rs").display().to_string() }
+            }),
+        )
+        .await;
+
+        assert_eq!(owners.worktree.ops(), vec!["changed".to_string()]);
+        assert_eq!(
+            changed_paths(&owners.worktree),
+            vec![owners.wt.join("a.rs")]
+        );
+        assert!(
+            owners.session.ops().is_empty(),
+            "a worktree file must not reach the session's backend: {:?}",
+            owners.session.requests()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_session_checkout_edit_reaches_the_session_backend() {
+        let owners = start_linked_owners(OwnerBehavior::default(), OwnerBehavior::default());
+        dispatch_from_main(
+            &owners,
+            &json!({
+                "hook_event_name": "PostToolUse", "session_id": "s1",
+                "tool_name": "Edit",
+                "tool_input": { "file_path": owners.main.join("a.rs").display().to_string() }
+            }),
+        )
+        .await;
+
+        assert_eq!(owners.session.ops(), vec!["changed".to_string()]);
+        assert_eq!(
+            changed_paths(&owners.session),
+            vec![owners.main.join("a.rs")]
+        );
+        assert!(
+            owners.worktree.ops().is_empty(),
+            "a session checkout file must not reach the worktree's backend: {:?}",
+            owners.worktree.requests()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_user_prompt_submit_joins_every_worktree_backends_flush() {
+        let owners = start_linked_owners(
+            OwnerBehavior {
+                flush_text: Some("main problem\n".to_string()),
+                ..OwnerBehavior::default()
+            },
+            OwnerBehavior {
+                flush_text: Some("worktree problem\n".to_string()),
+                ..OwnerBehavior::default()
+            },
+        );
+        let out = dispatch_from_main(
+            &owners,
+            &json!({ "hook_event_name": "UserPromptSubmit", "session_id": "s1" }),
+        )
+        .await;
+
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("json");
+        let context = parsed["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .expect("additionalContext");
+        let main_at = context.find("main problem");
+        let worktree_at = context.find("worktree problem");
+        assert!(
+            matches!((main_at, worktree_at), (Some(m), Some(w)) if m < w),
+            "the session's flush text, then the worktree's: {context:?}"
+        );
+        assert_eq!(
+            owners.session.ops(),
+            vec!["flush".to_string(), "ack".to_string()]
+        );
+        assert_eq!(
+            owners.worktree.ops(),
+            vec!["flush".to_string(), "ack".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_post_tool_batch_sends_a_worktree_path_to_the_worktree_backend() {
+        let flushing = || OwnerBehavior {
+            flush_text: Some(DEFAULT_FLUSH_TEXT.to_string()),
+            ..OwnerBehavior::default()
+        };
+        let owners = start_linked_owners(flushing(), flushing());
+        dispatch_from_main(
+            &owners,
+            &json!({
+                "hook_event_name": "PostToolBatch", "session_id": "s1",
+                "tool_calls": [
+                    { "tool_name": "Edit", "tool_input": { "file_path": owners.wt.join("a.rs").display().to_string() } }
+                ]
+            }),
+        )
+        .await;
+
+        let batch_ops = vec![
+            "changed".to_string(),
+            "flush".to_string(),
+            "ack".to_string(),
+        ];
+        assert_eq!(owners.worktree.ops(), batch_ops);
+        assert_eq!(
+            changed_paths(&owners.worktree),
+            vec![owners.wt.join("a.rs")]
+        );
+        assert_eq!(owners.session.ops(), batch_ops);
+        assert!(
+            changed_paths(&owners.session).is_empty(),
+            "the session's backend must not receive the worktree path: {:?}",
+            owners.session.requests()
+        );
+    }
+
+    /// A Codex `apply_patch` `PostToolUse` naming `file` by absolute path, run
+    /// from `cwd`.
+    fn codex_patch_payload(cwd: &Path, file: &Path) -> serde_json::Value {
+        json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "s1",
+            "cwd": cwd.display().to_string(),
+            "tool_name": "apply_patch",
+            "tool_input": {
+                "command": format!(
+                    "*** Begin Patch\n*** Update File: {}\n@@\n-old\n+new\n*** End Patch\n",
+                    file.display()
+                )
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn test_a_codex_worktree_patch_reaches_the_worktree_backend() {
+        let flushing = |text: &str| OwnerBehavior {
+            flush_text: Some(text.to_string()),
+            ..OwnerBehavior::default()
+        };
+        let owners =
+            start_linked_owners(flushing("main problem\n"), flushing("worktree problem\n"));
+        let out = dispatch_codex_from_main(
+            &owners,
+            &codex_patch_payload(&owners.main, &owners.wt.join("a.rs")),
+        )
+        .await;
+
+        assert_eq!(
+            owners.worktree.ops(),
+            vec![
+                "changed".to_string(),
+                "flush".to_string(),
+                "ack".to_string()
+            ]
+        );
+        let worktree_requests = owners.worktree.requests();
+        let Request::Changed {
+            attributed, paths, ..
+        } = &worktree_requests[0]
+        else {
+            panic!("expected a changed request: {:?}", worktree_requests[0]);
+        };
+        assert!(*attributed, "a Codex patch is attributed to its agent");
+        assert_eq!(*paths, vec![owners.wt.join("a.rs")]);
+        assert!(
+            changed_paths(&owners.session).is_empty(),
+            "the session's backend must not receive the worktree path: {:?}",
+            owners.session.requests()
+        );
+        assert!(
+            owners.session.ops().contains(&"flush".to_string()),
+            "the session's flush still runs: {:?}",
+            owners.session.ops()
+        );
+        assert!(out.contains("main problem"), "{out:?}");
+        assert!(out.contains("worktree problem"), "{out:?}");
+    }
+
+    #[tokio::test]
+    async fn test_a_codex_session_patch_reaches_the_session_backend() {
+        let owners = start_linked_owners(OwnerBehavior::default(), OwnerBehavior::default());
+        dispatch_codex_from_main(
+            &owners,
+            &codex_patch_payload(&owners.main, &owners.main.join("a.rs")),
+        )
+        .await;
+
+        assert_eq!(
+            changed_paths(&owners.session),
+            vec![owners.main.join("a.rs")]
+        );
+        assert!(
+            changed_paths(&owners.worktree).is_empty(),
+            "a session checkout patch must not reach the worktree's backend: {:?}",
+            owners.worktree.requests()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_codex_user_prompt_submit_joins_every_worktree_backends_flush() {
+        let owners = start_linked_owners(
+            OwnerBehavior {
+                flush_text: Some("main problem\n".to_string()),
+                ..OwnerBehavior::default()
+            },
+            OwnerBehavior {
+                flush_text: Some("worktree problem\n".to_string()),
+                ..OwnerBehavior::default()
+            },
+        );
+        let out = dispatch_codex_from_main(
+            &owners,
+            &json!({
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "s1",
+                "cwd": owners.main.display().to_string(),
+            }),
+        )
+        .await;
+
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("json");
+        let context = parsed["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .expect("additionalContext");
+        let main_at = context.find("main problem");
+        let worktree_at = context.find("worktree problem");
+        assert!(
+            matches!((main_at, worktree_at), (Some(m), Some(w)) if m < w),
+            "the session's flush text, then the worktree's: {context:?}"
+        );
+        let flush_ops = vec!["flush".to_string(), "ack".to_string()];
+        assert_eq!(owners.session.ops(), flush_ops);
+        assert_eq!(owners.worktree.ops(), flush_ops);
     }
 
     /// A real owner answers `Changed` with `Response::Error` once its
@@ -3230,6 +3749,51 @@ mod tests {
         assert_eq!(lines[5], "language servers: none");
         assert!(lines[6].starts_with("mcpls on PATH: "));
         assert_eq!(lines[8], "problems: none");
+    }
+
+    #[tokio::test]
+    async fn test_doctor_names_a_linked_worktrees_backend_when_none_runs() {
+        let (_dir, main, wt) = linked_checkouts_fixture();
+
+        let (out, _identity) = doctor_with_nothing_running(&main).await;
+        let wt_hash = mcpls_core::hooks::identity_hash(&wt).expect("hash for the worktree");
+
+        assert!(
+            out.lines().any(|line| {
+                line == format!(
+                    "worktree backend: {} -> {wt_hash} (no backend)",
+                    wt.display()
+                )
+            }),
+            "expected the linked worktree's backend line: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_doctor_names_a_running_linked_worktree_backend() {
+        let (_dir, main, wt) = linked_checkouts_fixture();
+        let wt_identity = mcpls_core::hooks::identity_for(&wt).expect("identity for the worktree");
+        let _owner = RecordingOwner::start_reporting_status(wt_identity, &wt, 0);
+
+        let socket_dir = tempfile::tempdir().expect("a temp dir");
+        let identity = local_identity_for(&main, socket_dir.path());
+        let out = super::doctor_scanning(
+            &main,
+            Examined::ProjectDir,
+            &checkout_root(&main),
+            &identity,
+            &test_machine(socket_dir.path()),
+            None,
+        )
+        .await
+        .text;
+
+        assert!(
+            out.lines().any(|line| line
+                .starts_with(&format!("worktree backend: {} -> ", wt.display()))
+                && line.ends_with("(running)")),
+            "expected the running linked worktree's backend line: {out}"
+        );
     }
 
     /// Named for what it still proves. It used to assert the local watch
@@ -4362,6 +4926,17 @@ mod tests {
         .await
     }
 
+    /// Dispatch a Grok payload run from the session's `main` checkout.
+    async fn dispatch_grok_from_main(owners: &LinkedOwners, stdin: &str) -> String {
+        dispatch_named(
+            Harness::Grok,
+            stdin,
+            &owners.main,
+            Some(&owners.session.identity),
+        )
+        .await
+    }
+
     #[tokio::test]
     async fn test_grok_post_tool_use_reports_written_files_and_returns_their_diagnostics() {
         for tool in ["search_replace", "write"] {
@@ -4478,6 +5053,57 @@ mod tests {
                 session: "s1".into()
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn test_a_grok_worktree_write_reaches_the_worktree_backend() {
+        let flushing = |text: &str| OwnerBehavior {
+            flush_text: Some(text.to_string()),
+            ..OwnerBehavior::default()
+        };
+        let owners =
+            start_linked_owners(flushing("main problem\n"), flushing("worktree problem\n"));
+        let input = json!({
+            "file_path": owners.wt.join("a.rs").display().to_string(),
+            "content": "fn a() {}"
+        });
+        let out = dispatch_grok_from_main(
+            &owners,
+            &grok_payload(
+                "PostToolUse",
+                "s1",
+                &owners.main,
+                &json!({
+                    "toolName": "write", "tool_name": "write", "toolUseId": "call_1",
+                    "toolInput": input, "tool_input": input
+                }),
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            owners.worktree.ops(),
+            vec![
+                "changed".to_string(),
+                "flush".to_string(),
+                "ack".to_string()
+            ]
+        );
+        let worktree_requests = owners.worktree.requests();
+        let Request::Changed {
+            attributed, paths, ..
+        } = &worktree_requests[0]
+        else {
+            panic!("expected a changed request: {:?}", worktree_requests[0]);
+        };
+        assert!(*attributed, "a Grok write is attributed to its agent");
+        assert_eq!(*paths, vec![owners.wt.join("a.rs")]);
+        assert!(
+            changed_paths(&owners.session).is_empty(),
+            "the session's backend must not receive the worktree path: {:?}",
+            owners.session.requests()
+        );
+        assert!(out.contains("worktree problem"), "{out:?}");
     }
 
     #[test]
