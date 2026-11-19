@@ -14,6 +14,7 @@ use tokio::io::{AsyncBufReadExt as _, AsyncRead, AsyncWrite, AsyncWriteExt as _,
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
+use super::gather;
 use crate::backend::handshake::{
     self, ConfigStamp, Handshake, HandshakeReply, Refusal, compare_builds,
 };
@@ -286,6 +287,13 @@ enum State {
     Failed(String),
 }
 
+/// A `get_new_diagnostics` call that waits for the answers of several backends.
+struct Gather {
+    id: Value,
+    parts: Vec<(usize, Value)>,
+    waiting: usize,
+}
+
 /// Another checkout's backend, as the relay holds it.
 enum Other {
     /// Host calls that wait for the attach.
@@ -338,6 +346,9 @@ pub(crate) async fn relay<R, W>(
     let mut init_answered = false;
     let mut others: HashMap<PathBuf, Other> = HashMap::new();
     let mut sent_to: HashMap<String, PathBuf> = HashMap::new();
+    let mut gathers: HashMap<String, Gather> = HashMap::new();
+    let mut gather_parts: HashMap<String, (String, usize)> = HashMap::new();
+    let mut gather_ids = 0u64;
 
     while let Some(event) = inbox.recv().await {
         let routable = matches!(event, Event::Host(_));
@@ -388,6 +399,48 @@ pub(crate) async fn relay<R, W>(
                     State::Connecting => deferred.push((line, message)),
                     State::Attached => {
                         if let Some(writer) = backend.as_mut() {
+                            if let Some(id) = message.get("id")
+                                && message.get("method").and_then(Value::as_str)
+                                    == Some("tools/call")
+                                && message.pointer("/params/name").and_then(Value::as_str)
+                                    == Some("get_new_diagnostics")
+                                && others
+                                    .values()
+                                    .any(|other| matches!(other, Other::Attached { .. }))
+                            {
+                                let host_key = id.to_string();
+                                let mut index = 0;
+                                for (root, other) in &mut others {
+                                    let Other::Attached {
+                                        writer: route_writer,
+                                        generation,
+                                        ..
+                                    } = other
+                                    else {
+                                        continue;
+                                    };
+                                    index += 1;
+                                    gather_ids += 1;
+                                    let part_id = Value::from(format!("mcpls-gather-{gather_ids}"));
+                                    let part_key = part_id.to_string();
+                                    let mut part = message.clone();
+                                    part["id"] = part_id;
+                                    sent_to.insert(part_key.clone(), root.clone());
+                                    gather_parts.insert(part_key, (host_key.clone(), index));
+                                    if write_line(route_writer, &part.to_string()).await.is_err() {
+                                        let _ = events
+                                            .send(Event::RouteClosed(root.clone(), *generation));
+                                    }
+                                }
+                                gathers.insert(
+                                    host_key,
+                                    Gather {
+                                        id: id.clone(),
+                                        parts: Vec::new(),
+                                        waiting: 1 + index,
+                                    },
+                                );
+                            }
                             track(&mut pending, &message);
                             if write_line(writer, &line).await.is_err() {
                                 let _ = events.send(Event::BackendClosed(generation));
@@ -477,7 +530,14 @@ pub(crate) async fn relay<R, W>(
                     if id.as_str() == Some(REPLAY_ID) {
                         continue;
                     }
-                    pending.remove(&id.to_string());
+                    let key = id.to_string();
+                    pending.remove(&key);
+                    if gathers.contains_key(&key) {
+                        if let Some(merged) = settle_part(&mut gathers, &key, 0, message) {
+                            write_value(&mut host_out, &merged).await;
+                        }
+                        continue;
+                    }
                 }
                 write_raw(&mut host_out, &line).await;
             }
@@ -502,8 +562,8 @@ pub(crate) async fn relay<R, W>(
                 }
                 unheard.clear();
                 let reason = messages::backend_stopped(&place);
-                for id in pending.drain() {
-                    let Ok(id) = serde_json::from_str::<Value>(&id) else {
+                for key in pending.drain() {
+                    let Ok(id) = serde_json::from_str::<Value>(&key) else {
                         continue;
                     };
                     let reply = serde_json::json!({
@@ -511,7 +571,14 @@ pub(crate) async fn relay<R, W>(
                         "id": id,
                         "error": {"code": -32603, "message": reason},
                     });
-                    write_value(&mut host_out, &reply).await;
+                    let answer = if gathers.contains_key(&key) {
+                        settle_part(&mut gathers, &key, 0, reply)
+                    } else {
+                        Some(reply)
+                    };
+                    if let Some(answer) = answer {
+                        write_value(&mut host_out, &answer).await;
+                    }
                 }
                 state = State::Failed(reason);
             }
@@ -588,7 +655,16 @@ pub(crate) async fn relay<R, W>(
                         let key = id.to_string();
                         if sent_to.get(&key) == Some(&root) {
                             sent_to.remove(&key);
-                            write_raw(&mut host_out, &line).await;
+                            match gather_parts.remove(&key) {
+                                Some((host_key, index)) => {
+                                    if let Some(merged) =
+                                        settle_part(&mut gathers, &host_key, index, message)
+                                    {
+                                        write_value(&mut host_out, &merged).await;
+                                    }
+                                }
+                                None => write_raw(&mut host_out, &line).await,
+                            }
                         }
                     }
                     (Some(_), None) => write_raw(&mut host_out, &line).await,
@@ -625,11 +701,39 @@ pub(crate) async fn relay<R, W>(
                         "id": id,
                         "error": {"code": -32603, "message": reason},
                     });
-                    write_value(&mut host_out, &reply).await;
+                    let answer = match gather_parts.remove(&key) {
+                        Some((host_key, index)) => {
+                            settle_part(&mut gathers, &host_key, index, reply)
+                        }
+                        None => Some(reply),
+                    };
+                    if let Some(answer) = answer {
+                        write_value(&mut host_out, &answer).await;
+                    }
                 }
             }
         }
     }
+}
+
+/// Records one backend's answer to a gathered call. Returns the merged answer
+/// once every part of the call has arrived.
+fn settle_part(
+    gathers: &mut HashMap<String, Gather>,
+    key: &str,
+    index: usize,
+    reply: Value,
+) -> Option<Value> {
+    let gather = gathers.get_mut(key)?;
+    gather.parts.push((index, reply));
+    gather.waiting -= 1;
+    if gather.waiting > 0 {
+        return None;
+    }
+    let Gather { id, mut parts, .. } = gathers.remove(key)?;
+    parts.sort_by_key(|(index, _)| *index);
+    let parts = parts.into_iter().map(|(_, part)| part).collect();
+    Some(gather::merge(&id, parts))
 }
 
 /// Record `message`'s id as awaiting the backend's answer, if it is a
@@ -1099,6 +1203,8 @@ mod fake {
         /// Answer the first MCP line as an `initialize`, then close as soon
         /// as the next line arrives.
         AnswerOnceThenClose,
+        /// Answer `initialize`, then answer every request with a tool result whose text is the given report.
+        Report(&'static str),
     }
 
     struct WriteClosedStream {
@@ -1178,6 +1284,7 @@ mod fake {
     }
 
     impl Door for FakeDoor {
+        #[allow(clippy::too_many_lines)]
         fn connect(&self) -> BoxFuture<'_, io::Result<Box<dyn HookStream>>> {
             let script = self
                 .scripts
@@ -1247,6 +1354,39 @@ mod fake {
                             }});
                             let _ = writer.write_all(format!("{answer}\n").as_bytes()).await;
                             let _ = lines.next_line().await;
+                        }
+                        Then::Report(report) => {
+                            let (reader, mut writer) = tokio::io::split(server);
+                            let mut lines = BufReader::new(reader).lines();
+                            while let Ok(Some(line)) = lines.next_line().await {
+                                let Ok(message) = serde_json::from_str::<Value>(&line) else {
+                                    continue;
+                                };
+                                let (Some(id), Some(method)) =
+                                    (message.get("id"), message["method"].as_str())
+                                else {
+                                    continue;
+                                };
+                                let answer = if method == "initialize" {
+                                    json!({"jsonrpc":"2.0","id":id,"result":{
+                                        "protocolVersion":"2025-11-25",
+                                        "capabilities":{},
+                                        "serverInfo":{"name":"mcpls","version":"0"},
+                                    }})
+                                } else {
+                                    json!({"jsonrpc":"2.0","id":id,"result":{
+                                        "content":[{"type":"text","text":report}],
+                                        "isError":false,
+                                    }})
+                                };
+                                if writer
+                                    .write_all(format!("{answer}\n").as_bytes())
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
                         }
                     }
                 });
@@ -1624,6 +1764,11 @@ mod relay_tests {
             self.send(json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"get_server_logs","arguments":{"file_path":file}}})).await;
             self.response(id).await
         }
+
+        async fn call_named(&mut self, id: i64, name: &str) -> Value {
+            self.send(json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":{}}})).await;
+            self.response(id).await
+        }
     }
 
     fn initialize_request() -> Value {
@@ -1890,6 +2035,45 @@ mod relay_tests {
                 .unwrap()
                 .contains(&Some(PathBuf::from("/wt")))
         );
+    }
+
+    /// `get_new_diagnostics` is answered with the reports of the session backend and every attached route backend.
+    #[tokio::test]
+    async fn test_new_diagnostics_merge_every_attached_backend() {
+        let door = FakeDoor::new(
+            Start::Spawned,
+            vec![Script::Server(
+                accepted(),
+                Then::Report(
+                    r#"{"changed":[{"file_path":"/work/a.rs","diagnostics":[],"omitted":0}],"cleared":[],"omitted":0}"#,
+                ),
+            )],
+        );
+        let wt_door = FakeDoor::new(
+            Start::Spawned,
+            vec![Script::Server(
+                accepted(),
+                Then::Report(
+                    r#"{"changed":[{"file_path":"/wt/b.rs","diagnostics":[],"omitted":0}],"cleared":[],"omitted":0}"#,
+                ),
+            )],
+        );
+        let router = FakeRouter(vec![(PathBuf::from("/wt"), Arc::clone(&wt_door), true)]);
+        let mut host = Host::start(door, Arc::new(router), request(), fast());
+        host.initialize().await;
+        host.call_file(2, "/wt/b.rs").await;
+
+        let merged = host.call_named(3, "get_new_diagnostics").await;
+        assert!(merged.get("error").is_none(), "{merged}");
+        let report: Value =
+            serde_json::from_str(merged["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        let files: Vec<&str> = report["changed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|file| file["file_path"].as_str().unwrap())
+            .collect();
+        assert_eq!(files, ["/work/a.rs", "/wt/b.rs"]);
     }
 
     /// A file under a route whose checkout has no backend to attach to is answered by the session's backend.
