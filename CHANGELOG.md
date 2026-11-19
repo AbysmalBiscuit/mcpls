@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.4](https://github.com/AbysmalBiscuit/mcpls/compare/v0.4.3...v0.4.4) (2026-11-19)
+
+
+### Features
+
+* **frontend:** merge new diagnostics across backends ([#96](https://github.com/AbysmalBiscuit/mcpls/issues/96)) ([cf6b563](https://github.com/AbysmalBiscuit/mcpls/commit/cf6b563f804c76a07006f59000cfa603d2fa7ebc))
+* **frontend:** merge symbol search across backends and detach idle ones ([#98](https://github.com/AbysmalBiscuit/mcpls/issues/98)) ([ca0fe91](https://github.com/AbysmalBiscuit/mcpls/commit/ca0fe91614d34693591826845297bbb1dc66b5e5))
+* **frontend:** route file tool calls to the worktree backend ([#95](https://github.com/AbysmalBiscuit/mcpls/issues/95)) ([524af4c](https://github.com/AbysmalBiscuit/mcpls/commit/524af4cedef8d24edefd19340a0f8bca2e1f4b77))
+* **hooks:** send worktree file events to the worktree backend ([#97](https://github.com/AbysmalBiscuit/mcpls/issues/97)) ([cc0ab1d](https://github.com/AbysmalBiscuit/mcpls/commit/cc0ab1df3c9785c2461fe7a4f55b734744f4fed2))
+
+
+### Bug Fixes
+
+* **diagnostics:** get_diagnostics returns empty list for clean push-only files ([#89](https://github.com/AbysmalBiscuit/mcpls/issues/89)) ([0c70b57](https://github.com/AbysmalBiscuit/mcpls/commit/0c70b5791e996069cdda3196d5990423f2a2f0b5))
+
 ## [0.4.3](https://github.com/AbysmalBiscuit/mcpls/compare/v0.4.2...v0.4.3) (2026-10-12)
 
 
