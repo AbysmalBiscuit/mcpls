@@ -89,6 +89,8 @@ pub(crate) struct Timing {
     pub(crate) gone: Duration,
     /// How long a gathered call waits for each route backend's answer.
     pub(crate) gather: Duration,
+    /// How long a route backend stays attached with no file call to it.
+    pub(crate) route_idle: Duration,
 }
 
 impl Default for Timing {
@@ -98,6 +100,7 @@ impl Default for Timing {
             retry: Duration::from_millis(500),
             gone: Duration::from_secs(5),
             gather: Duration::from_secs(10),
+            route_idle: Duration::from_secs(600),
         }
     }
 }
@@ -281,6 +284,7 @@ enum Event {
     },
     RouteLine(PathBuf, u64, String),
     RouteClosed(PathBuf, u64),
+    RouteIdle(PathBuf, u64),
     GatherTimeout(String),
 }
 
@@ -314,6 +318,8 @@ enum Other {
         writer: tokio::io::WriteHalf<Box<dyn HookStream>>,
         place: Place,
         generation: u64,
+        reader: tokio::task::AbortHandle,
+        used: Instant,
     },
     Failed(String),
 }
@@ -387,8 +393,12 @@ pub(crate) async fn relay<R, W>(
                     let root = route.root.clone();
                     match others.get_mut(&root) {
                         Some(Other::Attached {
-                            writer, generation, ..
+                            writer,
+                            generation,
+                            used,
+                            ..
                         }) => {
+                            *used = Instant::now();
                             sent_to.insert(id.to_string(), root.clone());
                             if write_line(writer, &line).await.is_err() {
                                 let _ = events.send(Event::RouteClosed(root, *generation));
@@ -618,12 +628,13 @@ pub(crate) async fn relay<R, W>(
                         let current = route_generation;
                         let (reader, mut writer) = tokio::io::split(stream);
                         let for_lines = root.clone();
-                        spawn_lines(
+                        let lines = spawn_lines(
                             reader,
                             events.clone(),
                             move |line| Event::RouteLine(for_lines.clone(), current, line),
                             Event::RouteClosed(root.clone(), current),
                         );
+                        spawn_route_idle(root.clone(), current, timing.route_idle, events.clone());
                         let replayed = replay_route(
                             &mut writer,
                             init.as_deref(),
@@ -642,6 +653,8 @@ pub(crate) async fn relay<R, W>(
                                 writer,
                                 place,
                                 generation: current,
+                                reader: lines,
+                                used: Instant::now(),
                             },
                         );
                     }
@@ -727,6 +740,36 @@ pub(crate) async fn relay<R, W>(
                     if let Some(answer) = answer {
                         write_value(&mut host_out, &answer).await;
                     }
+                }
+            }
+            Event::RouteIdle(root, route) => {
+                let Some(Other::Attached {
+                    used, generation, ..
+                }) = others.get(&root)
+                else {
+                    continue;
+                };
+                if *generation != route {
+                    continue;
+                }
+                let idle_for = used.elapsed();
+                let busy = sent_to.values().any(|owner| *owner == root);
+                if busy {
+                    spawn_route_idle(root, route, timing.route_idle, events.clone());
+                } else if idle_for < timing.route_idle {
+                    spawn_route_idle(
+                        root,
+                        route,
+                        timing.route_idle.saturating_sub(idle_for),
+                        events.clone(),
+                    );
+                } else if let Some(Other::Attached {
+                    mut writer, reader, ..
+                }) = others.remove(&root)
+                {
+                    let _ = writer.shutdown().await;
+                    reader.abort();
+                    tracing::debug!(root = %root.display(), "detached an idle route");
                 }
             }
             Event::GatherTimeout(host_key) => {
@@ -921,7 +964,8 @@ fn spawn_lines<R>(
     events: mpsc::UnboundedSender<Event>,
     line: impl Fn(String) -> Event + Send + 'static,
     closed: Event,
-) where
+) -> tokio::task::AbortHandle
+where
     R: AsyncRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
@@ -932,6 +976,19 @@ fn spawn_lines<R>(
             }
         }
         let _ = events.send(closed);
+    })
+    .abort_handle()
+}
+
+fn spawn_route_idle(
+    root: PathBuf,
+    generation: u64,
+    after: Duration,
+    events: mpsc::UnboundedSender<Event>,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(after).await;
+        let _ = events.send(Event::RouteIdle(root, generation));
     });
 }
 
@@ -1541,6 +1598,7 @@ mod fake {
             retry: Duration::from_millis(20),
             gone: Duration::from_millis(300),
             gather: Duration::from_millis(300),
+            route_idle: Duration::from_secs(60),
         }
     }
 
@@ -2373,5 +2431,73 @@ mod relay_tests {
         assert_ne!(retried["result"]["isError"], true, "{retried}");
         assert!(retried.get("error").is_none(), "{retried}");
         assert_eq!(wt_door.kinds.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_an_idle_route_is_detached_and_attached_again() {
+        let door = FakeDoor::new(
+            Start::Spawned,
+            vec![Script::Server(accepted(), Then::Serve)],
+        );
+        let wt_door = FakeDoor::new(
+            Start::Spawned,
+            vec![
+                Script::Server(accepted(), Then::Serve),
+                Script::Server(accepted(), Then::Serve),
+            ],
+        );
+        let router = FakeRouter(vec![(PathBuf::from("/wt"), Arc::clone(&wt_door), false)]);
+        let timing = Timing {
+            route_idle: Duration::from_millis(200),
+            ..fast()
+        };
+        let mut host = Host::start(
+            Arc::clone(&door) as Arc<dyn Door>,
+            Arc::new(router),
+            request(),
+            timing,
+        );
+        host.initialize().await;
+
+        let first = host.call_file(2, "/wt/a.rs").await;
+        assert_ne!(first["result"]["isError"], true, "{first}");
+
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        let second = host.call_file(3, "/wt/a.rs").await;
+        assert_ne!(second["result"]["isError"], true, "{second}");
+        assert!(second.get("error").is_none(), "{second}");
+        assert_eq!(wt_door.kinds.lock().unwrap().len(), 2);
+        assert_eq!(door.kinds.lock().unwrap().len(), 1);
+
+        let session = host.call_tool(4).await;
+        assert_ne!(session["result"]["isError"], true, "{session}");
+    }
+
+    #[tokio::test]
+    async fn test_a_route_in_use_stays_attached() {
+        let door = FakeDoor::new(
+            Start::Spawned,
+            vec![Script::Server(accepted(), Then::Serve)],
+        );
+        let wt_door = FakeDoor::new(
+            Start::Spawned,
+            vec![Script::Server(accepted(), Then::Serve)],
+        );
+        let router = FakeRouter(vec![(PathBuf::from("/wt"), Arc::clone(&wt_door), false)]);
+        let timing = Timing {
+            route_idle: Duration::from_millis(300),
+            ..fast()
+        };
+        let mut host = Host::start(door, Arc::new(router), request(), timing);
+        host.initialize().await;
+
+        for id in 2..=5 {
+            let call = host.call_file(id, "/wt/a.rs").await;
+            assert_ne!(call["result"]["isError"], true, "{call}");
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+
+        assert_eq!(wt_door.kinds.lock().unwrap().len(), 1);
     }
 }
