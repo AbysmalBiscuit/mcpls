@@ -87,6 +87,8 @@ pub(crate) struct Timing {
     pub(crate) retry: Duration,
     /// How long an evicted backend has to release the endpoint.
     pub(crate) gone: Duration,
+    /// How long a gathered call waits for each route backend's answer.
+    pub(crate) gather: Duration,
 }
 
 impl Default for Timing {
@@ -95,6 +97,7 @@ impl Default for Timing {
             start: Duration::from_secs(10),
             retry: Duration::from_millis(500),
             gone: Duration::from_secs(5),
+            gather: Duration::from_secs(10),
         }
     }
 }
@@ -278,6 +281,7 @@ enum Event {
     },
     RouteLine(PathBuf, u64, String),
     RouteClosed(PathBuf, u64),
+    GatherTimeout(String),
 }
 
 enum State {
@@ -287,11 +291,19 @@ enum State {
     Failed(String),
 }
 
-/// A `get_new_diagnostics` call that waits for the answers of several backends.
+/// How a gathered call merges its parts.
+#[derive(Clone, Copy)]
+enum Merge {
+    Diagnostics,
+    Symbols { limit: usize },
+}
+
+/// A tool call that waits for the answers of several backends.
 struct Gather {
     id: Value,
     parts: Vec<(usize, Value)>,
     waiting: usize,
+    merge: Merge,
 }
 
 /// Another checkout's backend, as the relay holds it.
@@ -400,10 +412,7 @@ pub(crate) async fn relay<R, W>(
                     State::Attached => {
                         if let Some(writer) = backend.as_mut() {
                             if let Some(id) = message.get("id")
-                                && message.get("method").and_then(Value::as_str)
-                                    == Some("tools/call")
-                                && message.pointer("/params/name").and_then(Value::as_str)
-                                    == Some("get_new_diagnostics")
+                                && let Some(merge) = gather_merge(&message)
                                 && others
                                     .values()
                                     .any(|other| matches!(other, Other::Attached { .. }))
@@ -432,14 +441,22 @@ pub(crate) async fn relay<R, W>(
                                             .send(Event::RouteClosed(root.clone(), *generation));
                                     }
                                 }
+                                let key = host_key.clone();
                                 gathers.insert(
                                     host_key,
                                     Gather {
                                         id: id.clone(),
                                         parts: Vec::new(),
                                         waiting: 1 + index,
+                                        merge,
                                     },
                                 );
+                                let events = events.clone();
+                                let wait = timing.gather;
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(wait).await;
+                                    let _ = events.send(Event::GatherTimeout(key));
+                                });
                             }
                             track(&mut pending, &message);
                             if write_line(writer, &line).await.is_err() {
@@ -712,7 +729,60 @@ pub(crate) async fn relay<R, W>(
                     }
                 }
             }
+            Event::GatherTimeout(host_key) => {
+                let expired: Vec<String> = gather_parts
+                    .iter()
+                    .filter(|(_, (owner, _))| *owner == host_key)
+                    .map(|(key, _)| key.clone())
+                    .collect();
+                for key in expired {
+                    let Some((_, index)) = gather_parts.remove(&key) else {
+                        continue;
+                    };
+                    let Some(root) = sent_to.remove(&key) else {
+                        continue;
+                    };
+                    let Ok(id) = serde_json::from_str::<Value>(&key) else {
+                        continue;
+                    };
+                    let reply = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {
+                            "code": -32603,
+                            "message": format!(
+                                "the backend of {} did not answer within {} ms",
+                                root.display(),
+                                timing.gather.as_millis()
+                            ),
+                        },
+                    });
+                    if let Some(merged) = settle_part(&mut gathers, &host_key, index, reply) {
+                        write_value(&mut host_out, &merged).await;
+                    }
+                }
+            }
         }
+    }
+}
+
+/// The merge a tool call's backends answer under, when the call is gathered.
+fn gather_merge(message: &Value) -> Option<Merge> {
+    if message.get("method").and_then(Value::as_str) != Some("tools/call") {
+        return None;
+    }
+    match message.pointer("/params/name").and_then(Value::as_str)? {
+        "get_new_diagnostics" => Some(Merge::Diagnostics),
+        "workspace_symbol_search" => {
+            let limit = message
+                .pointer("/params/arguments/limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(100);
+            Some(Merge::Symbols {
+                limit: usize::try_from(limit).unwrap_or(usize::MAX),
+            })
+        }
+        _ => None,
     }
 }
 
@@ -730,10 +800,18 @@ fn settle_part(
     if gather.waiting > 0 {
         return None;
     }
-    let Gather { id, mut parts, .. } = gathers.remove(key)?;
+    let Gather {
+        id,
+        merge,
+        mut parts,
+        ..
+    } = gathers.remove(key)?;
     parts.sort_by_key(|(index, _)| *index);
     let parts = parts.into_iter().map(|(_, part)| part).collect();
-    Some(gather::merge(&id, parts))
+    Some(match merge {
+        Merge::Diagnostics => gather::merge(&id, parts),
+        Merge::Symbols { limit } => gather::merge_symbols(&id, parts, limit),
+    })
 }
 
 /// Record `message`'s id as awaiting the backend's answer, if it is a
@@ -1205,6 +1283,8 @@ mod fake {
         AnswerOnceThenClose,
         /// Answer `initialize`, then answer every request with a tool result whose text is the given report.
         Report(&'static str),
+        /// Like `Report`, but sends no answer to a call of the named tool.
+        Silent(&'static str, &'static str),
     }
 
     struct WriteClosedStream {
@@ -1324,6 +1404,10 @@ mod fake {
                     if handshake::write(&mut server, &reply).await.is_err() {
                         return;
                     }
+                    let silent_tool = match &then {
+                        Then::Silent(_, tool) => Some(*tool),
+                        _ => None,
+                    };
                     match then {
                         Then::Serve => {
                             if let Ok(running) = test_server().serve(server).await {
@@ -1355,7 +1439,7 @@ mod fake {
                             let _ = writer.write_all(format!("{answer}\n").as_bytes()).await;
                             let _ = lines.next_line().await;
                         }
-                        Then::Report(report) => {
+                        Then::Report(report) | Then::Silent(report, _) => {
                             let (reader, mut writer) = tokio::io::split(server);
                             let mut lines = BufReader::new(reader).lines();
                             while let Ok(Some(line)) = lines.next_line().await {
@@ -1367,6 +1451,10 @@ mod fake {
                                 else {
                                     continue;
                                 };
+                                if silent_tool.is_some_and(|tool| message["params"]["name"] == tool)
+                                {
+                                    continue;
+                                }
                                 let answer = if method == "initialize" {
                                     json!({"jsonrpc":"2.0","id":id,"result":{
                                         "protocolVersion":"2025-11-25",
@@ -1452,6 +1540,7 @@ mod fake {
             start: Duration::from_millis(300),
             retry: Duration::from_millis(20),
             gone: Duration::from_millis(300),
+            gather: Duration::from_millis(300),
         }
     }
 
@@ -1769,6 +1858,11 @@ mod relay_tests {
             self.send(json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":{}}})).await;
             self.response(id).await
         }
+
+        async fn call_symbols(&mut self, id: i64) -> Value {
+            self.send(json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"workspace_symbol_search","arguments":{"query":"x"}}})).await;
+            self.response(id).await
+        }
     }
 
     fn initialize_request() -> Value {
@@ -2074,6 +2168,88 @@ mod relay_tests {
             .map(|file| file["file_path"].as_str().unwrap())
             .collect();
         assert_eq!(files, ["/work/a.rs", "/wt/b.rs"]);
+    }
+
+    /// `workspace_symbol_search` is answered with the symbols of the session backend and every attached route backend.
+    #[tokio::test]
+    async fn test_workspace_symbols_merge_every_attached_backend() {
+        let door = FakeDoor::new(
+            Start::Spawned,
+            vec![Script::Server(
+                accepted(),
+                Then::Report(
+                    r#"{"symbols":[{"name":"main_only","kind":"Function","location":{"uri":"file:///work/a.rs","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}}}]}"#,
+                ),
+            )],
+        );
+        let wt_door = FakeDoor::new(
+            Start::Spawned,
+            vec![Script::Server(
+                accepted(),
+                Then::Report(
+                    r#"{"symbols":[{"name":"worktree_only","kind":"Function","location":{"uri":"file:///wt/b.rs","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}}}]}"#,
+                ),
+            )],
+        );
+        let router = FakeRouter(vec![(PathBuf::from("/wt"), Arc::clone(&wt_door), true)]);
+        let mut host = Host::start(door, Arc::new(router), request(), fast());
+        host.initialize().await;
+        host.call_file(2, "/wt/b.rs").await;
+
+        let merged = host.call_symbols(3).await;
+        assert!(merged.get("error").is_none(), "{merged}");
+        let report: Value =
+            serde_json::from_str(merged["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        let names: Vec<&str> = report["symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|symbol| symbol["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["main_only", "worktree_only"]);
+    }
+
+    /// A route backend that never answers `workspace_symbol_search` does not hide the session's symbols.
+    #[tokio::test]
+    async fn test_a_silent_route_does_not_hide_the_session_symbols() {
+        let door = FakeDoor::new(
+            Start::Spawned,
+            vec![Script::Server(
+                accepted(),
+                Then::Report(
+                    r#"{"symbols":[{"name":"main_only","kind":"Function","location":{"uri":"file:///work/a.rs","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}}}]}"#,
+                ),
+            )],
+        );
+        let wt_door = FakeDoor::new(
+            Start::Spawned,
+            vec![Script::Server(
+                accepted(),
+                Then::Silent(
+                    r#"{"symbols":[{"name":"worktree_only","kind":"Function","location":{"uri":"file:///wt/b.rs","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}}}]}"#,
+                    "workspace_symbol_search",
+                ),
+            )],
+        );
+        let router = FakeRouter(vec![(PathBuf::from("/wt"), Arc::clone(&wt_door), true)]);
+        let mut host = Host::start(door, Arc::new(router), request(), fast());
+        host.initialize().await;
+        host.call_file(2, "/wt/b.rs").await;
+
+        let answered = tokio::time::timeout(Duration::from_secs(5), host.call_symbols(3))
+            .await
+            .expect("the symbol search is answered");
+        assert!(answered.get("error").is_none(), "{answered}");
+        let report: Value =
+            serde_json::from_str(answered["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        let names: Vec<&str> = report["symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|symbol| symbol["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["main_only"]);
     }
 
     /// A file under a route whose checkout has no backend to attach to is answered by the session's backend.
