@@ -301,8 +301,9 @@ pub enum Error {
     /// The server routed for a `get_diagnostics` call does not support pull
     /// diagnostics and has published no diagnostics for the file.
     #[error(
-        "server '{server_id}' does not support pull diagnostics and has published no \
-         diagnostics for this file; call get_new_diagnostics to receive its pushed diagnostics"
+        "server '{server_id}' does not support pull diagnostics (diagnosticProvider) and has \
+         published no diagnostics for this file; call get_new_diagnostics to receive its \
+         pushed diagnostics"
     )]
     PullDiagnosticsUnsupported {
         /// Routing identity of the push-only server.
@@ -721,7 +722,7 @@ mod tests {
         };
         assert_eq!(
             err.to_string(),
-            "server 'python' does not support pull diagnostics and has published no diagnostics for this file; call get_new_diagnostics to receive its pushed diagnostics"
+            "server 'python' does not support pull diagnostics (diagnosticProvider) and has published no diagnostics for this file; call get_new_diagnostics to receive its pushed diagnostics"
         );
     }
 
