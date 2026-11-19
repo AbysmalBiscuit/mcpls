@@ -230,12 +230,18 @@ impl Project {
     /// when launched and `exit <pid>` on the LSP `exit` notification.
     #[cfg(unix)]
     fn with_lifecycle_server(self) -> Self {
+        self.with_lifecycle_server_idle(60_000)
+    }
+
+    /// `with_lifecycle_server`, with the backend's idle timer set to `idle_ms`.
+    #[cfg(unix)]
+    fn with_lifecycle_server_idle(self, idle_ms: u64) -> Self {
         std::fs::write(self.root().join("marker.fake"), "").unwrap();
         std::fs::write(self.root().join("a.fake"), "").unwrap();
         let script = self.root().join("lifecycle_lsp.py");
         std::fs::write(&script, LIFECYCLE_LSP).unwrap();
         self.write_config(
-            60_000,
+            idle_ms,
             &format!(
                 "\n[[lsp_servers]]\nlanguage_id = \"fake\"\ncommand = \"python3\"\nargs = [{:?}, {:?}]\nfile_patterns = [\"**/*.fake\"]\ntimeout_seconds = 10\n\n[lsp_servers.heuristics]\nproject_markers = [\"marker.fake\"]\n",
                 script.display().to_string(),
@@ -680,6 +686,119 @@ fn two_worktrees_get_a_backend_each() {
         assert!(!alive(first_pid));
         assert!(!alive(second_pid));
     }
+}
+
+/// Make `worktree` a linked worktree of `main`'s repository, as
+/// `two_worktrees_get_a_backend_each` does.
+#[cfg(unix)]
+fn make_linked_worktree(main: &Project, worktree: &Project) {
+    std::fs::remove_dir_all(worktree.root().join(".git")).unwrap();
+    std::fs::write(
+        worktree.root().join(".git"),
+        format!("gitdir: {}/.git/worktrees/two", main.root().display()),
+    )
+    .unwrap();
+}
+
+/// A tool call on a file in a linked worktree of the session's repository
+/// starts a backend for that worktree and is answered by it.
+#[cfg(unix)]
+#[test]
+fn a_worktree_file_is_answered_by_a_backend_started_for_the_worktree() {
+    let one = Project::new(500).with_lifecycle_server_idle(500);
+    let two = Project::new(500);
+    make_linked_worktree(&one, &two);
+    std::fs::write(two.root().join("marker.fake"), "").unwrap();
+    std::fs::write(two.root().join("a.fake"), "").unwrap();
+
+    let mut a = one.frontend();
+    one.assert_attaches(&mut a);
+    assert_eq!(
+        Project::backend_pid_for(&two.root(), one.runtime.path(), &one.user),
+        None
+    );
+
+    let call = a.symbols(&two.root().join("a.fake"));
+    assert_tool_success(&call);
+
+    let worktree_pid = Project::backend_pid_for(&two.root(), one.runtime.path(), &one.user)
+        .expect("the worktree's backend");
+    assert_ne!(Some(worktree_pid), one.backend_pid());
+
+    let status = Project::command_with_identity(&two.root(), one.runtime.path(), &one.user)
+        .env("CLAUDE_PROJECT_DIR", two.root())
+        .arg("status")
+        .output()
+        .unwrap();
+    assert!(
+        stdout(&status).contains(", 1 session"),
+        "{}",
+        stdout(&status)
+    );
+
+    assert!(a.close(Duration::from_secs(5)));
+    Project::wait_for_backend_exit(
+        &two.root(),
+        one.runtime.path(),
+        &one.user,
+        "the worktree backend to exit",
+    );
+}
+
+/// A tool call on a file in an unrelated checkout with no running backend
+/// starts nothing and is answered by the session's backend with an
+/// outside-workspace error.
+#[cfg(unix)]
+#[test]
+fn a_file_in_an_unrelated_checkout_with_no_backend_starts_nothing() {
+    let one = Project::new(500).with_lifecycle_server_idle(500);
+    let three = Project::new(500);
+    std::fs::write(three.root().join("marker.fake"), "").unwrap();
+    std::fs::write(three.root().join("a.fake"), "").unwrap();
+
+    let mut a = one.frontend();
+    one.assert_attaches(&mut a);
+
+    let call = a.symbols(&three.root().join("a.fake"));
+    assert!(failure_text(&call).contains("outside workspace"), "{call}");
+    assert!(Project::backend_pid_for(&three.root(), one.runtime.path(), &one.user).is_none());
+}
+
+/// A tool call on a file in an unrelated checkout that already has a running
+/// backend is answered by that backend, and no new backend starts.
+#[cfg(unix)]
+#[test]
+fn a_file_in_a_checkout_with_a_started_backend_is_answered_by_it() {
+    let one = Project::new(500).with_lifecycle_server_idle(500);
+    let three = Project::new(60_000).with_lifecycle_server();
+    let started = Project::command_with_identity(&three.root(), one.runtime.path(), &one.user)
+        .arg("--config")
+        .arg(three.config())
+        .args(["backend", "start"])
+        .output()
+        .unwrap();
+    assert!(started.status.success(), "{}", stdout(&started));
+    // A kept backend never exits on its own, so a failed assertion must not
+    // skip the stop.
+    let _stop = OnDrop(|| {
+        let _ = Project::command_with_identity(&three.root(), one.runtime.path(), &one.user)
+            .arg("--config")
+            .arg(three.config())
+            .args(["backend", "stop", "--force"])
+            .output();
+    });
+
+    let mut a = one.frontend();
+    one.assert_attaches(&mut a);
+    let before = Project::backend_pid_for(&three.root(), one.runtime.path(), &one.user)
+        .expect("the started backend");
+
+    let call = a.symbols(&three.root().join("a.fake"));
+    assert_tool_success(&call);
+    assert_eq!(
+        Project::backend_pid_for(&three.root(), one.runtime.path(), &one.user),
+        Some(before)
+    );
 }
 
 /// Frontends racing from nothing start one backend, and none of them sees

@@ -2,9 +2,9 @@
 //! MCP traffic, or explain why there is no backend.
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,6 +17,7 @@ use tokio::time::Instant;
 use crate::backend::handshake::{
     self, ConfigStamp, Handshake, HandshakeReply, Refusal, compare_builds,
 };
+use crate::backend::route::{self, Reach};
 use crate::backend::spawn::{BackendLaunch, SpawnLock};
 use crate::backend::stub;
 use crate::bridge::SessionId;
@@ -49,6 +50,31 @@ pub(crate) enum Start {
 pub(crate) struct Place {
     pub(crate) root: PathBuf,
     pub(crate) log: PathBuf,
+}
+
+/// The backend of another checkout, which a tool call's file leads to.
+pub(crate) struct Route {
+    /// The checkout root, which the handshake names.
+    pub(crate) root: PathBuf,
+    pub(crate) door: Arc<dyn Door>,
+    /// Whether the frontend starts a backend there when none answers, rather
+    /// than only attaching to one that runs.
+    pub(crate) start: bool,
+}
+
+/// Which checkout's backend serves a tool call's file.
+pub(crate) trait Router: Send + Sync + 'static {
+    /// The route for `file`, or `None` when the session's backend serves it.
+    fn route(&self, file: &Path) -> Option<Route>;
+}
+
+/// A router that sends every call to the session's backend.
+pub(crate) struct NoRoutes;
+
+impl Router for NoRoutes {
+    fn route(&self, _file: &Path) -> Option<Route> {
+        None
+    }
 }
 
 /// The frontend's waits.
@@ -95,22 +121,35 @@ pub async fn run_frontend(options: FrontendOptions) {
         SessionId::from_host_env().map(|session| session.to_string()),
         options.stamp,
     );
-    let door: Arc<dyn Door> = match (
+    let (door, router): (Arc<dyn Door>, Arc<dyn Router>) = match (
         hooks::identity_for(&options.launch.root),
         std::env::current_exe(),
     ) {
-        (Ok(identity), Ok(exe)) => Arc::new(ProcessDoor {
-            identity,
-            launch: options.launch,
-            exe,
-        }),
-        (Err(error), _) => Arc::new(Unreachable(options.launch.root, error.to_string())),
-        (_, Err(error)) => Arc::new(Unreachable(options.launch.root, error.to_string())),
+        (Ok(identity), Ok(exe)) => (
+            Arc::new(ProcessDoor {
+                identity,
+                launch: options.launch.clone(),
+                exe: exe.clone(),
+            }),
+            Arc::new(ProcessRouter {
+                launch: options.launch,
+                exe,
+            }),
+        ),
+        (Err(error), _) => (
+            Arc::new(Unreachable(options.launch.root, error.to_string())),
+            Arc::new(NoRoutes),
+        ),
+        (_, Err(error)) => (
+            Arc::new(Unreachable(options.launch.root, error.to_string())),
+            Arc::new(NoRoutes),
+        ),
     };
     relay(
         tokio::io::stdin(),
         tokio::io::stdout(),
         door,
+        router,
         request,
         Timing::default(),
     )
@@ -164,6 +203,33 @@ impl Door for ProcessDoor {
     }
 }
 
+/// Routes a file in another checkout to that checkout's backend, by
+/// [`route::route`].
+struct ProcessRouter {
+    launch: BackendLaunch,
+    exe: PathBuf,
+}
+
+impl Router for ProcessRouter {
+    fn route(&self, file: &Path) -> Option<Route> {
+        let (root, reach) = route::route(&self.launch.root, file)?;
+        let identity = hooks::identity_for(&root).ok()?;
+        let launch = BackendLaunch {
+            root: root.clone(),
+            ..self.launch.clone()
+        };
+        Some(Route {
+            root,
+            door: Arc::new(ProcessDoor {
+                identity,
+                launch,
+                exe: self.exe.clone(),
+            }),
+            start: reach == Reach::Start,
+        })
+    }
+}
+
 /// A frontend that cannot derive its endpoint at all.
 struct Unreachable(PathBuf, String);
 
@@ -196,11 +262,21 @@ const REPLAY_ID: &str = "mcpls-frontend-replay";
 
 enum Event {
     Host(String),
+    /// A host line for the session's backend, sent without a routing check.
+    Unrouted(String),
     HostClosed,
     Attach(Outcome),
     /// A line from the backend stream the numbered attach opened.
     Backend(u64, String),
     BackendClosed(u64),
+    RouteAttach {
+        root: PathBuf,
+        place: Place,
+        /// `None` when nothing runs there and the route may not start one.
+        outcome: Option<Outcome>,
+    },
+    RouteLine(PathBuf, u64, String),
+    RouteClosed(PathBuf, u64),
 }
 
 enum State {
@@ -210,12 +286,25 @@ enum State {
     Failed(String),
 }
 
+/// Another checkout's backend, as the relay holds it.
+enum Other {
+    /// Host calls that wait for the attach.
+    Connecting(Vec<(String, Value)>),
+    Attached {
+        writer: tokio::io::WriteHalf<Box<dyn HookStream>>,
+        place: Place,
+        generation: u64,
+    },
+    Failed(String),
+}
+
 /// Relay `host_in` and `host_out` to the project's backend.
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn relay<R, W>(
     host_in: R,
     mut host_out: W,
     door: Arc<dyn Door>,
+    router: Arc<dyn Router>,
     request: Handshake,
     timing: Timing,
 ) where
@@ -237,6 +326,7 @@ pub(crate) async fn relay<R, W>(
     let mut backend: Option<tokio::io::WriteHalf<Box<dyn HookStream>>> = None;
     // Events from any backend stream but the latest one are stale.
     let mut generation = 0u64;
+    let mut route_generation = 0u64;
     let mut pending: HashSet<String> = HashSet::new();
     let mut deferred: Vec<(String, Value)> = Vec::new();
     // What the host sent the current backend before it sent anything back.
@@ -246,11 +336,14 @@ pub(crate) async fn relay<R, W>(
     let mut init: Option<String> = None;
     let mut initialized: Option<String> = None;
     let mut init_answered = false;
+    let mut others: HashMap<PathBuf, Other> = HashMap::new();
+    let mut sent_to: HashMap<String, PathBuf> = HashMap::new();
 
     while let Some(event) = inbox.recv().await {
+        let routable = matches!(event, Event::Host(_));
         match event {
             Event::HostClosed => return,
-            Event::Host(line) => {
+            Event::Host(line) | Event::Unrouted(line) => {
                 let Ok(message) = serde_json::from_str::<Value>(&line) else {
                     continue;
                 };
@@ -258,6 +351,38 @@ pub(crate) async fn relay<R, W>(
                     Some("initialize") => init = Some(line.clone()),
                     Some("notifications/initialized") => initialized = Some(line.clone()),
                     _ => {}
+                }
+                if routable
+                    && init.is_some()
+                    && message.get("method").and_then(Value::as_str) == Some("tools/call")
+                    && let Some(id) = message.get("id")
+                    && let Some(file) = message
+                        .pointer("/params/arguments/file_path")
+                        .and_then(Value::as_str)
+                    && let Some(route) = router.route(Path::new(file))
+                {
+                    let root = route.root.clone();
+                    match others.get_mut(&root) {
+                        Some(Other::Attached {
+                            writer, generation, ..
+                        }) => {
+                            sent_to.insert(id.to_string(), root.clone());
+                            if write_line(writer, &line).await.is_err() {
+                                let _ = events.send(Event::RouteClosed(root, *generation));
+                            }
+                        }
+                        Some(Other::Connecting(queue)) => queue.push((line, message)),
+                        Some(Other::Failed(reason)) => {
+                            if let Some(reply) = stub::answer(&message, reason) {
+                                write_value(&mut host_out, &reply).await;
+                            }
+                        }
+                        None => {
+                            others.insert(root, Other::Connecting(vec![(line, message)]));
+                            spawn_route_attach(route, request.clone(), timing, events.clone());
+                        }
+                    }
+                    continue;
                 }
                 match &state {
                     State::Connecting => deferred.push((line, message)),
@@ -390,6 +515,119 @@ pub(crate) async fn relay<R, W>(
                 }
                 state = State::Failed(reason);
             }
+            Event::RouteAttach {
+                root,
+                place,
+                outcome,
+            } => {
+                let Some(Other::Connecting(queue)) = others.remove(&root) else {
+                    continue;
+                };
+                match outcome {
+                    None => {
+                        for (line, _) in queue {
+                            let _ = events.send(Event::Unrouted(line));
+                        }
+                    }
+                    Some(Outcome::Attached(stream)) => {
+                        route_generation += 1;
+                        let current = route_generation;
+                        let (reader, mut writer) = tokio::io::split(stream);
+                        let for_lines = root.clone();
+                        spawn_lines(
+                            reader,
+                            events.clone(),
+                            move |line| Event::RouteLine(for_lines.clone(), current, line),
+                            Event::RouteClosed(root.clone(), current),
+                        );
+                        let replayed = replay_route(
+                            &mut writer,
+                            init.as_deref(),
+                            initialized.as_deref(),
+                            queue,
+                            &mut sent_to,
+                            &root,
+                        )
+                        .await;
+                        if replayed.is_err() {
+                            let _ = events.send(Event::RouteClosed(root.clone(), current));
+                        }
+                        others.insert(
+                            root,
+                            Other::Attached {
+                                writer,
+                                place,
+                                generation: current,
+                            },
+                        );
+                    }
+                    Some(Outcome::Waiting(reason)) => {
+                        answer_queue(&mut host_out, queue, &reason).await;
+                    }
+                    Some(Outcome::Failed(reason)) => {
+                        answer_queue(&mut host_out, queue, &reason).await;
+                        others.insert(root, Other::Failed(reason));
+                    }
+                }
+            }
+            Event::RouteLine(root, route, line) => {
+                if !matches!(
+                    others.get(&root),
+                    Some(Other::Attached { generation, .. }) if *generation == route
+                ) {
+                    continue;
+                }
+                let Ok(message) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                match (message.get("method"), message.get("id")) {
+                    (None, Some(id)) => {
+                        if id.as_str() == Some(REPLAY_ID) {
+                            continue;
+                        }
+                        let key = id.to_string();
+                        if sent_to.get(&key) == Some(&root) {
+                            sent_to.remove(&key);
+                            write_raw(&mut host_out, &line).await;
+                        }
+                    }
+                    (Some(_), None) => write_raw(&mut host_out, &line).await,
+                    (Some(_), Some(_)) => {
+                        tracing::debug!(root = %root.display(), "dropped a server request from a route");
+                    }
+                    (None, None) => {}
+                }
+            }
+            Event::RouteClosed(root, route) => {
+                let Some(Other::Attached {
+                    place, generation, ..
+                }) = others.get(&root)
+                else {
+                    continue;
+                };
+                if *generation != route {
+                    continue;
+                }
+                let reason = messages::backend_stopped(place);
+                others.remove(&root);
+                let lost: Vec<String> = sent_to
+                    .iter()
+                    .filter(|(_, owner)| **owner == root)
+                    .map(|(key, _)| key.clone())
+                    .collect();
+                for key in lost {
+                    sent_to.remove(&key);
+                    let Ok(id) = serde_json::from_str::<Value>(&key) else {
+                        continue;
+                    };
+                    let reply = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {"code": -32603, "message": reason},
+                    });
+                    write_value(&mut host_out, &reply).await;
+                }
+            }
         }
     }
 }
@@ -414,6 +652,72 @@ async fn answer_from_stub<W: AsyncWrite + Unpin>(
             write_value(host, &reply).await;
         }
     }
+}
+
+async fn answer_queue<W: AsyncWrite + Unpin>(
+    host: &mut W,
+    queue: Vec<(String, Value)>,
+    reason: &str,
+) {
+    for (_, message) in queue {
+        if let Some(reply) = stub::answer(&message, reason) {
+            write_value(host, &reply).await;
+        }
+    }
+}
+
+/// Sends the replayed handshake and the queued calls to a route's new backend.
+/// The backend never saw `initialize`, so it is replayed whatever the host got.
+async fn replay_route<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    init: Option<&str>,
+    initialized: Option<&str>,
+    queue: Vec<(String, Value)>,
+    sent_to: &mut HashMap<String, PathBuf>,
+    root: &Path,
+) -> io::Result<()> {
+    if let Some(line) = init
+        && let Ok(mut replay) = serde_json::from_str::<Value>(line)
+    {
+        replay["id"] = Value::from(REPLAY_ID);
+        write_line(writer, &replay.to_string()).await?;
+    }
+    if let Some(line) = initialized {
+        write_line(writer, line).await?;
+    }
+    for (line, message) in queue {
+        if let Some(id) = message.get("id") {
+            sent_to.insert(id.to_string(), root.to_path_buf());
+        }
+        write_line(writer, &line).await?;
+    }
+    Ok(())
+}
+
+fn spawn_route_attach(
+    route: Route,
+    request: Handshake,
+    timing: Timing,
+    events: mpsc::UnboundedSender<Event>,
+) {
+    tokio::spawn(async move {
+        let request = Handshake {
+            root: Some(route.root.clone()),
+            ..request
+        };
+        let door = route.door.as_ref();
+        let place = door.place();
+        let outcome = if route.start {
+            Some(attach(door, &request, &timing).await)
+        } else {
+            attach_running(door, &request, &timing).await
+        };
+        let _ = events.send(Event::RouteAttach {
+            root: route.root,
+            place,
+            outcome,
+        });
+    });
 }
 
 fn spawn_attach(
@@ -553,6 +857,19 @@ pub(crate) async fn attach(door: &dyn Door, request: &Handshake, timing: &Timing
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         }
+    }
+}
+
+/// Attach to a backend that already answers, or `None` when none does.
+async fn attach_running(door: &dyn Door, request: &Handshake, timing: &Timing) -> Option<Outcome> {
+    match handshake_with(door, request).await {
+        ConnectionAttempt::Connected(found) => {
+            match judge(door, request, found, timing, false).await {
+                Judged::Done(outcome) => Some(outcome),
+                Judged::Evicted => None,
+            }
+        }
+        ConnectionAttempt::Absent | ConnectionAttempt::Busy => None,
     }
 }
 
@@ -737,7 +1054,7 @@ mod messages {
 mod fake {
     use std::collections::VecDeque;
     use std::io;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
@@ -751,7 +1068,7 @@ mod fake {
         AsyncBufReadExt as _, AsyncRead, AsyncWrite, AsyncWriteExt as _, BufReader, ReadBuf,
     };
 
-    use super::{Door, Place, Start, Timing};
+    use super::{Door, Place, Route, Router, Start, Timing};
     use crate::backend::handshake::{
         self, ConfigStamp, ConnectionKind, Handshake, HandshakeReply, Refusal,
     };
@@ -829,6 +1146,7 @@ mod fake {
         start: Start,
         pub(super) starts: Mutex<usize>,
         pub(super) kinds: Arc<Mutex<Vec<ConnectionKind>>>,
+        pub(super) roots: Arc<Mutex<Vec<Option<PathBuf>>>>,
     }
 
     impl FakeDoor {
@@ -838,7 +1156,24 @@ mod fake {
                 start,
                 starts: Mutex::new(0),
                 kinds: Arc::new(Mutex::new(Vec::new())),
+                roots: Arc::new(Mutex::new(Vec::new())),
             })
+        }
+    }
+
+    /// Routes a file under one of its roots to that root's door.
+    pub(super) struct FakeRouter(pub(super) Vec<(PathBuf, Arc<FakeDoor>, bool)>);
+
+    impl Router for FakeRouter {
+        fn route(&self, file: &Path) -> Option<Route> {
+            self.0
+                .iter()
+                .find(|(root, _, _)| file.starts_with(root))
+                .map(|(root, door, start)| Route {
+                    root: root.clone(),
+                    door: Arc::clone(door) as Arc<dyn Door>,
+                    start: *start,
+                })
         }
     }
 
@@ -851,6 +1186,7 @@ mod fake {
                 .pop_front()
                 .unwrap_or(Script::Nobody);
             let kinds = Arc::clone(&self.kinds);
+            let roots = Arc::clone(&self.roots);
             Box::pin(async move {
                 let (reply, then) = match script {
                     Script::Nobody => return Err(io::ErrorKind::ConnectionRefused.into()),
@@ -874,6 +1210,7 @@ mod fake {
                         return;
                     };
                     kinds.lock().unwrap().push(request.kind);
+                    roots.lock().unwrap().push(request.root);
                     if matches!(&then, Then::CloseBeforeReply) {
                         return;
                     }
@@ -1188,6 +1525,7 @@ mod attach_tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod relay_tests {
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1195,8 +1533,8 @@ mod relay_tests {
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, DuplexStream, Lines};
     use tokio::time::Instant;
 
-    use super::fake::{FakeDoor, Script, Then, accepted, fast, refused, request};
-    use super::{Door, Start, Timing, relay};
+    use super::fake::{FakeDoor, FakeRouter, Script, Then, accepted, fast, refused, request};
+    use super::{Door, NoRoutes, Router, Start, Timing, relay};
     use crate::backend::handshake::{self, Handshake, Refusal};
 
     struct Host {
@@ -1206,10 +1544,15 @@ mod relay_tests {
     }
 
     impl Host {
-        fn start(door: Arc<dyn Door>, request: Handshake, timing: Timing) -> Self {
+        fn start(
+            door: Arc<dyn Door>,
+            router: Arc<dyn Router>,
+            request: Handshake,
+            timing: Timing,
+        ) -> Self {
             let (input, relay_in) = tokio::io::duplex(1 << 20);
             let (relay_out, output) = tokio::io::duplex(1 << 20);
-            let relay = tokio::spawn(relay(relay_in, relay_out, door, request, timing));
+            let relay = tokio::spawn(relay(relay_in, relay_out, door, router, request, timing));
             Self {
                 input,
                 output: BufReader::new(output).lines(),
@@ -1219,6 +1562,7 @@ mod relay_tests {
 
         async fn start_with_pending(
             door: Arc<dyn Door>,
+            router: Arc<dyn Router>,
             request: Handshake,
             timing: Timing,
             message: Value,
@@ -1229,7 +1573,7 @@ mod relay_tests {
                 .write_all(format!("{message}\n").as_bytes())
                 .await
                 .unwrap();
-            let relay = tokio::spawn(relay(relay_in, relay_out, door, request, timing));
+            let relay = tokio::spawn(relay(relay_in, relay_out, door, router, request, timing));
             Self {
                 input,
                 output: BufReader::new(output).lines(),
@@ -1275,6 +1619,11 @@ mod relay_tests {
             self.send(json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"get_server_logs","arguments":{}}})).await;
             self.response(id).await
         }
+
+        async fn call_file(&mut self, id: i64, file: &str) -> Value {
+            self.send(json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"get_server_logs","arguments":{"file_path":file}}})).await;
+            self.response(id).await
+        }
     }
 
     fn initialize_request() -> Value {
@@ -1287,7 +1636,7 @@ mod relay_tests {
             Start::Spawned,
             vec![Script::Server(accepted(), Then::Serve)],
         );
-        let mut host = Host::start(door, request(), fast());
+        let mut host = Host::start(door, Arc::new(NoRoutes), request(), fast());
         let init = host.initialize().await;
         assert_eq!(
             init["result"]["instructions"],
@@ -1307,7 +1656,7 @@ mod relay_tests {
                 Then::Close,
             )],
         );
-        let mut host = Host::start(door, request(), fast());
+        let mut host = Host::start(door, Arc::new(NoRoutes), request(), fast());
         let init = host.initialize().await;
         let text = init["result"]["instructions"].as_str().unwrap().to_string();
         assert!(
@@ -1333,7 +1682,7 @@ mod relay_tests {
             Start::Spawned,
             vec![Script::Server(accepted(), Then::AnswerOnceThenClose)],
         );
-        let mut host = Host::start(door, request(), fast());
+        let mut host = Host::start(door, Arc::new(NoRoutes), request(), fast());
         host.send(initialize_request()).await;
         let init = host.response(1).await;
         assert_eq!(init["result"]["serverInfo"]["name"], "mcpls", "{init}");
@@ -1362,7 +1711,12 @@ mod relay_tests {
                 Script::Server(accepted(), Then::Serve),
             ],
         );
-        let mut host = Host::start(Arc::clone(&door) as Arc<dyn Door>, request(), fast());
+        let mut host = Host::start(
+            Arc::clone(&door) as Arc<dyn Door>,
+            Arc::new(NoRoutes),
+            request(),
+            fast(),
+        );
         let init = host.initialize().await;
         assert_eq!(
             init["result"]["instructions"],
@@ -1383,7 +1737,7 @@ mod relay_tests {
                 Script::Server(accepted(), Then::CloseOnFirstLine),
             ],
         );
-        let mut host = Host::start(door, request(), fast());
+        let mut host = Host::start(door, Arc::new(NoRoutes), request(), fast());
         host.send(initialize_request()).await;
         let failed = host.response(1).await;
         assert!(
@@ -1406,8 +1760,14 @@ mod relay_tests {
                 Script::Server(accepted(), Then::CloseRead),
             ],
         );
-        let mut host =
-            Host::start_with_pending(door, request(), fast(), initialize_request()).await;
+        let mut host = Host::start_with_pending(
+            door,
+            Arc::new(NoRoutes),
+            request(),
+            fast(),
+            initialize_request(),
+        )
+        .await;
         let failed = host.response(1).await;
         assert!(
             failed["error"]["message"]
@@ -1421,7 +1781,7 @@ mod relay_tests {
     #[tokio::test]
     async fn test_a_waiting_tool_call_fails_at_once() {
         let door = FakeDoor::new(Start::Requested, vec![]);
-        let mut host = Host::start(door, request(), fast());
+        let mut host = Host::start(door, Arc::new(NoRoutes), request(), fast());
         host.initialize().await;
         let started = Instant::now();
         let call = host.call_tool(2).await;
@@ -1454,7 +1814,7 @@ mod relay_tests {
             retry: Duration::from_millis(200),
             ..fast()
         };
-        let mut host = Host::start(door, request(), timing);
+        let mut host = Host::start(door, Arc::new(NoRoutes), request(), timing);
         let init = host.initialize().await;
         assert!(
             init["result"]["instructions"]
@@ -1490,7 +1850,7 @@ mod relay_tests {
             Start::Spawned,
             vec![Script::Server(accepted(), Then::Serve)],
         );
-        let mut host = Host::start(door, request(), fast());
+        let mut host = Host::start(door, Arc::new(NoRoutes), request(), fast());
         host.initialize().await;
         let Host { input, relay, .. } = host;
         drop(input);
@@ -1498,5 +1858,160 @@ mod relay_tests {
             .await
             .expect("the relay returned after host EOF")
             .unwrap();
+    }
+
+    /// A file under a route with no backend running starts one at that route's root.
+    #[tokio::test]
+    async fn test_a_file_in_a_worktree_is_answered_by_a_backend_started_there() {
+        let door = FakeDoor::new(
+            Start::Spawned,
+            vec![Script::Server(accepted(), Then::Serve)],
+        );
+        let wt_door = FakeDoor::new(
+            Start::Spawned,
+            vec![
+                Script::Nobody,
+                Script::Nobody,
+                Script::Server(accepted(), Then::Serve),
+            ],
+        );
+        let router = FakeRouter(vec![(PathBuf::from("/wt"), Arc::clone(&wt_door), true)]);
+        let mut host = Host::start(door, Arc::new(router), request(), fast());
+        host.initialize().await;
+
+        let call = host.call_file(2, "/wt/a.rs").await;
+        assert!(call.get("error").is_none(), "{call}");
+        assert_ne!(call["result"]["isError"], true, "{call}");
+        assert_eq!(*wt_door.starts.lock().unwrap(), 1);
+        assert!(
+            wt_door
+                .roots
+                .lock()
+                .unwrap()
+                .contains(&Some(PathBuf::from("/wt")))
+        );
+    }
+
+    /// A file under a route whose checkout has no backend to attach to is answered by the session's backend.
+    #[tokio::test]
+    async fn test_a_file_with_no_backend_to_attach_to_goes_to_the_session_backend() {
+        let door = FakeDoor::new(
+            Start::Spawned,
+            vec![Script::Server(accepted(), Then::Serve)],
+        );
+        let wt_door = FakeDoor::new(Start::Spawned, vec![]);
+        let router = FakeRouter(vec![(PathBuf::from("/wt"), Arc::clone(&wt_door), false)]);
+        let mut host = Host::start(
+            Arc::clone(&door) as Arc<dyn Door>,
+            Arc::new(router),
+            request(),
+            fast(),
+        );
+        host.initialize().await;
+
+        let call = host.call_file(2, "/wt/a.rs").await;
+        assert_ne!(call["result"]["isError"], true, "{call}");
+        assert_eq!(*wt_door.starts.lock().unwrap(), 0);
+        assert_eq!(door.kinds.lock().unwrap().len(), 1);
+    }
+
+    /// A running backend of another checkout is attached to without starting one.
+    #[tokio::test]
+    async fn test_a_running_backend_of_another_checkout_is_attached_without_a_start() {
+        let door = FakeDoor::new(
+            Start::Spawned,
+            vec![Script::Server(accepted(), Then::Serve)],
+        );
+        let wt_door = FakeDoor::new(
+            Start::Spawned,
+            vec![Script::Server(accepted(), Then::Serve)],
+        );
+        let router = FakeRouter(vec![(PathBuf::from("/wt"), Arc::clone(&wt_door), false)]);
+        let mut host = Host::start(door, Arc::new(router), request(), fast());
+        host.initialize().await;
+
+        let call = host.call_file(2, "/wt/a.rs").await;
+        assert_ne!(call["result"]["isError"], true, "{call}");
+        assert_eq!(*wt_door.starts.lock().unwrap(), 0);
+        assert_eq!(wt_door.kinds.lock().unwrap().len(), 1);
+    }
+
+    /// A refused route fails only the call that needed it, and the session's backend keeps answering.
+    #[tokio::test]
+    async fn test_a_refused_route_fails_its_call_and_spares_the_session() {
+        let door = FakeDoor::new(
+            Start::Spawned,
+            vec![Script::Server(accepted(), Then::Serve)],
+        );
+        let wt_door = FakeDoor::new(
+            Start::Spawned,
+            vec![Script::Server(
+                refused("0.0.1", 2, Refusal::Build),
+                Then::Close,
+            )],
+        );
+        let router = FakeRouter(vec![(PathBuf::from("/wt"), Arc::clone(&wt_door), true)]);
+        let mut host = Host::start(door, Arc::new(router), request(), fast());
+        host.initialize().await;
+
+        let call = host.call_file(2, "/wt/a.rs").await;
+        assert_eq!(call["result"]["isError"], true, "{call}");
+        assert!(call.to_string().contains("0.0.1"), "{call}");
+
+        let session = host.call_tool(3).await;
+        assert_ne!(session["result"]["isError"], true, "{session}");
+    }
+
+    /// Calls to one route share a single connection to that checkout's backend.
+    #[tokio::test]
+    async fn test_calls_to_one_route_share_one_connection() {
+        let door = FakeDoor::new(
+            Start::Spawned,
+            vec![Script::Server(accepted(), Then::Serve)],
+        );
+        let wt_door = FakeDoor::new(
+            Start::Spawned,
+            vec![Script::Server(accepted(), Then::Serve)],
+        );
+        let router = FakeRouter(vec![(PathBuf::from("/wt"), Arc::clone(&wt_door), false)]);
+        let mut host = Host::start(door, Arc::new(router), request(), fast());
+        host.initialize().await;
+
+        let first = host.call_file(2, "/wt/a.rs").await;
+        let second = host.call_file(3, "/wt/a.rs").await;
+        assert_ne!(first["result"]["isError"], true, "{first}");
+        assert_ne!(second["result"]["isError"], true, "{second}");
+        assert_eq!(wt_door.kinds.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_a_route_reattaches_after_its_backend_closes() {
+        let door = FakeDoor::new(
+            Start::Spawned,
+            vec![Script::Server(accepted(), Then::Serve)],
+        );
+        let wt_door = FakeDoor::new(
+            Start::Spawned,
+            vec![
+                Script::Server(accepted(), Then::AnswerOnceThenClose),
+                Script::Server(accepted(), Then::Serve),
+            ],
+        );
+        let router = FakeRouter(vec![(PathBuf::from("/wt"), Arc::clone(&wt_door), false)]);
+        let mut host = Host::start(door, Arc::new(router), request(), fast());
+        host.initialize().await;
+
+        let failed = host.call_file(2, "/wt/a.rs").await;
+        assert!(
+            failed["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("stopped"),
+            "{failed}"
+        );
+        let retried = host.call_file(3, "/wt/a.rs").await;
+        assert_ne!(retried["result"]["isError"], true, "{retried}");
+        assert!(retried.get("error").is_none(), "{retried}");
+        assert_eq!(wt_door.kinds.lock().unwrap().len(), 2);
     }
 }
