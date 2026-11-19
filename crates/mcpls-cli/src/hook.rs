@@ -241,6 +241,14 @@ fn session_and_agent(payload: &impl Fields, host: HookHost) -> (String, HookAgen
     (session, agent)
 }
 
+/// Whether a delivering hook reports a tool call's paths before it flushes, and how.
+#[derive(Clone, Copy)]
+enum Changes {
+    None,
+    Unattributed,
+    Attributed,
+}
+
 /// Delivers one backend's share of a tool batch or prompt and returns the
 /// context its `Flush` answer carries.
 ///
@@ -250,27 +258,30 @@ async fn flush_backend(
     backend: Backend,
     agent: HookAgent,
     session: String,
-    with_changed: bool,
+    changes: Changes,
 ) -> Option<String> {
     let Backend {
         identity,
         paths,
         flush,
     } = backend;
-    let changed = with_changed.then(|| Request::Changed {
-        attributed: false,
-        agent: agent.clone(),
-        session: session.clone(),
-        paths,
-        event: ChangeEvent::Change,
-    });
+    let report = match changes {
+        Changes::None => None,
+        Changes::Unattributed | Changes::Attributed => Some(Request::Changed {
+            attributed: matches!(changes, Changes::Attributed),
+            agent: agent.clone(),
+            session: session.clone(),
+            paths,
+            event: ChangeEvent::Change,
+        }),
+    };
     if !flush {
-        if let Some(changed) = changed {
-            let _ = send(&identity, &changed, SOCKET_TIMEOUT).await;
+        if let Some(report) = report {
+            let _ = send(&identity, &report, SOCKET_TIMEOUT).await;
         }
         return None;
     }
-    let requests: Vec<Request> = changed
+    let requests: Vec<Request> = report
         .into_iter()
         .chain([Request::Flush { agent, session }])
         .collect();
@@ -286,19 +297,14 @@ async fn flush_backends(
     backends: Vec<Backend>,
     agent: HookAgent,
     session: String,
-    with_changed: bool,
+    changes: Changes,
 ) -> Option<String> {
     let count = backends.len();
     let mut tasks = JoinSet::new();
     for (index, backend) in backends.into_iter().enumerate() {
         let agent = agent.clone();
         let session = session.clone();
-        tasks.spawn(async move {
-            (
-                index,
-                flush_backend(backend, agent, session, with_changed).await,
-            )
-        });
+        tasks.spawn(async move { (index, flush_backend(backend, agent, session, changes).await) });
     }
     let mut contexts = vec![None; count];
     while let Some(joined) = tasks.join_next().await {
@@ -358,13 +364,13 @@ async fn run(
                 .flat_map(|call| written_paths(Some(call.tool)))
                 .collect();
             let backends = backends_for(project_dir, identity, paths);
-            let context = flush_backends(backends, agent, session, true).await;
+            let context = flush_backends(backends, agent, session, Changes::Unattributed).await;
             Ok(context_output(&batch, context))
         }
 
         ClaudeCodeView::UserPromptSubmit(prompt) => {
             let backends = backends_for(project_dir, identity, Vec::new());
-            let context = flush_backends(backends, agent, session, false).await;
+            let context = flush_backends(backends, agent, session, Changes::None).await;
             Ok(context_output(&prompt, context))
         }
 
@@ -2631,6 +2637,20 @@ mod tests {
         .await
     }
 
+    /// Dispatch a Codex payload run from the session's `main` checkout.
+    async fn dispatch_codex_from_main(
+        owners: &LinkedOwners,
+        payload: &serde_json::Value,
+    ) -> String {
+        dispatch_named(
+            Harness::Codex,
+            &payload.to_string(),
+            &owners.main,
+            Some(&owners.session.identity),
+        )
+        .await
+    }
+
     /// The paths of every `changed` request `owner` received, in order.
     fn changed_paths(owner: &RecordingOwner) -> Vec<PathBuf> {
         owner
@@ -2766,6 +2786,125 @@ mod tests {
             "the session's backend must not receive the worktree path: {:?}",
             owners.session.requests()
         );
+    }
+
+    /// A Codex `apply_patch` `PostToolUse` naming `file` by absolute path, run
+    /// from `cwd`.
+    fn codex_patch_payload(cwd: &Path, file: &Path) -> serde_json::Value {
+        json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "s1",
+            "cwd": cwd.display().to_string(),
+            "tool_name": "apply_patch",
+            "tool_input": {
+                "command": format!(
+                    "*** Begin Patch\n*** Update File: {}\n@@\n-old\n+new\n*** End Patch\n",
+                    file.display()
+                )
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn test_a_codex_worktree_patch_reaches_the_worktree_backend() {
+        let flushing = |text: &str| OwnerBehavior {
+            flush_text: Some(text.to_string()),
+            ..OwnerBehavior::default()
+        };
+        let owners =
+            start_linked_owners(flushing("main problem\n"), flushing("worktree problem\n"));
+        let out = dispatch_codex_from_main(
+            &owners,
+            &codex_patch_payload(&owners.main, &owners.wt.join("a.rs")),
+        )
+        .await;
+
+        assert_eq!(
+            owners.worktree.ops(),
+            vec![
+                "changed".to_string(),
+                "flush".to_string(),
+                "ack".to_string()
+            ]
+        );
+        let worktree_requests = owners.worktree.requests();
+        let Request::Changed {
+            attributed, paths, ..
+        } = &worktree_requests[0]
+        else {
+            panic!("expected a changed request: {:?}", worktree_requests[0]);
+        };
+        assert!(*attributed, "a Codex patch is attributed to its agent");
+        assert_eq!(*paths, vec![owners.wt.join("a.rs")]);
+        assert!(
+            changed_paths(&owners.session).is_empty(),
+            "the session's backend must not receive the worktree path: {:?}",
+            owners.session.requests()
+        );
+        assert!(
+            owners.session.ops().contains(&"flush".to_string()),
+            "the session's flush still runs: {:?}",
+            owners.session.ops()
+        );
+        assert!(out.contains("main problem"), "{out:?}");
+        assert!(out.contains("worktree problem"), "{out:?}");
+    }
+
+    #[tokio::test]
+    async fn test_a_codex_session_patch_reaches_the_session_backend() {
+        let owners = start_linked_owners(OwnerBehavior::default(), OwnerBehavior::default());
+        dispatch_codex_from_main(
+            &owners,
+            &codex_patch_payload(&owners.main, &owners.main.join("a.rs")),
+        )
+        .await;
+
+        assert_eq!(
+            changed_paths(&owners.session),
+            vec![owners.main.join("a.rs")]
+        );
+        assert!(
+            changed_paths(&owners.worktree).is_empty(),
+            "a session checkout patch must not reach the worktree's backend: {:?}",
+            owners.worktree.requests()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_codex_user_prompt_submit_joins_every_worktree_backends_flush() {
+        let owners = start_linked_owners(
+            OwnerBehavior {
+                flush_text: Some("main problem\n".to_string()),
+                ..OwnerBehavior::default()
+            },
+            OwnerBehavior {
+                flush_text: Some("worktree problem\n".to_string()),
+                ..OwnerBehavior::default()
+            },
+        );
+        let out = dispatch_codex_from_main(
+            &owners,
+            &json!({
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "s1",
+                "cwd": owners.main.display().to_string(),
+            }),
+        )
+        .await;
+
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("json");
+        let context = parsed["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .expect("additionalContext");
+        let main_at = context.find("main problem");
+        let worktree_at = context.find("worktree problem");
+        assert!(
+            matches!((main_at, worktree_at), (Some(m), Some(w)) if m < w),
+            "the session's flush text, then the worktree's: {context:?}"
+        );
+        let flush_ops = vec!["flush".to_string(), "ack".to_string()];
+        assert_eq!(owners.session.ops(), flush_ops);
+        assert_eq!(owners.worktree.ops(), flush_ops);
     }
 
     /// A real owner answers `Changed` with `Response::Error` once its
