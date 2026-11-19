@@ -4238,6 +4238,123 @@ mod tests {
         .expect("MCP diagnostic call should finish within five seconds");
     }
 
+    async fn push_only_diagnostics_call(
+        cached: Option<Vec<serde_json::Value>>,
+    ) -> serde_json::Value {
+        use rmcp::ServiceExt as _;
+        use tokio::io::{AsyncWriteExt as _, BufStream};
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("main.rs");
+            std::fs::write(
+                &path,
+                "trait T { fn hello(); }\nstruct S;\nimpl T for S {}\n",
+            )
+            .unwrap();
+            let (translator, _lsp) = translator_with_capabilities(
+                &dir,
+                &ServerId::from("rust"),
+                lsp_types::ServerCapabilities::default(),
+            );
+            let cache = Arc::new(Mutex::new(NotificationCache::new()));
+            let uri = crate::bridge::path_to_uri(&dunce::canonicalize(&path).unwrap()).unwrap();
+            let (delivery, floors) = default_delivery_and_floors();
+            let server = McplsServer::new(
+                Arc::new(translator),
+                Arc::clone(&cache),
+                Arc::from(vec![dir.path().to_path_buf()]),
+                Arc::new(ResourceSubscriptions::new()),
+                false,
+                delivery,
+                floors,
+                DiagnosticsConfig::default(),
+                test_settle(),
+            );
+            let (server_io, client_io) = tokio::io::duplex(65_536);
+            let started = tokio::spawn(async move { server.serve(server_io).await.unwrap() });
+            let mut wire = BufStream::new(client_io);
+            let initialized = mcp_test_request(
+                &mut wire,
+                json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25", "capabilities": {},
+                        "clientInfo": {"name": "structured-output-test", "version": "1"}
+                    }
+                }),
+            )
+            .await;
+            assert!(initialized["result"].is_object(), "{initialized}");
+            wire.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+                .await
+                .unwrap();
+            wire.flush().await.unwrap();
+            let running = started.await.unwrap();
+
+            if let Some(list) = cached {
+                cache.lock().await.store_diagnostics(
+                    &ServerId::from("rust"),
+                    &uri,
+                    Some(1),
+                    list.into_iter()
+                        .map(|value| serde_json::from_value(value).unwrap())
+                        .collect(),
+                );
+            }
+            let response = mcp_test_request(
+                &mut wire,
+                json!({
+                    "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": {"name": "get_diagnostics", "arguments": {"file_path": path}}
+                }),
+            )
+            .await;
+            running.cancel().await.unwrap();
+            response
+        })
+        .await
+        .expect("MCP diagnostic call should finish within five seconds")
+    }
+
+    /// A push-only server that published an empty list for a clean file returns that empty list.
+    #[tokio::test]
+    async fn test_get_diagnostics_push_only_clean_file_returns_empty_list() {
+        let response = push_only_diagnostics_call(Some(vec![])).await;
+        assert!(response["error"].is_null(), "{response}");
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        assert_eq!(
+            response["result"]["structuredContent"],
+            json!({"diagnostics": []})
+        );
+    }
+
+    /// A push-only server returns the diagnostics it published for the file.
+    #[tokio::test]
+    async fn test_get_diagnostics_push_only_returns_published_diagnostics() {
+        let response = push_only_diagnostics_call(Some(vec![diagnostic_wire_record(
+            Some("pyrefly"),
+            None,
+            "bad type",
+            0,
+        )]))
+        .await;
+        assert!(response["error"].is_null(), "{response}");
+        assert_eq!(
+            response["result"]["structuredContent"],
+            json!({"diagnostics": [diagnostic_expected_record(Some("pyrefly"), None, "bad type", 1)]})
+        );
+    }
+
+    /// A push-only server with an unpublished file points the caller to `get_new_diagnostics`.
+    #[tokio::test]
+    async fn test_get_diagnostics_push_only_unpublished_file_points_to_get_new_diagnostics() {
+        let response = push_only_diagnostics_call(None).await;
+        let message = response["error"]["message"].as_str().unwrap();
+        assert!(message.contains("pull diagnostics"), "{message}");
+        assert!(message.contains("get_new_diagnostics"), "{message}");
+    }
+
     #[tokio::test]
     async fn test_rename_tool_with_params() {
         let server = create_test_server();

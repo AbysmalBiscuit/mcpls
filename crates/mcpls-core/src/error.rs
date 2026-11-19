@@ -298,6 +298,17 @@ pub enum Error {
         capability: &'static str,
     },
 
+    /// The server routed for a `get_diagnostics` call does not support pull
+    /// diagnostics and has published no diagnostics for the file.
+    #[error(
+        "server '{server_id}' does not support pull diagnostics and has published no \
+         diagnostics for this file; call get_new_diagnostics to receive its pushed diagnostics"
+    )]
+    PullDiagnosticsUnsupported {
+        /// Routing identity of the push-only server.
+        server_id: ServerId,
+    },
+
     /// A tool was called with `apply: true` while its config key is `false`.
     #[error("{tool} cannot write: set `{config_key} = true` in mcpls.toml to allow it")]
     ApplyDisabled {
@@ -700,6 +711,17 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "server 'rust' does not support capability 'renameProvider'"
+        );
+    }
+
+    #[test]
+    fn test_error_display_pull_diagnostics_unsupported() {
+        let err = Error::PullDiagnosticsUnsupported {
+            server_id: ServerId::from("python"),
+        };
+        assert_eq!(
+            err.to_string(),
+            "server 'python' does not support pull diagnostics and has published no diagnostics for this file; call get_new_diagnostics to receive its pushed diagnostics"
         );
     }
 
