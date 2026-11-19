@@ -15,8 +15,8 @@ use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{
     Implementation, ListResourcesResult, ListToolsResult, ReadResourceRequestParams,
     ReadResourceResponse, ReadResourceResult, Resource, ResourceContents,
-    ResourceUpdatedNotificationParam, ServerCapabilities, ServerInfo, SubscribeRequestParams, Tool,
-    ToolAnnotations, UnsubscribeRequestParams,
+    ResourceUpdatedNotificationParam, ServerCapabilities, ServerConfig, SubscribeRequestParams,
+    Tool, ToolAnnotations, UnsubscribeRequestParams,
 };
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
@@ -535,7 +535,7 @@ impl McplsServer {
     /// `project_config_ignored` reports whether a CWD-discovered
     /// `./mcpls.toml` was skipped as untrusted when the active config was
     /// loaded (see [`ServerConfig::project_config_ignored`](crate::config::ServerConfig::project_config_ignored));
-    /// `get_info` surfaces it in [`ServerInfo::instructions`].
+    /// `get_info` surfaces it in [`ServerConfig::instructions`].
     ///
     /// `delivery` and `floors` should be the same `Arc`s the caller's
     /// diagnostics-baseline background task shares, so that `flush` and
@@ -1909,7 +1909,7 @@ impl ServerHandler for McplsServer {
         Ok(())
     }
 
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         let mut implementation = Implementation::new("mcpls", env!("CARGO_PKG_VERSION"));
         implementation.title = Some("MCPLS - MCP to LSP Bridge".to_string());
         implementation.description = Some(env!("CARGO_PKG_DESCRIPTION").to_string());
@@ -1920,7 +1920,7 @@ impl ServerHandler for McplsServer {
             .enable_resources()
             .enable_resources_subscribe()
             .build();
-        let mut server_info = ServerInfo::new(capabilities);
+        let mut server_info = ServerConfig::new(capabilities);
         server_info.server_info = implementation;
         let mut instructions = INSTRUCTIONS.to_string();
 

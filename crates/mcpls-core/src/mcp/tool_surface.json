@@ -464,7 +464,9 @@
           "required": [
             "range",
             "severity",
-            "message"
+            "message",
+            "code",
+            "source"
           ],
           "type": "object"
         },
