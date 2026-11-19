@@ -125,10 +125,7 @@ impl DiagnosticsDelivery {
                 }
             });
         for key in keys {
-            let owner = self
-                .ownership
-                .entry((root.clone(), key.clone()))
-                .or_default();
+            let owner = self.ownership.entry((root.clone(), key)).or_default();
             if owner.generation == 0 || owner.delivered {
                 self.next_generation += 1;
                 *owner = Ownership {
@@ -173,7 +170,7 @@ impl DiagnosticsDelivery {
                 self.next_snapshot += 1;
                 let snapshot = Arc::new(RetainedFile {
                     id: self.next_snapshot,
-                    root: root.clone(),
+                    root,
                     generation,
                     file: OwnedEntry {
                         key: key.clone(),
