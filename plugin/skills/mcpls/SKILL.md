@@ -31,7 +31,8 @@ Use text search and file reads for text: comments, docs, config, string literals
 
 - Positions are an absolute `file_path` plus 1-based `line` and `character`, and the character must land on the identifier. Every location an mcpls tool returns is already in that form, so feed it straight back in. A text search that reports line and column numbers gives the same 1-based position.
 - Start from a name with `workspace_symbol_search`; its result is the position the other tools need.
-- A file in another checkout or worktree fails with `path outside workspace`. Read it directly instead.
+- A file in a linked worktree of the session's repository works with its absolute path. mcpls starts that worktree's backend on the first call, so an agent does not start a backend by hand.
+- A file in another checkout with no running backend fails with `path outside workspace`. Read it directly instead.
 - The first call for a language starts its server. While it indexes, calls return empty results or a "still initializing" error. Retry shortly before concluding a symbol does not exist.
 - A call that fails with ``stopped; run `mcpls lsp start <id>` `` means the user stopped that server. If the task needs it, run the command the error names in the shell.
 - `get_document_symbols` returns the whole outline, tests included, which is thousands of lines for a large file. Prefer `workspace_symbol_search` there.
