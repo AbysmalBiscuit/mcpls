@@ -251,6 +251,25 @@ impl Project {
         self
     }
 
+    /// A language server that publishes one diagnostic per document change
+    /// and renames by rewriting the first three characters of the file.
+    #[cfg(unix)]
+    fn with_diagnosing_server_idle(self, idle_ms: u64) -> Self {
+        std::fs::write(self.root().join("marker.fake"), "").unwrap();
+        std::fs::write(self.root().join("a.fake"), "abc\n").unwrap();
+        let script = self.root().join("diagnosing_lsp.py");
+        std::fs::write(&script, DIAGNOSING_LSP).unwrap();
+        self.write_config(
+            idle_ms,
+            &format!(
+                "\n[[lsp_servers]]\nlanguage_id = \"fake\"\ncommand = \"python3\"\nargs = [{:?}, {:?}]\nfile_patterns = [\"**/*.fake\"]\ntimeout_seconds = 10\n\n[lsp_servers.heuristics]\nproject_markers = [\"marker.fake\"]\n",
+                script.display().to_string(),
+                self.lifecycle_log().display().to_string(),
+            ),
+        );
+        self
+    }
+
     /// The lifecycle server behind `bin/fake-ls`, which is missing until
     /// the entry's install command writes it.
     #[cfg(unix)]
@@ -337,6 +356,63 @@ while True:
     method = message.get("method")
     if method == "initialize":
         send({"id": message["id"], "result": {"capabilities": {"documentSymbolProvider": True}}})
+    elif method == "exit":
+        log.write(f"exit {os.getpid()}\n")
+        break
+    elif "id" in message:
+        send({"id": message["id"], "result": None})
+"#;
+
+#[cfg(unix)]
+const DIAGNOSING_LSP: &str = r#"import json, os, sys
+
+log = open(sys.argv[1], "a", buffering=1)
+log.write(f"start {os.getpid()}\n")
+
+def receive():
+    length = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        if line in (b"\r\n", b"\n"):
+            break
+        key, value = line.decode().split(":", 1)
+        if key.lower() == "content-length":
+            length = int(value.strip())
+    return json.loads(sys.stdin.buffer.read(length))
+
+def send(message):
+    body = json.dumps({"jsonrpc": "2.0", **message}).encode()
+    sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+    sys.stdout.buffer.flush()
+
+def span(end):
+    return {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": end}}
+
+while True:
+    message = receive()
+    if message is None:
+        break
+    method = message.get("method")
+    params = message.get("params", {})
+    if method == "initialize":
+        send({"id": message["id"], "result": {"capabilities": {
+            "documentSymbolProvider": True,
+            "renameProvider": True,
+            "textDocumentSync": 1,
+        }}})
+    elif method in ("textDocument/didOpen", "textDocument/didChange", "textDocument/didSave"):
+        uri = params["textDocument"]["uri"]
+        diagnostic = {
+            "range": span(1),
+            "severity": 1,
+            "message": f"fake {method} " + uri.rsplit("/", 1)[-1],
+        }
+        send({"method": "textDocument/publishDiagnostics", "params": {"uri": uri, "diagnostics": [diagnostic]}})
+    elif method == "textDocument/rename":
+        uri = params["textDocument"]["uri"]
+        send({"id": message["id"], "result": {"changes": {uri: [{"range": span(3), "newText": params["newName"]}]}}})
     elif method == "exit":
         log.write(f"exit {os.getpid()}\n")
         break
@@ -452,6 +528,11 @@ impl Frontend {
     }
 
     #[cfg(unix)]
+    fn tool(&mut self, name: &str, arguments: &Value) -> Value {
+        self.request("tools/call", &json!({"name": name, "arguments": arguments}))
+    }
+
+    #[cfg(unix)]
     fn pid(&self) -> u32 {
         self.child.id()
     }
@@ -538,6 +619,15 @@ fn last_pid(path: &Path) -> u32 {
 fn assert_tool_success(call: &Value) {
     assert!(call["result"].is_object(), "{call}");
     assert_ne!(call["result"]["isError"], true, "{call}");
+}
+
+/// The JSON report a tool returned as its text content.
+#[cfg(unix)]
+fn report(call: &Value) -> Value {
+    let text = call["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a text report in {call}"));
+    serde_json::from_str(text).unwrap_or_else(|_| panic!("a JSON report: {text}"))
 }
 
 /// The reason a failed call carries: a tool result's text, or a JSON-RPC
@@ -743,6 +833,139 @@ fn a_worktree_file_is_answered_by_a_backend_started_for_the_worktree() {
         &one.user,
         "the worktree backend to exit",
     );
+}
+
+/// Polls `get_new_diagnostics` until its note is null, which means every
+/// backend the session uses has taken its baseline.
+fn await_baseline(frontend: &mut Frontend) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let call = frontend.tool("get_new_diagnostics", &json!({}));
+        assert_tool_success(&call);
+        if report(&call)["note"].is_null() {
+            return;
+        }
+        assert!(Instant::now() < deadline, "no baseline: {call}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// `get_new_diagnostics` from a session reports the changed files of its own
+/// checkout and of a linked worktree's backend, each once. The worktree backend
+/// starts on the first call into its checkout, so that call comes first and the
+/// files that must count as new are opened only after both baselines.
+#[cfg(unix)]
+#[test]
+fn new_diagnostics_merge_the_session_and_worktree_backends() {
+    let one = Project::new(500).with_diagnosing_server_idle(500);
+    let two = Project::new(500);
+    make_linked_worktree(&one, &two);
+    std::fs::write(two.root().join("marker.fake"), "").unwrap();
+    std::fs::write(two.root().join("a.fake"), "abc\n").unwrap();
+    std::fs::write(two.root().join("b.fake"), "abc\n").unwrap();
+
+    let mut a = one.frontend();
+    one.assert_attaches(&mut a);
+    assert_tool_success(&a.symbols(&two.root().join("a.fake")));
+    await_baseline(&mut a);
+
+    let session_file = one.root().join("a.fake");
+    let worktree_file = two.root().join("b.fake");
+    assert_tool_success(&a.symbols(&session_file));
+    assert_tool_success(&a.symbols(&worktree_file));
+
+    let reported = |seen: &[String], path: &Path| {
+        seen.iter()
+            .any(|file| file.ends_with(&*path.to_string_lossy()))
+    };
+    let mut seen: Vec<String> = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let call = a.tool("get_new_diagnostics", &json!({}));
+        assert_tool_success(&call);
+        seen.extend(
+            report(&call)["changed"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|file| file["file_path"].as_str().unwrap().to_string()),
+        );
+        if (reported(&seen, &session_file) && reported(&seen, &worktree_file))
+            || Instant::now() >= deadline
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        reported(&seen, &session_file),
+        "the session's file: {seen:?}"
+    );
+    assert!(
+        reported(&seen, &worktree_file),
+        "the worktree's file: {seen:?}"
+    );
+
+    let again = a.tool("get_new_diagnostics", &json!({}));
+    assert_tool_success(&again);
+    assert_eq!(report(&again)["changed"], json!([]), "{again}");
+
+    assert!(a.close(Duration::from_secs(5)));
+    Project::wait_for_backend_exit(
+        &two.root(),
+        one.runtime.path(),
+        &one.user,
+        "the worktree backend to exit",
+    );
+}
+
+/// A `rename_symbol` with `apply` on a file in a linked worktree writes the
+/// edit and lists the worktree's file in the `new_diagnostics` footer.
+#[cfg(unix)]
+#[test]
+fn a_worktree_rename_reports_its_diagnostics_in_the_footer() {
+    let one = Project::new(500).with_diagnosing_server_idle(500);
+    let two = Project::new(500);
+    make_linked_worktree(&one, &two);
+    std::fs::write(two.root().join("marker.fake"), "").unwrap();
+    std::fs::write(two.root().join("a.fake"), "abc\n").unwrap();
+    let mut config = std::fs::read_to_string(one.config()).unwrap();
+    config.push_str("\n[apply]\nrename = true\n\n[diagnostics]\nfooter = true\n");
+    std::fs::write(one.config(), config).unwrap();
+
+    let mut a = one.frontend();
+    one.assert_attaches(&mut a);
+    await_baseline(&mut a);
+
+    let worktree_file = two.root().join("a.fake");
+    assert_tool_success(&a.symbols(&worktree_file));
+    await_baseline(&mut a);
+    let call = a.tool(
+        "rename_symbol",
+        &json!({
+            "file_path": worktree_file,
+            "line": 1,
+            "character": 1,
+            "new_name": "xyz",
+            "apply": true,
+        }),
+    );
+    assert_tool_success(&call);
+    assert_eq!(std::fs::read_to_string(&worktree_file).unwrap(), "xyz\n");
+
+    let changed = report(&call)["new_diagnostics"]["changed"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let worktree_file_str = worktree_file.to_string_lossy().into_owned();
+    assert!(
+        changed.iter().any(|file| file["file_path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with(&*worktree_file_str))),
+        "the worktree's file in the footer: {call}"
+    );
+
+    assert!(a.close(Duration::from_secs(5)));
 }
 
 /// A tool call on a file in an unrelated checkout with no running backend

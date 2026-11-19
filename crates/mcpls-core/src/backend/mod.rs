@@ -7,6 +7,7 @@
 pub mod control;
 pub mod endpoint;
 pub mod frontend;
+mod gather;
 pub mod handshake;
 mod route;
 pub mod spawn;
