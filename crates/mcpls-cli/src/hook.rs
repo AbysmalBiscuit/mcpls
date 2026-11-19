@@ -2000,6 +2000,9 @@ mod tests {
     /// Bind the owner's socket synchronously.
     #[cfg(not(windows))]
     fn bind_owner(socket: &Path) -> tokio::net::UnixListener {
+        if let Some(parent) = socket.parent() {
+            std::fs::create_dir_all(parent).expect("the socket's directory");
+        }
         tokio::net::UnixListener::bind(socket).expect("bind the recording owner")
     }
 
