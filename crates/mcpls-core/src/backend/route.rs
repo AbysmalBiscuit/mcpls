@@ -14,6 +14,7 @@ pub enum Reach {
 /// The checkout root holding `file`, and how to reach its backend, or `None`
 /// when the session's own backend serves `file`: a relative path, a path in
 /// no checkout, or a path in `session_root` itself.
+#[must_use]
 pub fn route(session_root: &Path, file: &Path) -> Option<(PathBuf, Reach)> {
     if !file.is_absolute() {
         return None;
@@ -31,6 +32,46 @@ pub fn route(session_root: &Path, file: &Path) -> Option<(PathBuf, Reach)> {
         _ => Reach::AttachOnly,
     };
     Some((root, reach))
+}
+
+/// The root of every other checkout of the repository at `root`: the main
+/// checkout and each linked worktree, read from the git common directory
+/// without running git. Empty when `root` is not a git checkout.
+pub fn linked_checkouts(root: &Path) -> Vec<PathBuf> {
+    let root = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let Some(common) = common_dir(&root) else {
+        return Vec::new();
+    };
+
+    let mut candidates = Vec::new();
+    if common.file_name().is_some_and(|name| name == ".git") {
+        candidates.extend(common.parent().map(Path::to_path_buf));
+    }
+    if let Ok(entries) = std::fs::read_dir(common.join("worktrees")) {
+        candidates.extend(
+            entries
+                .flatten()
+                .filter_map(|entry| worktree_checkout(&entry.path())),
+        );
+    }
+
+    let mut checkouts: Vec<PathBuf> = candidates
+        .into_iter()
+        .filter(|candidate| candidate.join(".git").exists())
+        .filter_map(|candidate| dunce::canonicalize(candidate).ok())
+        .filter(|candidate| *candidate != root)
+        .collect();
+    checkouts.sort();
+    checkouts.dedup();
+    checkouts
+}
+
+/// The checkout root of the linked worktree whose admin directory is `admin`,
+/// from the `gitdir` file, which names `<worktree>/.git`.
+fn worktree_checkout(admin: &Path) -> Option<PathBuf> {
+    let contents = std::fs::read_to_string(admin.join("gitdir")).ok()?;
+    let marker = admin.join(contents.trim());
+    marker.parent().map(Path::to_path_buf)
 }
 
 /// The directory `file` lives in: `file` itself when it is a directory, else
@@ -227,5 +268,71 @@ mod tests {
         let file = wt.join("new.rs");
 
         assert_eq!(route(&main, &file), Some((wt, Reach::Start)));
+    }
+
+    /// Registers `wt` as a linked worktree of the repository at `main`, under
+    /// the admin directory `main/.git/worktrees/<name>`.
+    fn link_worktree(main: &Path, name: &str, wt: &Path) -> PathBuf {
+        let admin = main.join(".git").join("worktrees").join(name);
+        std::fs::create_dir_all(&admin).expect("admin dir");
+        std::fs::write(
+            admin.join("gitdir"),
+            format!("{}\n", wt.join(".git").display()),
+        )
+        .expect("gitdir");
+        std::fs::write(admin.join("commondir"), "../..\n").expect("commondir");
+        make_worktree(wt, &admin);
+        admin
+    }
+
+    #[test]
+    fn test_a_main_checkout_lists_its_linked_worktrees() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = canonical(dir.path());
+        let main = root.join("main");
+        make_repo(&main);
+        let wt = root.join("wt");
+        link_worktree(&main, "w", &wt);
+
+        assert_eq!(linked_checkouts(&main), vec![wt]);
+    }
+
+    #[test]
+    fn test_a_worktree_lists_the_main_checkout_and_its_siblings() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = canonical(dir.path());
+        let main = root.join("main");
+        make_repo(&main);
+        let wt1 = root.join("wt1");
+        let wt2 = root.join("wt2");
+        link_worktree(&main, "w1", &wt1);
+        link_worktree(&main, "w2", &wt2);
+
+        let mut expected = vec![main, wt2];
+        expected.sort();
+        assert_eq!(linked_checkouts(&wt1), expected);
+    }
+
+    #[test]
+    fn test_a_repository_without_worktrees_lists_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let main = canonical(dir.path()).join("main");
+        make_repo(&main);
+
+        assert_eq!(linked_checkouts(&main), Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn test_a_stale_worktree_entry_is_skipped() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = canonical(dir.path());
+        let main = root.join("main");
+        make_repo(&main);
+        let admin = main.join(".git").join("worktrees").join("stale");
+        std::fs::create_dir_all(&admin).expect("admin dir");
+        let gone = root.join("gone").join(".git");
+        std::fs::write(admin.join("gitdir"), format!("{}\n", gone.display())).expect("gitdir");
+
+        assert_eq!(linked_checkouts(&main), Vec::<PathBuf>::new());
     }
 }
