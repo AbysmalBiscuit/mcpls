@@ -94,32 +94,20 @@ impl Translator {
         Ok(path_to_uri(&validated_path)?.to_string())
     }
 
-    /// Handle diagnostics request.
+    /// Return the diagnostics for one file.
     ///
-    /// Merges the LSP pull-model response (`textDocument/diagnostic`) with
-    /// whatever is already cached from `textDocument/publishDiagnostics` push
-    /// notifications for the same file, so this returns the same diagnostics
-    /// `get_cached_diagnostics` would for the file at the same point in time
-    /// (see #244 — rust-analyzer's pull endpoint omits flycheck/clippy-sourced
-    /// diagnostics, and empirically also some native ones, that are only ever
-    /// delivered via the push path). If the pull request itself fails (e.g. a
-    /// push-only server answering `-32601`, or a timeout), a non-empty cache
-    /// entry is returned as a cache-only result instead of propagating the
-    /// error, since the cache is not required to be fresher than the pull
-    /// response to be useful here.
-    ///
-    /// The cache is read only after the pull request settles (success or
-    /// failure) and held only for the lookup itself — never across the LSP
-    /// round-trip — matching the lock-ordering discipline documented on
-    /// `cached_diagnostics_uri`. Like `get_cached_diagnostics`, the cache is
-    /// treated as eventually consistent: a cached entry may reflect a
-    /// slightly older document version than the fresh pull result if an edit
-    /// landed inside the server's flycheck debounce window.
+    /// Merges the pull response (`textDocument/diagnostic`) with the push
+    /// cache, because some servers deliver diagnostics only by push. When the
+    /// pull request fails, a non-empty cache entry is the result. A server
+    /// without `diagnosticProvider` gets no pull request: the result is its
+    /// published diagnostics for the file, even an empty list.
     ///
     /// # Errors
     ///
-    /// Returns an error if the LSP pull request fails and the cache holds no
-    /// diagnostics for the file either, or if the file cannot be opened.
+    /// Returns `Error::PullDiagnosticsUnsupported` if the server does not support
+    /// pull diagnostics and has published nothing for the file. Returns the pull
+    /// error if the pull request fails and the cache holds no diagnostics for the
+    /// file. Returns an error if the file cannot be opened.
     pub async fn handle_diagnostics(
         &self,
         file_path: String,
@@ -134,20 +122,30 @@ impl Translator {
 
         let path = self.parse_file_uri(&uri)?;
         let language = crate::bridge::state::detect_language(&path, &self.extension_map);
-        let pull_response: Result<lsp_types::DocumentDiagnosticReportResult> = match self
-            .require_capability_for_document(
-                &server_id,
-                "diagnosticProvider",
-                Some((&path, &language)),
-                |caps| caps.diagnostic_provider.is_some(),
-            ) {
-            Ok(()) => {
-                client
-                    .request("textDocument/diagnostic", params, client.request_timeout())
-                    .await
-            }
-            Err(error) => Err(error),
-        };
+        let capability = self.require_capability_for_document(
+            &server_id,
+            "diagnosticProvider",
+            Some((&path, &language)),
+            |caps| caps.diagnostic_provider.is_some(),
+        );
+        if capability.is_err() {
+            let diag_info = {
+                let cache = notification_cache.lock().await;
+                cache.get_diagnostics(uri.as_str()).cloned()
+            };
+            return match diag_info {
+                Some(info) => Ok(Self::diagnostics_from_cache_entry(
+                    Some(&info),
+                    ctx.encoding,
+                    &self.document_tracker,
+                )
+                .await),
+                None => Err(Error::PullDiagnosticsUnsupported { server_id }),
+            };
+        }
+        let pull_response: Result<lsp_types::DocumentDiagnosticReportResult> = client
+            .request("textDocument/diagnostic", params, client.request_timeout())
+            .await;
 
         let diag_info = {
             let cache = notification_cache.lock().await;

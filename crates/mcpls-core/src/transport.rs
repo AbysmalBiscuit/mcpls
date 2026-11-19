@@ -1641,11 +1641,14 @@ mod tests {
 
             // A stateless request (protocolVersion >= 2026-07-28) never
             // creates a session, so it must bypass the cap entirely even
-            // though the slot above is still held.
-            let stateless_initialize = br#"{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2026-07-28","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}"#;
-            let stateless = raw_http_post(addr, "/mcp", accept_headers, stateless_initialize).await;
+            // though the slot above is still held. `initialize` always takes
+            // the legacy path, so the stateless request is `server/discover`.
+            let stateless_headers = "Accept: application/json, text/event-stream\r\nContent-Type: application/json\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: server/discover\r\n";
+            let stateless_discover = br#"{"jsonrpc":"2.0","id":2,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}"#;
+            let stateless =
+                raw_http_post(addr, "/mcp", stateless_headers, stateless_discover).await;
             assert!(
-                !stateless.starts_with("HTTP/1.1 429"),
+                stateless.starts_with("HTTP/1.1 200"),
                 "stateless requests must bypass the session cap entirely, got: {stateless}"
             );
 
