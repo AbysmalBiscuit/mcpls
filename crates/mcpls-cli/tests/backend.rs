@@ -788,6 +788,14 @@ fn make_linked_worktree(main: &Project, worktree: &Project) {
         format!("gitdir: {}/.git/worktrees/two", main.root().display()),
     )
     .unwrap();
+    let admin = main.root().join(".git").join("worktrees").join("two");
+    std::fs::create_dir_all(&admin).unwrap();
+    std::fs::write(
+        admin.join("gitdir"),
+        format!("{}/.git\n", worktree.root().display()),
+    )
+    .unwrap();
+    std::fs::write(admin.join("commondir"), "../..\n").unwrap();
 }
 
 /// A tool call on a file in a linked worktree of the session's repository
@@ -910,6 +918,81 @@ fn new_diagnostics_merge_the_session_and_worktree_backends() {
     let again = a.tool("get_new_diagnostics", &json!({}));
     assert_tool_success(&again);
     assert_eq!(report(&again)["changed"], json!([]), "{again}");
+
+    assert!(a.close(Duration::from_secs(5)));
+    Project::wait_for_backend_exit(
+        &two.root(),
+        one.runtime.path(),
+        &one.user,
+        "the worktree backend to exit",
+    );
+}
+
+/// Runs `mcpls hook` as Claude Code would, with `payload` on stdin, and
+/// returns what it printed.
+#[cfg(unix)]
+fn fire_claude_hook(project: &Project, payload: &Value) -> String {
+    let mut child =
+        Project::command_with_identity(&project.root(), project.runtime.path(), &project.user)
+            .env("CLAUDE_PROJECT_DIR", project.root())
+            .arg("hook")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.to_string().as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{}", stdout(&output));
+    stdout(&output)
+}
+
+/// A successful Claude Code edit to a file in a linked worktree makes the
+/// worktree's backend's diagnostic reach the agent through `UserPromptSubmit`,
+/// and only once.
+#[cfg(unix)]
+#[test]
+fn a_worktree_edit_hook_delivers_its_diagnostic_once() {
+    let one = Project::new(500).with_diagnosing_server_idle(500);
+    let two = Project::new(500);
+    make_linked_worktree(&one, &two);
+    std::fs::write(two.root().join("marker.fake"), "").unwrap();
+    std::fs::write(two.root().join("a.fake"), "abc\n").unwrap();
+
+    let mut a = one.frontend();
+    one.assert_attaches(&mut a);
+    assert_tool_success(&a.symbols(&two.root().join("a.fake")));
+    await_baseline(&mut a);
+
+    let edited = two.root().join("b.fake");
+    std::fs::write(&edited, "abc\n").unwrap();
+    fire_claude_hook(
+        &one,
+        &json!({
+            "hook_event_name": "PostToolUse", "session_id": "hook-s1",
+            "tool_name": "Edit", "tool_input": {"file_path": edited},
+            "tool_response": {"success": true},
+        }),
+    );
+
+    let prompt = json!({
+        "hook_event_name": "UserPromptSubmit", "session_id": "hook-s1",
+        "prompt": "x",
+    });
+    let mut delivered = String::new();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !delivered.contains("b.fake") && Instant::now() < deadline {
+        delivered.push_str(&fire_claude_hook(&one, &prompt));
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(delivered.contains("b.fake"), "{delivered}");
+
+    let again = fire_claude_hook(&one, &prompt);
+    assert!(!again.contains("b.fake"), "{again}");
 
     assert!(a.close(Duration::from_secs(5)));
     Project::wait_for_backend_exit(
