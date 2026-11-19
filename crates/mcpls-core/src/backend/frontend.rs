@@ -87,6 +87,10 @@ pub(crate) struct Timing {
     pub(crate) retry: Duration,
     /// How long an evicted backend has to release the endpoint.
     pub(crate) gone: Duration,
+    /// How long a gathered call waits for each route backend's answer.
+    pub(crate) gather: Duration,
+    /// How long a route backend stays attached with no file call to it.
+    pub(crate) route_idle: Duration,
 }
 
 impl Default for Timing {
@@ -95,6 +99,8 @@ impl Default for Timing {
             start: Duration::from_secs(10),
             retry: Duration::from_millis(500),
             gone: Duration::from_secs(5),
+            gather: Duration::from_secs(10),
+            route_idle: Duration::from_secs(600),
         }
     }
 }
@@ -278,6 +284,8 @@ enum Event {
     },
     RouteLine(PathBuf, u64, String),
     RouteClosed(PathBuf, u64),
+    RouteIdle(PathBuf, u64),
+    GatherTimeout(String),
 }
 
 enum State {
@@ -287,11 +295,19 @@ enum State {
     Failed(String),
 }
 
-/// A `get_new_diagnostics` call that waits for the answers of several backends.
+/// How a gathered call merges its parts.
+#[derive(Clone, Copy)]
+enum Merge {
+    Diagnostics,
+    Symbols { limit: usize },
+}
+
+/// A tool call that waits for the answers of several backends.
 struct Gather {
     id: Value,
     parts: Vec<(usize, Value)>,
     waiting: usize,
+    merge: Merge,
 }
 
 /// Another checkout's backend, as the relay holds it.
@@ -302,6 +318,8 @@ enum Other {
         writer: tokio::io::WriteHalf<Box<dyn HookStream>>,
         place: Place,
         generation: u64,
+        reader: tokio::task::AbortHandle,
+        used: Instant,
     },
     Failed(String),
 }
@@ -375,8 +393,12 @@ pub(crate) async fn relay<R, W>(
                     let root = route.root.clone();
                     match others.get_mut(&root) {
                         Some(Other::Attached {
-                            writer, generation, ..
+                            writer,
+                            generation,
+                            used,
+                            ..
                         }) => {
+                            *used = Instant::now();
                             sent_to.insert(id.to_string(), root.clone());
                             if write_line(writer, &line).await.is_err() {
                                 let _ = events.send(Event::RouteClosed(root, *generation));
@@ -400,10 +422,7 @@ pub(crate) async fn relay<R, W>(
                     State::Attached => {
                         if let Some(writer) = backend.as_mut() {
                             if let Some(id) = message.get("id")
-                                && message.get("method").and_then(Value::as_str)
-                                    == Some("tools/call")
-                                && message.pointer("/params/name").and_then(Value::as_str)
-                                    == Some("get_new_diagnostics")
+                                && let Some(merge) = gather_merge(&message)
                                 && others
                                     .values()
                                     .any(|other| matches!(other, Other::Attached { .. }))
@@ -432,14 +451,22 @@ pub(crate) async fn relay<R, W>(
                                             .send(Event::RouteClosed(root.clone(), *generation));
                                     }
                                 }
+                                let key = host_key.clone();
                                 gathers.insert(
                                     host_key,
                                     Gather {
                                         id: id.clone(),
                                         parts: Vec::new(),
                                         waiting: 1 + index,
+                                        merge,
                                     },
                                 );
+                                let events = events.clone();
+                                let wait = timing.gather;
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(wait).await;
+                                    let _ = events.send(Event::GatherTimeout(key));
+                                });
                             }
                             track(&mut pending, &message);
                             if write_line(writer, &line).await.is_err() {
@@ -601,12 +628,13 @@ pub(crate) async fn relay<R, W>(
                         let current = route_generation;
                         let (reader, mut writer) = tokio::io::split(stream);
                         let for_lines = root.clone();
-                        spawn_lines(
+                        let lines = spawn_lines(
                             reader,
                             events.clone(),
                             move |line| Event::RouteLine(for_lines.clone(), current, line),
                             Event::RouteClosed(root.clone(), current),
                         );
+                        spawn_route_idle(root.clone(), current, timing.route_idle, events.clone());
                         let replayed = replay_route(
                             &mut writer,
                             init.as_deref(),
@@ -625,6 +653,8 @@ pub(crate) async fn relay<R, W>(
                                 writer,
                                 place,
                                 generation: current,
+                                reader: lines,
+                                used: Instant::now(),
                             },
                         );
                     }
@@ -712,7 +742,90 @@ pub(crate) async fn relay<R, W>(
                     }
                 }
             }
+            Event::RouteIdle(root, route) => {
+                let Some(Other::Attached {
+                    used, generation, ..
+                }) = others.get(&root)
+                else {
+                    continue;
+                };
+                if *generation != route {
+                    continue;
+                }
+                let idle_for = used.elapsed();
+                let busy = sent_to.values().any(|owner| *owner == root);
+                if busy {
+                    spawn_route_idle(root, route, timing.route_idle, events.clone());
+                } else if idle_for < timing.route_idle {
+                    spawn_route_idle(
+                        root,
+                        route,
+                        timing.route_idle.saturating_sub(idle_for),
+                        events.clone(),
+                    );
+                } else if let Some(Other::Attached {
+                    mut writer, reader, ..
+                }) = others.remove(&root)
+                {
+                    let _ = writer.shutdown().await;
+                    reader.abort();
+                    tracing::debug!(root = %root.display(), "detached an idle route");
+                }
+            }
+            Event::GatherTimeout(host_key) => {
+                let expired: Vec<String> = gather_parts
+                    .iter()
+                    .filter(|(_, (owner, _))| *owner == host_key)
+                    .map(|(key, _)| key.clone())
+                    .collect();
+                for key in expired {
+                    let Some((_, index)) = gather_parts.remove(&key) else {
+                        continue;
+                    };
+                    let Some(root) = sent_to.remove(&key) else {
+                        continue;
+                    };
+                    let Ok(id) = serde_json::from_str::<Value>(&key) else {
+                        continue;
+                    };
+                    let reply = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {
+                            "code": -32603,
+                            "message": format!(
+                                "the backend of {} did not answer within {} ms",
+                                root.display(),
+                                timing.gather.as_millis()
+                            ),
+                        },
+                    });
+                    if let Some(merged) = settle_part(&mut gathers, &host_key, index, reply) {
+                        write_value(&mut host_out, &merged).await;
+                    }
+                }
+            }
         }
+    }
+}
+
+/// The merge a tool call's backends answer under, when the call is gathered.
+fn gather_merge(message: &Value) -> Option<Merge> {
+    if message.get("method").and_then(Value::as_str) != Some("tools/call") {
+        return None;
+    }
+    match message.pointer("/params/name").and_then(Value::as_str)? {
+        "get_new_diagnostics" => Some(Merge::Diagnostics),
+        "workspace_symbol_search" => {
+            let limit = message
+                .pointer("/params/arguments/limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(100);
+            Some(Merge::Symbols {
+                limit: usize::try_from(limit).unwrap_or(usize::MAX),
+            })
+        }
+        _ => None,
     }
 }
 
@@ -730,10 +843,18 @@ fn settle_part(
     if gather.waiting > 0 {
         return None;
     }
-    let Gather { id, mut parts, .. } = gathers.remove(key)?;
+    let Gather {
+        id,
+        merge,
+        mut parts,
+        ..
+    } = gathers.remove(key)?;
     parts.sort_by_key(|(index, _)| *index);
     let parts = parts.into_iter().map(|(_, part)| part).collect();
-    Some(gather::merge(&id, parts))
+    Some(match merge {
+        Merge::Diagnostics => gather::merge(&id, parts),
+        Merge::Symbols { limit } => gather::merge_symbols(&id, parts, limit),
+    })
 }
 
 /// Record `message`'s id as awaiting the backend's answer, if it is a
@@ -843,7 +964,8 @@ fn spawn_lines<R>(
     events: mpsc::UnboundedSender<Event>,
     line: impl Fn(String) -> Event + Send + 'static,
     closed: Event,
-) where
+) -> tokio::task::AbortHandle
+where
     R: AsyncRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
@@ -854,6 +976,19 @@ fn spawn_lines<R>(
             }
         }
         let _ = events.send(closed);
+    })
+    .abort_handle()
+}
+
+fn spawn_route_idle(
+    root: PathBuf,
+    generation: u64,
+    after: Duration,
+    events: mpsc::UnboundedSender<Event>,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(after).await;
+        let _ = events.send(Event::RouteIdle(root, generation));
     });
 }
 
@@ -1205,6 +1340,8 @@ mod fake {
         AnswerOnceThenClose,
         /// Answer `initialize`, then answer every request with a tool result whose text is the given report.
         Report(&'static str),
+        /// Like `Report`, but sends no answer to a call of the named tool.
+        Silent(&'static str, &'static str),
     }
 
     struct WriteClosedStream {
@@ -1324,6 +1461,10 @@ mod fake {
                     if handshake::write(&mut server, &reply).await.is_err() {
                         return;
                     }
+                    let silent_tool = match &then {
+                        Then::Silent(_, tool) => Some(*tool),
+                        _ => None,
+                    };
                     match then {
                         Then::Serve => {
                             if let Ok(running) = test_server().serve(server).await {
@@ -1355,7 +1496,7 @@ mod fake {
                             let _ = writer.write_all(format!("{answer}\n").as_bytes()).await;
                             let _ = lines.next_line().await;
                         }
-                        Then::Report(report) => {
+                        Then::Report(report) | Then::Silent(report, _) => {
                             let (reader, mut writer) = tokio::io::split(server);
                             let mut lines = BufReader::new(reader).lines();
                             while let Ok(Some(line)) = lines.next_line().await {
@@ -1367,6 +1508,10 @@ mod fake {
                                 else {
                                     continue;
                                 };
+                                if silent_tool.is_some_and(|tool| message["params"]["name"] == tool)
+                                {
+                                    continue;
+                                }
                                 let answer = if method == "initialize" {
                                     json!({"jsonrpc":"2.0","id":id,"result":{
                                         "protocolVersion":"2025-11-25",
@@ -1452,6 +1597,8 @@ mod fake {
             start: Duration::from_millis(300),
             retry: Duration::from_millis(20),
             gone: Duration::from_millis(300),
+            gather: Duration::from_millis(300),
+            route_idle: Duration::from_secs(60),
         }
     }
 
@@ -1769,6 +1916,11 @@ mod relay_tests {
             self.send(json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":{}}})).await;
             self.response(id).await
         }
+
+        async fn call_symbols(&mut self, id: i64) -> Value {
+            self.send(json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"workspace_symbol_search","arguments":{"query":"x"}}})).await;
+            self.response(id).await
+        }
     }
 
     fn initialize_request() -> Value {
@@ -2076,6 +2228,88 @@ mod relay_tests {
         assert_eq!(files, ["/work/a.rs", "/wt/b.rs"]);
     }
 
+    /// `workspace_symbol_search` is answered with the symbols of the session backend and every attached route backend.
+    #[tokio::test]
+    async fn test_workspace_symbols_merge_every_attached_backend() {
+        let door = FakeDoor::new(
+            Start::Spawned,
+            vec![Script::Server(
+                accepted(),
+                Then::Report(
+                    r#"{"symbols":[{"name":"main_only","kind":"Function","location":{"uri":"file:///work/a.rs","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}}}]}"#,
+                ),
+            )],
+        );
+        let wt_door = FakeDoor::new(
+            Start::Spawned,
+            vec![Script::Server(
+                accepted(),
+                Then::Report(
+                    r#"{"symbols":[{"name":"worktree_only","kind":"Function","location":{"uri":"file:///wt/b.rs","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}}}]}"#,
+                ),
+            )],
+        );
+        let router = FakeRouter(vec![(PathBuf::from("/wt"), Arc::clone(&wt_door), true)]);
+        let mut host = Host::start(door, Arc::new(router), request(), fast());
+        host.initialize().await;
+        host.call_file(2, "/wt/b.rs").await;
+
+        let merged = host.call_symbols(3).await;
+        assert!(merged.get("error").is_none(), "{merged}");
+        let report: Value =
+            serde_json::from_str(merged["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        let names: Vec<&str> = report["symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|symbol| symbol["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["main_only", "worktree_only"]);
+    }
+
+    /// A route backend that never answers `workspace_symbol_search` does not hide the session's symbols.
+    #[tokio::test]
+    async fn test_a_silent_route_does_not_hide_the_session_symbols() {
+        let door = FakeDoor::new(
+            Start::Spawned,
+            vec![Script::Server(
+                accepted(),
+                Then::Report(
+                    r#"{"symbols":[{"name":"main_only","kind":"Function","location":{"uri":"file:///work/a.rs","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}}}]}"#,
+                ),
+            )],
+        );
+        let wt_door = FakeDoor::new(
+            Start::Spawned,
+            vec![Script::Server(
+                accepted(),
+                Then::Silent(
+                    r#"{"symbols":[{"name":"worktree_only","kind":"Function","location":{"uri":"file:///wt/b.rs","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}}}]}"#,
+                    "workspace_symbol_search",
+                ),
+            )],
+        );
+        let router = FakeRouter(vec![(PathBuf::from("/wt"), Arc::clone(&wt_door), true)]);
+        let mut host = Host::start(door, Arc::new(router), request(), fast());
+        host.initialize().await;
+        host.call_file(2, "/wt/b.rs").await;
+
+        let answered = tokio::time::timeout(Duration::from_secs(5), host.call_symbols(3))
+            .await
+            .expect("the symbol search is answered");
+        assert!(answered.get("error").is_none(), "{answered}");
+        let report: Value =
+            serde_json::from_str(answered["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        let names: Vec<&str> = report["symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|symbol| symbol["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["main_only"]);
+    }
+
     /// A file under a route whose checkout has no backend to attach to is answered by the session's backend.
     #[tokio::test]
     async fn test_a_file_with_no_backend_to_attach_to_goes_to_the_session_backend() {
@@ -2197,5 +2431,73 @@ mod relay_tests {
         assert_ne!(retried["result"]["isError"], true, "{retried}");
         assert!(retried.get("error").is_none(), "{retried}");
         assert_eq!(wt_door.kinds.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_an_idle_route_is_detached_and_attached_again() {
+        let door = FakeDoor::new(
+            Start::Spawned,
+            vec![Script::Server(accepted(), Then::Serve)],
+        );
+        let wt_door = FakeDoor::new(
+            Start::Spawned,
+            vec![
+                Script::Server(accepted(), Then::Serve),
+                Script::Server(accepted(), Then::Serve),
+            ],
+        );
+        let router = FakeRouter(vec![(PathBuf::from("/wt"), Arc::clone(&wt_door), false)]);
+        let timing = Timing {
+            route_idle: Duration::from_millis(200),
+            ..fast()
+        };
+        let mut host = Host::start(
+            Arc::clone(&door) as Arc<dyn Door>,
+            Arc::new(router),
+            request(),
+            timing,
+        );
+        host.initialize().await;
+
+        let first = host.call_file(2, "/wt/a.rs").await;
+        assert_ne!(first["result"]["isError"], true, "{first}");
+
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        let second = host.call_file(3, "/wt/a.rs").await;
+        assert_ne!(second["result"]["isError"], true, "{second}");
+        assert!(second.get("error").is_none(), "{second}");
+        assert_eq!(wt_door.kinds.lock().unwrap().len(), 2);
+        assert_eq!(door.kinds.lock().unwrap().len(), 1);
+
+        let session = host.call_tool(4).await;
+        assert_ne!(session["result"]["isError"], true, "{session}");
+    }
+
+    #[tokio::test]
+    async fn test_a_route_in_use_stays_attached() {
+        let door = FakeDoor::new(
+            Start::Spawned,
+            vec![Script::Server(accepted(), Then::Serve)],
+        );
+        let wt_door = FakeDoor::new(
+            Start::Spawned,
+            vec![Script::Server(accepted(), Then::Serve)],
+        );
+        let router = FakeRouter(vec![(PathBuf::from("/wt"), Arc::clone(&wt_door), false)]);
+        let timing = Timing {
+            route_idle: Duration::from_millis(300),
+            ..fast()
+        };
+        let mut host = Host::start(door, Arc::new(router), request(), timing);
+        host.initialize().await;
+
+        for id in 2..=5 {
+            let call = host.call_file(id, "/wt/a.rs").await;
+            assert_ne!(call["result"]["isError"], true, "{call}");
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+
+        assert_eq!(wt_door.kinds.lock().unwrap().len(), 1);
     }
 }
