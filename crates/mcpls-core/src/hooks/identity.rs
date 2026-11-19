@@ -135,7 +135,7 @@ fn root_from(canonical: &Path, home: Option<&Path>) -> PathBuf {
 /// directory such as `/tmp` would otherwise claim every directory under it.
 /// The file is checked with `is_file` before it is read, so a FIFO named
 /// `.git` is never opened.
-fn holds_checkout_marker(dir: &Path) -> bool {
+pub(crate) fn holds_checkout_marker(dir: &Path) -> bool {
     let marker = dir.join(".git");
     if marker.is_dir() {
         return marker.join("HEAD").is_file();

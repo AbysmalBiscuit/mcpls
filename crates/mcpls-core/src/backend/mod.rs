@@ -8,6 +8,7 @@ pub mod control;
 pub mod endpoint;
 pub mod frontend;
 pub mod handshake;
+mod route;
 pub mod spawn;
 mod stub;
 
