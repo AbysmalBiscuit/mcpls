@@ -130,7 +130,10 @@ jobs:
           cache-targets: "false"
           shared-key: "ci"
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-      - uses: taiki-e/install-action@dee540ee3f3ff5c6a0665fed9996875d0ba04ca2 # nextest
+      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
+        with:
+          tool: cargo-nextest
+          fallback: none
       - name: Build and archive tests
         run: cargo nextest archive --workspace --all-features --lib --bins --tests --archive-file nextest-archive.tar.zst
       - name: Upload test archive
@@ -188,7 +191,10 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
-      - uses: taiki-e/install-action@dee540ee3f3ff5c6a0665fed9996875d0ba04ca2 # nextest
+      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
+        with:
+          tool: cargo-nextest
+          fallback: none
       - name: Download test archive
         uses: actions/download-artifact@v8
         with:
@@ -210,7 +216,10 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
-      - uses: taiki-e/install-action@dee540ee3f3ff5c6a0665fed9996875d0ba04ca2 # nextest
+      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
+        with:
+          tool: cargo-nextest
+          fallback: none
       - name: Download test archive
         uses: actions/download-artifact@v8
         with:
@@ -232,7 +241,10 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
-      - uses: taiki-e/install-action@dee540ee3f3ff5c6a0665fed9996875d0ba04ca2 # nextest
+      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
+        with:
+          tool: cargo-nextest
+          fallback: none
       - name: Download test archive
         uses: actions/download-artifact@v8
         with:
@@ -367,21 +379,16 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
-      checks: write
-      issues: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
-      # Vulnerability scanning only. This fork does not upstream, so it keeps
-      # no license allow-list and no `deny.toml`; `cargo audit` needs neither,
-      # reading `Cargo.lock` against the RustSec database directly.
-      #
-      # Not SHA-pinned like every other action here, because the digest could
-      # not be verified from the environment this was written in and a wrong
-      # one fails the job at checkout. Dependabot watches `github-actions` in
-      # this repository weekly and will pin it.
-      - uses: rustsec/audit-check@v2
+      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit
+          fallback: none
+      # Informational advisories (unmaintained, unsound, notice) print as
+      # warnings and do not fail the job; vulnerabilities exit non-zero.
+      - name: cargo audit
+        run: cargo audit
 
   coverage:
     name: Coverage
@@ -403,8 +410,10 @@ jobs:
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           shared-key: "coverage"
-      - uses: taiki-e/install-action@caf4aedf2bfe5bfb679703b29290921f4711b2f3 # cargo-llvm-cov
-      - uses: taiki-e/install-action@dee540ee3f3ff5c6a0665fed9996875d0ba04ca2 # nextest
+      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
+        with:
+          tool: cargo-llvm-cov,cargo-nextest
+          fallback: none
       - name: Generate coverage
         run: cargo llvm-cov nextest --workspace --all-features --lib --bins --lcov --output-path lcov.info
       - name: Upload coverage
