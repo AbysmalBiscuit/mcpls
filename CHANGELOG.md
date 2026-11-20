@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.5](https://github.com/AbysmalBiscuit/mcpls/compare/v0.4.4...v0.4.5) (2026-11-20)
+
+
+### Bug Fixes
+
+* **release:** build on the latest runner images ([#101](https://github.com/AbysmalBiscuit/mcpls/issues/101)) ([9ddd70e](https://github.com/AbysmalBiscuit/mcpls/commit/9ddd70e18c7a3abaf8ca85f657dcd5b0a3decf0e))
+
 ## [0.4.4](https://github.com/AbysmalBiscuit/mcpls/compare/v0.4.3...v0.4.4) (2026-11-19)
 
 
