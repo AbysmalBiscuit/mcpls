@@ -338,7 +338,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
       - name: Install dist
         shell: bash
-        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh"
+        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.34.0/cargo-dist-installer.sh | sh"
       - name: Check release.yml
         run: dist generate --check
 
@@ -362,7 +362,7 @@ jobs:
       - name: Install dist for Windows bootstrap tests
         if: runner.os == 'Windows'
         shell: pwsh
-        run: irm https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.ps1 | iex
+        run: irm https://github.com/axodotdev/cargo-dist/releases/download/v0.34.0/cargo-dist-installer.ps1 | iex
       - name: Generate the pinned installer for Windows bootstrap tests
         if: runner.os == 'Windows'
         run: dist build --artifacts=global
